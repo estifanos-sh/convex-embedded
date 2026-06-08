@@ -1,0 +1,29 @@
+packages:
+  - apps/*
+  - packages/*
+  - tools/*
+
+catalogMode: prefer
+
+catalog:
+  "@types/node": ^25
+  typescript: ^6
+  "@typescript/native-preview": latest
+  vite: npm:@voidzero-dev/vite-plus-core@latest
+  vitest: npm:@voidzero-dev/vite-plus-test@latest
+  vite-plus: latest
+  convex: ^1.40.0
+overrides:
+  vite: "catalog:"
+  vitest: "catalog:"
+peerDependencyRules:
+  allowAny:
+    - vite
+    - vitest
+  allowedVersions:
+    vite: "*"
+    vitest: "*"
+allowBuilds:
+  # esbuild is a transitive dep of `convex` (its CLI bundler); we build with tsdown and never run
+  # esbuild, so don't build its native binary.
+  esbuild: false
