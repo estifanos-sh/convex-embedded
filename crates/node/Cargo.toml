@@ -1,0 +1,20 @@
+[package]
+name = "node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+napi = { version = "2", features = ["napi6", "tokio_rt"] }
+napi-derive = "2"
+storage = { path = "../storage" }
+
+[build-dependencies]
+napi-build = "2"

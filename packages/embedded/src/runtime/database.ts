@@ -1,8 +1,15 @@
 import type { GenericDataModel, TableNamesInDataModel, WithoutSystemFields } from "convex/server";
-import type { EmbeddedStore } from "../storage/store";
-import type { StoreSchema, StoredDoc, TableDef, UpsertIn, WriteBatch } from "../storage/types";
+import type {
+  RuntimeStorageReader,
+  RuntimeStorageWriter,
+  StoreSchema,
+  StoredDoc,
+  TableDef,
+  UpsertIn,
+  WriteBatch,
+} from "../storage/types";
 import type { Doc, Id } from "./model";
-import { type Query, QueryBuilder } from "./query";
+import { type Query, QueryBuilder, type QueryOverlay, type ReadTracker } from "./query";
 import { dataOf, extractCols, makeId, materialize, type RawDoc, tableFromId } from "./values";
 
 export type Schema = Map<string, TableDef>;
@@ -39,23 +46,27 @@ function tableDef(schema: Schema, table: string): TableDef {
 }
 
 export function createReader<DM extends GenericDataModel>(
-  store: EmbeddedStore,
+  store: RuntimeStorageReader,
   schema: Schema,
+  tracker?: ReadTracker,
 ): DatabaseReader<DM> {
   return {
     async get<T extends TableNamesInDataModel<DM>>(id: Id<T>): Promise<Doc<DM, T> | null> {
-      const stored = await store.get(tableFromId(id), id);
+      const table = tableFromId(id);
+      tracker?.table(table);
+      const stored = await store.get(table, id);
       return stored ? (materialize(stored) as unknown as Doc<DM, T>) : null;
     },
     query<T extends TableNamesInDataModel<DM>>(table: T): Query<DM, T> {
-      return new QueryBuilder<DM, T>(store, tableDef(schema, table));
+      return new QueryBuilder<DM, T>(store, tableDef(schema, table), undefined, tracker);
     },
   };
 }
 
 export function createWriter<DM extends GenericDataModel>(
-  store: EmbeddedStore,
+  store: RuntimeStorageWriter,
   schema: Schema,
+  tracker?: ReadTracker,
 ): { db: DatabaseWriter<DM>; toBatch: () => WriteBatch } {
   const upserts = new Map<string, { input: UpsertIn; doc: StoredDoc }>();
   const deletes = new Set<string>();
@@ -81,12 +92,24 @@ export function createWriter<DM extends GenericDataModel>(
     return stored ? materialize(stored) : null;
   };
 
+  const overlayFor = (table: string): QueryOverlay => ({
+    staged: [...upserts.values()]
+      .filter((e) => e.input.table === table)
+      .map((e) => materialize(e.doc)),
+    deleted: new Set([...deletes].filter((id) => tableFromId(id) === table)),
+  });
+
   const db: DatabaseWriter<DM> = {
     async get<T extends TableNamesInDataModel<DM>>(id: Id<T>): Promise<Doc<DM, T> | null> {
       return (await read(id)) as unknown as Doc<DM, T> | null;
     },
     query<T extends TableNamesInDataModel<DM>>(table: T): Query<DM, T> {
-      return new QueryBuilder<DM, T>(store, tableDef(schema, table));
+      return new QueryBuilder<DM, T>(
+        store,
+        tableDef(schema, table),
+        () => overlayFor(table),
+        tracker,
+      );
     },
     async insert<T extends TableNamesInDataModel<DM>>(
       table: T,

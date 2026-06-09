@@ -3,6 +3,8 @@ export type Row = Record<string, unknown>;
 
 export type IdentityKey = string;
 export type Affinity = "TEXT" | "REAL" | "INTEGER";
+export type ColValue = string | number | bigint | boolean | null | undefined;
+export type StoredDocData = Record<string, unknown>;
 
 export interface ColumnDef {
   name: string;
@@ -27,14 +29,14 @@ export interface StoreSchema {
 export interface StoredDoc {
   _id: string;
   _creationTime: number;
-  data: unknown;
+  data: StoredDocData;
 }
 
 export interface UpsertIn {
   table: string;
   id: string;
-  data: unknown;
-  cols: Record<string, Param>;
+  data: StoredDocData;
+  cols: Record<string, ColValue>;
   creationTime: number;
 }
 
@@ -49,18 +51,14 @@ export interface WriteBatch {
 }
 
 export type Bound =
-  | { kind: "eq"; value: Param }
+  | { kind: "eq"; value: ColValue }
   | {
       kind: "range";
-      lower?: Param;
+      lower?: ColValue;
       lowerInclusive?: boolean;
-      upper?: Param;
+      upper?: ColValue;
       upperInclusive?: boolean;
     };
-
-export interface SeekKey {
-  values: Param[];
-}
 
 export interface ScanSpec {
   table: string;
@@ -68,13 +66,29 @@ export interface ScanSpec {
   bounds?: Bound[];
   order: "asc" | "desc";
   limit?: number;
-  seek?: SeekKey;
 }
 
 export interface CountSpec {
   table: string;
   index?: string;
   bounds?: Bound[];
+}
+
+export interface RuntimeStorage {
+  get(table: string, id: string): Promise<StoredDoc | undefined>;
+  scan(spec: ScanSpec): Promise<StoredDoc[] | null>;
+  count(spec: CountSpec): Promise<number | null>;
+  nextCreationTime(): number;
+  commit(batch: WriteBatch): Promise<void>;
+}
+
+export type RuntimeStorageReader = Pick<RuntimeStorage, "get" | "scan" | "count">;
+export type RuntimeStorageWriter = RuntimeStorage;
+
+export interface EmbeddedStoreBackend extends RuntimeStorage {
+  setup(schema: StoreSchema): Promise<void>;
+  clear(): Promise<void>;
+  close(): Promise<void>;
 }
 
 export type BoundParam = string | number | bigint | boolean | null | Uint8Array;

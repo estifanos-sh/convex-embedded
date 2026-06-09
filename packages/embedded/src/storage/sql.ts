@@ -11,9 +11,9 @@ const SELECT_COLS = "id, creation_time_ms, data";
 export function compileScan(spec: ScanSpec, table: TableDef): CompileResult {
   const cols = planColumns(spec.index, table);
   if (cols === "miss") return { kind: "miss" };
-  if (spec.seek) return { kind: "miss" };
 
   const w = boundsClause(spec.bounds ?? [], cols);
+  if (w.kind === "miss") return { kind: "miss" };
   if (w.kind === "unsatisfiable") return w;
 
   const orderCols = cols.length ? [...cols, "creation_time_ms", "id"] : ["creation_time_ms", "id"];
@@ -31,6 +31,7 @@ export function compileCount(spec: CountSpec, table: TableDef): CompileResult {
   if (cols === "miss") return { kind: "miss" };
 
   const w = boundsClause(spec.bounds ?? [], cols);
+  if (w.kind === "miss") return { kind: "miss" };
   if (w.kind === "unsatisfiable") return w;
 
   const sql = `SELECT COUNT(*) AS n FROM doc__${table.name} WHERE identity_key = ?${w.clause}`;
@@ -49,7 +50,7 @@ export function countParams(spec: CountSpec): Param[] {
 }
 
 export function scanKey(spec: ScanSpec): string {
-  return `s|${spec.table}|${spec.index ?? "@pk"}|${boundsShape(spec.bounds)}|${spec.order}|${spec.seek ? "k" : ""}|${spec.limit !== undefined ? "l" : ""}`;
+  return `s|${spec.table}|${spec.index ?? "@pk"}|${boundsShape(spec.bounds)}|${spec.order}|${spec.limit !== undefined ? "l" : ""}`;
 }
 
 export function countKey(spec: CountSpec): string {
@@ -62,7 +63,10 @@ function planColumns(index: string | undefined, table: TableDef): string[] | "mi
   return def ? def.fields : "miss";
 }
 
-type ClauseResult = { kind: "ok"; clause: string } | { kind: "unsatisfiable"; reason: string };
+type ClauseResult =
+  | { kind: "ok"; clause: string }
+  | { kind: "miss" }
+  | { kind: "unsatisfiable"; reason: string };
 
 function boundsClause(bounds: Bound[], cols: string[]): ClauseResult {
   const target = cols.length ? cols : ["id"];
@@ -76,9 +80,13 @@ function boundsClause(bounds: Bound[], cols: string[]): ClauseResult {
     if (seenRange) return { kind: "unsatisfiable", reason: "bound follows a range bound" };
     const col = target[i]!;
     if (b.kind === "eq") {
+      if (b.value === undefined || b.value === null) return { kind: "miss" };
       clauses.push(`${col} = ?`);
     } else {
       seenRange = true;
+      // A range with neither side set intentionally contributes no SQL clause. This mirrors
+      // the Rust builder and keeps programmatic range construction a harmless no-op.
+      if (b.lower === null || b.upper === null) return { kind: "miss" };
       if (b.lower !== undefined) clauses.push(`${col} ${b.lowerInclusive ? ">=" : ">"} ?`);
       if (b.upper !== undefined) clauses.push(`${col} ${b.upperInclusive ? "<=" : "<"} ?`);
     }
@@ -90,7 +98,7 @@ function boundsParams(bounds: Bound[]): Param[] {
   const params: Param[] = [];
   for (const b of bounds) {
     if (b.kind === "eq") {
-      params.push(b.value);
+      if (b.value !== null && b.value !== undefined) params.push(b.value);
     } else {
       if (b.lower !== undefined) params.push(b.lower);
       if (b.upper !== undefined) params.push(b.upper);
@@ -103,7 +111,10 @@ function boundsShape(bounds?: Bound[]): string {
   if (!bounds) return "";
   return bounds
     .map((b) => {
-      if (b.kind === "eq") return "eq";
+      if (b.kind === "eq") {
+        if (b.value === undefined) return "equ";
+        return b.value === null ? "eqn" : "eq";
+      }
       const lo = b.lower !== undefined ? (b.lowerInclusive ? "L" : "l") : "";
       const hi = b.upper !== undefined ? (b.upperInclusive ? "U" : "u") : "";
       return `r${lo}${hi}`;

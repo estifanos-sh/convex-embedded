@@ -1,5 +1,6 @@
 import { PlanCache } from "./cache";
 import { type Clock, createClock } from "./clock";
+import { decode, encode } from "../runtime/codec";
 import {
   type CompileResult,
   SCAN_CAP,
@@ -14,10 +15,12 @@ import type {
   BoundParam,
   Connection,
   CountSpec,
+  EmbeddedStoreBackend,
   IdentityKey,
   Param,
   Row,
   ScanSpec,
+  StoredDocData,
   Statement,
   StoreSchema,
   StoredDoc,
@@ -28,7 +31,7 @@ import type {
 const SELECT_DOC = "id, creation_time_ms, data";
 const RESERVED = new Set(["id", "identity_key", "creation_time_ms", "data"]);
 
-export class EmbeddedStore {
+export class EmbeddedStore implements EmbeddedStoreBackend {
   private readonly tables = new Map<string, TableDef>();
   private readonly plans = new PlanCache<CompileResult>();
   private readonly stmts = new Map<string, Promise<Statement>>();
@@ -208,18 +211,24 @@ function validateIdent(name: string): void {
   if (!ok) throw new Error(`invalid identifier: ${JSON.stringify(name)}`);
 }
 
-function encodeData(value: unknown): string {
-  return JSON.stringify(value);
+function encodeData(value: StoredDocData): string {
+  return encode(value);
 }
 
 function rowToDoc(row: Row): StoredDoc {
+  const data = decode(row.data as string);
+  if (!isRecord(data)) throw new Error("stored document data must be an object");
   return {
     _id: row.id as string,
     _creationTime: row.creation_time_ms as number,
-    data: JSON.parse(row.data as string),
+    data,
   };
 }
 
 function bind(params: Param[]): BoundParam[] {
   return params.map((p) => (p instanceof ArrayBuffer ? new Uint8Array(p) : p));
+}
+
+function isRecord(value: unknown): value is StoredDocData {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
