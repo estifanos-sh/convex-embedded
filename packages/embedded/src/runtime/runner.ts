@@ -1,21 +1,86 @@
 import { getFunctionName } from "convex/server";
 import type { GenericDataModel } from "convex/server";
-import type { GenericValidator, PropertyValidators, ValidatorJSON } from "convex/values";
-import type { RuntimeStorageWriter, StoreSchema, WriteBatch } from "../storage/types";
-import { assertValue, clone, equals, fromJson, normalize, normalizeObject } from "./codec";
+import { convexToJson } from "convex/values";
+import type { GenericValidator, PropertyValidators, Value, ValidatorJSON } from "convex/values";
+import type { RuntimeStorageWriter, StoreSchema } from "../storage/types";
+import {
+  assertValueWalk,
+  decode,
+  decodeError,
+  encode,
+  encodeError,
+  equals,
+  normalizeCopy,
+} from "./codec";
 import { createReader, createWriter, toSchema } from "./database";
 import type { FunctionReference, RegisteredFunction } from "./functions";
 import type { ReadTracker } from "./query";
-import { tableFromId } from "./values";
+import { validateFields, validateJson, validateValue } from "./validate";
 
-export type ModuleMap = Record<string, Record<string, unknown>>;
+/**
+ * Convex function modules keyed by module path.
+ *
+ * @internal
+ */
+export type ModuleMap = Record<string, ModuleEntry>;
+
+/**
+ * A loaded Convex module.
+ *
+ * @internal
+ */
+export type ModuleExports = Record<string, unknown>;
+
+/**
+ * A Convex module or lazy module loader.
+ *
+ * @internal
+ */
+export type ModuleEntry = ModuleExports | (() => Promise<ModuleExports>);
+
+/**
+ * Watched-query value callback.
+ *
+ * @internal
+ */
 export type OnUpdateCallback = (value: unknown) => void;
+
+/**
+ * Watched-query error callback.
+ *
+ * @internal
+ */
 export type OnUpdateErrorCallback = (error: unknown) => void;
+
+/**
+ * Stops a watched query.
+ *
+ * @internal
+ */
 export type StopOnUpdate = () => void;
 
+/**
+ * Metadata for a mutation execution.
+ *
+ * @internal
+ */
+export interface RunMutationOptions {
+  mutationId?: string;
+  onAccepted?(this: void, mutationId: string): void;
+}
+
+/**
+ * JavaScript Convex execution runner.
+ *
+ * @internal
+ */
 export interface Runner {
   runQuery(ref: FunctionReference, args?: Record<string, unknown>): Promise<unknown>;
-  runMutation(ref: FunctionReference, args?: Record<string, unknown>): Promise<unknown>;
+  runMutation(
+    ref: FunctionReference,
+    args?: Record<string, unknown>,
+    options?: RunMutationOptions,
+  ): Promise<unknown>;
   onUpdate(
     ref: FunctionReference,
     args: Record<string, unknown>,
@@ -24,106 +89,190 @@ export interface Runner {
   ): StopOnUpdate;
 }
 
+/**
+ * The canonical identity of a watched query inside the runner: function name plus canonical args
+ * JSON, used for the runner's watcher dedup. The browser leader keys cross-client watches with its
+ * own variant (`coordinator/leader.ts`) that additionally folds in the auth context — keep the two
+ * separate; they are not interchangeable.
+ *
+ * @internal
+ */
+export function watchKey(name: string, args: Record<string, unknown>): string {
+  return JSON.stringify({ name, args: convexToJson(args as Value) });
+}
+
+/**
+ * The key a watched query invalidates on. Today this is a table name; the alias is the seam for
+ * finer-grained dependency tracking later.
+ *
+ * @internal
+ */
+export type InvalidationKey = string;
+
+/**
+ * Creates a local JavaScript Convex execution runner backed by embedded storage.
+ *
+ * @internal
+ */
 export function createRunner(
   modules: ModuleMap,
   store: RuntimeStorageWriter,
   storeSchema: StoreSchema,
 ): Runner {
   const schema = toSchema(storeSchema);
-  const allTables = new Set(storeSchema.tables.map((table) => table.name));
-  const watchers = new Set<Watcher>();
+  const allTables = new Set<InvalidationKey>(storeSchema.tables.map((table) => table.name));
+  const moduleCache = new Map<string, Promise<ModuleExports>>();
+  const watchers = new Map<string, Watcher>();
   let mutationQueue: Promise<void> = Promise.resolve();
 
-  const runTrackedQuery = async (
-    ref: FunctionReference,
-    args: Record<string, unknown>,
-  ): Promise<{ value: unknown; tables: Set<string> }> => {
-    const tables = new Set<string>();
-    const tracker: ReadTracker = { table: (table) => tables.add(table) };
-    const value = await runQuery(ref, args, tracker);
-    return { value, tables };
-  };
-
-  const runQuery = (
+  const runQuery = async (
     ref: FunctionReference,
     args: Record<string, unknown>,
     tracker?: ReadTracker,
+    db = createReader<GenericDataModel>(store, schema, tracker),
   ): Promise<unknown> => {
-    const fn = find(modules, ref);
+    const fn = await loadFunction(modules, moduleCache, ref);
     if (fn.kind !== "query") throw new Error(`${describeRef(ref)} is not a query`);
     const checked = validateArgs(fn, args);
-    return Promise.resolve(
-      fn.handler(
-        {
-          db: createReader<GenericDataModel>(store, schema, tracker),
-          runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-            runQuery(childRef, childArgs, tracker),
-        },
-        checked,
-      ),
-    ).then((result) => validateReturn(fn, result));
+    const result = await fn.handler(
+      {
+        ...runtimeServices(),
+        db,
+        runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+          runQuery(childRef, childArgs, tracker, db),
+      },
+      checked,
+    );
+    return validateReturn(fn, result);
   };
+
+  const createMutationTransaction = () => createWriter<GenericDataModel>(store, schema);
+  type MutationTransaction = ReturnType<typeof createMutationTransaction>;
 
   const runMutationDirect = async (
     ref: FunctionReference,
     args: Record<string, unknown>,
+    options: RunMutationOptions = {},
+    tx?: MutationTransaction,
   ): Promise<unknown> => {
-    const fn = find(modules, ref);
+    const root = tx ?? createMutationTransaction();
+    const snapshot = tx?.snapshot();
+    const fn = await loadFunction(modules, moduleCache, ref);
     if (fn.kind !== "mutation") throw new Error(`${describeRef(ref)} is not a mutation`);
     const checked = validateArgs(fn, args);
-    const { db, toBatch } = createWriter<GenericDataModel>(store, schema);
-    const result = await fn.handler(
-      {
-        db,
-        runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-          runQuery(childRef, childArgs),
-        runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-          runMutationDirect(childRef, childArgs),
-      },
-      checked,
-    );
-    const validated = validateReturn(fn, result);
-    const batch = toBatch();
-    await store.commit(batch);
-    const tables = changedTables(batch);
-    if (tables.size) notify(tables);
-    return validated;
+    if (!tx && options.mutationId && store.mutation) {
+      const existing = await store.mutation.begin({
+        args: encode(checked),
+        mutationId: options.mutationId,
+        name: functionName(ref),
+      });
+      options.onAccepted?.(options.mutationId);
+      if (existing.status === "committed") {
+        // The result was already validated when first committed; re-validating a replayed result
+        // (and a committed `undefined` becomes `null`, never re-running the returns validator).
+        return existing.result === undefined ? null : decode(existing.result);
+      }
+      if (existing.status === "failed") {
+        throw decodeError(existing.error ?? `mutation failed: ${options.mutationId}`);
+      }
+    } else if (!tx && options.mutationId) {
+      options.onAccepted?.(options.mutationId);
+    }
+    let validated: unknown;
+    try {
+      const result = await fn.handler(
+        {
+          ...runtimeServices(),
+          db: root.db,
+          runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+            runQuery(childRef, childArgs, undefined, root.db),
+          runSnapshotQuery: (
+            childRef: FunctionReference,
+            childArgs: Record<string, unknown> = {},
+          ) => runQuery(childRef, childArgs),
+          runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+            runMutationDirect(childRef, childArgs, options, root),
+        },
+        checked,
+      );
+      validated = validateReturn(fn, result);
+    } catch (error) {
+      // Deterministic failure (handler threw or the return validator rejected): it reproduces on
+      // replay, so record it as the mutation's terminal `failed` outcome (preserving ConvexError).
+      if (snapshot) root.restore(snapshot);
+      if (!tx && options.mutationId && store.mutation) {
+        await store.mutation.fail(options.mutationId, encodeError(error)).catch(() => undefined);
+      }
+      throw error;
+    }
+    if (tx) return validated;
+    try {
+      const batch = root.toBatch();
+      const commit = await store.commit(batch, {
+        mutationId: options.mutationId,
+        mutationResult: options.mutationId === undefined ? undefined : encode(validated),
+        source: "local",
+      });
+      const tables = new Set(commit.changedTables);
+      if (tables.size) notify(tables);
+      return validated;
+    } catch (error) {
+      // Transient storage failure: NOT recorded as `failed`, so the mutation can be retried. The
+      // ledger entry stays pending and a later replay re-runs the handler.
+      if (snapshot) root.restore(snapshot);
+      throw error;
+    }
   };
 
   const rerun = (watcher: Watcher): void => {
-    if (!watchers.has(watcher)) return;
-    if (watcher.running) {
+    if (!watchers.has(watcher.key)) return;
+    if (watcher.pendingTables) {
       watcher.dirty = true;
       return;
     }
-    watcher.running = true;
     void (async () => {
+      let tables = new Set<InvalidationKey>();
       try {
         do {
           watcher.dirty = false;
-          const { value, tables } = await runTrackedQuery(watcher.ref, watcher.args);
-          if (!watchers.has(watcher)) return;
-          watcher.tables = tables;
-          if (!watcher.hasValue || !equals(watcher.value, value)) {
-            watcher.hasValue = true;
-            watcher.value = value;
-            watcher.callback(value);
+          watcher.missed = false;
+          tables = new Set<InvalidationKey>();
+          watcher.pendingTables = tables;
+          try {
+            const value = await runQuery(watcher.ref, watcher.args, {
+              table: (table) => tables.add(table),
+            });
+            if (!watchers.has(watcher.key)) return;
+            watcher.tables = tables;
+            if (watcher.last?.kind !== "value" || !equals(watcher.last.value, value)) {
+              watcher.last = { kind: "value", value };
+              for (const subscriber of watcher.subscribers) {
+                callSafely(() => subscriber.callback(value));
+              }
+            }
+          } finally {
+            watcher.pendingTables = null;
           }
-        } while (watcher.dirty && watchers.has(watcher));
+        } while (watcher.dirty && watchers.has(watcher.key));
       } catch (error) {
-        if (!watchers.has(watcher)) return;
-        watcher.tables = new Set(allTables);
-        watcher.onError?.(error);
+        if (!watchers.has(watcher.key)) return;
+        watcher.tables = tables.size ? tables : new Set(allTables);
+        watcher.last = { kind: "error", error };
+        for (const subscriber of watcher.subscribers) {
+          if (subscriber.onError) callSafely(() => subscriber.onError?.(error));
+        }
+        if (watcher.dirty || watcher.missed) rerun(watcher);
       }
-    })().finally(() => {
-      watcher.running = false;
-      if (watcher.dirty && watchers.has(watcher)) rerun(watcher);
-    });
+    })();
   };
 
-  const notify = (tables: ReadonlySet<string>): void => {
-    for (const watcher of watchers) {
-      if (watcher.running || intersects(watcher.tables, tables)) rerun(watcher);
+  const notify = (tables: ReadonlySet<InvalidationKey>): void => {
+    for (const watcher of watchers.values()) {
+      if (intersects(watcher.pendingTables ?? watcher.tables, tables)) {
+        rerun(watcher);
+      } else if (watcher.pendingTables) {
+        watcher.missed = true;
+      }
     }
   };
 
@@ -138,57 +287,122 @@ export function createRunner(
 
   return {
     async runQuery(ref, args = {}) {
-      return runQuery(ref, clone(args) as Record<string, unknown>);
+      return runQuery(ref, normalizeCopy(args) as Record<string, unknown>);
     },
-    async runMutation(ref, args = {}) {
-      const snapshot = clone(args) as Record<string, unknown>;
-      return enqueueMutation(() => runMutationDirect(ref, snapshot));
+    async runMutation(ref, args = {}, options = {}) {
+      const detached = normalizeCopy(args) as Record<string, unknown>;
+      return enqueueMutation(() => runMutationDirect(ref, detached, options));
     },
     onUpdate(ref, args, callback, onError) {
-      const fn = find(modules, ref);
-      if (fn.kind !== "query") throw new Error(`${describeRef(ref)} is not a query`);
-      const watcher: Watcher = {
-        ref,
-        args: clone(args) as Record<string, unknown>,
-        callback,
-        onError,
-        tables: new Set(),
-        running: false,
-        dirty: false,
-        hasValue: false,
-        value: undefined,
-      };
-      watchers.add(watcher);
-      rerun(watcher);
+      const detached = normalizeCopy(args) as Record<string, unknown>;
+      const key = watchKey(functionName(ref), detached);
+      const subscriber: Subscriber = { callback, onError };
+      let watcher = watchers.get(key);
+      if (watcher) {
+        watcher.subscribers.add(subscriber);
+        if (watcher.last) {
+          queueMicrotask(() => {
+            if (!watcher?.subscribers.has(subscriber)) return;
+            // Read `last` inside the microtask, not at subscribe time: a run may complete in the
+            // gap, and the subscriber must see the current value, not the one captured earlier.
+            const last = watcher.last;
+            if (!last) return;
+            if (last.kind === "value") callSafely(() => subscriber.callback(last.value));
+            else if (subscriber.onError) callSafely(() => subscriber.onError?.(last.error));
+          });
+        }
+      } else {
+        watcher = {
+          key,
+          ref,
+          args: detached,
+          subscribers: new Set([subscriber]),
+          tables: new Set(),
+          pendingTables: null,
+          dirty: false,
+          missed: false,
+          last: undefined,
+        };
+        watchers.set(key, watcher);
+        rerun(watcher);
+      }
       return () => {
-        watchers.delete(watcher);
+        watcher.subscribers.delete(subscriber);
+        if (!watcher.subscribers.size) watchers.delete(key);
       };
     },
   };
 }
 
-interface Watcher {
-  ref: FunctionReference;
-  args: Record<string, unknown>;
+interface Subscriber {
   callback: OnUpdateCallback;
   onError: OnUpdateErrorCallback | undefined;
-  tables: Set<string>;
-  running: boolean;
-  dirty: boolean;
-  hasValue: boolean;
-  value: unknown;
 }
 
-function changedTables(batch: WriteBatch): Set<string> {
-  const tables = new Set<string>();
-  for (const upsert of batch.upserts) tables.add(upsert.table);
-  for (const del of batch.deletes) tables.add(del.table);
-  return tables;
+interface Watcher {
+  key: string;
+  ref: FunctionReference;
+  args: Record<string, unknown>;
+  subscribers: Set<Subscriber>;
+  /**
+   * Read set of the last completed run. A failed run proves nothing about dependencies, so it
+   * leaves the tables read before the failure (or every table for a read-free failure) and a
+   * later commit can recover the watcher.
+   */
+  tables: Set<InvalidationKey>;
+  /** Read set of the in-flight run, populated incrementally; null when idle. */
+  pendingTables: Set<InvalidationKey> | null;
+  dirty: boolean;
+  /** A commit landed mid-run outside the in-flight read set; only matters if the run fails. */
+  missed: boolean;
+  last: { kind: "value"; value: unknown } | { kind: "error"; error: unknown } | undefined;
+}
+
+function runtimeServices(): {
+  auth: { getUserIdentity(): Promise<null> };
+  meta: Record<string, never>;
+  scheduler: Record<string, unknown>;
+  storage: Record<string, unknown>;
+} {
+  return {
+    auth: {
+      async getUserIdentity() {
+        return null;
+      },
+    },
+    meta: {},
+    scheduler: unsupportedService("scheduler"),
+    storage: unsupportedService("storage"),
+  };
+}
+
+function unsupportedService(name: string): Record<string, unknown> {
+  return new Proxy(
+    {},
+    {
+      get(_target, property) {
+        if (typeof property === "symbol") return undefined;
+        return () => {
+          throw new Error(`Convex embedded runtime does not support ctx.${name}.${property} yet.`);
+        };
+      },
+    },
+  );
 }
 
 function intersects(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   for (const value of a) if (b.has(value)) return true;
   return false;
+}
+
+function callSafely(call: () => void): void {
+  try {
+    call();
+  } catch (error) {
+    queueMicrotask(() => {
+      throw error;
+    });
+  }
 }
 
 interface RunnableFunction {
@@ -200,17 +414,40 @@ interface RunnableFunction {
   handler: (ctx: unknown, args: Record<string, unknown>) => unknown;
 }
 
-function find(modules: ModuleMap, ref: FunctionReference): RunnableFunction {
+async function loadFunction(
+  modules: ModuleMap,
+  moduleCache: Map<string, Promise<ModuleExports>>,
+  ref: FunctionReference,
+): Promise<RunnableFunction> {
   const fullName = functionName(ref);
   const sep = fullName.indexOf(":");
   const file = sep < 0 ? fullName : fullName.slice(0, sep);
   const name = sep < 0 ? "default" : fullName.slice(sep + 1);
-  const module = modules[file];
-  if (!module) throw new Error(`unknown module: ${file}`);
+  const module = await loadModule(modules, moduleCache, file);
   const fn = module[name];
   const registered = toRunnable(fn);
   if (!registered) throw new Error(`not a registered function: ${fullName}`);
   return registered;
+}
+
+function loadModule(
+  modules: ModuleMap,
+  moduleCache: Map<string, Promise<ModuleExports>>,
+  file: string,
+): Promise<ModuleExports> {
+  const cached = moduleCache.get(file);
+  if (cached) return cached;
+
+  const entry = modules[file];
+  if (!entry) throw new Error(`unknown module: ${file}`);
+
+  const loading = typeof entry === "function" ? entry() : Promise.resolve(entry);
+  const cachedLoading = loading.catch((error) => {
+    moduleCache.delete(file);
+    throw error;
+  });
+  moduleCache.set(file, cachedLoading);
+  return cachedLoading;
 }
 
 function functionName(ref: FunctionReference): string {
@@ -266,205 +503,20 @@ function validateArgs(
   fn: RunnableFunction,
   args: Record<string, unknown>,
 ): Record<string, unknown> {
-  const normalized = normalizeObject(args);
+  const checked = normalizeCopy(args) as Record<string, unknown>;
   if (fn.args) {
-    validateFields(normalized, fn.args, "args");
+    validateFields(checked, fn.args, "args");
   } else if (fn.argsJson) {
-    validateJson(normalized, fn.argsJson, "args");
+    validateJson(checked, fn.argsJson, "args");
   } else {
-    assertValue(normalized, "args");
+    assertValueWalk(checked, "args");
   }
-  return normalized;
+  return checked;
 }
 
 function validateReturn(fn: RunnableFunction, value: unknown): unknown {
-  const normalized = normalize(value);
+  const normalized = normalizeCopy(value);
   if (fn.returns) validateValue(normalized, fn.returns, "return value");
   else if (fn.returnsJson) validateJson(normalized, fn.returnsJson, "return value");
-  else assertValue(normalized, "return value");
   return normalized;
-}
-
-function validateFields(
-  value: Record<string, unknown>,
-  fields: PropertyValidators,
-  path: string,
-): void {
-  for (const key of Object.keys(value)) {
-    if (!Object.hasOwn(fields, key)) throw new Error(`${path}.${key} is not a declared argument`);
-  }
-  for (const [key, validator] of Object.entries(fields)) {
-    validateValue(value[key], validator as GenericValidator, `${path}.${key}`);
-  }
-}
-
-function validateValue(value: unknown, validator: GenericValidator, path: string): void {
-  if (isOptional(validator) && value === undefined) return;
-  if (value === undefined) throw new Error(`${path} is required`);
-  switch (validator.kind) {
-    case "any":
-      assertValue(value, path);
-      return;
-    case "id":
-      if (typeof value !== "string") throw new Error(`${path} must be an id`);
-      if (validator.tableName && tableFromId(value) !== validator.tableName) {
-        throw new Error(`${path} must be an id for table ${validator.tableName}`);
-      }
-      return;
-    case "string":
-      if (typeof value !== "string") throw new Error(`${path} must be a string`);
-      return;
-    case "float64":
-      if (typeof value !== "number") throw new Error(`${path} must be a number`);
-      return;
-    case "int64":
-      if (typeof value !== "bigint") throw new Error(`${path} must be an int64`);
-      return;
-    case "boolean":
-      if (typeof value !== "boolean") throw new Error(`${path} must be a boolean`);
-      return;
-    case "bytes":
-      if (!(value instanceof ArrayBuffer)) throw new Error(`${path} must be bytes`);
-      return;
-    case "null":
-      if (value !== null) throw new Error(`${path} must be null`);
-      return;
-    case "literal":
-      if (!equals(value, validator.value)) throw new Error(`${path} must be the literal value`);
-      return;
-    case "array":
-      if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
-      value.forEach((entry, i) => validateValue(entry, validator.element, `${path}[${i}]`));
-      return;
-    case "object":
-      validateRecordObject(value, path);
-      validateFields(value as Record<string, unknown>, validator.fields, path);
-      return;
-    case "record":
-      validateRecordObject(value, path);
-      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-        validateValue(key, validator.key, `${path}.${key} key`);
-        validateValue(entry, validator.value, `${path}.${key}`);
-      }
-      return;
-    case "union":
-      for (const member of validator.members) {
-        try {
-          validateValue(value, member, path);
-          return;
-        } catch {
-          // Try the next union member.
-        }
-      }
-      throw new Error(`${path} does not match any union member`);
-  }
-}
-
-function validateJson(value: unknown, validator: ValidatorJSON, path: string): void {
-  switch (validator.type) {
-    case "any":
-      assertValue(value, path);
-      return;
-    case "id":
-      if (typeof value !== "string") throw new Error(`${path} must be an id`);
-      if (tableFromId(value) !== validator.tableName) {
-        throw new Error(`${path} must be an id for table ${validator.tableName}`);
-      }
-      return;
-    case "string":
-      if (typeof value !== "string") throw new Error(`${path} must be a string`);
-      return;
-    case "number":
-      if (typeof value !== "number") throw new Error(`${path} must be a number`);
-      return;
-    case "bigint":
-      if (typeof value !== "bigint") throw new Error(`${path} must be an int64`);
-      return;
-    case "boolean":
-      if (typeof value !== "boolean") throw new Error(`${path} must be a boolean`);
-      return;
-    case "bytes":
-      if (!(value instanceof ArrayBuffer)) throw new Error(`${path} must be bytes`);
-      return;
-    case "null":
-      if (value !== null) throw new Error(`${path} must be null`);
-      return;
-    case "literal":
-      if (!equals(value, fromJson(validator.value)))
-        throw new Error(`${path} must be the literal value`);
-      return;
-    case "array":
-      if (!Array.isArray(value)) throw new Error(`${path} must be an array`);
-      value.forEach((entry, i) => validateJson(entry, validator.value, `${path}[${i}]`));
-      return;
-    case "object":
-      validateRecordObject(value, path);
-      validateJsonFields(value as Record<string, unknown>, validator.value, path);
-      return;
-    case "record":
-      validateRecordObject(value, path);
-      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-        validateJsonRecordKey(key, validator.keys, `${path}.${key} key`);
-        validateJson(entry, validator.values.fieldType, `${path}.${key}`);
-      }
-      return;
-    case "union":
-      for (const member of validator.value) {
-        try {
-          validateJson(value, member, path);
-          return;
-        } catch {
-          // Try the next union member.
-        }
-      }
-      throw new Error(`${path} does not match any union member`);
-  }
-}
-
-function validateJsonFields(
-  value: Record<string, unknown>,
-  fields: Extract<ValidatorJSON, { type: "object" }>["value"],
-  path: string,
-): void {
-  for (const key of Object.keys(value)) {
-    if (!Object.hasOwn(fields, key)) throw new Error(`${path}.${key} is not a declared field`);
-  }
-  for (const [key, field] of Object.entries(fields)) {
-    if (value[key] === undefined && field.optional) continue;
-    validateJson(value[key], field.fieldType, `${path}.${key}`);
-  }
-}
-
-function validateJsonRecordKey(
-  value: string,
-  validator: Extract<ValidatorJSON, { type: "record" }>["keys"],
-  path: string,
-): void {
-  if (validator.type === "string") return;
-  if (validator.type === "id") {
-    if (tableFromId(value) !== validator.tableName) {
-      throw new Error(`${path} must be an id for table ${validator.tableName}`);
-    }
-    return;
-  }
-  throw new Error(`${path} has unsupported record key validator`);
-}
-
-function validateRecordObject(
-  value: unknown,
-  path: string,
-): asserts value is Record<string, unknown> {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    Array.isArray(value) ||
-    value instanceof ArrayBuffer ||
-    Object.getPrototypeOf(value) !== Object.prototype
-  ) {
-    throw new Error(`${path} must be an object`);
-  }
-}
-
-function isOptional(validator: GenericValidator): boolean {
-  return validator.isOptional === "optional";
 }

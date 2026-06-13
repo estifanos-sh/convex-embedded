@@ -4,15 +4,25 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "ready": "vp fmt && vp lint && vp run test -r && vp run build -r",
-    "dev": "vp run website#dev",
+    "ready": "vp check && vp test && vp run @convex-dev/embedded#style && vp run @convex-dev/embedded#build && vp run build:browser:vite",
+    "style": "vp run @convex-dev/embedded#style",
+    "dev:convex": "vpx convex dev",
+    "dev:browser:vite": "pnpm --filter @convex-dev/embedded-demo-browser-vite dev",
+    "build:browser:vite": "pnpm --filter @convex-dev/embedded-demo-browser-vite build",
+    "preview:browser:vite": "pnpm --filter @convex-dev/embedded-demo-browser-vite preview",
     "prepare": "vp config"
   },
+  "dependencies": {
+    "@types/node": "catalog:",
+    "convex": "catalog:"
+  },
   "devDependencies": {
-    "vite-plus": "catalog:"
+    "vite": "catalog:",
+    "vite-plus": "catalog:",
+    "vitest": "catalog:"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=24.0.0"
   },
   "packageManager": "pnpm@11.5.2"
 }

@@ -2,66 +2,95 @@ import type {
   FilterBuilder as ConvexFilterBuilder,
   GenericDataModel,
   IndexNames,
+  IndexRange as ConvexIndexRange,
+  IndexRangeBuilder as ConvexIndexRangeBuilder,
   NamedIndex,
   NamedTableInfo,
   Query as ConvexQuery,
   TableNamesInDataModel,
 } from "convex/server";
-import type { Bound, ColValue, RuntimeStorageReader, TableDef } from "../storage/types";
+import { convexToJson, jsonToConvex } from "convex/values";
+import type { JSONValue, Value } from "convex/values";
+import {
+  DEFAULT_SCAN_PAGE,
+  type Bound,
+  type ColValue,
+  type RuntimeStorageReader,
+  type TableDef,
+} from "../storage/types";
 import { compare as compareConvex, equals as equalsConvex } from "./codec";
 import type { Doc } from "./model";
-import { materialize, type RawDoc } from "./values";
+import { compileFieldPath, readFieldPath, type RawDoc } from "./values";
 
+/**
+ * Tracks tables read by a query so watched queries can be invalidated.
+ *
+ * @internal
+ */
 export interface ReadTracker {
   table(table: string): void;
 }
 
+/**
+ * Staged mutation changes applied over committed storage during read-your-writes queries.
+ *
+ * @internal
+ */
 export interface QueryOverlay {
   staged: readonly RawDoc[];
   deleted: ReadonlySet<string>;
 }
 
-type IndexField<
-  DM extends GenericDataModel,
-  T extends TableNamesInDataModel<DM>,
-  I extends IndexNames<NamedTableInfo<DM, T>>,
-> = NamedIndex<NamedTableInfo<DM, T>, I>[number] & keyof Doc<DM, T> & string;
 type FilterPredicate<DM extends GenericDataModel, T extends TableNamesInDataModel<DM>> = Parameters<
   ConvexQuery<NamedTableInfo<DM, T>>["filter"]
 >[0];
 
-export interface IndexRange<
+/**
+ * Convex-compatible index range builder type used by the local query facade.
+ *
+ * @internal
+ */
+export type IndexRange<
   DM extends GenericDataModel,
   T extends TableNamesInDataModel<DM>,
   I extends IndexNames<NamedTableInfo<DM, T>>,
-> {
-  eq<F extends IndexField<DM, T, I>>(field: F, value: Doc<DM, T>[F]): IndexRange<DM, T, I>;
-  gt<F extends IndexField<DM, T, I>>(field: F, value: Doc<DM, T>[F]): IndexRange<DM, T, I>;
-  gte<F extends IndexField<DM, T, I>>(field: F, value: Doc<DM, T>[F]): IndexRange<DM, T, I>;
-  lt<F extends IndexField<DM, T, I>>(field: F, value: Doc<DM, T>[F]): IndexRange<DM, T, I>;
-  lte<F extends IndexField<DM, T, I>>(field: F, value: Doc<DM, T>[F]): IndexRange<DM, T, I>;
-}
+> = ConvexIndexRangeBuilder<Doc<DM, T>, NamedIndex<NamedTableInfo<DM, T>, I>>;
 
 interface RuntimeExpression<T> {
   readonly kind: "expression";
   eval(doc: RawDoc): T;
 }
 
+/**
+ * Ordered local query surface.
+ *
+ * @internal
+ */
 export interface OrderedQuery<DM extends GenericDataModel, T extends TableNamesInDataModel<DM>> {
   filter(predicate: FilterPredicate<DM, T>): OrderedQuery<DM, T>;
+  limit(n: number): OrderedQuery<DM, T>;
+  paginate(options: PaginationOptions): Promise<PaginationResult<Doc<DM, T>>>;
   take(n: number): Promise<Doc<DM, T>[]>;
   collect(): Promise<Doc<DM, T>[]>;
   first(): Promise<Doc<DM, T> | null>;
   unique(): Promise<Doc<DM, T> | null>;
+  [Symbol.asyncIterator](): AsyncIterator<Doc<DM, T>>;
 }
 
+/**
+ * Local query initializer/query surface exposed through `ctx.db.query`.
+ *
+ * @internal
+ */
 export interface Query<
   DM extends GenericDataModel,
   T extends TableNamesInDataModel<DM>,
 > extends OrderedQuery<DM, T> {
+  count(): Promise<number>;
+  fullTableScan(): Query<DM, T>;
   withIndex<I extends IndexNames<NamedTableInfo<DM, T>>>(
     index: I,
-    range?: (q: IndexRange<DM, T, I>) => IndexRange<DM, T, I>,
+    range?: (q: IndexRange<DM, T, I>) => ConvexIndexRange,
   ): Query<DM, T>;
   order(dir: "asc" | "desc"): OrderedQuery<DM, T>;
   filter(predicate: FilterPredicate<DM, T>): Query<DM, T>;
@@ -74,148 +103,470 @@ interface FieldRange {
   upperInclusive?: boolean;
 }
 
+type RangeExpression =
+  | { type: "eq"; field: string; value: ColValue }
+  | { type: "gt"; field: string; value: ColValue }
+  | { type: "gte"; field: string; value: ColValue }
+  | { type: "lt"; field: string; value: ColValue }
+  | { type: "lte"; field: string; value: ColValue };
+
 class Bounds {
-  readonly eqs = new Map<string, ColValue>();
-  readonly ranges = new Map<string, FieldRange>();
+  private consumed = false;
 
-  eq(field: string, value: ColValue): this {
-    this.eqs.set(field, toColValue(value));
-    return this;
-  }
-  gt(field: string, value: ColValue): this {
-    Object.assign(this.range(field), { lower: toColValue(value), lowerInclusive: false });
-    return this;
-  }
-  gte(field: string, value: ColValue): this {
-    Object.assign(this.range(field), { lower: toColValue(value), lowerInclusive: true });
-    return this;
-  }
-  lt(field: string, value: ColValue): this {
-    Object.assign(this.range(field), { upper: toColValue(value), upperInclusive: false });
-    return this;
-  }
-  lte(field: string, value: ColValue): this {
-    Object.assign(this.range(field), { upper: toColValue(value), upperInclusive: true });
-    return this;
+  constructor(private readonly expressions: readonly RangeExpression[] = []) {}
+
+  eq(field: string, value: ColValue): Bounds {
+    return this.next({ type: "eq", field, value: toColValue(value) });
   }
 
-  private range(field: string): FieldRange {
-    let r = this.ranges.get(field);
-    if (!r) {
-      r = {};
-      this.ranges.set(field, r);
+  gt(field: string, value: ColValue): Bounds {
+    return this.next({ type: "gt", field, value: toColValue(value) });
+  }
+
+  gte(field: string, value: ColValue): Bounds {
+    return this.next({ type: "gte", field, value: toColValue(value) });
+  }
+
+  lt(field: string, value: ColValue): Bounds {
+    return this.next({ type: "lt", field, value: toColValue(value) });
+  }
+
+  lte(field: string, value: ColValue): Bounds {
+    return this.next({ type: "lte", field, value: toColValue(value) });
+  }
+
+  export(): readonly RangeExpression[] {
+    this.consume();
+    return this.expressions;
+  }
+
+  private next(expression: RangeExpression): Bounds {
+    this.consume();
+    return new Bounds([...this.expressions, expression]);
+  }
+
+  private consume(): void {
+    if (this.consumed) {
+      throw new Error(
+        "IndexRangeBuilder has already been used! Chain your method calls like `q => q.eq(...).eq(...)`. See https://docs.convex.dev/using/indexes",
+      );
     }
-    return r;
+    this.consumed = true;
   }
 }
 
+interface QueryPlan {
+  bounds?: readonly RangeExpression[];
+  indexName?: string;
+  initializer?: boolean;
+  limit?: number;
+  orderSet?: boolean;
+  orderDir?: "asc" | "desc";
+  predicates?: readonly ((doc: RawDoc) => boolean)[];
+}
+
+interface PaginationOptions {
+  cursor: string | null;
+  endCursor?: string | null;
+  numItems: number;
+}
+
+interface PaginationResult<T> {
+  continueCursor: string;
+  isDone: boolean;
+  page: T[];
+  pageStatus?: "SplitRecommended" | "SplitRequired" | null;
+  splitCursor?: string | null;
+}
+
+/** A pre-split order field: a Convex field path plus its compiled segments. */
+interface OrderField {
+  field: string;
+  segments: readonly string[];
+}
+
+/** A document's order-key tuple in Convex value space. */
+type KeyTuple = readonly unknown[];
+
+const FIRST_PAGE = 64;
+const MIN_PAGE = 16;
+
+/**
+ * Runtime implementation of the local query facade.
+ *
+ * Every terminal consumes one streaming pipeline: paged backend scans (already in index order)
+ * are reordered only within SQL-NULL-ambiguous runs, merged with the sorted overlay, re-checked
+ * against exact Convex bounds, and filtered — pulling pages only while consumers keep reading.
+ *
+ * @internal
+ */
 export class QueryBuilder<
   DM extends GenericDataModel,
   T extends TableNamesInDataModel<DM>,
 > implements Query<DM, T> {
-  private indexName: string | undefined;
-  private bounds: Bounds | undefined;
-  private orderDir: "asc" | "desc" = "asc";
-  private readonly predicates: ((doc: RawDoc) => boolean)[] = [];
+  private readonly bounds: readonly RangeExpression[] | undefined;
+  private consumed = false;
+  private readonly indexName: string | undefined;
+  private readonly initializer: boolean;
+  private readonly limitCount: number | undefined;
+  private readonly orderDir: "asc" | "desc";
+  private readonly orderSet: boolean;
+  private readonly predicates: readonly ((doc: RawDoc) => boolean)[];
+  /** Bound expressions with pre-split field paths; compiled once per builder, read per doc. */
+  private readonly matchers: readonly {
+    expression: RangeExpression;
+    segments: readonly string[];
+  }[];
 
   constructor(
     private readonly store: RuntimeStorageReader,
     private readonly def: TableDef,
     private readonly overlay?: () => QueryOverlay,
     private readonly tracker?: ReadTracker,
-  ) {}
+    plan: QueryPlan = {},
+  ) {
+    this.bounds = plan.bounds;
+    this.indexName = plan.indexName;
+    this.initializer = plan.initializer ?? true;
+    this.limitCount = plan.limit;
+    this.orderDir = plan.orderDir ?? "asc";
+    this.orderSet = plan.orderSet ?? false;
+    this.predicates = plan.predicates ?? [];
+    this.matchers = (plan.bounds ?? []).map((expression) => ({
+      expression,
+      segments: compileFieldPath(expression.field),
+    }));
+  }
+
+  fullTableScan(): Query<DM, T> {
+    if (!this.initializer) {
+      throw new Error("fullTableScan can only be called on a table query initializer.");
+    }
+    return this.withPlan({ bounds: undefined, indexName: undefined });
+  }
 
   withIndex<I extends IndexNames<NamedTableInfo<DM, T>>>(
     index: I,
-    range?: (q: IndexRange<DM, T, I>) => IndexRange<DM, T, I>,
+    range?: (q: IndexRange<DM, T, I>) => ConvexIndexRange,
   ): Query<DM, T> {
+    if (!this.initializer) {
+      throw new Error("withIndex can only be called on a table query initializer.");
+    }
     if (!this.def.indexes.some((i) => i.name === index)) {
       throw new Error(`unknown index ${String(index)} on table ${this.def.name}`);
     }
-    this.indexName = String(index);
+    let bounds: readonly RangeExpression[] | undefined;
     if (range) {
-      const bounds = new Bounds();
-      range(bounds as unknown as IndexRange<DM, T, I>);
-      this.bounds = bounds;
+      const builder = range(new Bounds() as unknown as IndexRange<DM, T, I>);
+      if (!(builder instanceof Bounds)) {
+        throw new Error("Index range callback must return a range builder.");
+      }
+      bounds = builder.export();
     }
-    return this;
+    return this.withPlan({ bounds, indexName: String(index) });
   }
 
   order(dir: "asc" | "desc"): OrderedQuery<DM, T> {
-    this.orderDir = dir;
-    return this;
+    const query = this.consumeForUse();
+    if (query.orderSet) throw new Error("order can only be specified once");
+    return query.withPlan({ orderDir: dir, orderSet: true });
   }
 
   filter(predicate: FilterPredicate<DM, T>): Query<DM, T> {
+    const query = this.consumeForUse();
     const expr = predicate(createFilterBuilder<DM, T>());
-    this.predicates.push((doc) => asBoolean(evalExpression(expr, doc)));
-    return this;
+    return query.withPlan({
+      predicates: [...query.predicates, (doc) => asBoolean(evalExpression(expr, doc))],
+    });
   }
 
   take(n: number): Promise<Doc<DM, T>[]> {
-    return this.run(n);
+    validateNonNegativeInteger(n, "take");
+    if (n === 0) return Promise.resolve([]);
+    return this.consumeForUse().withPlan({ limit: n }).collect();
   }
-  collect(): Promise<Doc<DM, T>[]> {
-    return this.run();
+
+  async collect(): Promise<Doc<DM, T>[]> {
+    const query = this.consumeForUse();
+    const docs: RawDoc[] = [];
+    for await (const batch of query.batches()) {
+      for (const doc of batch) docs.push(doc);
+    }
+    return docs as unknown as Doc<DM, T>[];
   }
+
+  async count(): Promise<number> {
+    const query = this.consumeForUse();
+    query.tracker?.table(query.def.name);
+    const bounds = query.buildBounds();
+    const overlay = query.overlay?.();
+    if (boundsAreExact(bounds) && !query.predicates.length) {
+      if (!overlay) {
+        const pushed = await query.store.doc.count({
+          table: query.def.name,
+          index: query.indexName,
+          bounds,
+        });
+        if (pushed !== null) return pushed;
+      } else {
+        return query.countWithOverlay(bounds, overlay);
+      }
+    }
+    let n = 0;
+    for await (const batch of query.batches()) n += batch.length;
+    return n;
+  }
+
   async first(): Promise<Doc<DM, T> | null> {
-    return (await this.run(1))[0] ?? null;
+    return (await this.take(1))[0] ?? null;
   }
+
   async unique(): Promise<Doc<DM, T> | null> {
-    const rows = await this.run(2);
-    if (rows.length > 1) throw new Error(`unique: more than one match in ${this.def.name}`);
+    const rows = await this.take(2);
+    if (rows.length > 1) {
+      const firstId = rows[0]!._id as string;
+      const secondId = rows[1]!._id as string;
+      throw new Error(
+        `unique() query returned more than one result from table ${this.def.name}:\n [${firstId}, ${secondId}, ...]`,
+      );
+    }
     return rows[0] ?? null;
   }
 
-  private async run(limit?: number): Promise<Doc<DM, T>[]> {
-    this.tracker?.table(this.def.name);
-    const overlay = this.overlay?.();
-    const slack = overlay ? overlay.deleted.size + overlay.staged.length : 0;
-    const backendLimit = this.predicates.length || limit === undefined ? undefined : limit + slack;
-    const scanned = await this.store.scan({
-      table: this.def.name,
-      index: this.indexName,
-      bounds: this.buildBounds(),
-      order: this.orderDir,
-      limit: backendLimit,
+  limit(n: number): OrderedQuery<DM, T> {
+    validateNonNegativeInteger(n, "limit");
+    const query = this.consumeForUse();
+    return query.withPlan({
+      limit: query.limitCount === undefined ? n : Math.min(query.limitCount, n),
     });
-    let raw: RawDoc[];
-    if (scanned !== null) {
-      raw = scanned.map(materialize).filter((d) => this.matchesBounds(d));
-    } else {
-      const broad = await this.store.scan({ table: this.def.name, order: this.orderDir });
-      if (broad === null) throw new Error(`cannot scan table ${this.def.name}`);
-      raw = broad.map(materialize).filter((d) => this.matchesBounds(d));
-    }
-    if (overlay) raw = this.applyOverlay(raw, overlay);
-    else raw = this.sort(raw);
-    let docs = raw;
-    for (const predicate of this.predicates) docs = docs.filter(predicate);
-    const materialized = docs as unknown as Doc<DM, T>[];
-    return limit !== undefined && materialized.length > limit
-      ? materialized.slice(0, limit)
-      : materialized;
   }
 
-  private applyOverlay(raw: RawDoc[], overlay: QueryOverlay): RawDoc[] {
-    const stagedIds = new Set(overlay.staged.map((d) => d._id));
-    const merged = raw.filter((d) => !stagedIds.has(d._id) && !overlay.deleted.has(d._id));
-    for (const d of overlay.staged) {
-      if (!overlay.deleted.has(d._id) && this.matchesBounds(d)) merged.push(d);
-    }
-    return this.sort(merged);
-  }
+  async paginate(options: PaginationOptions): Promise<PaginationResult<Doc<DM, T>>> {
+    validatePositiveInteger(options.numItems, "paginate");
+    const query = this.consumeForUse();
+    const orderFields = query.orderFields();
+    const after = decodePageCursor(options.cursor);
+    const end =
+      options.endCursor === null || options.endCursor === undefined
+        ? undefined
+        : decodePageCursor(options.endCursor);
 
-  private sort(raw: RawDoc[]): RawDoc[] {
-    const order = [...this.indexFields(), "_creationTime", "_id"];
-    raw.sort((a, b) => {
-      for (const f of order) {
-        const c = compareConvex(docValue(a, f), docValue(b, f));
-        if (c !== 0) return this.orderDir === "desc" ? -c : c;
+    if (after === END) {
+      return {
+        continueCursor: PAGE_CURSOR_END,
+        isDone: true,
+        page: [],
+        pageStatus: null,
+        splitCursor: null,
+      };
+    }
+
+    const page: RawDoc[] = [];
+    let lastKey: KeyTuple | undefined;
+    let exhausted = true;
+    outer: for await (const batch of query.batches(after, options.numItems)) {
+      for (const doc of batch) {
+        const key = query.keyOf(doc, orderFields);
+        if (end !== undefined && end !== END && query.compareKeys(key, end) > 0) {
+          exhausted = false;
+          break outer;
+        }
+        page.push(doc);
+        lastKey = key;
+        if (end === undefined && page.length >= options.numItems) {
+          exhausted = false;
+          break outer;
+        }
       }
-      return 0;
-    });
-    return raw;
+    }
+
+    if (end !== undefined) {
+      return {
+        continueCursor: options.endCursor ?? PAGE_CURSOR_END,
+        isDone: end === END && exhausted,
+        page: page as unknown as Doc<DM, T>[],
+        pageStatus: null,
+        splitCursor: null,
+      };
+    }
+    return {
+      continueCursor:
+        exhausted || lastKey === undefined ? PAGE_CURSOR_END : encodePageCursor(lastKey),
+      isDone: exhausted,
+      page: page as unknown as Doc<DM, T>[],
+      pageStatus: null,
+      splitCursor: null,
+    };
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<Doc<DM, T>> {
+    return this.consumeForUse().docs() as AsyncIterator<unknown> as AsyncIterator<Doc<DM, T>>;
+  }
+
+  /** Thin per-document view of {@link batches} for the public async iterator. */
+  private async *docs(
+    after?: KeyTuple,
+    limitHint?: number,
+  ): AsyncGenerator<RawDoc, void, undefined> {
+    for await (const batch of this.batches(after, limitHint)) yield* batch;
+  }
+
+  /**
+   * The streaming pipeline every terminal consumes, page-batched: the async boundary is one
+   * backend page, and all per-document work — staged-overlay merge, resume guard, predicates,
+   * limit — runs in sync loops. Stops fetching as soon as the consumer stops pulling. Every
+   * backend doc — even one that is deleted, overridden, or filtered — is an order watermark
+   * that flushes staged docs sorted before it.
+   */
+  private async *batches(
+    after?: KeyTuple,
+    limitHint?: number,
+  ): AsyncGenerator<readonly RawDoc[], void, undefined> {
+    this.tracker?.table(this.def.name);
+    if (this.limitCount === 0) return;
+    const orderFields = this.orderFields();
+    const byOrder = (a: RawDoc, b: RawDoc): number => this.compareDocs(a, b, orderFields);
+    const overlay = this.overlay?.();
+    const deleted = overlay?.deleted;
+    const overridden = overlay ? new Set(overlay.staged.map((d) => d._id)) : undefined;
+    const staged = overlay
+      ? overlay.staged
+          .filter((d) => !overlay.deleted.has(d._id) && this.matchesBounds(d))
+          .sort(byOrder)
+      : [];
+    const slack = overlay ? overlay.deleted.size + overlay.staged.length : 0;
+    const hint = limitHint ?? this.limitCount;
+    const firstPage =
+      hint === undefined
+        ? FIRST_PAGE
+        : Math.min(Math.max(hint + slack + 1, MIN_PAGE), DEFAULT_SCAN_PAGE);
+
+    let emitted = 0;
+    let stagedIndex = 0;
+    const limit = this.limitCount;
+    const passes = (doc: RawDoc): boolean =>
+      this.matchesBounds(doc) &&
+      (after === undefined || this.compareKeys(this.keyOf(doc, orderFields), after) > 0) &&
+      this.predicates.every((predicate) => predicate(doc));
+
+    for await (const page of this.pages(firstPage, after)) {
+      const out: RawDoc[] = [];
+      for (const doc of page) {
+        while (stagedIndex < staged.length && byOrder(staged[stagedIndex]!, doc) < 0) {
+          const next = staged[stagedIndex++]!;
+          if (passes(next)) {
+            out.push(next);
+            if (limit !== undefined && ++emitted >= limit) {
+              yield out;
+              return;
+            }
+          }
+        }
+        if (deleted?.has(doc._id) || overridden?.has(doc._id)) continue;
+        if (passes(doc)) {
+          out.push(doc);
+          if (limit !== undefined && ++emitted >= limit) {
+            yield out;
+            return;
+          }
+        }
+      }
+      if (out.length) yield out;
+    }
+
+    const out: RawDoc[] = [];
+    while (stagedIndex < staged.length) {
+      const next = staged[stagedIndex++]!;
+      if (passes(next)) {
+        out.push(next);
+        if (limit !== undefined && ++emitted >= limit) break;
+      }
+    }
+    if (out.length) yield out;
+  }
+
+  /**
+   * Backend pages in exact Convex order. Index columns store order-preserving keys, so the
+   * SQLite index B-tree is already in Convex order — including `undefined` < `null`, `-0` < `+0`,
+   * int64 before float64, and NaN — with no reorder needed. Bounds are exact too, so pages stream
+   * straight through. A keyset resume seek is exact for every value, so `resumeAfterKey` carries
+   * the full key (no collapsed-value rescan).
+   */
+  private async *pages(
+    firstPage: number,
+    after: KeyTuple | undefined,
+  ): AsyncGenerator<readonly RawDoc[], void, undefined> {
+    const resumeAfterKey = after?.map((value) => value as ColValue);
+    let cursor: string | undefined;
+    let pageSize = firstPage;
+    while (true) {
+      const page = await this.store.doc.scan({
+        table: this.def.name,
+        index: this.indexName,
+        bounds: this.buildBounds(),
+        order: this.orderDir,
+        pageSize,
+        cursor,
+        resumeAfterKey: cursor === undefined ? resumeAfterKey : undefined,
+      });
+      if (page.docs.length) yield page.docs;
+      if (page.cursor === null) return;
+      cursor = page.cursor;
+      pageSize = Math.min(pageSize * 2, DEFAULT_SCAN_PAGE);
+    }
+  }
+
+  /** Counts committed keys (no payload decode) adjusted by the overlay's staged/deleted ids. */
+  private async countWithOverlay(
+    bounds: Bound[] | undefined,
+    overlay: QueryOverlay,
+  ): Promise<number> {
+    const overridden = new Set(overlay.staged.map((d) => d._id));
+    let n = overlay.staged.filter(
+      (d) => !overlay.deleted.has(d._id) && this.matchesBounds(d),
+    ).length;
+    let cursor: string | undefined;
+    do {
+      const page = await this.store.key.scan({
+        table: this.def.name,
+        index: this.indexName,
+        bounds,
+        order: this.orderDir,
+        cursor,
+      });
+      for (const id of page.ids) {
+        if (!overlay.deleted.has(id) && !overridden.has(id)) n += 1;
+      }
+      cursor = page.cursor ?? undefined;
+    } while (cursor !== undefined);
+    return n;
+  }
+
+  /** The order-key fields of this query: index fields, then `_creationTime`, then `_id`. */
+  private orderFields(): OrderField[] {
+    const fields = unique([...this.indexFields(), "_creationTime", "_id"]);
+    return fields.map((field) => ({ field, segments: compileFieldPath(field) }));
+  }
+
+  private keyOf(doc: RawDoc, orderFields: readonly OrderField[]): KeyTuple {
+    return orderFields.map((key) => docValue(doc, key));
+  }
+
+  /** Tuple comparison in emit order (direction applied). */
+  private compareKeys(a: KeyTuple, b: KeyTuple): number {
+    for (let i = 0; i < a.length; i += 1) {
+      const c = compareConvex(a[i], b[i]);
+      if (c !== 0) return this.orderDir === "desc" ? -c : c;
+    }
+    return 0;
+  }
+
+  private compareDocs(a: RawDoc, b: RawDoc, orderFields: readonly OrderField[]): number {
+    for (const key of orderFields) {
+      const c = compareConvex(docValue(a, key), docValue(b, key));
+      if (c !== 0) return this.orderDir === "desc" ? -c : c;
+    }
+    return 0;
   }
 
   private indexFields(): string[] {
@@ -224,46 +575,205 @@ export class QueryBuilder<
   }
 
   private buildBounds(): Bound[] | undefined {
-    if (!this.bounds || !this.indexName) return undefined;
+    if (!this.bounds?.length || !this.indexName) return undefined;
     const index = this.def.indexes.find((i) => i.name === this.indexName);
     if (!index) return undefined;
     const out: Bound[] = [];
+    let expressionIndex = 0;
     for (const field of index.fields) {
-      if (this.bounds.eqs.has(field)) {
-        out.push({ kind: "eq", value: this.bounds.eqs.get(field) as ColValue });
-      } else if (this.bounds.ranges.has(field)) {
-        out.push({ kind: "range", ...(this.bounds.ranges.get(field) as FieldRange) });
-        break;
+      const expression = this.bounds[expressionIndex];
+      if (!expression) break;
+      if (expression.field !== field) {
+        throw new Error(
+          `index range field ${expression.field} does not match index field ${field}`,
+        );
+      }
+      if (expression.type === "eq") {
+        out.push({ kind: "eq", value: expression.value });
+        expressionIndex++;
       } else {
+        const range: FieldRange = {};
+        let hasLower = false;
+        let hasUpper = false;
+        while (this.bounds[expressionIndex]?.field === field) {
+          const current = this.bounds[expressionIndex]!;
+          switch (current.type) {
+            case "gt":
+            case "gte":
+              if (hasLower) throw new Error(`duplicate lower bound on ${field}`);
+              hasLower = true;
+              range.lower = current.value;
+              range.lowerInclusive = current.type === "gte";
+              break;
+            case "lt":
+            case "lte":
+              if (hasUpper) throw new Error(`duplicate upper bound on ${field}`);
+              hasUpper = true;
+              range.upper = current.value;
+              range.upperInclusive = current.type === "lte";
+              break;
+            case "eq":
+              throw new Error(`equality bound follows range bound on ${field}`);
+          }
+          expressionIndex++;
+        }
+        out.push({ kind: "range", ...range });
         break;
       }
+    }
+    if (expressionIndex < this.bounds.length) {
+      const expression = this.bounds[expressionIndex]!;
+      throw new Error(`index range field ${expression.field} is not usable by ${this.indexName}`);
     }
     return out.length ? out : undefined;
   }
 
   private matchesBounds(doc: RawDoc): boolean {
-    if (!this.bounds) return true;
-    for (const [field, value] of this.bounds.eqs) {
-      if (!equalsConvex(docValue(doc, field), value)) return false;
-    }
-    for (const [field, r] of this.bounds.ranges) {
-      const v = docValue(doc, field);
-      if (r.lower !== undefined) {
-        const c = compareConvex(v, r.lower);
-        if (r.lowerInclusive ? c < 0 : c <= 0) return false;
-      }
-      if (r.upper !== undefined) {
-        const c = compareConvex(v, r.upper);
-        if (r.upperInclusive ? c > 0 : c >= 0) return false;
+    for (const matcher of this.matchers) {
+      const expression = matcher.expression;
+      const value =
+        expression.field === "_id" || expression.field === "_creationTime"
+          ? doc[expression.field]
+          : readFieldPath(doc, matcher.segments);
+      switch (expression.type) {
+        case "eq":
+          if (!equalsConvex(value, expression.value)) return false;
+          break;
+        case "gt":
+          if (compareConvex(value, expression.value) <= 0) return false;
+          break;
+        case "gte":
+          if (compareConvex(value, expression.value) < 0) return false;
+          break;
+        case "lt":
+          if (compareConvex(value, expression.value) >= 0) return false;
+          break;
+        case "lte":
+          if (compareConvex(value, expression.value) > 0) return false;
+          break;
       }
     }
     return true;
   }
+
+  private withPlan(plan: QueryPlan): QueryBuilder<DM, T> {
+    return new QueryBuilder(this.store, this.def, this.overlay, this.tracker, {
+      bounds: Object.hasOwn(plan, "bounds") ? plan.bounds : this.bounds,
+      indexName: plan.indexName ?? this.indexName,
+      initializer: plan.initializer ?? false,
+      limit: Object.hasOwn(plan, "limit") ? plan.limit : this.limitCount,
+      orderDir: plan.orderDir ?? this.orderDir,
+      orderSet: plan.orderSet ?? this.orderSet,
+      predicates: plan.predicates ?? this.predicates,
+    });
+  }
+
+  private consumeForUse(): QueryBuilder<DM, T> {
+    if (this.initializer) {
+      return this.withPlan({ initializer: false });
+    }
+    if (this.consumed) {
+      throw new Error(
+        "A query can only be chained once and can't be chained after iteration begins.",
+      );
+    }
+    this.consumed = true;
+    return this;
+  }
 }
 
-function docValue(doc: RawDoc, field: string): unknown {
-  if (field === "_id" || field === "_creationTime") return doc[field];
-  return doc[field];
+function validateNonNegativeInteger(value: number, method: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${method}: n must be a non-negative integer`);
+  }
+}
+
+function validatePositiveInteger(value: number, method: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${method}: n must be a positive integer`);
+  }
+}
+
+/** Whether SQL represents these bounds exactly (no `null`-valued endpoint to widen). */
+function boundsAreExact(bounds: Bound[] | undefined): boolean {
+  // Every value (including `null` and `undefined`) encodes to an exact order key, so an `eq`
+  // bound and a real range endpoint are exact. The one inexact case for a count PUSHDOWN is a
+  // range endpoint whose value is `undefined`: the storage `Bound` cannot distinguish "endpoint
+  // is undefined" from "no endpoint" (both serialize as absent), so a pushdown would treat it as
+  // unbounded and overcount. Such bounds count through the stream instead (the scan re-checks via
+  // `matchesBounds`). The endpoint was set iff its inclusivity flag is present.
+  return !bounds?.some(
+    (bound) =>
+      bound.kind === "range" &&
+      ((bound.lower === undefined && bound.lowerInclusive !== undefined) ||
+        (bound.upper === undefined && bound.upperInclusive !== undefined)),
+  );
+}
+
+const END = Symbol("end-cursor");
+const PAGE_CURSOR_PREFIX = "v1:";
+const PAGE_CURSOR_END = "v1:end";
+
+/**
+ * Pagination cursors are versioned, opaque encodings of the last returned document's order-key
+ * tuple — stable under interleaved writes, O(pageSize) to resume. `undefined` elements (missing
+ * index fields) are recorded in a positional mask because Convex JSON cannot carry undefined.
+ */
+function encodePageCursor(key: KeyTuple): string {
+  const missing: number[] = [];
+  const values = key.map((value, i) => {
+    if (value === undefined) {
+      missing.push(i);
+      return null;
+    }
+    return convexToJson(value as Value);
+  });
+  return PAGE_CURSOR_PREFIX + toBase64Url(JSON.stringify({ k: values, u: missing }));
+}
+
+function decodePageCursor(cursor: string | null): KeyTuple | typeof END | undefined {
+  if (cursor === null) return undefined;
+  if (cursor === PAGE_CURSOR_END) return END;
+  if (!cursor.startsWith(PAGE_CURSOR_PREFIX)) {
+    throw new Error(`invalid pagination cursor: ${cursor}`);
+  }
+  let parsed: { k: JSONValue[]; u: number[] };
+  try {
+    parsed = JSON.parse(fromBase64Url(cursor.slice(PAGE_CURSOR_PREFIX.length))) as {
+      k: JSONValue[];
+      u: number[];
+    };
+  } catch {
+    throw new Error(`invalid pagination cursor: ${cursor}`);
+  }
+  if (!Array.isArray(parsed.k) || !Array.isArray(parsed.u)) {
+    throw new Error(`invalid pagination cursor: ${cursor}`);
+  }
+  const missing = new Set(parsed.u);
+  return parsed.k.map((value, i) => (missing.has(i) ? undefined : jsonToConvex(value)));
+}
+
+function toBase64Url(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromBase64Url(encoded: string): string {
+  const binary = atob(encoded.replace(/-/g, "+").replace(/_/g, "/"));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+function unique<T>(values: T[]): T[] {
+  return [...new Set(values)];
+}
+
+function docValue(doc: RawDoc, key: OrderField): unknown {
+  if (key.field === "_id" || key.field === "_creationTime") return doc[key.field];
+  return readFieldPath(doc, key.segments);
 }
 
 function createFilterBuilder<
@@ -299,7 +809,10 @@ function createFilterBuilder<
       expr((doc) => exprs.every((candidate) => asBoolean(evalExpression(candidate, doc)))),
     or: (...exprs: unknown[]) =>
       expr((doc) => exprs.some((candidate) => asBoolean(evalExpression(candidate, doc)))),
-    field: (fieldPath: string) => expr((doc) => fieldValue(doc, fieldPath)),
+    field: (fieldPath: string) => {
+      const segments = compileFieldPath(fieldPath);
+      return expr((doc) => readFieldPath(doc, segments));
+    },
   };
   return builder as unknown as ConvexFilterBuilder<NamedTableInfo<DM, T>>;
 }
@@ -319,15 +832,6 @@ function isExpression(value: unknown): value is RuntimeExpression<unknown> {
 
 function evalExpression(value: unknown, doc: RawDoc): unknown {
   return isExpression(value) ? value.eval(doc) : value;
-}
-
-function fieldValue(doc: RawDoc, fieldPath: string): unknown {
-  let current: unknown = doc;
-  for (const segment of fieldPath.split(".")) {
-    if (typeof current !== "object" || current === null) return undefined;
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return current;
 }
 
 function compare(op: "eq" | "neq" | "lt" | "lte" | "gt" | "gte", l: unknown, r: unknown): boolean {
@@ -400,12 +904,19 @@ function asBoolean(value: unknown): boolean {
 }
 
 function toColValue(value: unknown): ColValue {
+  // `undefined` is a valid bound — `q.eq("field", undefined)` queries documents missing that
+  // field (Convex orders a missing field as `undefined`). `null`, NaN, ±Infinity and -0 are
+  // valid too. Composite values cannot be bound.
   if (value === undefined) return undefined;
   if (value === null) return null;
-  if (typeof value === "string" || typeof value === "bigint" || typeof value === "boolean") {
+  if (
+    typeof value === "string" ||
+    typeof value === "bigint" ||
+    typeof value === "boolean" ||
+    typeof value === "number"
+  ) {
     return value;
   }
-  if (typeof value === "number" && Number.isFinite(value)) return value;
   throw new Error(`query bound value is not supported: ${describeValue(value)}`);
 }
 

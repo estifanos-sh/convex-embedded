@@ -8,32 +8,57 @@
   ],
   "type": "module",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
+    "./bundler": {
+      "types": "./dist/bundler.d.mts",
+      "import": "./dist/bundler.mjs"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.mts",
+      "import": "./dist/browser.mjs"
     },
     "./node": {
-      "types": "./dist/node.d.ts",
-      "import": "./dist/node.js"
+      "types": "./dist/node.d.mts",
+      "import": "./dist/node.mjs"
+    },
+    "./unplugin": {
+      "types": "./dist/unplugin.d.mts",
+      "import": "./dist/unplugin.mjs"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.mts",
+      "import": "./dist/vite.mjs"
     },
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "vp pack",
+    "build": "node scripts/build.ts",
+    "build:ts": "vp pack",
+    "native": "node scripts/native.ts",
+    "wasm": "node scripts/wasm.ts",
+    "style": "node scripts/style.ts",
     "dev": "vp pack --watch",
-    "test": "vp test",
+    "test": "vp test run --project node",
+    "test:browser": "node scripts/browser.ts",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
-    "@tursodatabase/database": "^0.6.1",
-    "convex": "catalog:"
+    "@napi-rs/wasm-runtime": "catalog:",
+    "convex": "catalog:",
+    "unplugin": "catalog:"
   },
   "devDependencies": {
+    "@emnapi/core": "catalog:",
+    "@emnapi/runtime": "catalog:",
+    "@napi-rs/cli": "catalog:",
     "@types/node": "catalog:",
     "@typescript/native-preview": "catalog:",
+    "playwright": "catalog:",
     "typescript": "catalog:",
+    "vite": "catalog:",
     "vite-plus": "catalog:",
     "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   }
 }

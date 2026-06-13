@@ -1,0 +1,75 @@
+/**
+ * Vite and Vite+ adapter for embedded Convex browser builds.
+ *
+ * @remarks
+ * The adapter registers generated Convex virtual modules and configures the
+ * cross-origin isolation headers required by the browser WASM storage backend.
+ *
+ * @example
+ * ```ts
+ * import { defineConfig } from "vite";
+ * import convexEmbedded from "@convex-dev/embedded/vite";
+ *
+ * export default defineConfig({
+ *   plugins: [convexEmbedded()],
+ * });
+ * ```
+ *
+ * @packageDocumentation
+ */
+import { convexEmbeddedUnplugin } from "./unplugin";
+import type { ConvexEmbeddedPluginOptions } from "./unplugin";
+
+export type { ConvexEmbeddedPluginOptions };
+
+type VitePlugin = {
+  config?: () => Record<string, unknown>;
+  name: string;
+};
+
+/**
+ * Vite/Vite+ adapter for embedded Convex module discovery.
+ *
+ * @param options - Optional Convex directory, schema path, and disable flag.
+ * @returns Vite plugins/config entries for the main build and worker build.
+ *
+ * @public
+ */
+export function convexEmbedded(options?: ConvexEmbeddedPluginOptions): VitePlugin[] {
+  return [
+    convexEmbeddedViteConfig(options),
+    convexEmbeddedUnplugin.vite(options) as unknown as VitePlugin,
+  ];
+}
+
+export default convexEmbedded;
+
+function convexEmbeddedViteConfig(options?: ConvexEmbeddedPluginOptions): VitePlugin {
+  return {
+    name: "convex-embedded:vite-config",
+    config() {
+      return {
+        optimizeDeps: {
+          exclude: ["@convex-dev/embedded", "@convex-dev/embedded/browser"],
+          include: ["@napi-rs/wasm-runtime", "convex/values"],
+        },
+        worker: {
+          plugins: () => [convexEmbeddedUnplugin.vite(options)],
+        },
+        server: {
+          headers: crossOriginIsolationHeaders(),
+        },
+        preview: {
+          headers: crossOriginIsolationHeaders(),
+        },
+      };
+    },
+  };
+}
+
+function crossOriginIsolationHeaders(): Record<string, string> {
+  return {
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cross-Origin-Opener-Policy": "same-origin",
+  };
+}
