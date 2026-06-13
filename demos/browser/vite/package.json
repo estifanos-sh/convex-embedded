@@ -1,0 +1,28 @@
+{
+  "name": "@convex-dev/embedded-demo-browser-vite",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vp dev",
+    "build": "tsc && vp build",
+    "preview": "vp preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@convex-dev/embedded": "workspace:*",
+    "@fontsource-variable/inter": "catalog:",
+    "@tailwindcss/forms": "catalog:",
+    "@tailwindcss/vite": "catalog:",
+    "convex": "catalog:",
+    "tailwindcss": "catalog:"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

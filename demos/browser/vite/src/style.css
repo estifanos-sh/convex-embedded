@@ -1,0 +1,78 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter/wght.css";
+@import "@fontsource-variable/inter/wght-italic.css";
+
+@plugin "@tailwindcss/forms" {
+  strategy: "class";
+}
+
+/* GT America — Convex's display font, hosted on their docs CDN. */
+@font-face {
+  font-family: "GT America";
+  font-weight: 400;
+  font-display: swap;
+  src: url(https://docs.convex.dev/fonts/GT-America-Standard-Regular.woff2);
+}
+@font-face {
+  font-family: "GT America";
+  font-weight: 500;
+  font-display: swap;
+  src: url(https://docs.convex.dev/fonts/GT-America-Standard-Medium.woff2);
+}
+@font-face {
+  font-family: "GT America";
+  font-weight: 700;
+  font-display: swap;
+  src: url(https://docs.convex.dev/fonts/GT-America-Standard-Bold.woff2);
+}
+
+@theme inline {
+  --color-background-primary: rgb(30, 28, 26);
+  --color-background-secondary: rgb(42, 40, 37);
+  --color-background-tertiary: rgb(60, 58, 55);
+  --color-content-primary: rgb(255, 255, 255);
+  --color-content-secondary: rgb(185, 177, 170);
+  --color-content-tertiary: rgb(151, 144, 138);
+  --color-content-accent: rgb(99, 168, 248);
+  --color-content-success: rgb(180, 236, 146);
+  --color-content-error: rgb(255, 202, 193);
+  --color-border-transparent: rgba(163, 156, 148, 0.3);
+  --color-border-selected: rgb(225, 215, 205);
+  --color-util-accent: rgb(63, 82, 149);
+  --color-brand-red: rgb(238, 52, 47);
+
+  --font-sans:
+    "Inter Variable", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display:
+    "GT America", "Inter Variable", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+@layer base {
+  * {
+    @apply border-border-transparent;
+  }
+
+  html,
+  body {
+    @apply bg-background-primary text-content-primary;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overscroll-behavior: contain;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  input:focus,
+  button:focus {
+    outline: none;
+  }
+}
