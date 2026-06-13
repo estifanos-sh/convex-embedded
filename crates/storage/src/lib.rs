@@ -5,23 +5,29 @@
 //! commits inside one `BEGIN IMMEDIATE` transaction and rolls back explicitly on error — there are
 //! no version counters or `_meta` table. Creation times come from a monotonic [`clock`] whose
 //! high-water mark is recovered on `setup`. `open` tunes the connection to WAL with a busy timeout.
-//! Scans/counts are compiled by [`sql`] with a shape-keyed plan cache and an unbounded-scan cap.
+//!
+//! Reads are total and paged: [`sql`] compiles every scan shape (widening bounds it cannot
+//! represent exactly), rows stream straight off the statement into documents, and pages resume
+//! through keyset cursors. The commit/mutation ledgers are pruned by consumer watermark, and a
+//! `__embedded_blobs` table stores binary payloads without any text encoding.
 
 pub mod clock;
-pub mod driver;
+mod driver;
 pub mod error;
-pub mod sql;
+#[cfg(target_arch = "wasm32")]
+pub mod opfs;
+mod sql;
 pub mod store;
 pub mod types;
 
 #[cfg(test)]
 mod tests;
 
-pub use driver::TursoDriver;
 pub use error::StorageError;
-pub use sql::{CompileResult, SCAN_CAP};
+pub use sql::{DEFAULT_SCAN_PAGE, SCAN_CAP};
 pub use store::EmbeddedStore;
 pub use types::{
-    Affinity, Bound, ColValue, ColumnDef, CountSpec, DeleteIn, IndexDef, Order, ReadOutcome,
-    ScanSpec, StoreSchema, StoredDoc, TableDef, UpsertIn, WriteBatch,
+    Bound, ColValue, ColumnDef, CommitOptions, CommitResult, CountSpec, DeleteIn, IndexDef,
+    MutationCall, MutationRecord, MutationStatus, Order, Page, PruneResult, ScanSpec, StoreSchema,
+    TableDef, UpsertIn, WriteBatch,
 };

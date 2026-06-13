@@ -12,9 +12,12 @@ crate-type = ["cdylib"]
 doctest = false
 
 [dependencies]
-napi = { version = "2", features = ["napi6", "tokio_rt"] }
+napi = { version = "2", features = ["napi6", "async"] }
 napi-derive = "2"
 storage = { path = "../storage" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["sync"] }
 
 [build-dependencies]
 napi-build = "2"

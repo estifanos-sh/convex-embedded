@@ -1,6 +1,6 @@
-//! Monotonic clock mirroring the TS `storage/clock.ts`. `now()` never goes backward and is unique
-//! within a wall-clock millisecond (the float-ms value is the §3.2 HLC's wallClock); `observe()` is
-//! its remote-floor rule, reused here to recover the high-water mark on open.
+//! Monotonic storage clock. `next()` never goes backward and is unique within a wall-clock
+//! millisecond (the float-ms value is the §3.2 HLC's wallClock); `observe()` is its remote-floor
+//! rule, reused here to recover the high-water mark on open.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
