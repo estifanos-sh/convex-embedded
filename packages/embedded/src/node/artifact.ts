@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { errorMessage } from "../error";
+import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
+import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
+
 /**
  * Loaded NAPI module shape expected by the Node adapter.
  *
@@ -12,12 +16,13 @@ import { fileURLToPath } from "node:url";
  */
 export interface NativeModule {
   apiVersion(): number;
+  protocolVersion(): number;
   Store: {
-    open(path: string, identityKey?: string): unknown;
+    open(path: string, selectorKey?: string, defaultIdentityKey?: string): unknown;
   };
 }
 
-const NATIVE_API_VERSION = 6;
+export const NATIVE_API_VERSION = EMBEDDED_STORAGE_ABI_VERSION;
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -25,8 +30,6 @@ const here = dirname(fileURLToPath(import.meta.url));
  * Loads and validates the platform native storage artifact.
  *
  * @internal
- * @todo Replace dev artifact probing with packaged per-platform optional dependencies once the
- * native release layout is stable.
  */
 export function loadNativeModule(): NativeModule {
   const candidates = nativeArtifactCandidates();
@@ -35,16 +38,23 @@ export function loadNativeModule(): NativeModule {
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
     try {
-      return validateNativeModule(require(loadableArtifactPath(candidate)), candidate);
+      const loaded = validateNativeModule(require(loadableArtifactPath(candidate)), candidate);
+      if (process.env.CONVEX_EMBEDDED_NATIVE_TRACE === "1") {
+        console.error(`Loaded native artifact: ${candidate}`);
+      }
+      return loaded;
     } catch (error) {
       failures.push(`${candidate}: ${errorMessage(error)}`);
+      if (process.env.CONVEX_EMBEDDED_NATIVE_TRACE === "1") {
+        console.error(`Failed native artifact: ${candidate}: ${errorMessage(error)}`);
+      }
     }
   }
 
   throw new Error(nativeArtifactError(candidates, failures));
 }
 
-function validateNativeModule(value: unknown, path: string): NativeModule {
+export function validateNativeModule(value: unknown, path: string): NativeModule {
   const module = value as Partial<NativeModule>;
   if (typeof module.apiVersion !== "function") {
     throw new Error(`native artifact did not export apiVersion: ${path}`);
@@ -55,6 +65,15 @@ function validateNativeModule(value: unknown, path: string): NativeModule {
       `native artifact API version mismatch at ${path}: expected ${NATIVE_API_VERSION}, got ${version}`,
     );
   }
+  if (typeof module.protocolVersion !== "function") {
+    throw new Error(`native artifact did not export protocolVersion: ${path}`);
+  }
+  const protocolVersion = module.protocolVersion();
+  if (protocolVersion !== EMBEDDED_PROTOCOL_VERSION) {
+    throw new Error(
+      `native artifact protocol mismatch at ${path}: expected ${EMBEDDED_PROTOCOL_VERSION}, got ${protocolVersion}`,
+    );
+  }
   if (typeof module.Store?.open !== "function") {
     throw new Error(`native artifact did not export Store.open: ${path}`);
   }
@@ -62,7 +81,6 @@ function validateNativeModule(value: unknown, path: string): NativeModule {
 }
 
 function loadableArtifactPath(path: string): string {
-  if (extname(path) === ".node") return path;
   const stat = statSync(path);
   const key = createHash("sha256")
     .update(path)
@@ -110,7 +128,14 @@ function nativeArtifactCandidates(): string[] {
   if (process.env.CONVEX_EMBEDDED_DEV_NATIVE !== "1") {
     return unique([...(explicit ? [explicit] : []), ...packageCandidates]);
   }
-  const roots = [resolve(here, "../../.."), resolve(here, "../../../..")];
+  const cwd = process.cwd();
+  const roots = unique([
+    resolve(here, "../../.."),
+    resolve(here, "../../../.."),
+    cwd,
+    resolve(cwd, ".."),
+    resolve(cwd, "../.."),
+  ]);
   const devCandidates = roots.flatMap((root) => [
     resolve(root, "target/release/convex-embedded.node"),
     resolve(root, "target/debug/convex-embedded.node"),
@@ -124,7 +149,7 @@ function nativeArtifactCandidates(): string[] {
     resolve(root, "target/debug/node.dll"),
   ]);
 
-  return unique([...(explicit ? [explicit] : []), ...packageCandidates, ...devCandidates]);
+  return unique([...(explicit ? [explicit] : []), ...devCandidates, ...packageCandidates]);
 }
 
 function nativeTarget(): string {
@@ -147,7 +172,7 @@ function hasGlibc(): boolean {
 function nativeArtifactError(candidates: string[], failures: string[]): string {
   const lines = [
     "ConvexEmbeddedClient could not load the native storage artifact.",
-    "Set CONVEX_EMBEDDED_NATIVE to an absolute .node artifact path, or build/package the Node artifact.",
+    "Set CONVEX_EMBEDDED_NATIVE to an absolute .node artifact path, or run `vp run @convex-dev/embedded#build` to package the Node artifact.",
     "Checked:",
     ...candidates.map((candidate) => `  - ${candidate}`),
   ];
@@ -159,8 +184,4 @@ function nativeArtifactError(candidates: string[], failures: string[]): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

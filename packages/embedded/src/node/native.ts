@@ -7,6 +7,8 @@ import { StoreAdapter, type StoreBinding } from "../storage/binding";
  */
 export interface NativeStoreOptions {
   identityKey?: string;
+  selectorKey?: string;
+  defaultIdentityKey?: string;
 }
 
 /**
@@ -34,10 +36,14 @@ export class NativeStore extends StoreAdapter {
    * @internal
    */
   static async openWith(
-    Store: { open(path: string, identityKey?: string): unknown },
+    Store: { open(path: string, selectorKey?: string, defaultIdentityKey?: string): unknown },
     path: string,
     options: NativeStoreOptions = {},
   ): Promise<NativeStore> {
-    return new NativeStore((await Store.open(path, options.identityKey)) as StoreBinding);
+    const selectorKey = options.selectorKey ?? options.identityKey;
+    const defaultIdentityKey = options.defaultIdentityKey ?? options.identityKey;
+    return new NativeStore(
+      (await Store.open(path, selectorKey, defaultIdentityKey)) as StoreBinding,
+    );
   }
 }

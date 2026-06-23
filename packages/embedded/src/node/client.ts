@@ -2,24 +2,37 @@
  * Node implementation of the embedded Convex client.
  *
  * @remarks
- * This module is re-exported by `@convex-dev/embedded/node`. Prefer that
- * package entrypoint in application code.
+ * Use this entrypoint for Node processes that run embedded Convex functions
+ * against the Rust/NAPI storage backend.
  *
  * @packageDocumentation
  */
-import { EmbeddedClient, type ConvexModules } from "../client";
+import { createEmbeddedAuthState, EmbeddedClient, type ConvexModules } from "../client";
 import type { ConvexEmbeddedSchema } from "../schema";
-import { loadNativeModule, type NativeModule } from "./artifact";
+import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
+import { loadNativeModule, validateNativeModule, type NativeModule } from "./artifact";
 import { NativeStore } from "./native";
 
 export type {
   ConvexEmbeddedMutationOptions,
+  AuthTokenFetcher,
   ConvexModules,
-  MutationOptions,
-  OptimisticLocalStore,
-  OptimisticUpdate,
+  EmbeddedDataDelete,
+  EmbeddedDataEvent,
+  EmbeddedDataUpsert,
+  EmbeddedConnectionState,
+  EmbeddedEvent,
+  EmbeddedEventListener,
+  EmbeddedOperationEvent,
+  EmbeddedOperationKind,
+  EmbeddedOperationPhase,
+  EmbeddedRemoteEvent,
+  EmbeddedRemoteStatus,
+  EmbeddedSchedulerEvent,
+  EmbeddedSpanEvent,
+  EmbeddedSpanPhase,
+  EmbeddedStorageEvent,
   Watch,
-  WatchQueryOptions,
 } from "../client";
 export type { ConvexEmbeddedSchema } from "../schema";
 
@@ -62,27 +75,20 @@ export interface ConvexEmbeddedClientOptions {
    * Parent directories must be writable by the Node process.
    */
   path: string;
+
+  /** Convex deployment URL. Omit it for a local-only runtime. */
+  url?: string;
 }
 
 const nativeOverrides = new WeakMap<ConvexEmbeddedClientOptions, NativeModule>();
 
 /**
- * Embedded Convex client for Node.
+ * Node embedded client backed by the Rust/NAPI storage artifact.
  *
  * @remarks
  * Convex functions execute in JavaScript in the current process; storage is
  * provided by the Rust/NAPI backend. The native artifact is loaded from the
  * package, or from `CONVEX_EMBEDDED_NATIVE` when set.
- *
- * @example
- * ```ts
- * import { ConvexEmbeddedClient } from "@convex-dev/embedded/node";
- * import { api } from "../convex/_generated/api";
- * import schema from "../convex/schema";
- *
- * const client = new ConvexEmbeddedClient({ schema, modules, path: "local.db" });
- * await client.mutation(api.todos.create, { text: "Write docs" });
- * ```
  *
  * @public
  */
@@ -96,14 +102,31 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
    * opening fails.
    */
   constructor(options: ConvexEmbeddedClientOptions) {
-    const native = nativeOverrides.get(options) ?? loadNativeModule();
+    const native = validateNativeModule(
+      nativeOverrides.get(options) ?? loadNativeModule(),
+      "ConvexEmbeddedClient native artifact",
+    );
     nativeOverrides.delete(options);
+    const authState = createEmbeddedAuthState();
     super({
       schema: options.schema,
       modules: options.modules,
-      store: NativeStore.openWith(native.Store, options.path),
+      store: openStore(native, options.path),
+      authState,
+      remote: toRemoteOptions(options),
     });
   }
+}
+
+function openStore(native: NativeModule, path: string): Promise<NativeStore> {
+  return NativeStore.openWith(native.Store, path, {
+    defaultIdentityKey: EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY,
+    selectorKey: path,
+  });
+}
+
+function toRemoteOptions(options: ConvexEmbeddedClientOptions): { url: string } | undefined {
+  return options.url === undefined ? undefined : { url: options.url };
 }
 
 /**

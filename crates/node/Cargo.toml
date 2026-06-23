@@ -12,12 +12,25 @@ crate-type = ["cdylib"]
 doctest = false
 
 [dependencies]
+anyhow = "1"
+base64 = "0.13"
+convex = { version = "=0.10.4", default-features = false }
+convex_sync_types = "=0.10.4"
 napi = { version = "2", features = ["napi6", "async"] }
 napi-derive = "2"
+remote = { path = "../remote" }
+serde_json = "1"
 storage = { path = "../storage" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["sync"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-channel = "0.3"
+futures-util = "0.3"
+
 [build-dependencies]
 napi-build = "2"
+
+[dev-dependencies]
+storage = { path = "../storage", features = ["testkit"] }

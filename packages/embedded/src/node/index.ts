@@ -22,14 +22,32 @@
  * @packageDocumentation
  */
 export { ConvexEmbeddedClient } from "./client";
+export {
+  EMBEDDED_UPLOAD_PATH,
+  createConvexEmbeddedUploadFetch,
+  type ConvexEmbeddedUploadFetch,
+  type ConvexEmbeddedUploadFetchOptions,
+} from "../browser/upload";
 export type {
+  AuthTokenFetcher,
   ConvexEmbeddedClientOptions,
   ConvexEmbeddedMutationOptions,
   ConvexEmbeddedSchema,
   ConvexModules,
-  MutationOptions,
-  OptimisticLocalStore,
-  OptimisticUpdate,
+  EmbeddedDataDelete,
+  EmbeddedDataEvent,
+  EmbeddedDataUpsert,
+  EmbeddedConnectionState,
+  EmbeddedEvent,
+  EmbeddedEventListener,
+  EmbeddedOperationEvent,
+  EmbeddedOperationKind,
+  EmbeddedOperationPhase,
+  EmbeddedRemoteEvent,
+  EmbeddedRemoteStatus,
+  EmbeddedSchedulerEvent,
+  EmbeddedSpanEvent,
+  EmbeddedSpanPhase,
+  EmbeddedStorageEvent,
   Watch,
-  WatchQueryOptions,
 } from "./client";
