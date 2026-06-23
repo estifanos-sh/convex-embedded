@@ -1,0 +1,2398 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { performance } from "node:perf_hooks";
+
+import { makeFunctionReference } from "convex/server";
+import { expect, test } from "vite-plus/test";
+
+import {
+  adapterUpsert,
+  benchModules,
+  benchSchema,
+  benchId,
+  bindingEq,
+  bindingUpsert,
+  createAdapterBenchHarness,
+  createBindingBenchHarness,
+  createNativeRuntimeBenchHarness,
+  createRuntimeBenchHarness,
+  nativeModule,
+  type AdapterBenchHarness,
+  type BindingBenchHarness,
+  type RuntimeBenchHarness,
+  type RuntimeBenchHarnessOptions,
+  runtimeBenchRevs,
+  runtimeBenchStoreSchema,
+  temporaryStorePath,
+} from "./harness";
+import {
+  createConvexEmbeddedClientForTest,
+  type ConvexEmbeddedClient,
+} from "../../src/node/client";
+import type { ConvexEmbeddedMutationOptions, EmbeddedClientMutationTiming } from "../../src/client";
+import type {
+  BindingCommitOptions,
+  BindingCountSpec,
+  BindingReadSpec,
+  BindingWriteBatch,
+  ReadCacheStats,
+  StoreBinding,
+} from "../../src/storage/binding";
+import type { OneUpsertCommit, WriteBatch } from "../../src/storage/types";
+import type { RunMutationOptions, RunMutationTiming } from "../../src/runtime/runner";
+import { freezeNormalizedTreeWithEstimate, reviveDoc } from "../../src/runtime/codec";
+
+type BenchLayer =
+  | "adapter"
+  | "binding"
+  | "client"
+  | "memory"
+  | "runtime-cold"
+  | "runtime-hot"
+  | "runtime-insert";
+type BenchRunResult =
+  | Promise<unknown>
+  | bigint
+  | boolean
+  | null
+  | number
+  | object
+  | string
+  | symbol
+  | undefined;
+
+interface BenchOptions {
+  compare?: string;
+  iterations: number;
+  layers: BenchLayer[];
+  out?: string;
+  rows: number;
+  smoke: boolean;
+  split: boolean;
+  warmups: number;
+  watcherFanout: number;
+}
+
+interface BenchResult {
+  baselineHz?: number;
+  baselineName?: string;
+  baselineRatio?: number;
+  cacheBytes?: number;
+  cacheHits?: number;
+  cacheMisses?: number;
+  headMeanMs?: number;
+  hz: number;
+  heapBytesPerOp?: number;
+  heapDeltaBytes?: number;
+  iterations: number;
+  layer: BenchLayer;
+  maxMs: number;
+  meanMs: number;
+  medianMs: number;
+  minMs: number;
+  medianHz: number;
+  name: string;
+  p90Ms: number;
+  p95Ms: number;
+  p99Ms: number;
+  phaseMeanMs?: Partial<Record<string, number>>;
+  relativeStddev: number;
+  samplesMs: number[];
+  stddevMs: number;
+  tailMeanMs?: number;
+  totalMs: number;
+  trimmedHz: number;
+  trimmedMeanMs: number;
+}
+
+interface BenchReport {
+  comparisons?: BenchComparison[];
+  iterations: number;
+  node: string;
+  results: BenchResult[];
+  rows: number;
+  runtime: "typescript";
+  semanticNotes: string[];
+  smoke: boolean;
+  split: boolean;
+  timestamp: string;
+  version: 3;
+  warmups: number;
+}
+
+interface MeasureOptions {
+  baseline?: { hz: number; name: string };
+  beforeEach?: () => void;
+  phases?: { means(): Partial<Record<string, number>> | undefined; reset(): void };
+  readStats?: () => ReadCacheStats;
+}
+
+interface BenchBaseline {
+  capturedAt: string;
+  notes: string[];
+  source: string;
+  summaries: BenchSummary[];
+  version: 1;
+}
+
+interface BenchSummary {
+  gate?: boolean;
+  hz: number;
+  layer: string;
+  meanMs: number;
+  name: string;
+  p95Ms: number;
+}
+
+interface BenchComparison {
+  baselineHz: number;
+  baselineName: string;
+  currentHz: number;
+  layer: BenchLayer;
+  medianRatio: number;
+  name: string;
+  ratio: number;
+  status: "fail" | "inconclusive" | "pass";
+  trimmedRatio: number;
+}
+
+type MutationTimingPhase = Exclude<keyof RunMutationTiming, "mutationId">;
+
+interface MutationTimingRecorder {
+  readonly callback?: (timing: RunMutationTiming) => void;
+  means(): Partial<Record<string, number>> | undefined;
+  reset(): void;
+}
+
+interface ClientTimingRecorder {
+  readonly callback?: (timing: EmbeddedClientMutationTiming) => void;
+  means(): Partial<Record<string, number>> | undefined;
+  reset(): void;
+}
+
+const mutationTimingPhases = [
+  "prepareMs",
+  "argsEncodeMs",
+  "beginMs",
+  "handlerMs",
+  "batchMs",
+  "resultEncodeMs",
+  "commitMs",
+  "notifyMs",
+  "totalMs",
+] as const satisfies readonly MutationTimingPhase[];
+
+const clientTimingPhases = [
+  "stateMs",
+  "normalizeMs",
+  "operationMs",
+  "authMs",
+  "idMs",
+  "runnerMs",
+  "totalMs",
+] as const satisfies readonly (keyof EmbeddedClientMutationTiming)[];
+
+const clientInsert = makeFunctionReference<
+  "mutation",
+  { body: string; channel: string; sequence: number },
+  string
+>(runtimeBenchRevs.insert);
+const clientPatch = makeFunctionReference<
+  "mutation",
+  { body: string; id: string; updated: number },
+  null
+>(runtimeBenchRevs.patch);
+const clientSeed = makeFunctionReference<"mutation", { channel: string; rows: number }, string[]>(
+  runtimeBenchRevs.seed,
+);
+
+let benchmarkWarmups = 10;
+
+test("typescript runtime benchmark", async () => {
+  const options = parseOptions();
+  benchmarkWarmups = options.warmups;
+  const results: BenchResult[] = [];
+
+  for (const layer of options.layers) {
+    results.push(...(await runLayer(layer, options)));
+  }
+
+  const report: BenchReport = {
+    iterations: options.iterations,
+    node: process.version,
+    results,
+    rows: options.rows,
+    runtime: "typescript",
+    semanticNotes: [
+      "read/query old-baseline ratios are directly comparable",
+      "write old-baseline ratios compare against the old async-persist path; embedded resolves mutations after durable projection plus dirty-head commit",
+      "runtime write scenarios measure commit resolution, not downstream watcher reruns",
+      "heap KB is net heap delta over measured iterations; heapBytesPerOp is recorded in JSON",
+      "comparison gates use raw mean throughput; a mean miss with passing trimmed/median throughput is reported as inconclusive rather than a proven regression",
+      ...(options.split
+        ? [
+            "split timings are diagnostic and intentionally opt-in because timing probes add overhead",
+          ]
+        : []),
+    ],
+    smoke: options.smoke,
+    split: options.split,
+    timestamp: new Date().toISOString(),
+    version: 3,
+    warmups: options.warmups,
+  };
+
+  const baseline = options.compare ? readComparisonBaseline(options.compare) : undefined;
+  const comparisons = baseline ? compareToBaseline(report, baseline) : [];
+  if (comparisons.length) report.comparisons = comparisons;
+
+  printReport(report, options.layers, comparisons);
+  if (options.out) {
+    mkdirSync(dirname(options.out), { recursive: true });
+    writeFileSync(options.out, `${JSON.stringify(report, null, 2)}\n`);
+    console.log(`\nWrote ${options.out}`);
+  }
+
+  expect(report.results.length).toBeGreaterThan(0);
+  for (const result of report.results) {
+    expect(Number.isFinite(result.hz)).toBe(true);
+    expect(result.iterations).toBe(options.iterations);
+  }
+  const failures = comparisons.filter((comparison) => comparison.status === "fail");
+  expect(
+    failures.map(
+      (failure) =>
+        `${failure.layer} ${failure.name}: ${formatRatio(failure.ratio)} vs ${failure.baselineName}`,
+    ),
+  ).toEqual([]);
+}, 300_000);
+
+async function runLayer(layer: BenchLayer, options: BenchOptions): Promise<BenchResult[]> {
+  switch (layer) {
+    case "memory":
+      return runRuntimeScenarios(layer, options, createRuntimeBenchHarness, "hot");
+    case "runtime-hot":
+      return runRuntimeScenarios(layer, options, createNativeRuntimeBenchHarness, "hot");
+    case "runtime-insert":
+      return runRuntimeInsertScenarios(layer, options, createNativeRuntimeBenchHarness);
+    case "runtime-cold":
+      return runRuntimeScenarios(layer, options, createNativeRuntimeBenchHarness, "cold");
+    case "adapter":
+      return runAdapterScenarios(layer, options);
+    case "binding":
+      return runBindingScenarios(layer, options);
+    case "client":
+      return runClientScenarios(layer, options);
+  }
+}
+
+async function runRuntimeInsertScenarios(
+  layer: BenchLayer,
+  options: BenchOptions,
+  createHarness: (options?: RuntimeBenchHarnessOptions) => Promise<RuntimeBenchHarness>,
+): Promise<BenchResult[]> {
+  const harnesses: RuntimeBenchHarness[] = [];
+  try {
+    const results: BenchResult[] = [];
+    const insertHarness = await createHarness({ seedRows: 0 });
+    harnesses.push(insertHarness);
+    let sequence = 0;
+    const insertPhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.insert",
+        options.iterations,
+        () =>
+          insertHarness.runner.runMutation(
+            runtimeBenchRevs.insert,
+            {
+              body: `inserted-${sequence}`,
+              channel: insertHarness.channel,
+              sequence: sequence++,
+            },
+            mutationTimingOption(insertPhases),
+          ),
+        {
+          baseline: oldBaselines.mutationInsert,
+          phases: insertPhases,
+          readStats: insertHarness.readCacheStats,
+        },
+      ),
+    );
+
+    const productionInsertHarness = await createHarness({ seedRows: 0 });
+    harnesses.push(productionInsertHarness);
+    let productionSequence = 0;
+    const productionInsertPhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.insert.with_id",
+        options.iterations,
+        () => {
+          const id = productionSequence++;
+          return productionInsertHarness.runner.runMutation(
+            runtimeBenchRevs.insert,
+            {
+              body: `inserted-with-id-${id}`,
+              channel: productionInsertHarness.channel,
+              sequence: id,
+            },
+            mutationIdTimingOption(`bench:${id}`, productionInsertPhases),
+          );
+        },
+        {
+          baseline: oldBaselines.mutationInsert,
+          phases: productionInsertPhases,
+          readStats: productionInsertHarness.readCacheStats,
+        },
+      ),
+    );
+
+    const storageInsertHarness = await createHarness({ seedRows: 0 });
+    harnesses.push(storageInsertHarness);
+    const storageInserts: OneUpsertCommit[] = Array.from(
+      { length: options.iterations + options.warmups },
+      (_, index) => ({
+        fresh: true,
+        upsert: adapterUpsert(benchId(index), storageInsertHarness.channel, index),
+      }),
+    );
+    let storageInsertSequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "storage.one_upsert.no_handler",
+        options.iterations,
+        () => {
+          const commit = storageInserts[storageInsertSequence++ % storageInserts.length]!;
+          return storageInsertHarness.store.commitOneUpsert!(commit, {
+            changes: "omit",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        { readStats: storageInsertHarness.readCacheStats },
+      ),
+    );
+
+    const storageWithIdHarness = await createHarness({ seedRows: 0 });
+    harnesses.push(storageWithIdHarness);
+    const storageWithIdInserts = Array.from(
+      { length: options.iterations + options.warmups },
+      (_, index) => {
+        const id = benchId(index);
+        return {
+          args: `{"body":"inserted-with-id-${index}","channel":"${storageWithIdHarness.channel}","sequence":${index}}`,
+          commit: {
+            fresh: true,
+            upsert: adapterUpsert(
+              id,
+              storageWithIdHarness.channel,
+              index,
+              `inserted-with-id-${index}`,
+            ),
+          } satisfies OneUpsertCommit,
+          mutationId: `bench:${index}`,
+          result: `"${id}"`,
+        };
+      },
+    );
+    let storageWithIdSequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "storage.one_upsert.no_handler.with_id",
+        options.iterations,
+        () => {
+          const item = storageWithIdInserts[storageWithIdSequence++ % storageWithIdInserts.length]!;
+          return storageWithIdHarness.store.commitOneUpsert!(item.commit, {
+            changes: "omit",
+            mutationArgs: item.args,
+            mutationFresh: true,
+            mutationId: item.mutationId,
+            mutation: "terminal",
+            mutationName: "messages:insert",
+            mutationResult: item.result,
+            source: "local",
+          });
+        },
+        { readStats: storageWithIdHarness.readCacheStats },
+      ),
+    );
+    if (storageWithIdHarness.store.mutation) {
+      const storageWithLookupHarness = await createHarness({ seedRows: 0 });
+      harnesses.push(storageWithLookupHarness);
+      const mutation = storageWithLookupHarness.store.mutation;
+      if (!mutation) throw new Error("storage lookup benchmark requires mutation storage");
+      const storageWithLookupInserts = Array.from(
+        { length: options.iterations + options.warmups },
+        (_, index) => {
+          const id = benchId(index);
+          return {
+            args: `{"body":"inserted-with-lookup-${index}","channel":"${storageWithLookupHarness.channel}","sequence":${index}}`,
+            commit: {
+              fresh: true,
+              upsert: adapterUpsert(
+                id,
+                storageWithLookupHarness.channel,
+                index,
+                `inserted-with-lookup-${index}`,
+              ),
+            } satisfies OneUpsertCommit,
+            mutationId: `bench-lookup:${index}`,
+            result: `"${id}"`,
+          };
+        },
+      );
+      for (const item of storageWithLookupInserts) {
+        await mutation.begin({
+          args: item.args,
+          mutationId: item.mutationId,
+          name: "messages:insert",
+        });
+      }
+      let storageWithLookupSequence = 0;
+      results.push(
+        await measure(
+          layer,
+          "storage.one_upsert.no_handler.with_id.lookup",
+          options.iterations,
+          () => {
+            const item =
+              storageWithLookupInserts[
+                storageWithLookupSequence++ % storageWithLookupInserts.length
+              ]!;
+            return storageWithLookupHarness.store.commitOneUpsert!(item.commit, {
+              changes: "omit",
+              mutationArgs: item.args,
+              mutationFresh: false,
+              mutationId: item.mutationId,
+              mutation: "terminal",
+              mutationName: "messages:insert",
+              mutationResult: item.result,
+              source: "local",
+            });
+          },
+          { readStats: storageWithLookupHarness.readCacheStats },
+        ),
+      );
+    }
+    return results;
+  } finally {
+    await Promise.all(harnesses.map((harness) => harness.close()));
+  }
+}
+
+async function runRuntimeScenarios(
+  layer: BenchLayer,
+  options: BenchOptions,
+  createHarness: (options?: RuntimeBenchHarnessOptions) => Promise<RuntimeBenchHarness>,
+  temperature: "cold" | "hot",
+): Promise<BenchResult[]> {
+  const harnesses: RuntimeBenchHarness[] = [];
+  try {
+    const results: BenchResult[] = [];
+    const readHarness = await createHarness({ seedRows: options.rows });
+    harnesses.push(readHarness);
+    const cacheState = temperature === "hot" ? "cache_hit" : "cache_miss";
+    let cursor = 0;
+    results.push(
+      await measure(
+        layer,
+        `query.get.${cacheState}`,
+        options.iterations,
+        () =>
+          readHarness.runner.runQuery(runtimeBenchRevs.get, {
+            id: readHarness.ids[cursor++ % readHarness.ids.length],
+          }),
+        {
+          beforeEach: coldBeforeEach(readHarness, temperature),
+          readStats: readHarness.readCacheStats,
+        },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        `query.index.take20.${cacheState}`,
+        options.iterations,
+        () =>
+          readHarness.runner.runQuery(runtimeBenchRevs.listByChannel, {
+            channel: readHarness.channel,
+            limit: 20,
+          }),
+        {
+          baseline: oldBaselines.indexedTake20,
+          beforeEach: coldBeforeEach(readHarness, temperature),
+          readStats: readHarness.readCacheStats,
+        },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        `query.index.take100.${cacheState}`,
+        options.iterations,
+        () =>
+          readHarness.runner.runQuery(runtimeBenchRevs.listByChannel, {
+            channel: readHarness.channel,
+            limit: 100,
+          }),
+        {
+          beforeEach: coldBeforeEach(readHarness, temperature),
+          readStats: readHarness.readCacheStats,
+        },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        `query.index.take1000.${cacheState}`,
+        options.iterations,
+        () =>
+          readHarness.runner.runQuery(runtimeBenchRevs.listByChannel, {
+            channel: readHarness.channel,
+            limit: 1_000,
+          }),
+        {
+          beforeEach: coldBeforeEach(readHarness, temperature),
+          readStats: readHarness.readCacheStats,
+        },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        `query.index.count.${cacheState}`,
+        options.iterations,
+        () =>
+          readHarness.runner.runQuery(runtimeBenchRevs.countByChannel, {
+            channel: readHarness.channel,
+          }),
+        {
+          beforeEach: coldBeforeEach(readHarness, temperature),
+          readStats: readHarness.readCacheStats,
+        },
+      ),
+    );
+
+    const writeHarness = await createHarness({ seedRows: options.rows });
+    harnesses.push(writeHarness);
+    let patchIndex = 0;
+    const patchPhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.patch",
+        options.iterations,
+        () =>
+          writeHarness.runner.runMutation(
+            runtimeBenchRevs.patch,
+            {
+              body: `patched-${patchIndex}`,
+              id: writeHarness.ids[patchIndex++ % writeHarness.ids.length],
+              updated: patchIndex,
+            },
+            mutationTimingOption(patchPhases),
+          ),
+        { phases: patchPhases, readStats: writeHarness.readCacheStats },
+      ),
+    );
+
+    const productionPatchHarness = await createHarness({ seedRows: options.rows });
+    harnesses.push(productionPatchHarness);
+    let productionPatchIndex = 0;
+    const productionPatchPhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.patch.with_id",
+        options.iterations,
+        () => {
+          const id = productionPatchIndex++;
+          return productionPatchHarness.runner.runMutation(
+            runtimeBenchRevs.patch,
+            {
+              body: `patched-with-id-${id}`,
+              id: productionPatchHarness.ids[id % productionPatchHarness.ids.length],
+              updated: id,
+            },
+            mutationIdTimingOption(`bench-patch:${id}`, productionPatchPhases),
+          );
+        },
+        { phases: productionPatchPhases, readStats: productionPatchHarness.readCacheStats },
+      ),
+    );
+
+    const rewriteHarness = await createHarness({ seedRows: 1 });
+    harnesses.push(rewriteHarness);
+    let rewriteSequence = 0;
+    const rewritePhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.rewrite_same_row",
+        options.iterations,
+        () => {
+          rewriteSequence += 1;
+          return rewriteHarness.runner.runMutation(
+            runtimeBenchRevs.patch,
+            {
+              body: `rewrite-${rewriteSequence}`,
+              id: rewriteHarness.ids[0]!,
+              updated: rewriteSequence,
+            },
+            mutationTimingOption(rewritePhases),
+          );
+        },
+        { phases: rewritePhases, readStats: rewriteHarness.readCacheStats },
+      ),
+    );
+
+    const insertHarness = await createHarness({ seedRows: 0 });
+    harnesses.push(insertHarness);
+    let sequence = 0;
+    const insertPhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.insert",
+        options.iterations,
+        () =>
+          insertHarness.runner.runMutation(
+            runtimeBenchRevs.insert,
+            {
+              body: `inserted-${sequence}`,
+              channel: insertHarness.channel,
+              sequence: sequence++,
+            },
+            mutationTimingOption(insertPhases),
+          ),
+        {
+          baseline: oldBaselines.mutationInsert,
+          phases: insertPhases,
+          readStats: insertHarness.readCacheStats,
+        },
+      ),
+    );
+
+    const productionInsertHarness = await createHarness({ seedRows: 0 });
+    harnesses.push(productionInsertHarness);
+    let productionSequence = 0;
+    const productionInsertPhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.insert.with_id",
+        options.iterations,
+        () => {
+          const id = productionSequence++;
+          return productionInsertHarness.runner.runMutation(
+            runtimeBenchRevs.insert,
+            {
+              body: `inserted-with-id-${id}`,
+              channel: productionInsertHarness.channel,
+              sequence: id,
+            },
+            mutationIdTimingOption(`bench:${id}`, productionInsertPhases),
+          );
+        },
+        {
+          baseline: oldBaselines.mutationInsert,
+          phases: productionInsertPhases,
+          readStats: productionInsertHarness.readCacheStats,
+        },
+      ),
+    );
+
+    const readWriteHarness = await createHarness({ seedRows: 0 });
+    harnesses.push(readWriteHarness);
+    let readWriteSequence = 0;
+    const readWritePhases = createMutationTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "mutation.read_your_writes",
+        options.iterations,
+        () =>
+          readWriteHarness.runner.runMutation(
+            runtimeBenchRevs.readYourWrites,
+            {
+              body: `ryw-${readWriteSequence}`,
+              channel: readWriteHarness.channel,
+              sequence: readWriteSequence++,
+            },
+            mutationTimingOption(readWritePhases),
+          ),
+        { phases: readWritePhases, readStats: readWriteHarness.readCacheStats },
+      ),
+    );
+
+    if (options.watcherFanout > 0) {
+      const sameQueryWatch = await createSameQueryWatchBench(createHarness, options.watcherFanout);
+      harnesses.push(sameQueryWatch.harness);
+      results.push(
+        await measure(
+          layer,
+          `watch.same_query_fanout.${options.watcherFanout}`,
+          options.iterations,
+          () => sameQueryWatch.run(),
+          { readStats: sameQueryWatch.harness.readCacheStats },
+        ),
+      );
+
+      const distinctQueryWatch = await createDistinctQueryWatchBench(
+        createHarness,
+        options.watcherFanout,
+      );
+      harnesses.push(distinctQueryWatch.harness);
+      results.push(
+        await measure(
+          layer,
+          `watch.distinct_query_fanout.${options.watcherFanout}`,
+          options.iterations,
+          () => distinctQueryWatch.run(),
+          { readStats: distinctQueryWatch.harness.readCacheStats },
+        ),
+      );
+
+      const hiddenDataOnlyWatch = await createHiddenDataOnlyWatchBench(
+        createHarness,
+        options.watcherFanout,
+      );
+      harnesses.push(hiddenDataOnlyWatch.harness);
+      results.push(
+        await measure(
+          layer,
+          `watch.hidden_data_only_fanout.${options.watcherFanout}`,
+          options.iterations,
+          () => hiddenDataOnlyWatch.run(),
+          { readStats: hiddenDataOnlyWatch.harness.readCacheStats },
+        ),
+      );
+    }
+
+    return results;
+  } finally {
+    await Promise.all(harnesses.map((harness) => harness.close()));
+  }
+}
+
+interface WatchBench {
+  harness: RuntimeBenchHarness;
+  run(): Promise<void>;
+}
+
+async function createSameQueryWatchBench(
+  createHarness: (options?: RuntimeBenchHarnessOptions) => Promise<RuntimeBenchHarness>,
+  subscribers: number,
+): Promise<WatchBench> {
+  const harness = await createHarness({ seedRows: 20 });
+  const tracker = createWatchTracker(subscribers);
+  const stops = Array.from({ length: subscribers }, () =>
+    harness.runner.onUpdate(
+      runtimeBenchRevs.listByChannel,
+      { channel: harness.channel, limit: 20 },
+      () => tracker.callback(),
+    ),
+  );
+  await tracker.waitForInitial();
+
+  let sequence = 0;
+  return {
+    harness: {
+      ...harness,
+      close: async () => {
+        for (const stop of stops) stop();
+        await harness.close();
+      },
+    },
+    run: async () => {
+      sequence += 1;
+      const settled = tracker.waitForNext();
+      await harness.runner.runMutation(runtimeBenchRevs.patch, {
+        body: `watch-same-${sequence}`,
+        id: harness.ids[0]!,
+        updated: sequence,
+      });
+      await settled;
+    },
+  };
+}
+
+async function createDistinctQueryWatchBench(
+  createHarness: (options?: RuntimeBenchHarnessOptions) => Promise<RuntimeBenchHarness>,
+  watchers: number,
+): Promise<WatchBench> {
+  const rows = Math.max(20, watchers);
+  const harness = await createHarness({ seedRows: rows });
+  const tracker = createWatchTracker(watchers);
+  const stops = Array.from({ length: watchers }, (_, index) =>
+    harness.runner.onUpdate(
+      runtimeBenchRevs.listByChannel,
+      { channel: harness.channel, limit: index + 1 },
+      () => tracker.callback(),
+    ),
+  );
+  await tracker.waitForInitial();
+
+  let sequence = 0;
+  return {
+    harness: {
+      ...harness,
+      close: async () => {
+        for (const stop of stops) stop();
+        await harness.close();
+      },
+    },
+    run: async () => {
+      sequence += 1;
+      const settled = tracker.waitForNext();
+      await harness.runner.runMutation(runtimeBenchRevs.patch, {
+        body: `watch-distinct-${sequence}`,
+        id: harness.ids[0]!,
+        updated: sequence,
+      });
+      await settled;
+    },
+  };
+}
+
+async function createHiddenDataOnlyWatchBench(
+  createHarness: (options?: RuntimeBenchHarnessOptions) => Promise<RuntimeBenchHarness>,
+  watchers: number,
+): Promise<WatchBench> {
+  const rows = Math.max(200, watchers * 2);
+  const harness = await createHarness({ seedRows: rows });
+  let unexpectedCallbacks = 0;
+  const tracker = createWatchTracker(watchers);
+  const stops = Array.from({ length: watchers }, (_, index) =>
+    harness.runner.onUpdate(
+      runtimeBenchRevs.listByChannel,
+      { channel: harness.channel, limit: index + 1 },
+      () => {
+        const wasInitialized = tracker.initialized();
+        tracker.callback();
+        if (wasInitialized) unexpectedCallbacks += 1;
+      },
+    ),
+  );
+  await tracker.waitForInitial();
+
+  let sequence = 0;
+  return {
+    harness: {
+      ...harness,
+      close: async () => {
+        for (const stop of stops) stop();
+        await harness.close();
+      },
+    },
+    run: async () => {
+      sequence += 1;
+      await harness.runner.runMutation(runtimeBenchRevs.patch, {
+        body: `watch-hidden-${sequence}`,
+        id: harness.ids[harness.ids.length - 1]!,
+        updated: sequence,
+      });
+      if (unexpectedCallbacks) {
+        throw new Error(
+          `hidden data-only watch unexpectedly delivered ${unexpectedCallbacks} callbacks`,
+        );
+      }
+    },
+  };
+}
+
+function createWatchTracker(expected: number): {
+  callback(): void;
+  initialized(): boolean;
+  waitForInitial(): Promise<void>;
+  waitForNext(): Promise<void>;
+} {
+  let initialSeen = 0;
+  let initialResolve: (() => void) | undefined;
+  const initial = new Promise<void>((resolve) => {
+    initialResolve = resolve;
+  });
+  let remaining = 0;
+  let resolveNext: (() => void) | undefined;
+  return {
+    callback() {
+      if (initialSeen < expected) {
+        initialSeen += 1;
+        if (initialSeen === expected) initialResolve?.();
+        return;
+      }
+      if (!remaining) return;
+      remaining -= 1;
+      if (!remaining) resolveNext?.();
+    },
+    initialized: () => initialSeen >= expected,
+    waitForInitial: () => initial,
+    waitForNext() {
+      if (remaining) throw new Error("watch benchmark already waiting for an update");
+      remaining = expected;
+      return new Promise<void>((resolve) => {
+        resolveNext = resolve;
+      });
+    },
+  };
+}
+
+async function runAdapterScenarios(
+  layer: BenchLayer,
+  options: BenchOptions,
+): Promise<BenchResult[]> {
+  const harnesses: AdapterBenchHarness[] = [];
+  try {
+    const results: BenchResult[] = [];
+    const readHarness = await createAdapterBenchHarness({ seedRows: options.rows });
+    harnesses.push(readHarness);
+    let cursor = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.doc.read",
+        options.iterations,
+        () =>
+          readHarness.store.doc.read(
+            "messages",
+            readHarness.ids[cursor++ % readHarness.ids.length],
+          ),
+        { readStats: readHarness.readCacheStats },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        "adapter.doc.page.read20",
+        options.iterations,
+        () =>
+          readHarness.store.doc.page.read({
+            table: "messages",
+            index: "by_channel",
+            bounds: [{ kind: "eq", value: readHarness.channel }],
+            order: "asc",
+            pageSize: 20,
+          }),
+        { baseline: oldBaselines.indexedTake20, readStats: readHarness.readCacheStats },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        "adapter.doc.page.read100",
+        options.iterations,
+        () =>
+          readHarness.store.doc.page.read({
+            table: "messages",
+            index: "by_channel",
+            bounds: [{ kind: "eq", value: readHarness.channel }],
+            order: "asc",
+            pageSize: 100,
+          }),
+        { readStats: readHarness.readCacheStats },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        "adapter.doc.page.read1000",
+        options.iterations,
+        () =>
+          readHarness.store.doc.page.read({
+            table: "messages",
+            index: "by_channel",
+            bounds: [{ kind: "eq", value: readHarness.channel }],
+            order: "asc",
+            pageSize: 1_000,
+          }),
+        { readStats: readHarness.readCacheStats },
+      ),
+    );
+    let resumeSequence = 0;
+    const resumeMax = Math.max(1, readHarness.ids.length - 1_002);
+    results.push(
+      await measure(
+        layer,
+        "adapter.doc.page.read1000.resume",
+        options.iterations,
+        () => {
+          const index = resumeSequence++ % resumeMax;
+          return readHarness.store.doc.page.read({
+            table: "messages",
+            index: "by_channel",
+            bounds: [{ kind: "eq", value: readHarness.channel }],
+            order: "asc",
+            pageSize: 1_000,
+            resumeAfterKey: [readHarness.channel, index + 1, benchId(index)],
+          });
+        },
+        { readStats: readHarness.readCacheStats },
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        "adapter.doc.count",
+        options.iterations,
+        () =>
+          readHarness.store.doc.count.read({
+            table: "messages",
+            index: "by_channel",
+            bounds: [{ kind: "eq", value: readHarness.channel }],
+          }),
+        { readStats: readHarness.readCacheStats },
+      ),
+    );
+
+    const writeHarness = await createAdapterBenchHarness({ seedRows: options.rows });
+    harnesses.push(writeHarness);
+    const warmups = options.warmups;
+    const patchBatches: WriteBatch[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, batchIndex) => {
+        const index = batchIndex % writeHarness.ids.length;
+        return {
+          upserts: [
+            adapterUpsert(
+              writeHarness.ids[index]!,
+              writeHarness.channel,
+              index,
+              `patched-${batchIndex + 1}`,
+            ),
+          ],
+          dataOnlyIds: [{ table: "messages", id: writeHarness.ids[index]! }],
+          deletes: [],
+        };
+      },
+    );
+    let patchIndex = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.commit.patch.data_only",
+        options.iterations,
+        () => {
+          const batch = patchBatches[patchIndex++ % patchBatches.length]!;
+          return writeHarness.store.commit(batch, {
+            changes: "include",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        { readStats: writeHarness.readCacheStats },
+      ),
+    );
+    const fullPatchBatches: WriteBatch[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, batchIndex) => {
+        const index = batchIndex % writeHarness.ids.length;
+        return {
+          upserts: [
+            adapterUpsert(
+              writeHarness.ids[index]!,
+              writeHarness.channel,
+              index,
+              `full-patched-${batchIndex + 1}`,
+            ),
+          ],
+          deletes: [],
+        };
+      },
+    );
+    let fullPatchIndex = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.commit.patch.full_index",
+        options.iterations,
+        () => {
+          const batch = fullPatchBatches[fullPatchIndex++ % fullPatchBatches.length]!;
+          return writeHarness.store.commit(batch, {
+            changes: "include",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        { readStats: writeHarness.readCacheStats },
+      ),
+    );
+
+    const rewriteHarness = await createAdapterBenchHarness({ seedRows: 1 });
+    harnesses.push(rewriteHarness);
+    const rewriteBatches: WriteBatch[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        upserts: [
+          adapterUpsert(rewriteHarness.ids[0]!, rewriteHarness.channel, 0, `rewrite-${index + 1}`),
+        ],
+        dataOnlyIds: [{ table: "messages", id: rewriteHarness.ids[0]! }],
+        deletes: [],
+      }),
+    );
+    let rewriteSequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.commit.rewrite_same_row.data_only",
+        options.iterations,
+        () => {
+          const batch = rewriteBatches[rewriteSequence++ % rewriteBatches.length]!;
+          return rewriteHarness.store.commit(batch, {
+            changes: "include",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        { readStats: rewriteHarness.readCacheStats },
+      ),
+    );
+
+    const insertHarness = await createAdapterBenchHarness({ seedRows: 0 });
+    harnesses.push(insertHarness);
+    const insertBatches: WriteBatch[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        upserts: [adapterUpsert(benchId(index), insertHarness.channel, index)],
+        freshIds: [{ table: "messages", id: benchId(index) }],
+        deletes: [],
+      }),
+    );
+    let sequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.commit.insert",
+        options.iterations,
+        () => {
+          const batch = insertBatches[sequence++ % insertBatches.length]!;
+          return insertHarness.store.commit(batch, {
+            changes: "include",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        { baseline: oldBaselines.mutationInsert, readStats: insertHarness.readCacheStats },
+      ),
+    );
+
+    const oneUpsertInsertHarness = await createAdapterBenchHarness({ seedRows: 0 });
+    harnesses.push(oneUpsertInsertHarness);
+    const oneUpsertInserts: OneUpsertCommit[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        fresh: true,
+        upsert: adapterUpsert(benchId(index), oneUpsertInsertHarness.channel, index),
+      }),
+    );
+    let oneUpsertInsertSequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.commit.insert.one_upsert",
+        options.iterations,
+        () => {
+          const commit = oneUpsertInserts[oneUpsertInsertSequence++ % oneUpsertInserts.length]!;
+          return oneUpsertInsertHarness.store.commitOneUpsert(commit, {
+            changes: "include",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        {
+          baseline: oldBaselines.mutationInsert,
+          readStats: oneUpsertInsertHarness.readCacheStats,
+        },
+      ),
+    );
+
+    const oneUpsertNoChangesHarness = await createAdapterBenchHarness({ seedRows: 0 });
+    harnesses.push(oneUpsertNoChangesHarness);
+    const oneUpsertNoChanges: OneUpsertCommit[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        fresh: true,
+        upsert: adapterUpsert(benchId(index), oneUpsertNoChangesHarness.channel, index),
+      }),
+    );
+    let oneUpsertNoChangesSequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.commit.insert.one_upsert.no_changes",
+        options.iterations,
+        () => {
+          const commit =
+            oneUpsertNoChanges[oneUpsertNoChangesSequence++ % oneUpsertNoChanges.length]!;
+          return oneUpsertNoChangesHarness.store.commitOneUpsert(commit, {
+            changes: "omit",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        { readStats: oneUpsertNoChangesHarness.readCacheStats },
+      ),
+    );
+
+    const insertNoChangesHarness = await createAdapterBenchHarness({ seedRows: 0 });
+    harnesses.push(insertNoChangesHarness);
+    const insertNoChangesBatches: WriteBatch[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        upserts: [adapterUpsert(benchId(index), insertNoChangesHarness.channel, index)],
+        freshIds: [{ table: "messages", id: benchId(index) }],
+        deletes: [],
+      }),
+    );
+    let noChangesSequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "adapter.commit.insert.no_changes",
+        options.iterations,
+        () => {
+          const batch =
+            insertNoChangesBatches[noChangesSequence++ % insertNoChangesBatches.length]!;
+          return insertNoChangesHarness.store.commit(batch, {
+            changes: "omit",
+            mutation: "none",
+            source: "local",
+          });
+        },
+        { readStats: insertNoChangesHarness.readCacheStats },
+      ),
+    );
+
+    const remoteInsertHarness = await createAdapterBenchHarness({ seedRows: 0 });
+    harnesses.push(remoteInsertHarness);
+    const remoteInsertBatches: WriteBatch[] = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        upserts: [adapterUpsert(benchId(index), remoteInsertHarness.channel, index)],
+        freshIds: [{ table: "messages", id: benchId(index) }],
+        deletes: [],
+      }),
+    );
+    let remoteSequence = 0;
+    results.push(
+      await measure(layer, "adapter.commit.insert.remote", options.iterations, () => {
+        const batch = remoteInsertBatches[remoteSequence++ % remoteInsertBatches.length]!;
+        return remoteInsertHarness.store.commit(batch, { changes: "include", source: "remote" });
+      }),
+    );
+    return results;
+  } finally {
+    await Promise.all(harnesses.map((harness) => harness.close()));
+  }
+}
+
+interface ClientBenchHarness {
+  channel: string;
+  client: ConvexEmbeddedClient;
+  close(): Promise<void>;
+  ids: string[];
+}
+
+async function createClientBenchHarness(
+  options: RuntimeBenchHarnessOptions = {},
+): Promise<ClientBenchHarness> {
+  const client = createConvexEmbeddedClientForTest(
+    {
+      modules: { messages: benchModules },
+      path: temporaryStorePath(),
+      schema: benchSchema,
+    },
+    nativeModule(),
+  );
+  const channel = options.channel ?? "general";
+  const ids =
+    (options.seedRows ?? 0) > 0
+      ? await client.mutation(clientSeed, { channel, rows: options.seedRows! })
+      : [];
+  (client as unknown as { __devtoolsClearActivity(): void }).__devtoolsClearActivity();
+  return {
+    channel,
+    client,
+    close: () => client.close(),
+    ids,
+  };
+}
+
+async function runClientScenarios(
+  layer: BenchLayer,
+  options: BenchOptions,
+): Promise<BenchResult[]> {
+  const harnesses: ClientBenchHarness[] = [];
+  try {
+    const results: BenchResult[] = [];
+
+    const insertHarness = await createClientBenchHarness({ seedRows: 0 });
+    harnesses.push(insertHarness);
+    let sequence = 0;
+    const insertTiming = createClientTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "client.mutation.insert",
+        options.iterations,
+        () =>
+          insertHarness.client.mutation(
+            clientInsert,
+            {
+              body: `client-inserted-${sequence}`,
+              channel: insertHarness.channel,
+              sequence: sequence++,
+            },
+            clientTimingOption(insertTiming),
+          ),
+        { baseline: oldBaselines.mutationInsert, phases: insertTiming },
+      ),
+    );
+
+    const patchHarness = await createClientBenchHarness({ seedRows: options.rows });
+    harnesses.push(patchHarness);
+    let patchIndex = 0;
+    const patchTiming = createClientTimingRecorder(options.split);
+    results.push(
+      await measure(
+        layer,
+        "client.mutation.patch",
+        options.iterations,
+        () =>
+          patchHarness.client.mutation(
+            clientPatch,
+            {
+              body: `client-patched-${patchIndex}`,
+              id: patchHarness.ids[patchIndex++ % patchHarness.ids.length]!,
+              updated: patchIndex,
+            },
+            clientTimingOption(patchTiming),
+          ),
+        { phases: patchTiming },
+      ),
+    );
+
+    return results;
+  } finally {
+    await Promise.all(harnesses.map((harness) => harness.close()));
+  }
+}
+
+async function runBindingScenarios(
+  layer: BenchLayer,
+  options: BenchOptions,
+): Promise<BenchResult[]> {
+  const harnesses: BindingBenchHarness[] = [];
+  try {
+    const results: BenchResult[] = [];
+    const readHarness = await createBindingBenchHarness({ seedRows: options.rows });
+    harnesses.push(readHarness);
+    let cursor = 0;
+    results.push(
+      await measure(layer, "binding.docRead", options.iterations, () =>
+        bindingDocRead(
+          readHarness,
+          "messages",
+          readHarness.ids[cursor++ % readHarness.ids.length]!,
+        ),
+      ),
+    );
+    results.push(
+      await measure(
+        layer,
+        "binding.docPageRead20",
+        options.iterations,
+        () =>
+          bindingDocPageRead(readHarness, {
+            table: "messages",
+            index: "by_channel",
+            bounds: [bindingEq(readHarness.channel)],
+            order: "asc",
+            pageSize: 20,
+          }),
+        { baseline: oldBaselines.indexedTake20 },
+      ),
+    );
+    results.push(
+      await measure(layer, "binding.docPageRead100", options.iterations, () =>
+        bindingDocPageRead(readHarness, {
+          table: "messages",
+          index: "by_channel",
+          bounds: [bindingEq(readHarness.channel)],
+          order: "asc",
+          pageSize: 100,
+        }),
+      ),
+    );
+    results.push(
+      await measure(layer, "binding.docPageRead1000", options.iterations, () =>
+        bindingDocPageRead(readHarness, {
+          table: "messages",
+          index: "by_channel",
+          bounds: [bindingEq(readHarness.channel)],
+          order: "asc",
+          pageSize: 1_000,
+        }),
+      ),
+    );
+    let bindingResumeSequence = 0;
+    const bindingResumeMax = Math.max(1, readHarness.ids.length - 1_002);
+    results.push(
+      await measure(layer, "binding.docPageRead1000.resume", options.iterations, () => {
+        const index = bindingResumeSequence++ % bindingResumeMax;
+        return bindingDocPageRead(readHarness, {
+          table: "messages",
+          index: "by_channel",
+          bounds: [bindingEq(readHarness.channel)],
+          order: "asc",
+          pageSize: 1_000,
+          resumeAfterKey: [
+            { text: readHarness.channel },
+            { real: index + 1 },
+            { text: benchId(index) },
+          ],
+        });
+      }),
+    );
+    const textSamples = await bindingPageTextSamples(readHarness, bindingResumeMax);
+    let parseSequence = 0;
+    results.push(
+      await measure(layer, "js.page.parse1000", options.iterations, () => {
+        const text = textSamples[parseSequence++ % textSamples.length]!;
+        return (JSON.parse(text) as unknown[]).length;
+      }),
+    );
+    let parseReviveSequence = 0;
+    results.push(
+      await measure(layer, "js.page.parse_revive1000", options.iterations, () => {
+        const text = textSamples[parseReviveSequence++ % textSamples.length]!;
+        return parseReviveDocs(text).length;
+      }),
+    );
+    let parseReviveFreezeSequence = 0;
+    results.push(
+      await measure(layer, "js.page.parse_revive_freeze1000", options.iterations, () => {
+        const text = textSamples[parseReviveFreezeSequence++ % textSamples.length]!;
+        const docs = parseReviveDocs(text);
+        freezeNormalizedTreeWithEstimate({ cursor: null, docs });
+        return docs.length;
+      }),
+    );
+    results.push(
+      await measure(layer, "binding.docCountRead", options.iterations, () =>
+        bindingDocCountRead(readHarness, {
+          table: "messages",
+          index: "by_channel",
+          bounds: [bindingEq(readHarness.channel)],
+        }),
+      ),
+    );
+    results.push(
+      await measure(layer, "binding.clock.next", options.iterations, () =>
+        readHarness.binding.clockRead(),
+      ),
+    );
+
+    const writeHarness = await createBindingBenchHarness({ seedRows: options.rows });
+    harnesses.push(writeHarness);
+    const warmups = options.warmups;
+    const patchBatches = Array.from({ length: options.iterations + warmups }, (_, batchIndex) => {
+      const index = batchIndex % writeHarness.ids.length;
+      return {
+        upserts: [
+          bindingUpsert(
+            writeHarness.ids[index]!,
+            writeHarness.channel,
+            index,
+            `patched-${batchIndex + 1}`,
+          ),
+        ],
+        deletes: [],
+        dataOnlyIds: [{ table: "messages", id: writeHarness.ids[index]! }],
+        freshIds: [],
+        idMappings: [],
+      };
+    });
+    let patchIndex = 0;
+    results.push(
+      await measure(layer, "binding.commit.patch.data_only", options.iterations, () => {
+        const batch = patchBatches[patchIndex++ % patchBatches.length]!;
+        return bindingCommit(writeHarness, batch, { source: "local" });
+      }),
+    );
+    const fullPatchBatches = Array.from(
+      { length: options.iterations + warmups },
+      (_, batchIndex) => {
+        const index = batchIndex % writeHarness.ids.length;
+        return {
+          upserts: [
+            bindingUpsert(
+              writeHarness.ids[index]!,
+              writeHarness.channel,
+              index,
+              `full-patched-${batchIndex + 1}`,
+            ),
+          ],
+          deletes: [],
+          freshIds: [],
+          idMappings: [],
+        };
+      },
+    );
+    let fullPatchIndex = 0;
+    results.push(
+      await measure(layer, "binding.commit.patch.full_index", options.iterations, () => {
+        const batch = fullPatchBatches[fullPatchIndex++ % fullPatchBatches.length]!;
+        return bindingCommit(writeHarness, batch, { source: "local" });
+      }),
+    );
+
+    const rewriteHarness = await createBindingBenchHarness({ seedRows: 1 });
+    harnesses.push(rewriteHarness);
+    const rewriteBatches = Array.from({ length: options.iterations + warmups }, (_, index) => ({
+      upserts: [
+        bindingUpsert(rewriteHarness.ids[0]!, rewriteHarness.channel, 0, `rewrite-${index + 1}`),
+      ],
+      dataOnlyIds: [{ table: "messages", id: rewriteHarness.ids[0]! }],
+      deletes: [],
+      freshIds: [],
+      idMappings: [],
+    }));
+    let rewriteSequence = 0;
+    results.push(
+      await measure(layer, "binding.commit.rewrite_same_row.data_only", options.iterations, () => {
+        const batch = rewriteBatches[rewriteSequence++ % rewriteBatches.length]!;
+        return bindingCommit(rewriteHarness, batch, { source: "local" });
+      }),
+    );
+
+    const insertHarness = await createBindingBenchHarness({ seedRows: 0 });
+    harnesses.push(insertHarness);
+    const insertBatches = Array.from({ length: options.iterations + warmups }, (_, index) => ({
+      upserts: [bindingUpsert(benchId(index), insertHarness.channel, index)],
+      deletes: [],
+      freshIds: [{ table: "messages", id: benchId(index) }],
+      idMappings: [],
+    }));
+    let sequence = 0;
+    results.push(
+      await measure(
+        layer,
+        "binding.commit.insert",
+        options.iterations,
+        () => {
+          const batch = insertBatches[sequence++ % insertBatches.length]!;
+          return bindingCommit(insertHarness, batch, { source: "local" });
+        },
+        { baseline: oldBaselines.mutationInsert },
+      ),
+    );
+
+    const mutationFreshHarness = await createBindingBenchHarness({ seedRows: 0 });
+    harnesses.push(mutationFreshHarness);
+    let mutationFreshSequence = 0;
+    results.push(
+      await measure(layer, "binding.mutation.fresh", options.iterations, () => {
+        const index = mutationFreshSequence++;
+        const mutationId = `bench-mutation:${index}`;
+        return mutationFreshHarness.binding.mutationFresh!({
+          args: `{"body":"message ${index}","channel":"${mutationFreshHarness.channel}","sequence":${index}}`,
+          mutationId,
+          name: "messages:send",
+        });
+      }),
+    );
+
+    if (insertHarness.binding.commitOneUpsert) {
+      const oneUpsertHarness = await createBindingBenchHarness({ seedRows: 0 });
+      harnesses.push(oneUpsertHarness);
+      const oneUpsertBatches = Array.from({ length: options.iterations + warmups }, (_, index) => ({
+        upserts: [bindingUpsert(benchId(index), oneUpsertHarness.channel, index)],
+        deletes: [],
+        freshIds: [{ table: "messages", id: benchId(index) }],
+        idMappings: [],
+      }));
+      let oneUpsertSequence = 0;
+      results.push(
+        await measure(layer, "binding.commit.insert.one_upsert_sync", options.iterations, () => {
+          const batch = oneUpsertBatches[oneUpsertSequence++ % oneUpsertBatches.length]!;
+          return bindingCommitOneUpsert(oneUpsertHarness, batch, { source: "local" });
+        }),
+      );
+    }
+
+    if (insertHarness.binding.commitOneUpsert) {
+      const inlineWithMutationHarness = await createBindingBenchHarness({ seedRows: 0 });
+      harnesses.push(inlineWithMutationHarness);
+      const inlineWithMutationBatches = Array.from(
+        { length: options.iterations + warmups },
+        (_, index) => ({
+          upserts: [bindingUpsert(benchId(index), inlineWithMutationHarness.channel, index)],
+          deletes: [],
+          freshIds: [{ table: "messages", id: benchId(index) }],
+          idMappings: [],
+        }),
+      );
+      const inlineWithMutationMetadata = Array.from(
+        { length: options.iterations + warmups },
+        (_, index) => ({
+          args: `{"body":"message ${index}","channel":"${inlineWithMutationHarness.channel}","sequence":${index}}`,
+          id: `bench-commit-precomputed:${index}`,
+          result: `"${benchId(index)}"`,
+        }),
+      );
+      let inlineWithMutationSequence = 0;
+      results.push(
+        await measure(layer, "binding.commit.insert.inline.with_id", options.iterations, () => {
+          const index = inlineWithMutationSequence++;
+          const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
+          const mutationId = `bench-commit:${index}`;
+          return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+            includeChanges: false,
+            mutationArgs: `{"body":"message ${index}","channel":"${inlineWithMutationHarness.channel}","sequence":${index}}`,
+            mutationId,
+            mutationName: "messages:send",
+            mutationResult: `"${benchId(index)}"`,
+            mutationFresh: true,
+            source: "local",
+          });
+        }),
+      );
+      let inlineWithMutationPrecomputedSequence = 0;
+      results.push(
+        await measure(
+          layer,
+          "binding.commit.insert.inline.with_id.precomputed",
+          options.iterations,
+          () => {
+            const index = inlineWithMutationPrecomputedSequence++;
+            const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
+            const metadata = inlineWithMutationMetadata[index % inlineWithMutationMetadata.length]!;
+            return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+              includeChanges: false,
+              mutationArgs: metadata.args,
+              mutationId: metadata.id,
+              mutationName: "messages:send",
+              mutationResult: metadata.result,
+              mutationFresh: true,
+              source: "local",
+            });
+          },
+        ),
+      );
+      let inlineWithMutationPrecomputedArgsSequence = 0;
+      results.push(
+        await measure(
+          layer,
+          "binding.commit.insert.inline.with_id.precomputed_args",
+          options.iterations,
+          () => {
+            const index = inlineWithMutationPrecomputedArgsSequence++;
+            const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
+            const metadata = inlineWithMutationMetadata[index % inlineWithMutationMetadata.length]!;
+            return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+              includeChanges: false,
+              mutationArgs: metadata.args,
+              mutationId: `bench-commit-precomputed-args:${index}`,
+              mutationName: "messages:send",
+              mutationResult: `"${benchId(index)}"`,
+              mutationFresh: true,
+              source: "local",
+            });
+          },
+        ),
+      );
+      let inlineWithMutationPrecomputedResultSequence = 0;
+      results.push(
+        await measure(
+          layer,
+          "binding.commit.insert.inline.with_id.precomputed_result",
+          options.iterations,
+          () => {
+            const index = inlineWithMutationPrecomputedResultSequence++;
+            const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
+            const metadata = inlineWithMutationMetadata[index % inlineWithMutationMetadata.length]!;
+            return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+              includeChanges: false,
+              mutationArgs: `{"body":"message ${index}","channel":"${inlineWithMutationHarness.channel}","sequence":${index}}`,
+              mutationId: `bench-commit-precomputed-result:${index}`,
+              mutationName: "messages:send",
+              mutationResult: metadata.result,
+              mutationFresh: true,
+              source: "local",
+            });
+          },
+        ),
+      );
+
+      const inlineWithMutationLookupHarness = await createBindingBenchHarness({ seedRows: 0 });
+      harnesses.push(inlineWithMutationLookupHarness);
+      const inlineWithMutationLookupBatches = Array.from(
+        { length: options.iterations + warmups },
+        (_, index) => ({
+          upserts: [bindingUpsert(benchId(index), inlineWithMutationLookupHarness.channel, index)],
+          deletes: [],
+          freshIds: [{ table: "messages", id: benchId(index) }],
+          idMappings: [],
+        }),
+      );
+      let inlineWithMutationLookupSequence = 0;
+      results.push(
+        await measure(
+          layer,
+          "binding.commit.insert.inline.with_id.lookup",
+          options.iterations,
+          () => {
+            const index = inlineWithMutationLookupSequence++;
+            const batch =
+              inlineWithMutationLookupBatches[index % inlineWithMutationLookupBatches.length]!;
+            const mutationId = `bench-commit-lookup:${index}`;
+            return bindingCommitOneUpsert(inlineWithMutationLookupHarness, batch, {
+              includeChanges: false,
+              mutationArgs: `{"body":"message ${index}","channel":"${inlineWithMutationLookupHarness.channel}","sequence":${index}}`,
+              mutationId,
+              mutationName: "messages:send",
+              mutationResult: `"${benchId(index)}"`,
+              source: "local",
+            });
+          },
+        ),
+      );
+    }
+
+    const insertNoChangesHarness = await createBindingBenchHarness({ seedRows: 0 });
+    harnesses.push(insertNoChangesHarness);
+    const insertNoChangesBatches = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        upserts: [bindingUpsert(benchId(index), insertNoChangesHarness.channel, index)],
+        deletes: [],
+        freshIds: [{ table: "messages", id: benchId(index) }],
+        idMappings: [],
+      }),
+    );
+    let noChangesSequence = 0;
+    results.push(
+      await measure(layer, "binding.commit.insert.no_changes", options.iterations, () => {
+        const batch = insertNoChangesBatches[noChangesSequence++ % insertNoChangesBatches.length]!;
+        return bindingCommit(insertNoChangesHarness, batch, {
+          includeChanges: false,
+          source: "local",
+        });
+      }),
+    );
+
+    if (insertHarness.binding.commitOneUpsert) {
+      const inlineInsertHarness = await createBindingBenchHarness({ seedRows: 0 });
+      harnesses.push(inlineInsertHarness);
+      const inlineInsertBatches = Array.from(
+        { length: options.iterations + warmups },
+        (_, index) => ({
+          upserts: [bindingUpsert(benchId(index), inlineInsertHarness.channel, index)],
+          deletes: [],
+          freshIds: [{ table: "messages", id: benchId(index) }],
+          idMappings: [],
+        }),
+      );
+      let inlineSequence = 0;
+      results.push(
+        await measure(layer, "binding.commit.insert.inline", options.iterations, () => {
+          const batch = inlineInsertBatches[inlineSequence++ % inlineInsertBatches.length]!;
+          return bindingCommitOneUpsert(inlineInsertHarness, batch, { source: "local" });
+        }),
+      );
+    }
+
+    if (insertHarness.binding.commitOneUpsert) {
+      const inlineNoChangesHarness = await createBindingBenchHarness({ seedRows: 0 });
+      harnesses.push(inlineNoChangesHarness);
+      const inlineNoChangesBatches = Array.from(
+        { length: options.iterations + warmups },
+        (_, index) => ({
+          upserts: [bindingUpsert(benchId(index), inlineNoChangesHarness.channel, index)],
+          deletes: [],
+          freshIds: [{ table: "messages", id: benchId(index) }],
+          idMappings: [],
+        }),
+      );
+      let inlineNoChangesSequence = 0;
+      results.push(
+        await measure(layer, "binding.commit.insert.inline.no_changes", options.iterations, () => {
+          const batch =
+            inlineNoChangesBatches[inlineNoChangesSequence++ % inlineNoChangesBatches.length]!;
+          return bindingCommitOneUpsert(inlineNoChangesHarness, batch, {
+            includeChanges: false,
+            source: "local",
+          });
+        }),
+      );
+    }
+
+    const remoteInsertHarness = await createBindingBenchHarness({ seedRows: 0 });
+    harnesses.push(remoteInsertHarness);
+    const remoteInsertBatches = Array.from(
+      { length: options.iterations + warmups },
+      (_, index) => ({
+        upserts: [bindingUpsert(benchId(index), remoteInsertHarness.channel, index)],
+        deletes: [],
+        freshIds: [{ table: "messages", id: benchId(index) }],
+        idMappings: [],
+      }),
+    );
+    let remoteSequence = 0;
+    results.push(
+      await measure(layer, "binding.commit.insert.remote", options.iterations, () => {
+        const batch = remoteInsertBatches[remoteSequence++ % remoteInsertBatches.length]!;
+        return bindingCommit(remoteInsertHarness, batch, { source: "remote" });
+      }),
+    );
+    const emptyHarness = await createBindingBenchHarness({ seedRows: 0 });
+    harnesses.push(emptyHarness);
+    const emptyBatch: BindingWriteBatch = {
+      upserts: [],
+      deletes: [],
+      freshIds: [],
+      idMappings: [],
+    };
+    results.push(
+      await measure(layer, "binding.commit.empty", options.iterations, () =>
+        bindingCommit(emptyHarness, emptyBatch, { source: "remote" }),
+      ),
+    );
+    results.push(
+      await measure(layer, "binding.commit.empty.local", options.iterations, () =>
+        bindingCommit(emptyHarness, emptyBatch, {
+          includeChanges: false,
+          source: "local",
+        }),
+      ),
+    );
+    let emptyWithMutationSequence = 0;
+    results.push(
+      await measure(layer, "binding.commit.empty.with_id", options.iterations, () => {
+        const index = emptyWithMutationSequence++;
+        return bindingCommit(emptyHarness, emptyBatch, {
+          includeChanges: false,
+          mutationArgs: `{"sequence":${index}}`,
+          mutationId: `bench-empty-commit:${index}`,
+          mutationName: "messages:noop",
+          mutationResult: "null",
+          mutationFresh: true,
+          source: "local",
+        });
+      }),
+    );
+    results.push(...(await runBindingOpenSetupScenarios(layer, options)));
+    return results;
+  } finally {
+    await Promise.all(harnesses.map((harness) => harness.close()));
+  }
+}
+
+async function runBindingOpenSetupScenarios(
+  layer: BenchLayer,
+  options: BenchOptions,
+): Promise<BenchResult[]> {
+  const results: BenchResult[] = [];
+  const Store = nativeModule().Store;
+  const warmPath = temporaryStorePath();
+  const warmStore = (await Store.open(warmPath)) as StoreBinding;
+  await warmStore.setup(runtimeBenchStoreSchema);
+  await Promise.resolve(warmStore.close());
+
+  results.push(
+    await measure(layer, "binding.open.cold", options.iterations, async () => {
+      const binding = (await Store.open(temporaryStorePath())) as StoreBinding;
+      await Promise.resolve(binding.close());
+    }),
+  );
+  results.push(
+    await measure(layer, "binding.open.warm", options.iterations, async () => {
+      const binding = (await Store.open(warmPath)) as StoreBinding;
+      await Promise.resolve(binding.close());
+    }),
+  );
+  results.push(
+    await measure(layer, "binding.open_setup.cold", options.iterations, async () => {
+      const binding = (await Store.open(temporaryStorePath())) as StoreBinding;
+      try {
+        await binding.setup(runtimeBenchStoreSchema);
+      } finally {
+        await Promise.resolve(binding.close());
+      }
+    }),
+  );
+  results.push(
+    await measure(layer, "binding.open_setup.warm", options.iterations, async () => {
+      const binding = (await Store.open(warmPath)) as StoreBinding;
+      try {
+        await binding.setup(runtimeBenchStoreSchema);
+      } finally {
+        await Promise.resolve(binding.close());
+      }
+    }),
+  );
+  return results;
+}
+
+function bindingDocRead(harness: BindingBenchHarness, table: string, id: string) {
+  return harness.binding.docRead(table, id);
+}
+
+function bindingDocPageRead(harness: BindingBenchHarness, spec: BindingReadSpec) {
+  return harness.binding.docPageRead(spec);
+}
+
+async function bindingPageTextSamples(
+  harness: BindingBenchHarness,
+  resumeMax: number,
+): Promise<string[]> {
+  const count = Math.min(64, Math.max(1, resumeMax));
+  const samples: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const page = await bindingDocPageRead(harness, {
+      table: "messages",
+      index: "by_channel",
+      bounds: [bindingEq(harness.channel)],
+      order: "asc",
+      pageSize: 1_000,
+      resumeAfterKey: [{ text: harness.channel }, { real: index + 1 }, { text: benchId(index) }],
+    });
+    samples.push(page.text);
+  }
+  return samples;
+}
+
+function parseReviveDocs(text: string): Record<string, unknown>[] {
+  const docs = JSON.parse(text) as Record<string, unknown>[];
+  for (const doc of docs) reviveDoc(doc);
+  return docs;
+}
+
+function bindingDocCountRead(harness: BindingBenchHarness, spec: BindingCountSpec) {
+  return harness.binding.docCountRead(spec);
+}
+
+function bindingCommit(
+  harness: BindingBenchHarness,
+  batch: BindingWriteBatch,
+  options: BindingCommitOptions,
+) {
+  return harness.binding.commit(batch, options);
+}
+
+function bindingCommitOneUpsert(
+  harness: BindingBenchHarness,
+  batch: BindingWriteBatch,
+  options: BindingCommitOptions,
+) {
+  const upsert = batch.upserts[0]!;
+  return harness.binding.commitOneUpsert
+    ? harness.binding.commitOneUpsert(
+        upsert.table,
+        upsert.id,
+        upsert.data,
+        upsert.cols,
+        upsert.creationTime,
+        options.source,
+        options.mutationId,
+        options.mutationName,
+        options.mutationArgs,
+        options.mutationResult,
+        options.includeChanges,
+        batch.freshIds.length === 1,
+        batch.dataOnlyIds?.length === 1,
+        options.mutationFresh,
+      )
+    : bindingCommit(harness, batch, options);
+}
+
+function parseOptions(): BenchOptions {
+  const smoke = process.env.EMBEDDED_BENCH_SMOKE === "1";
+  const iterations = readNumber("EMBEDDED_BENCH_ITERATIONS") ?? (smoke ? 25 : 1_000);
+  const requestedWarmups =
+    readNumber("EMBEDDED_BENCH_WARMUPS") ?? readNumber("EMBEDDED_BENCH_WARMUP") ?? 100;
+  return {
+    compare: process.env.EMBEDDED_BENCH_COMPARE,
+    iterations,
+    layers: parseLayers(process.env.EMBEDDED_BENCH_LAYER ?? "all"),
+    out: process.env.EMBEDDED_BENCH_OUT,
+    rows: readNumber("EMBEDDED_BENCH_ROWS") ?? (smoke ? 250 : 10_000),
+    smoke,
+    split: process.env.EMBEDDED_BENCH_SPLIT === "1",
+    warmups: Math.min(iterations, requestedWarmups),
+    watcherFanout: readNonNegativeNumber("EMBEDDED_BENCH_WATCHERS") ?? 0,
+  };
+}
+
+function readComparisonBaseline(path: string): BenchBaseline {
+  const value = JSON.parse(readFileSync(path, "utf8")) as BenchBaseline;
+  if (value.version !== 1 || !Array.isArray(value.summaries)) {
+    throw new Error(`${path} is not a benchmark baseline file`);
+  }
+  return value;
+}
+
+function compareToBaseline(report: BenchReport, baseline: BenchBaseline): BenchComparison[] {
+  const byKey = new Map<string, BenchSummary>();
+  for (const summary of baseline.summaries) {
+    byKey.set(`${summary.layer}:${summary.name}`, summary);
+  }
+
+  const tolerance = readNonNegativeNumber("EMBEDDED_BENCH_COMPARE_TOLERANCE_PERCENT") ?? 0;
+  const floor = 1 - tolerance / 100;
+  const comparisons: BenchComparison[] = [];
+  for (const result of report.results) {
+    const summary = byKey.get(`${result.layer}:${result.name}`);
+    if (!summary) continue;
+    if (summary.gate === false) continue;
+    const ratio = result.hz / summary.hz;
+    const trimmedRatio = result.trimmedHz / summary.hz;
+    const medianRatio = result.medianHz / summary.hz;
+    comparisons.push({
+      baselineHz: summary.hz,
+      baselineName: baseline.source,
+      currentHz: result.hz,
+      layer: result.layer,
+      medianRatio,
+      name: result.name,
+      ratio,
+      status: comparisonStatus({ medianRatio, ratio, trimmedRatio }, floor),
+      trimmedRatio,
+    });
+  }
+  return comparisons;
+}
+
+function comparisonStatus(
+  ratios: { medianRatio: number; ratio: number; trimmedRatio: number },
+  floor: number,
+): BenchComparison["status"] {
+  if (ratios.ratio >= floor) return "pass";
+  if (ratios.trimmedRatio >= floor || ratios.medianRatio >= floor) return "inconclusive";
+  return "fail";
+}
+
+function readNumber(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
+  return Math.floor(parsed);
+}
+
+function readNonNegativeNumber(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative number`);
+  }
+  return Math.floor(parsed);
+}
+
+function parseLayers(raw: string): BenchLayer[] {
+  const layers = raw.split(",").flatMap((part) => {
+    const layer = part.trim();
+    if (layer === "all") return ["memory", "runtime-hot", "runtime-cold", "adapter", "binding"];
+    if (layer === "native") return ["runtime-hot", "runtime-cold", "adapter", "binding"];
+    if (
+      layer === "adapter" ||
+      layer === "binding" ||
+      layer === "client" ||
+      layer === "memory" ||
+      layer === "runtime-cold" ||
+      layer === "runtime-hot" ||
+      layer === "runtime-insert"
+    ) {
+      return [layer];
+    }
+    throw new Error(
+      "EMBEDDED_BENCH_LAYER must be one of: all, native, memory, runtime-hot, runtime-cold, runtime-insert, adapter, binding, client",
+    );
+  });
+  return [...new Set(layers)] as BenchLayer[];
+}
+
+async function measure(
+  layer: BenchLayer,
+  name: string,
+  iterations: number,
+  run: () => BenchRunResult,
+  options: MeasureOptions = {},
+): Promise<BenchResult> {
+  for (let index = 0; index < benchmarkWarmups; index += 1) {
+    options.beforeEach?.();
+    await run();
+  }
+  options.phases?.reset();
+
+  const startStats = options.readStats?.();
+  const startHeap = process.memoryUsage().heapUsed;
+  const samples: number[] = [];
+  for (let index = 0; index < iterations; index += 1) {
+    options.beforeEach?.();
+    const started = performance.now();
+    await run();
+    samples.push(performance.now() - started);
+  }
+  const endHeap = process.memoryUsage().heapUsed;
+  const endStats = options.readStats?.();
+  const cacheDelta = diffStats(startStats, endStats);
+  const split = Math.max(1, Math.ceil(iterations * 0.1));
+  const headMeanMs = mean(samples.slice(0, split));
+  const tailMeanMs = mean(samples.slice(-split));
+  const sortedSamples = [...samples].sort((left, right) => left - right);
+  const totalMs = samples.reduce((sum, sample) => sum + sample, 0);
+  const hz = iterations / (totalMs / 1_000);
+  const trimmedSamples = trimSamples(sortedSamples, 0.1);
+  const trimmedMeanMs = mean(trimmedSamples);
+  const medianMs = percentile(sortedSamples, 0.5);
+  const stddevMs = stddev(samples, totalMs / iterations);
+  const heapDeltaBytes = endHeap - startHeap;
+  return {
+    baselineHz: options.baseline?.hz,
+    baselineName: options.baseline?.name,
+    baselineRatio: options.baseline ? hz / options.baseline.hz : undefined,
+    cacheBytes: endStats?.bytes,
+    cacheHits: cacheDelta?.hits,
+    cacheMisses: cacheDelta?.misses,
+    headMeanMs,
+    hz,
+    heapBytesPerOp: heapDeltaBytes / iterations,
+    heapDeltaBytes,
+    iterations,
+    layer,
+    maxMs: sortedSamples[sortedSamples.length - 1] ?? 0,
+    meanMs: totalMs / iterations,
+    medianHz: medianMs > 0 ? 1_000 / medianMs : 0,
+    medianMs,
+    minMs: sortedSamples[0] ?? 0,
+    name,
+    p90Ms: percentile(sortedSamples, 0.9),
+    p95Ms: percentile(sortedSamples, 0.95),
+    p99Ms: percentile(sortedSamples, 0.99),
+    phaseMeanMs: options.phases?.means(),
+    relativeStddev: stddevMs / (totalMs / iterations),
+    samplesMs: samples,
+    stddevMs,
+    tailMeanMs,
+    totalMs,
+    trimmedHz: trimmedMeanMs > 0 ? 1_000 / trimmedMeanMs : 0,
+    trimmedMeanMs,
+  };
+}
+
+function createMutationTimingRecorder(enabled: boolean): MutationTimingRecorder {
+  if (!enabled) {
+    return {
+      means: () => undefined,
+      reset: () => undefined,
+    };
+  }
+  const totals = new Map<MutationTimingPhase, number>();
+  let count = 0;
+  return {
+    callback(timing) {
+      count += 1;
+      for (const key of mutationTimingPhases) {
+        totals.set(key, (totals.get(key) ?? 0) + timing[key]);
+      }
+    },
+    means() {
+      if (count === 0) return undefined;
+      const means: Partial<Record<string, number>> = {};
+      for (const key of mutationTimingPhases) means[key] = (totals.get(key) ?? 0) / count;
+      return means;
+    },
+    reset() {
+      count = 0;
+      totals.clear();
+    },
+  };
+}
+
+function createClientTimingRecorder(enabled: boolean): ClientTimingRecorder {
+  if (!enabled) {
+    return {
+      means: () => undefined,
+      reset: () => undefined,
+    };
+  }
+  const totals = new Map<keyof EmbeddedClientMutationTiming, number>();
+  let count = 0;
+  return {
+    callback(timing) {
+      count += 1;
+      for (const key of clientTimingPhases) {
+        totals.set(key, (totals.get(key) ?? 0) + timing[key]);
+      }
+    },
+    means() {
+      if (count === 0) return undefined;
+      const means: Partial<Record<string, number>> = {};
+      for (const key of clientTimingPhases) means[key] = (totals.get(key) ?? 0) / count;
+      return means;
+    },
+    reset() {
+      count = 0;
+      totals.clear();
+    },
+  };
+}
+
+function mutationTimingOption(recorder: MutationTimingRecorder): RunMutationOptions | undefined {
+  return recorder.callback ? { onTiming: recorder.callback } : undefined;
+}
+
+function clientTimingOption(
+  recorder: ClientTimingRecorder,
+): ConvexEmbeddedMutationOptions<Record<string, never>> | undefined {
+  return recorder.callback
+    ? ({ onTiming: recorder.callback } as ConvexEmbeddedMutationOptions<Record<string, never>>)
+    : undefined;
+}
+
+function mutationIdTimingOption(
+  mutationId: string,
+  recorder: MutationTimingRecorder,
+): RunMutationOptions {
+  return recorder.callback
+    ? { mutationFresh: true, mutationId, onTiming: recorder.callback }
+    : { mutationFresh: true, mutationId };
+}
+
+function coldBeforeEach(
+  harness: RuntimeBenchHarness,
+  temperature: "cold" | "hot",
+): (() => void) | undefined {
+  return temperature === "cold" ? harness.clearReadCache : undefined;
+}
+
+function diffStats(
+  before: ReadCacheStats | undefined,
+  after: ReadCacheStats | undefined,
+): { hits: number; misses: number } | undefined {
+  if (!before || !after) return undefined;
+  return {
+    hits: sumStats(after.hits) - sumStats(before.hits),
+    misses: sumStats(after.misses) - sumStats(before.misses),
+  };
+}
+
+function sumStats(stats: Record<string, number>): number {
+  return Object.values(stats).reduce((sum, value) => sum + value, 0);
+}
+
+function mean(values: number[]): number {
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function stddev(values: number[], average: number): number {
+  if (values.length === 0) return 0;
+  const variance =
+    values.reduce((sum, value) => {
+      const delta = value - average;
+      return sum + delta * delta;
+    }, 0) / values.length;
+  return Math.sqrt(variance);
+}
+
+function trimSamples(sortedSamples: number[], fraction: number): number[] {
+  if (sortedSamples.length < 3) return sortedSamples;
+  const trim = Math.min(
+    Math.floor(sortedSamples.length / 2) - 1,
+    Math.floor(sortedSamples.length * fraction),
+  );
+  return sortedSamples.slice(trim, sortedSamples.length - trim);
+}
+
+function percentile(samples: number[], percent: number): number {
+  if (!samples.length) return 0;
+  const index = Math.min(samples.length - 1, Math.ceil(samples.length * percent) - 1);
+  return samples[index] ?? 0;
+}
+
+function printReport(
+  report: BenchReport,
+  layers: BenchLayer[],
+  comparisons: BenchComparison[],
+): void {
+  console.log("Embedded runtime benchmark");
+  console.log(
+    `runtime=typescript node=${report.node} layers=${layers.join(",")} rows=${report.rows} iterations=${report.iterations} warmups=${report.warmups}`,
+  );
+  for (const note of report.semanticNotes) console.log(`note=${note}`);
+  for (const layer of layers) {
+    console.log("");
+    console.log(`[${layer}]`);
+    console.log(
+      `${"scenario".padEnd(28)} ${"ops/sec".padStart(12)} ${"mean ms".padStart(10)} ${"trim ms".padStart(10)} ${"p50 ms".padStart(10)} ${"p95 ms".padStart(10)} ${"max ms".padStart(10)} ${"cache h/m".padStart(13)} ${"heap KB".padStart(9)} ${"vs old".padStart(8)}`,
+    );
+    for (const result of report.results.filter((entry) => entry.layer === layer)) {
+      console.log(
+        `${result.name.padEnd(28)} ${format(result.hz).padStart(12)} ${format(result.meanMs).padStart(10)} ${format(result.trimmedMeanMs).padStart(10)} ${format(result.medianMs).padStart(10)} ${format(result.p95Ms).padStart(10)} ${format(result.maxMs).padStart(10)} ${formatCache(result).padStart(13)} ${formatHeap(result.heapDeltaBytes).padStart(9)} ${formatRatio(result.baselineRatio).padStart(8)}`,
+      );
+      if (result.phaseMeanMs) {
+        console.log(`  split ${result.name}: ${formatPhaseMeans(result.phaseMeanMs)}`);
+      }
+    }
+  }
+  if (!comparisons.length) return;
+
+  console.log("");
+  console.log("[comparison]");
+  console.log(
+    `${"scenario".padEnd(40)} ${"current".padStart(12)} ${"baseline".padStart(12)} ${"ratio".padStart(8)} ${"trim".padStart(8)} ${"median".padStart(8)} ${"gate".padStart(12)}`,
+  );
+  for (const comparison of comparisons) {
+    console.log(
+      `${`${comparison.layer} ${comparison.name}`.padEnd(40)} ${format(comparison.currentHz).padStart(12)} ${format(comparison.baselineHz).padStart(12)} ${formatRatio(comparison.ratio).padStart(8)} ${formatRatio(comparison.trimmedRatio).padStart(8)} ${formatRatio(comparison.medianRatio).padStart(8)} ${comparison.status.padStart(12)}`,
+    );
+  }
+}
+
+function format(value: number): string {
+  if (value >= 1_000) return value.toFixed(0);
+  if (value >= 100) return value.toFixed(1);
+  return value.toFixed(3);
+}
+
+function formatRatio(value: number | undefined): string {
+  if (value === undefined) return "";
+  return `${value.toFixed(2)}x`;
+}
+
+function formatCache(result: BenchResult): string {
+  if (result.cacheHits === undefined || result.cacheMisses === undefined) return "";
+  return `${result.cacheHits}/${result.cacheMisses}`;
+}
+
+function formatHeap(value: number | undefined): string {
+  if (value === undefined) return "";
+  return format(value / 1024);
+}
+
+function formatPhaseMeans(phases: Partial<Record<string, number>>): string {
+  return Object.keys(phases)
+    .filter((phase) => phase !== "totalMs")
+    .map((phase) => `${phase.replace(/Ms$/, "")}=${format(phases[phase] ?? 0)}ms`)
+    .join(" ");
+}
+
+const oldBaselines = {
+  indexedTake20: {
+    hz: 6_554,
+    name: "old executeLocal query indexed range + take 20",
+  },
+  mutationInsert: {
+    hz: 7_175,
+    name: "old executeLocal mutation insert",
+  },
+} as const;

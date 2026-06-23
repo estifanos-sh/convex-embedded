@@ -1,0 +1,202 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import { writeRevisionVolume } from "../../../scripts/volume.js";
+import { readNumberEnvValue, readNumberListEnvValue, readTabsEnvValue } from "./env.js";
+import { browserBenchOutPath, hostedDeployment, metalFixtureDir, packageRoot } from "./paths.js";
+import type {
+  BrowserLatencyBenchOptions,
+  BrowserLatencyBenchScenario,
+  BrowserRemoteBenchOptions,
+  BrowserScaleBenchOptions,
+  BrowserStartupBenchOptions,
+  MetalReconnectVolumeBenchOptions,
+  MetalScaleBenchOptions,
+} from "./types.js";
+
+export function browserLatencyScenarios(
+  options: BrowserLatencyBenchOptions,
+): BrowserLatencyBenchScenario[] {
+  const devtoolsValues = options.profile === "full" ? [false, true] : [false, true];
+  const watchValues = options.profile === "full" ? [false, true] : [false, true];
+  const scenarios: BrowserLatencyBenchScenario[] = [];
+  for (const tabs of options.tabs) {
+    for (const rowCount of options.rowCounts) {
+      for (const devtoolsOpen of devtoolsValues) {
+        for (const watchActive of watchValues) {
+          if (
+            options.profile === "smoke" &&
+            tabs === "two" &&
+            (rowCount !== 100 || devtoolsOpen || !watchActive)
+          ) {
+            continue;
+          }
+          scenarios.push({ devtoolsOpen, rowCount, tabs, watchActive });
+        }
+      }
+    }
+  }
+  return scenarios;
+}
+
+export function readBrowserLatencyBenchOptions(
+  fallback: BrowserLatencyBenchOptions,
+): BrowserLatencyBenchOptions {
+  return {
+    iterations: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_ITERATIONS", fallback.iterations || 10),
+    latencyP90BudgetMs: readNumberEnvValue(
+      "EMBEDDED_BROWSER_BENCH_LATENCY_P90_BUDGET_MS",
+      fallback.latencyP90BudgetMs || 10,
+    ),
+    out: process.env.EMBEDDED_BROWSER_BENCH_OUT ?? fallback.out,
+    profile:
+      process.env.EMBEDDED_BROWSER_BENCH_PROFILE === "full"
+        ? "full"
+        : process.env.EMBEDDED_BROWSER_BENCH_PROFILE === "smoke"
+          ? "smoke"
+          : fallback.profile,
+    rowCounts: readNumberListEnvValue("EMBEDDED_BROWSER_BENCH_ROWS", fallback.rowCounts),
+    tabs: readTabsEnvValue("EMBEDDED_BROWSER_BENCH_TABS", fallback.tabs),
+    warmups: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_WARMUPS", fallback.warmups || 3),
+  };
+}
+
+export function readBrowserStartupBenchOptions(
+  fallback: BrowserStartupBenchOptions,
+): BrowserStartupBenchOptions {
+  return {
+    iterations: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_ITERATIONS", fallback.iterations || 10),
+    out: process.env.EMBEDDED_BROWSER_BENCH_OUT ?? fallback.out,
+    warmups: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_WARMUPS", fallback.warmups || 3),
+  };
+}
+
+export function readBrowserRemoteBenchOptions(
+  fallback: BrowserRemoteBenchOptions,
+): BrowserRemoteBenchOptions {
+  return {
+    iterations: readNumberEnvValue("EMBEDDED_BROWSER_REMOTE_ITERATIONS", fallback.iterations || 20),
+    out: process.env.EMBEDDED_BROWSER_REMOTE_OUT ?? fallback.out,
+    remoteUrl: process.env.EMBEDDED_BROWSER_REMOTE_URL ?? fallback.remoteUrl,
+    timeoutMs: readNumberEnvValue(
+      "EMBEDDED_BROWSER_REMOTE_TIMEOUT_MS",
+      fallback.timeoutMs || 15_000,
+    ),
+    warmups: readNumberEnvValue("EMBEDDED_BROWSER_REMOTE_WARMUPS", fallback.warmups || 3),
+  };
+}
+
+export function readBrowserScaleBenchOptions(
+  fallback: BrowserScaleBenchOptions,
+): BrowserScaleBenchOptions {
+  return {
+    clients: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_CLIENTS", fallback.clients || 2),
+    durationMs: readNumberEnvValue(
+      "EMBEDDED_BROWSER_BENCH_DURATION_MS",
+      fallback.durationMs || 250,
+    ),
+    out: process.env.EMBEDDED_BROWSER_BENCH_OUT ?? fallback.out,
+    rows: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_SCALE_ROWS", fallback.rows || 1_000),
+  };
+}
+
+export function readMetalScaleBenchOptions(
+  fallback: MetalScaleBenchOptions,
+): MetalScaleBenchOptions {
+  return {
+    clients: readNumberEnvValue("EMBEDDED_METAL_BENCH_CLIENTS", fallback.clients || 5),
+    out: process.env.EMBEDDED_METAL_BENCH_OUT ?? fallback.out,
+    remoteUrl: fallback.remoteUrl,
+    revs: readNumberEnvValue("EMBEDDED_METAL_BENCH_REVS", fallback.revs || 2_000),
+    skipRevList:
+      process.env.EMBEDDED_METAL_BENCH_SKIP_REV_LIST === "1" || fallback.skipRevList === true,
+    timeoutMs: Math.min(
+      300_000,
+      readNumberEnvValue("EMBEDDED_METAL_BENCH_TIMEOUT_MS", fallback.timeoutMs ?? 120_000),
+    ),
+    writes: readNumberEnvValue("EMBEDDED_METAL_BENCH_WRITES", fallback.writes || 50),
+  };
+}
+
+export function readMetalReconnectVolumeBenchOptions(
+  fallback: MetalReconnectVolumeBenchOptions,
+): MetalReconnectVolumeBenchOptions {
+  return {
+    clients: readNumberEnvValue("EMBEDDED_METAL_BENCH_CLIENTS", fallback.clients || 5),
+    deployment:
+      process.env.EMBEDDED_METAL_BENCH_DEPLOYMENT ??
+      process.env.CONVEX_DEPLOYMENT ??
+      hostedDeployment ??
+      fallback.deployment,
+    out: process.env.EMBEDDED_METAL_BENCH_OUT ?? fallback.out,
+    remoteUrl: fallback.remoteUrl,
+    revs: readNumberEnvValue("EMBEDDED_METAL_BENCH_REVS", fallback.revs || 5),
+    skipRevList:
+      process.env.EMBEDDED_METAL_BENCH_SKIP_REV_LIST === "1" || fallback.skipRevList === true,
+    timeoutMs: readNumberEnvValue("EMBEDDED_METAL_BENCH_TIMEOUT_MS", fallback.timeoutMs || 120_000),
+  };
+}
+
+export function replaceMetalRevisionVolume(options: {
+  deployment: string;
+  remoteUrl: string;
+  revs: number;
+  rowId: string;
+}): void {
+  const deployment = options.deployment.trim();
+  if (!deployment) {
+    throw new Error(
+      "Hosted volume seeding requires EMBEDDED_METAL_BENCH_DEPLOYMENT or CONVEX_DEPLOYMENT.",
+    );
+  }
+  if (deployment === "prod" || deployment.startsWith("prod:")) {
+    throw new Error("Hosted volume seeding cannot replace revision history in production.");
+  }
+  const hostname = new URL(options.remoteUrl).hostname;
+  const deploymentName = deployment.includes(":")
+    ? deployment.slice(deployment.indexOf(":") + 1)
+    : deployment;
+  if (!hostname.startsWith(`${deploymentName}.`)) {
+    throw new Error(
+      `Hosted volume deployment ${deployment} does not match remote URL ${options.remoteUrl}.`,
+    );
+  }
+
+  const scratch = mkdtempSync(`${tmpdir()}/embedded-volume-`);
+  try {
+    const documents = path.join(scratch, "revisions", "documents.jsonl");
+    const input = path.join(scratch, "revisions.zip");
+    writeRevisionVolume({ out: documents, rowId: options.rowId, rows: options.revs });
+    const zipped = spawnSync("zip", ["-q", "-r", input, "revisions"], {
+      cwd: scratch,
+      encoding: "utf8",
+    });
+    if (zipped.status !== 0) {
+      throw new Error(
+        `Hosted revision snapshot compression failed (${zipped.status ?? "signal"}): ${zipped.stderr || zipped.stdout}`,
+      );
+    }
+    const imported = spawnSync(
+      "vpx",
+      ["convex", "import", "--component", "embedded", "--replace", "--yes", input],
+      { cwd: metalFixtureDir, encoding: "utf8" },
+    );
+    if (imported.status !== 0) {
+      throw new Error(
+        `Hosted revision import failed (${imported.status ?? "signal"}): ${imported.stderr || imported.stdout}`,
+      );
+    }
+  } finally {
+    rmSync(scratch, { force: true, recursive: true });
+  }
+}
+
+export function resolveBenchOutPath(
+  out: string | undefined,
+  fallback = browserBenchOutPath,
+): string {
+  if (!out) return fallback;
+  return path.isAbsolute(out) ? out : path.resolve(packageRoot, out);
+}

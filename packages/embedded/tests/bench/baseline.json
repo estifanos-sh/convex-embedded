@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "source": "best-known comparable local architecture floor",
+  "capturedAt": "2026-06-29",
+  "notes": [
+    "These are the strongest preserved comparable architecture targets, not a floor captured from the implementation under test.",
+    "V5 must split and measure its added durability phases, then meet these end-to-end targets instead of lowering the gate.",
+    "The initial V5 self-baseline is preserved as diagnostic evidence in baselines/initial.json.",
+    "Replace a floor only with three repeatable release-mode runs that improve the same semantic operation."
+  ],
+  "summaries": [
+    {
+      "layer": "runtime-hot",
+      "name": "mutation.insert",
+      "hz": 19444,
+      "meanMs": 0.05143,
+      "p95Ms": 0
+    },
+    {
+      "layer": "runtime-hot",
+      "name": "mutation.insert.with_id",
+      "hz": 14456,
+      "meanMs": 0.06918,
+      "p95Ms": 0
+    },
+    {
+      "layer": "runtime-hot",
+      "name": "mutation.patch",
+      "hz": 20628,
+      "meanMs": 0.04848,
+      "p95Ms": 0
+    },
+    {
+      "layer": "runtime-hot",
+      "name": "mutation.rewrite_same_row",
+      "hz": 23465,
+      "meanMs": 0.04262,
+      "p95Ms": 0
+    }
+  ]
+}

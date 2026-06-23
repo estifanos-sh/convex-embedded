@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "source": "recovered pre-V5 best-known evidence",
+  "capturedAt": "2026-06-29",
+  "notes": [
+    "Recovered from historical performance-loop notes after the original scratch artifacts were removed.",
+    "All rows are evidence-only because their exact completion and cache contracts require revalidation before use as gates.",
+    "Use these rows to identify optimization targets and reproduce like-for-like scenarios."
+  ],
+  "summaries": [
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.insert",
+      "hz": 22313,
+      "meanMs": 0.04482,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.insert.with_id",
+      "hz": 16575,
+      "meanMs": 0.06033,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.patch",
+      "hz": 27931,
+      "meanMs": 0.0358,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.rewrite_same_row",
+      "hz": 32658,
+      "meanMs": 0.03062,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "query.index.take20",
+      "hz": 145406,
+      "meanMs": 0.00688,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "query.index.take100",
+      "hz": 66689,
+      "meanMs": 0.01499,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "adapter",
+      "name": "commit.insert",
+      "hz": 23855,
+      "meanMs": 0.04192,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "binding",
+      "name": "commit.insert",
+      "hz": 25077,
+      "meanMs": 0.03988,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "binding",
+      "name": "commit.insert.inline",
+      "hz": 28811,
+      "meanMs": 0.03471,
+      "p95Ms": 0
+    },
+    {
+      "gate": false,
+      "layer": "adapter",
+      "name": "doc.page.read1000.resume",
+      "hz": 580,
+      "meanMs": 1.72414,
+      "p95Ms": 0
+    }
+  ]
+}

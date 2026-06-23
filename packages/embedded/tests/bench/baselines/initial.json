@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "source": "initial V5 durable local runtime diagnostic",
+  "capturedAt": "2026-07-10",
+  "notes": [
+    "V5 mutation completion includes durable projection, mutation ledger, dirty-head, and replay-envelope work.",
+    "These rows preserve the first green-against-itself V5 floor for diagnosis only.",
+    "They are not release gates and must not replace the stronger comparable architecture floor."
+  ],
+  "summaries": [
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.insert",
+      "hz": 7500,
+      "meanMs": 0.13333,
+      "p95Ms": 0.4
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.insert.with_id",
+      "hz": 7500,
+      "meanMs": 0.13333,
+      "p95Ms": 0.3
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.patch",
+      "hz": 8000,
+      "meanMs": 0.125,
+      "p95Ms": 0.25
+    },
+    {
+      "gate": false,
+      "layer": "runtime-hot",
+      "name": "mutation.rewrite_same_row",
+      "hz": 7800,
+      "meanMs": 0.12821,
+      "p95Ms": 0.25
+    }
+  ]
+}
