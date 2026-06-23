@@ -1,0 +1,45 @@
+[package]
+name = "remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow = "1"
+convex_sync_types = "=0.10.4"
+futures-util = "0.3"
+serde_json = "1"
+sha2 = "0.10"
+storage = { path = "../storage" }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+tracing = "0.1"
+url = "2.5.4"
+uuid = { version = "1.6", features = ["v4"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+convex = { version = "=0.10.4", default-features = false, features = [
+  "native-client",
+  "rustls-tls-webpki-roots",
+] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots", "url"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+convex = { version = "=0.10.4", default-features = false, features = ["base-client"] }
+
+[dev-dependencies]
+convex = { version = "=0.10.4", default-features = false, features = [
+  "native-client",
+  "rustls-tls-webpki-roots",
+] }
+convex_sync_types = "=0.10.4"
+storage = { path = "../storage", features = ["testkit"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
