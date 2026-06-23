@@ -1,4 +1,5 @@
-import { randomId } from "../util";
+import { randomId } from "../id/random";
+import { getTimerTime } from "../time";
 import { assertSameRuntimeIdentity, createRuntimeIdentity, runtimeScope } from "./identity";
 import {
   serializeError,
@@ -14,7 +15,7 @@ import {
   type CoordinatorEnv,
   workerGlobal,
 } from "./coordinator/env";
-import { RequestLedger } from "./coordinator/ledger";
+import { RequestOutbox } from "./coordinator/outbox";
 import { LeaderRuntime, type LeaderClient, type RemoteFollower } from "./coordinator/leader";
 import { Mailbox } from "./coordinator/mailbox";
 import {
@@ -37,7 +38,6 @@ import {
   clientId,
   deferred,
   localClientKey,
-  serializeErrorLike,
   type CoordinatorTimeouts,
   type Deferred,
 } from "./coordinator/state";
@@ -59,29 +59,29 @@ export interface CoordinatorOptions {
   workerId?: string;
 }
 
-export const LifecyclePhase = {
-  Starting: 1,
-  Active: 2,
-  Closing: 3,
-  Closed: 4,
-} as const;
-
-type LifecyclePhaseCode = (typeof LifecyclePhase)[keyof typeof LifecyclePhase];
 type Timer = ReturnType<CoordinatorEnv["setTimer"]>;
 type CoordinatorEnvOverrides = Partial<Omit<CoordinatorEnv, "timeouts">> & {
   timeouts?: Partial<CoordinatorTimeouts>;
 };
 
-type RuntimeTransport =
-  | { epoch: string; kind: "leader"; leader: LeaderRuntime }
-  | { epoch: string; kind: "follower"; leaderId: string; mailbox: Mailbox<PeerMessage> };
-
-interface PendingAttach {
-  leaderEpoch: string;
-  leaderId: string;
-  mailbox: Mailbox<PeerMessage>;
-  timer: Timer;
-}
+type RuntimeOwnership =
+  | { ownership: "seeking" }
+  | {
+      epoch: string;
+      leaderId: string;
+      mailbox: Mailbox<PeerMessage>;
+      ownership: "attaching";
+      timer: Timer;
+    }
+  | {
+      epoch: string;
+      leaderId: string;
+      mailbox: Mailbox<PeerMessage>;
+      ownership: "follower";
+    }
+  | { ownership: "promoting" }
+  | { epoch: string; leader: LeaderRuntime; ownership: "leader" }
+  | { ownership: "closed" };
 
 interface RuntimeAddress {
   clientId: string;
@@ -93,32 +93,29 @@ interface RuntimeAddress {
   workerId: string;
 }
 
-interface Lifecycle {
-  closePromise?: Promise<void>;
-  initReady: Deferred;
-  initResponded: boolean;
-  phase: LifecyclePhaseCode;
-}
+type Lifecycle =
+  | { initReady: Deferred; lifecycle: "starting" }
+  | { idleShutdownTimer?: Timer; lifecycle: "active" }
+  | { closePromise: Promise<void>; lifecycle: "closing" }
+  | { lifecycle: "closed" };
 
 interface LeaderDiscovery {
   /** Consecutive retryable attach rejections in the current discovery round. */
   attachRejections?: number;
   /** Backoff timer scheduled after a retryable attach rejection, tracked so it can be cancelled. */
   attachBackoff?: Timer;
-  connecting?: Promise<void>;
   leaderBeacon?: Timer;
-  pendingAttach?: PendingAttach;
   recoveryTimer?: Timer;
 }
 
-/** Consecutive retryable rejections tolerated before discovery fails loudly. */
-const MAX_ATTACH_REJECTIONS = 8;
+const MAX_ATTACH_BACKOFF_EXPONENT = 16;
+const IDLE_SHUTDOWN_DELAY_MS = 1_000;
 
 interface RuntimeResources {
   control?: Mailbox<ControlMessage>;
   localClient: LeaderClient;
-  storageLease?: Deferred;
-  transport?: RuntimeTransport;
+  ownership: RuntimeOwnership;
+  storageLease?: { release: Deferred; released: Deferred };
   workerLease: Deferred;
   workerMailbox?: Mailbox<PeerMessage>;
 }
@@ -126,7 +123,7 @@ interface RuntimeResources {
 interface CoordinatorState {
   address: RuntimeAddress;
   discovery: LeaderDiscovery;
-  ledger: RequestLedger;
+  outbox: RequestOutbox;
   lifecycle: Lifecycle;
   resources: RuntimeResources;
 }
@@ -136,7 +133,7 @@ type RuntimeRequest = Exclude<
   Extract<
     WorkerRequest,
     {
-      op: typeof WorkerCommand.Close | typeof WorkerCommand.Heartbeat | typeof WorkerCommand.Init;
+      op: typeof WorkerCommand.Close | typeof WorkerCommand.Init;
     }
   >
 >;
@@ -158,7 +155,6 @@ type PeerHandler<T extends PeerMessage = PeerMessage> = (
 
 const localRequestHandlers = new Map<WorkerCommandCode, LocalRequestHandler>([
   [WorkerCommand.Close, (runtime, request) => runtime.handleClose(request as never)],
-  [WorkerCommand.Heartbeat, () => undefined],
   [
     WorkerCommand.Init,
     (runtime, request) =>
@@ -168,8 +164,27 @@ const localRequestHandlers = new Map<WorkerCommandCode, LocalRequestHandler>([
         op: WorkerEvent.Result,
       }),
   ],
+  [
+    WorkerCommand.AuthTokenResult,
+    (runtime, request) => runtime.handleRuntimeRequest(request as never),
+  ],
   [WorkerCommand.Mutation, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
   [WorkerCommand.Query, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
+  [WorkerCommand.Route, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
+  [
+    WorkerCommand.IdentityRead,
+    (runtime, request) => runtime.handleRuntimeRequest(request as never),
+  ],
+  [
+    WorkerCommand.IdentityWrite,
+    (runtime, request) => runtime.handleRuntimeRequest(request as never),
+  ],
+  [
+    WorkerCommand.RemoteIdentityRead,
+    (runtime, request) => runtime.handleRuntimeRequest(request as never),
+  ],
+  [WorkerCommand.Upload, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
+  [WorkerCommand.Devtools, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
   [WorkerCommand.WatchStart, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
   [WorkerCommand.WatchStop, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
 ]);
@@ -202,11 +217,11 @@ const peerHandlers = new Map<number, PeerHandler>([
 export function createConvexEmbeddedCoordinatedWorkerFromMessage(
   options: CoordinatorOptions = {},
 ): void {
-  let runtime: CoordinatorRuntime | undefined;
+  const state = workerCoordinatorState();
   workerGlobal().onmessage = (event) => {
     const request = event.data as WorkerRequest;
     if (request.op === WorkerCommand.Init) {
-      if (runtime) {
+      if (state.runtime) {
         postDefault({
           error: serializeError(new Error("Convex embedded worker is already initialized.")),
           id: request.id,
@@ -215,22 +230,26 @@ export function createConvexEmbeddedCoordinatedWorkerFromMessage(
         return;
       }
       try {
-        runtime = createCoordinatorRuntime(request, toEnv(options));
-        void runtime.start();
+        state.runtime = createCoordinatorRuntime(request, toEnv(options));
+        void state.runtime.start();
       } catch (error) {
         postDefault({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
       }
       return;
     }
-    if (!runtime) {
+    if (!state.runtime) {
       postDefault({
-        error: serializeError(new Error("Convex embedded worker has not been initialized.")),
+        error: serializeError(
+          new Error(
+            `Convex embedded worker has not been initialized for op ${String(request.op)}.`,
+          ),
+        ),
         id: request.id,
         op: WorkerEvent.Result,
       });
       return;
     }
-    runtime.handle(request);
+    state.runtime.handle(request);
   };
 }
 
@@ -264,21 +283,23 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     const id = clientId(init);
     const address: RuntimeAddress = {
       clientId: id,
-      controlName: controlChannelName(scope),
+      controlName: controlChannelName(init.identity.storageId),
       identity: init.identity,
       scope,
       storagePath: init.storagePath,
       workerChannelName: workerChannelName(scope, workerId),
       workerId,
     };
-    const ledger = new RequestLedger({
+    const outbox = new RequestOutbox({
       clearTimer: (timer) => this.env.clearTimer(timer),
       post: (response) => this.postLocal(response),
       setTimer: (callback, ms) => this.env.setTimer(callback, ms),
     });
     const localClient: LeaderClient = {
+      activeMutations: 0,
       id: localClientKey(workerId, id),
       post: (response) => this.postRuntimeResponse(response),
+      remoteConfigured: init.remote !== undefined,
       watches: new Map(),
       workerId,
     };
@@ -290,14 +311,14 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.state = {
       address,
       discovery: {},
-      ledger,
+      outbox,
       lifecycle: {
         initReady,
-        initResponded: false,
-        phase: LifecyclePhase.Starting,
+        lifecycle: "starting",
       },
       resources: {
         localClient,
+        ownership: { ownership: "seeking" },
         workerLease,
       },
     };
@@ -317,7 +338,8 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       await this.holdWorkerLock();
       this.requestStorageLease();
       this.ensureConnected();
-      await this.state.lifecycle.initReady.promise;
+      const lifecycle = this.state.lifecycle;
+      if (lifecycle.lifecycle === "starting") await lifecycle.initReady.promise;
     } catch (error) {
       this.fail(error);
     }
@@ -344,8 +366,14 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       });
       return;
     }
+    this.cancelIdleShutdown();
     try {
-      this.state.ledger.record(request);
+      const ownership = this.state.resources.ownership;
+      if (ownership.ownership === "leader") {
+        void ownership.leader.handle(this.state.resources.localClient, request);
+        return;
+      }
+      this.state.outbox.record(request);
       this.sendOrConnect(request);
     } catch (error) {
       this.postLocal({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
@@ -357,28 +385,32 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       this.postLocal({ id: request.id, op: WorkerEvent.Result });
       return;
     }
-    this.state.ledger.record(request);
-    if (this.state.resources.transport) {
+    this.state.outbox.record(request);
+    if (
+      this.state.resources.ownership.ownership === "leader" ||
+      this.state.resources.ownership.ownership === "follower"
+    ) {
       this.sendThroughTransport(request);
-      void this.state.ledger.onSettled(request.id).finally(() => {
-        void this.shutdown();
+      void this.state.outbox.onSettled(request.id).finally(() => {
+        this.scheduleIdleShutdown();
       });
       return;
     }
     this.postRuntimeResponse({ id: request.id, op: WorkerEvent.Result });
-    void this.shutdown();
+    this.scheduleIdleShutdown();
   }
 
   handleSeekLeader(message: Extract<ControlMessage, { op: typeof ControlOp.SeekLeader }>): void {
     if (message.workerId === this.state.address.workerId) return;
-    const transport = this.state.resources.transport;
-    if (transport?.kind !== "leader") return;
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership !== "leader") return;
     this.state.resources.control?.send({
-      identity: transport.leader.identity,
-      leaderEpoch: transport.epoch,
+      identity: ownership.leader.identity,
+      leaderEpoch: ownership.epoch,
       leaderId: this.state.address.workerId,
       op: ControlOp.BroadcastLeader,
       protocol: CoordinatorProtocol,
+      scope: this.state.address.scope,
     });
   }
 
@@ -386,28 +418,27 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     message: Extract<ControlMessage, { op: typeof ControlOp.BroadcastLeader }>,
   ): void {
     if (message.leaderId === this.state.address.workerId) return;
-    const { discovery, resources } = this.state;
-    if (resources.transport?.kind === "leader") return;
-    if (
-      resources.transport?.kind === "follower" &&
-      resources.transport.epoch === message.leaderEpoch
-    ) {
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership === "leader" || ownership.ownership === "promoting") return;
+    if (ownership.ownership === "follower" && ownership.epoch === message.leaderEpoch) {
       return;
     }
-    if (discovery.pendingAttach?.leaderEpoch === message.leaderEpoch) return;
-    this.attachToLeader(message.leaderId, message.leaderEpoch);
+    if (ownership.ownership === "attaching" && ownership.epoch === message.leaderEpoch) return;
+    this.attachToLeader(message.leaderId, message.leaderEpoch, message.scope);
   }
 
   handleAttach(message: Extract<PeerMessage, { op: typeof PeerOp.Attach }>): void {
-    const transport = this.state.resources.transport;
-    if (message.workerId === this.state.address.workerId || transport?.kind !== "leader") return;
-    transport.leader.attachFollower(
+    const ownership = this.state.resources.ownership;
+    if (message.workerId === this.state.address.workerId || ownership.ownership !== "leader")
+      return;
+    this.cancelIdleShutdown();
+    ownership.leader.attachFollower(
       message,
       (name) => this.env.channels.open(name),
       (follower) =>
         this.monitorFollower(
-          this.state.resources.transport?.kind === "leader"
-            ? this.state.resources.transport.leader
+          this.state.resources.ownership.ownership === "leader"
+            ? this.state.resources.ownership.leader
             : undefined,
           follower,
         ),
@@ -416,75 +447,81 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   handlePeerRequest(message: Extract<PeerMessage, { op: typeof PeerOp.Request }>): void {
-    const transport = this.state.resources.transport;
-    if (message.fromWorkerId === this.state.address.workerId || transport?.kind !== "leader") {
+    const ownership = this.state.resources.ownership;
+    if (message.fromWorkerId === this.state.address.workerId || ownership.ownership !== "leader") {
       return;
     }
-    if (message.leaderEpoch !== transport.epoch) return;
-    void transport.leader.handlePeerRequest(message);
+    if (message.leaderEpoch !== ownership.epoch) return;
+    void ownership.leader.handlePeerRequest(message);
   }
 
   handleRequestAck(message: Extract<PeerMessage, { op: typeof PeerOp.RequestAck }>): void {
-    const transport = this.state.resources.transport;
-    if (transport?.kind !== "follower" || transport.epoch !== message.leaderEpoch) return;
-    this.state.ledger.acknowledge(message.requestId);
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership !== "follower" || ownership.epoch !== message.leaderEpoch) return;
+    this.state.outbox.confirm(message.requestId);
     this.postDebug("worker:coordination:request-ack", { requestId: message.requestId });
   }
 
   handleAttached(message: Extract<PeerMessage, { op: typeof PeerOp.Attached }>): void {
-    const attach = this.state.discovery.pendingAttach;
-    if (!attach || attach.leaderEpoch !== message.leaderEpoch) return;
-    this.env.clearTimer(attach.timer);
-    this.state.discovery.pendingAttach = undefined;
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership !== "attaching" || ownership.epoch !== message.leaderEpoch) return;
+    this.env.clearTimer(ownership.timer);
     this.state.discovery.attachRejections = undefined;
     this.clearAttachBackoff();
     this.stopLeaderBeacon();
     this.clearRecoveryTimer();
-    this.state.resources.transport = {
+    this.state.resources.ownership = {
       epoch: message.leaderEpoch,
-      kind: "follower",
       leaderId: message.leaderId,
-      mailbox: attach.mailbox,
+      mailbox: ownership.mailbox,
+      ownership: "follower",
     };
-    this.resolveConnecting();
-    this.postInitSuccess();
     this.postDebug("worker:coordination:reconnect-success", {
       leaderEpoch: message.leaderEpoch,
       leaderId: message.leaderId,
       role: "follower",
     });
     this.replayLedger();
+    this.postInitSuccess();
   }
 
   handleRejected(message: Extract<PeerMessage, { op: typeof PeerOp.Rejected }>): void {
-    const attach = this.state.discovery.pendingAttach;
+    const attach = this.state.resources.ownership;
     // Ignore a late rejection from a previous attach target — only the current attempt's leader
     // epoch may cancel the current pending attach (mirrors `handleAttached`).
-    if (!attach || attach.leaderEpoch !== message.leaderEpoch) return;
+    if (attach.ownership !== "attaching" || attach.epoch !== message.leaderEpoch) return;
     this.env.clearTimer(attach.timer);
     attach.mailbox.close();
-    this.state.discovery.pendingAttach = undefined;
+    this.state.resources.ownership = { ownership: "seeking" };
     const error = new Error(message.error.message);
     error.name = message.error.name ?? "Error";
+    if (message.code === RejectCode.DeploymentMismatch) {
+      this.postLocal({
+        event: {
+          at: getTimerTime(),
+          degradation: "deployment-mismatch",
+          error: error.message,
+          type: "runtime",
+        },
+        op: WorkerEvent.Event,
+      });
+      this.postDebug("worker:coordination:deployment-mismatch", {
+        leaderEpoch: message.leaderEpoch,
+      });
+    }
     if (
       message.code === RejectCode.IdentityMismatch ||
-      message.code === RejectCode.StoragePathMismatch
+      message.code === RejectCode.DeploymentMismatch ||
+      message.code === RejectCode.StoragePathMismatch ||
+      message.code === RejectCode.RemoteMismatch
     ) {
       this.fail(error);
       return;
     }
     const rejections = (this.state.discovery.attachRejections ?? 0) + 1;
     this.state.discovery.attachRejections = rejections;
-    if (rejections >= MAX_ATTACH_REJECTIONS) {
-      this.fail(
-        new Error(
-          `ConvexEmbeddedClient failed to attach to the browser runtime leader after ${rejections} attempts: ${message.error.message}`,
-        ),
-      );
-      return;
-    }
     const backoff = Math.min(
-      this.env.timeouts.helloIntervalMs * 2 ** rejections,
+      this.env.timeouts.helloIntervalMs * 2 ** Math.min(rejections, MAX_ATTACH_BACKOFF_EXPONENT),
       this.env.timeouts.leaderRecoveryTimeoutMs,
     );
     this.postDebug("worker:coordination:attach-rejected", { backoff, rejections });
@@ -503,13 +540,14 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   handlePeerResponse(message: Extract<PeerMessage, { op: typeof PeerOp.Response }>): void {
-    const transport = this.state.resources.transport;
-    if (transport?.kind !== "follower" || transport.epoch !== message.leaderEpoch) return;
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership !== "follower" || ownership.epoch !== message.leaderEpoch) return;
     this.postRuntimeResponse(message.response);
   }
 
   private sendOrConnect(request: WorkerRequest): void {
-    if (!this.state.resources.transport) {
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership !== "leader" && ownership.ownership !== "follower") {
       this.postDebug("worker:coordination:request-deferred", {
         requestId: request.id,
         requestOp: request.op,
@@ -521,24 +559,24 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   private sendThroughTransport(request: WorkerRequest): void {
-    const transport = this.state.resources.transport;
-    if (!transport) return;
-    this.state.ledger.markSent(request.id);
-    if (transport.kind === "leader") {
-      void transport.leader.handle(this.state.resources.localClient, request);
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership !== "leader" && ownership.ownership !== "follower") return;
+    this.state.outbox.markSent(request.id);
+    if (ownership.ownership === "leader") {
+      void ownership.leader.handle(this.state.resources.localClient, request);
       return;
     }
-    transport.mailbox.send({
+    ownership.mailbox.send({
       fromWorkerId: this.state.address.workerId,
-      leaderEpoch: transport.epoch,
+      leaderEpoch: ownership.epoch,
       op: PeerOp.Request,
       protocol: CoordinatorProtocol,
       request,
     });
-    const epoch = transport.epoch;
-    this.state.ledger.armAckTimer(request.id, this.env.timeouts.forwardAckTimeoutMs, () => {
-      const current = this.state.resources.transport;
-      if (current?.kind !== "follower" || current.epoch !== epoch) return;
+    const epoch = ownership.epoch;
+    this.state.outbox.armAckTimer(request.id, this.env.timeouts.forwardAckTimeoutMs, () => {
+      const current = this.state.resources.ownership;
+      if (current.ownership !== "follower" || current.epoch !== epoch) return;
       this.postDebug("worker:coordination:request-ack-timeout", {
         leaderEpoch: epoch,
         requestId: request.id,
@@ -547,14 +585,14 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       this.invalidateFollowerTransport(epoch);
     });
     this.postDebug("worker:coordination:request-forward", {
-      leaderEpoch: transport.epoch,
+      leaderEpoch: ownership.epoch,
       requestId: request.id,
       requestOp: request.op,
     });
   }
 
   private replayLedger(): void {
-    for (const request of this.state.ledger.replayableRequests()) {
+    for (const request of this.state.outbox.ownershipRequests()) {
       this.postDebug("worker:coordination:request-replay", {
         requestId: request.id,
         requestOp: request.op,
@@ -564,49 +602,41 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   private ensureConnected(): void {
-    const { discovery, resources } = this.state;
-    // Already connected (leader OR an established follower) — nothing to seek. The recovery path
-    // clears the follower transport before re-seeking, so this does not block reconnection; it
-    // only stops a stray attach-backoff timer from restarting the beacon on a healthy follower.
-    if (this.isClosedOrClosing() || resources.transport !== undefined) return;
-    if (!discovery.connecting) {
-      const ready = deferred();
-      discovery.connecting = ready.promise;
-      ready.promise.catch(() => undefined);
-      this.postDebug("worker:coordination:reconnect-start", {
-        workerId: this.state.address.workerId,
-      });
-    }
+    if (this.isClosedOrClosing() || this.state.resources.ownership.ownership !== "seeking") return;
+    this.postDebug("worker:coordination:reconnect-start", {
+      workerId: this.state.address.workerId,
+    });
     this.startLeaderBeacon();
   }
 
-  private resolveConnecting(): void {
-    this.state.discovery.connecting = undefined;
-  }
-
-  private attachToLeader(leaderId: string, leaderEpoch: string): void {
-    const { discovery } = this.state;
+  private attachToLeader(leaderId: string, leaderEpoch: string, leaderScope: string): void {
     this.stopLeaderBeacon();
-    discovery.pendingAttach?.mailbox.close();
-    if (discovery.pendingAttach) this.env.clearTimer(discovery.pendingAttach.timer);
+    this.clearPendingAttach();
     this.clearFollowerTransport();
-    const mailbox = this.openSendOnlyMailbox<PeerMessage>(
-      workerChannelName(this.state.address.scope, leaderId),
-    );
+    const mailbox = this.openSendOnlyMailbox<PeerMessage>(workerChannelName(leaderScope, leaderId));
     const timer = this.env.setTimer(() => {
-      if (this.state.discovery.pendingAttach?.leaderEpoch !== leaderEpoch) return;
+      const current = this.state.resources.ownership;
+      if (current.ownership !== "attaching" || current.epoch !== leaderEpoch) return;
       mailbox.close();
-      this.state.discovery.pendingAttach = undefined;
+      this.state.resources.ownership = { ownership: "seeking" };
       this.postDebug("worker:coordination:attach-timeout", { leaderEpoch, leaderId });
       this.ensureConnected();
     }, this.env.timeouts.attachTimeoutMs);
-    discovery.pendingAttach = { leaderEpoch, leaderId, mailbox, timer };
+    this.state.resources.ownership = {
+      epoch: leaderEpoch,
+      leaderId,
+      mailbox,
+      ownership: "attaching",
+      timer,
+    };
     this.postDebug("worker:coordination:attaching", { leaderEpoch, leaderId });
     mailbox.send({
       clientId: this.state.address.clientId,
       identity: this.state.address.identity,
       op: PeerOp.Attach,
       protocol: CoordinatorProtocol,
+      remote: this.init.remote,
+      scope: this.state.address.scope,
       storagePath: this.state.address.storagePath,
       workerId: this.state.address.workerId,
     });
@@ -614,8 +644,8 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
 
   private invalidateFollowerTransport(previousEpoch: string): void {
     this.clearFollowerTransport();
-    this.state.ledger.clearAllAckTimers();
-    if (!this.state.discovery.recoveryTimer) {
+    this.state.outbox.clearAllAckTimers();
+    if (this.state.discovery.recoveryTimer === undefined) {
       this.state.discovery.recoveryTimer = this.env.setTimer(() => {
         this.state.discovery.recoveryTimer = undefined;
         this.postDebug("worker:coordination:recovery-timeout", { previousEpoch });
@@ -627,10 +657,10 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   private clearFollowerTransport(): void {
-    const transport = this.state.resources.transport;
-    if (transport?.kind === "follower") {
-      transport.mailbox.close();
-      this.state.resources.transport = undefined;
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership === "follower") {
+      ownership.mailbox.close();
+      this.state.resources.ownership = { ownership: "seeking" };
     }
   }
 
@@ -639,7 +669,8 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.clearPendingAttach();
     this.clearAttachBackoff();
     this.clearFollowerTransport();
-    this.state.ledger.clearAllAckTimers();
+    this.state.outbox.clearAllAckTimers();
+    this.state.resources.ownership = { ownership: "promoting" };
     this.postDebug("worker:coordination:promoting", { workerId: this.state.address.workerId });
     const runtime = await this.env.openRuntime(this.init, (response) => this.postLocal(response));
     const leader = new LeaderRuntime({
@@ -651,18 +682,46 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     });
     if (this.isClosedOrClosing()) return leader;
     leader.addLocalClient(this.state.resources.localClient);
+    const {
+      abandonWorkerRemote,
+      closeWorkerRemoteSocket,
+      ensureWorkerRemoteStarted,
+      stopWorkerRemote,
+    } = await import("./runtime");
+    const startRemote = () => {
+      if (this.init.remote === undefined) return;
+      runtime.remoteReady = ensureWorkerRemoteStarted(
+        runtime,
+        this.init.remote,
+        this.init.debug,
+        (response) => this.postLocal(response),
+      );
+    };
+    if (this.init.remote !== undefined) startRemote();
+    leader.enableRecovery({
+      abandonRemote: () => {
+        if (this.init.remote !== undefined) abandonWorkerRemote(runtime);
+      },
+      restartRemote: () => startRemote(),
+      stopRemote: () => {
+        if (this.init.remote !== undefined) void stopWorkerRemote(runtime).catch(() => undefined);
+      },
+      closeRemoteSocket: () => {
+        if (this.init.remote !== undefined) closeWorkerRemoteSocket(runtime);
+      },
+      onDeadInstance: (error) => this.releaseDeadInstance(error),
+    });
     this.state.discovery.attachRejections = undefined;
-    this.state.resources.transport = { epoch: leader.epoch, kind: "leader", leader };
+    this.state.resources.ownership = { epoch: leader.epoch, leader, ownership: "leader" };
     this.state.resources.control?.send({
       identity: leader.identity,
       leaderEpoch: leader.epoch,
       leaderId: this.state.address.workerId,
       op: ControlOp.BroadcastLeader,
       protocol: CoordinatorProtocol,
+      scope: this.state.address.scope,
     });
     this.clearRecoveryTimer();
-    this.resolveConnecting();
-    this.postInitSuccess();
     this.postDebug("worker:coordination:leader", {
       leaderEpoch: leader.epoch,
       workerId: this.state.address.workerId,
@@ -673,6 +732,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       role: "leader",
     });
     this.replayLedger();
+    this.postInitSuccess();
     return leader;
   }
 
@@ -696,40 +756,64 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       .request(storageOwnerLockName(this.state.address.identity), async () => {
         if (this.isClosedOrClosing()) return;
         const release = deferred();
-        this.state.resources.storageLease = release;
+        const released = deferred();
+        const storageLease = { release, released };
+        released.promise.catch(() => undefined);
+        this.state.resources.storageLease = storageLease;
         let leader: LeaderRuntime | undefined;
         try {
           leader = await this.openLeaderRuntime();
           await release.promise;
         } finally {
           if (
-            this.state.resources.transport?.kind === "leader" &&
-            this.state.resources.transport.leader === leader
+            this.state.resources.ownership.ownership === "leader" &&
+            this.state.resources.ownership.leader === leader
           ) {
-            this.state.resources.transport = undefined;
+            this.state.resources.ownership = { ownership: "seeking" };
           }
           await leader?.close().catch(() => undefined);
+          if (this.state.resources.storageLease === storageLease) {
+            this.state.resources.storageLease = undefined;
+          }
+          released.resolve();
         }
       })
       .catch((error) => this.fail(error));
+  }
+
+  /**
+   * A dead store instance releases its storage lease so a follower tab promotes with a fresh
+   * worker; `requestStorageLease`'s finally then closes the abandoned leader. Durable state is
+   * untouched, and a page reload of any tab also starts clean.
+   */
+  private releaseDeadInstance(error: unknown): void {
+    this.postDebug("worker:coordination:store-instance-dead", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    this.state.resources.storageLease?.release.resolve();
   }
 
   private monitorFollower(leader: LeaderRuntime | undefined, follower: RemoteFollower): void {
     if (!leader) return;
     void this.env.locks
       .request(workerLockName(this.state.address.scope, follower.workerId), async () => {
-        const transport = this.state.resources.transport;
-        if (transport?.kind !== "leader" || transport.leader !== leader) return;
+        const ownership = this.state.resources.ownership;
+        if (ownership.ownership !== "leader" || ownership.leader !== leader) return;
         leader.cleanupFollower(follower.workerId);
       })
       .catch((error) => this.postDebug("worker:coordination:follower-monitor-error", error));
   }
 
   private startLeaderBeacon(): void {
-    const { discovery, resources } = this.state;
-    if (discovery.leaderBeacon || resources.transport?.kind === "leader") return;
+    const { discovery } = this.state;
+    if (
+      discovery.leaderBeacon !== undefined ||
+      this.state.resources.ownership.ownership !== "seeking"
+    ) {
+      return;
+    }
     const send = () => {
-      if (this.isClosedOrClosing() || this.state.resources.transport?.kind === "leader") {
+      if (this.isClosedOrClosing() || this.state.resources.ownership.ownership !== "seeking") {
         this.state.discovery.leaderBeacon = undefined;
         return;
       }
@@ -738,6 +822,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
         identity: this.state.address.identity,
         op: ControlOp.SeekLeader,
         protocol: CoordinatorProtocol,
+        scope: this.state.address.scope,
         storagePath: this.state.address.storagePath,
         workerId: this.state.address.workerId,
       });
@@ -752,28 +837,28 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
 
   private stopLeaderBeacon(): void {
     const beacon = this.state.discovery.leaderBeacon;
-    if (!beacon) return;
+    if (beacon === undefined) return;
     this.env.clearTimer(beacon);
     this.state.discovery.leaderBeacon = undefined;
   }
 
   private clearPendingAttach(): void {
-    const attach = this.state.discovery.pendingAttach;
-    if (!attach) return;
+    const attach = this.state.resources.ownership;
+    if (attach.ownership !== "attaching") return;
     this.env.clearTimer(attach.timer);
     attach.mailbox.close();
-    this.state.discovery.pendingAttach = undefined;
+    this.state.resources.ownership = { ownership: "seeking" };
   }
 
   private clearRecoveryTimer(): void {
     const timer = this.state.discovery.recoveryTimer;
-    if (!timer) return;
+    if (timer === undefined) return;
     this.env.clearTimer(timer);
     this.state.discovery.recoveryTimer = undefined;
   }
 
   private postRuntimeResponse(response: WorkerResponse): void {
-    this.state.ledger.settle(response);
+    this.state.outbox.complete(response);
     if (response.op === WorkerEvent.Result) {
       this.postDebug("worker:coordination:request-settled", { requestId: response.id });
     }
@@ -786,56 +871,85 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   private postInitSuccess(): void {
-    if (this.state.lifecycle.initResponded) return;
-    this.state.lifecycle.initResponded = true;
-    this.state.lifecycle.phase = LifecyclePhase.Active;
+    const lifecycle = this.state.lifecycle;
+    if (lifecycle.lifecycle !== "starting") return;
+    lifecycle.initReady.resolve();
+    this.state.lifecycle = { lifecycle: "active" };
     this.postLocal({ id: this.init.id, op: WorkerEvent.Result });
-    this.state.lifecycle.initReady.resolve();
   }
 
   private postInitError(error: unknown): void {
-    if (this.state.lifecycle.initResponded) return;
-    this.state.lifecycle.initResponded = true;
+    const lifecycle = this.state.lifecycle;
+    if (lifecycle.lifecycle !== "starting") return;
     this.postLocal({
-      error: serializeErrorLike(error),
+      error: serializeError(error),
       id: this.init.id,
       op: WorkerEvent.Result,
     });
-    this.state.lifecycle.initReady.reject(error);
+    lifecycle.initReady.reject(error);
   }
 
   private fail(error: unknown): void {
     this.postInitError(error);
-    this.state.ledger.rejectAll(error);
+    this.state.outbox.rejectAll(error);
     void this.shutdown();
   }
 
+  private scheduleIdleShutdown(): void {
+    const lifecycle = this.state.lifecycle;
+    if (lifecycle.lifecycle !== "active" || lifecycle.idleShutdownTimer !== undefined) {
+      return;
+    }
+    this.postDebug("worker:coordination:idle-shutdown-scheduled", {
+      delayMs: IDLE_SHUTDOWN_DELAY_MS,
+    });
+    lifecycle.idleShutdownTimer = this.env.setTimer(() => {
+      if (this.state.lifecycle.lifecycle === "active") {
+        this.state.lifecycle.idleShutdownTimer = undefined;
+      }
+      void this.shutdown();
+    }, IDLE_SHUTDOWN_DELAY_MS);
+  }
+
+  private cancelIdleShutdown(): void {
+    const lifecycle = this.state.lifecycle;
+    if (lifecycle.lifecycle !== "active") return;
+    const timer = lifecycle.idleShutdownTimer;
+    if (timer === undefined) return;
+    this.env.clearTimer(timer);
+    lifecycle.idleShutdownTimer = undefined;
+    this.postDebug("worker:coordination:idle-shutdown-cancelled");
+  }
+
   private async shutdown(): Promise<void> {
-    this.state.lifecycle.closePromise ??= this.doShutdown();
-    return this.state.lifecycle.closePromise;
+    const lifecycle = this.state.lifecycle;
+    if (lifecycle.lifecycle === "closed") return;
+    if (lifecycle.lifecycle === "closing") return lifecycle.closePromise;
+    const closePromise = this.doShutdown();
+    this.state.lifecycle = { closePromise, lifecycle: "closing" };
+    return closePromise;
   }
 
   private async doShutdown(): Promise<void> {
-    if (this.state.lifecycle.phase === LifecyclePhase.Closed) return;
-    if (this.state.lifecycle.phase === LifecyclePhase.Closing) return;
-    this.state.lifecycle.phase = LifecyclePhase.Closing;
     this.stopLeaderBeacon();
+    this.cancelIdleShutdown();
     this.clearRecoveryTimer();
     this.clearPendingAttach();
     this.clearAttachBackoff();
-    const leader =
-      this.state.resources.transport?.kind === "leader"
-        ? this.state.resources.transport.leader
-        : undefined;
+    const ownership = this.state.resources.ownership;
+    const leader = ownership.ownership === "leader" ? ownership.leader : undefined;
     this.clearFollowerTransport();
-    this.state.resources.transport = undefined;
-    this.state.resources.storageLease?.resolve();
-    await leader?.close().catch(() => undefined);
-    this.state.ledger.rejectAll(new Error("ConvexEmbeddedClient has been closed."));
+    this.clearPendingAttach();
+    this.state.resources.ownership = { ownership: "closed" };
+    const storageLease = this.state.resources.storageLease;
+    storageLease?.release.resolve();
+    if (storageLease) await storageLease.released.promise;
+    else await leader?.close().catch(() => undefined);
+    this.state.outbox.rejectAll(new Error("ConvexEmbeddedClient has been closed."));
     this.state.resources.control?.close();
     this.state.resources.workerMailbox?.close();
     this.state.resources.workerLease.resolve();
-    this.state.lifecycle.phase = LifecyclePhase.Closed;
+    this.state.lifecycle = { lifecycle: "closed" };
     this.env.closeSelf();
   }
 
@@ -852,8 +966,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
 
   private isClosedOrClosing(): boolean {
     return (
-      this.state.lifecycle.phase === LifecyclePhase.Closing ||
-      this.state.lifecycle.phase === LifecyclePhase.Closed
+      this.state.lifecycle.lifecycle === "closing" || this.state.lifecycle.lifecycle === "closed"
     );
   }
 
@@ -892,7 +1005,9 @@ function mergeEnv(overrides: CoordinatorEnvOverrides): CoordinatorEnv {
     openRuntime:
       overrides.openRuntime ??
       ((request, post) =>
-        import("./runtime").then(({ initFromMessage }) => initFromMessage(request, post))),
+        import("./runtime").then(({ initFromMessage }) =>
+          initFromMessage(request, post, { events: false }),
+        )),
     postLocal: overrides.postLocal ?? ((response) => workerGlobal().postMessage?.(response)),
     randomId: overrides.randomId ?? randomId,
     setTimer: overrides.setTimer ?? ((callback, ms) => setTimeout(callback, ms)),
@@ -918,4 +1033,13 @@ function toEnv(options: CoordinatorOptions): CoordinatorEnvOverrides {
 function postDefault(message: WorkerResponse): void {
   // Responses may contain user ArrayBuffers; structured clone preserves sender ownership.
   workerGlobal().postMessage?.(message);
+}
+
+function workerCoordinatorState(): { runtime?: CoordinatorRuntime } {
+  const key = "__CONVEX_EMBEDDED_COORDINATOR__";
+  const global = workerGlobal() as ReturnType<typeof workerGlobal> & {
+    [key]?: { runtime?: CoordinatorRuntime };
+  };
+  global[key] ??= {};
+  return global[key];
 }

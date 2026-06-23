@@ -1,6 +1,4 @@
-import type { SerializedError } from "../protocol";
-
-export { deferred, type Deferred } from "../../util";
+export { deferred, type Deferred } from "../../promise";
 
 export const HELLO_INTERVAL_MS = 100;
 export const ATTACH_TIMEOUT_MS = 1_000;
@@ -29,11 +27,4 @@ export function clientId(request: { clientId?: string; id: number }): string {
 
 export function localClientKey(workerId: string, id: string): string {
   return `${workerId}:${id}`;
-}
-
-export function serializeErrorLike(error: unknown): SerializedError {
-  if (error instanceof Error) {
-    return { message: error.message, name: error.name, stack: error.stack };
-  }
-  return { message: String(error), name: "Error" };
 }

@@ -1,12 +1,28 @@
-import { getFunctionName } from "convex/server";
-import type { Runner, RunMutationOptions } from "../runtime/runner";
+import type { UserIdentity } from "convex/server";
+import type {
+  Runner,
+  RunnerDevtoolsRequest,
+  RunnerRoute,
+  RunMutationTiming,
+  RunMutationOptions,
+  RunOptions,
+  StopOnUpdate,
+} from "../runtime/runner";
+import { functionName } from "../runtime/service";
+import type { EmbeddedEventListener, EmbeddedRuntimeEvent } from "../events";
+import type { ConvexEmbeddedRemoteOptions } from "../client";
 import type { FunctionReference } from "../runtime/functions";
-import { randomId } from "../util";
+import { getTimerTime } from "../time";
+import { randomId } from "../id/random";
+import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
+import type { RemoteIdentity } from "../storage/types";
 import {
   deserializeError,
+  serializeError,
   type EmbeddedWorker,
   type EmbeddedWorkerSource,
   type RuntimeIdentity,
+  type WatchPatch,
   WorkerCommand,
   type WorkerCommandCode,
   WorkerEvent,
@@ -19,6 +35,8 @@ export interface WorkerRunnerInit {
   closeTimeoutMs?: number;
   debug?: boolean;
   identity?: RuntimeIdentity;
+  remote?: ConvexEmbeddedRemoteOptions;
+  remoteAuth?: (args: { forceRefreshToken: boolean }) => Promise<string | null> | string | null;
   requestTimeoutMs?: number;
   storagePath: string;
 }
@@ -26,6 +44,8 @@ export interface WorkerRunnerInit {
 interface PendingRequest {
   accepted: boolean;
   onAccepted: ((this: void, mutationId: string) => void) | undefined;
+  onTiming: ((this: void, timing: RunMutationTiming) => void) | undefined;
+  requestStartedAt: number;
   reject(error: unknown): void;
   resolve(value: unknown): void;
   timer: ReturnType<typeof setTimeout> | undefined;
@@ -34,6 +54,7 @@ interface PendingRequest {
 
 interface WatchCallbacks {
   callback(value: unknown): void;
+  lastValue: unknown;
   onError(error: unknown): void;
   started: boolean;
   stopped: boolean;
@@ -42,7 +63,6 @@ interface WatchCallbacks {
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_ACCEPTED_RESULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
-const HEARTBEAT_INTERVAL_MS = 5_000;
 
 type WorkerEventHandler = (runner: WorkerRunner, message: Partial<WorkerResponse>) => void;
 
@@ -50,8 +70,11 @@ const workerEventHandlers = new Map<number, WorkerEventHandler>([
   [WorkerEvent.Result, (runner, message) => runner.handleResult(message)],
   [WorkerEvent.MutationAccepted, (runner, message) => runner.handleMutationAccepted(message)],
   [WorkerEvent.WatchUpdated, (runner, message) => runner.handleWatchUpdated(message)],
+  [WorkerEvent.WatchPatched, (runner, message) => runner.handleWatchPatched(message)],
   [WorkerEvent.WatchFailed, (runner, message) => runner.handleWatchFailed(message)],
   [WorkerEvent.Debug, (runner, message) => runner.handleDebug(message)],
+  [WorkerEvent.Event, (runner, message) => runner.handleEvent(message)],
+  [WorkerEvent.AuthTokenRequest, (runner, message) => runner.handleAuthTokenRequest(message)],
 ]);
 
 /**
@@ -79,19 +102,22 @@ export class WorkerRunner implements Runner {
   private nextWatchId = 1;
   private readonly acceptedResultTimeoutMs: number;
   private readonly closeTimeoutMs: number;
-  private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly ready: Promise<unknown>;
   private readonly requestTimeoutMs: number;
+  private readonly eventListeners = new Set<EmbeddedEventListener>();
+  private readonly remoteAuth:
+    | ((args: { forceRefreshToken: boolean }) => Promise<string | null> | string | null)
+    | undefined;
   private readonly watches = new Map<number, WatchCallbacks>();
   private readonly worker: EmbeddedWorker;
-
   constructor(source: EmbeddedWorkerSource, init?: WorkerRunnerInit) {
     this.worker = typeof source === "function" ? source() : source;
     this.acceptedResultTimeoutMs =
       init?.acceptedResultTimeoutMs ?? DEFAULT_ACCEPTED_RESULT_TIMEOUT_MS;
     this.closeTimeoutMs = init?.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.requestTimeoutMs = init?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.remoteAuth = init?.remoteAuth;
     this.worker.addEventListener("message", this.onMessage);
     this.worker.addEventListener("error", this.onWorkerError);
     this.worker.addEventListener("messageerror", this.onWorkerError);
@@ -103,6 +129,18 @@ export class WorkerRunner implements Runner {
             debug: init.debug ?? debugHook() !== undefined,
             id: this.allocateId(),
             identity: init.identity,
+            remote: init.remote
+              ? {
+                  authFetchToken: init.remoteAuth !== undefined,
+                  clientId: this.clientId,
+                  moduleGraphHash: init.identity?.moduleGraphHash ?? "local",
+                  operationTimeoutMs: init.remote.operationTimeoutMs,
+                  protocolVersion: init.identity?.protocolVersion ?? EMBEDDED_PROTOCOL_VERSION,
+                  receiveTimeoutMs: init.remote.receiveTimeoutMs,
+                  schemaHash: init.identity?.schemaHash ?? "local",
+                  url: init.remote.url,
+                }
+              : undefined,
             storagePath: init.storagePath,
             op: WorkerCommand.Init,
           },
@@ -110,38 +148,89 @@ export class WorkerRunner implements Runner {
         )
       : Promise.resolve();
     this.ready.catch(() => undefined);
-    if (init?.identity) {
-      this.ready
-        .then(() => {
-          if (this.closed) return;
-          this.heartbeatTimer = setInterval(() => {
-            try {
-              this.worker.postMessage({
-                clientId: this.clientId,
-                id: this.allocateId(),
-                op: WorkerCommand.Heartbeat,
-              });
-            } catch (error) {
-              this.dispose(workerEventError(error));
-            }
-          }, HEARTBEAT_INTERVAL_MS);
-        })
-        .catch(() => undefined);
-    }
   }
 
-  async runQuery(ref: FunctionReference, args: Record<string, unknown> = {}): Promise<unknown> {
+  initialized(): Promise<unknown> {
+    return this.ready;
+  }
+
+  readonly identity = {
+    read: async () => {
+      await this.ready;
+      return await this.request<{ identity: UserIdentity | null; identityKey: string } | undefined>(
+        {
+          clientId: this.clientId,
+          id: this.allocateId(),
+          op: WorkerCommand.IdentityRead,
+        },
+        { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+      );
+    },
+    write: async (identityKey: string) => {
+      await this.ready;
+      await this.request(
+        {
+          clientId: this.clientId,
+          id: this.allocateId(),
+          identityKey,
+          op: WorkerCommand.IdentityWrite,
+        },
+        { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+      );
+    },
+  };
+
+  readonly remote = {
+    identity: {
+      read: async () => {
+        await this.ready;
+        return await this.request<RemoteIdentity | undefined>(
+          {
+            clientId: this.clientId,
+            id: this.allocateId(),
+            op: WorkerCommand.RemoteIdentityRead,
+          },
+          { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+        );
+      },
+    },
+    scope: { write: async () => undefined },
+  };
+
+  async route(
+    ref: FunctionReference,
+    args: Record<string, unknown>,
+    kind: "query" | "mutation" | "action",
+  ): Promise<RunnerRoute> {
+    await this.ready;
+    return this.request<RunnerRoute>(
+      {
+        args,
+        clientId: this.clientId,
+        id: this.allocateId(),
+        kind,
+        name: functionName(ref),
+        op: WorkerCommand.Route,
+      },
+      { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+    );
+  }
+
+  async runQuery(
+    ref: FunctionReference,
+    args: Record<string, unknown> = {},
+    options: RunOptions = {},
+  ): Promise<unknown> {
     await this.ready;
     return this.request(
       {
         args,
+        auth: options.auth,
         clientId: this.clientId,
         id: this.allocateId(),
         name: functionName(ref),
         op: WorkerCommand.Query,
       },
-      // A slow query rejects only itself; it must not dispose the whole runner. Disposal is
-      // reserved for Init/protocol failures (default "fatal").
       { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
     );
   }
@@ -153,31 +242,95 @@ export class WorkerRunner implements Runner {
   ): Promise<unknown> {
     await this.ready;
     const id = this.allocateId();
+    const generatedMutationId = options.mutationId === undefined;
     return this.request(
       {
         args,
+        auth: options.auth,
         clientId: this.clientId,
         id,
+        mutationFresh: generatedMutationId,
         mutationId: options.mutationId ?? `${this.clientId}:${id}`,
         name: functionName(ref),
         op: WorkerCommand.Mutation,
+        rngSeed: randomId("rng"),
       },
       {
         onAccepted: options.onAccepted,
+        onTiming: options.onTiming,
         timeoutMs: this.requestTimeoutMs,
       },
     );
   }
+
+  async runAction(
+    _ref: FunctionReference,
+    _args: Record<string, unknown> = {},
+    _options: RunOptions = {},
+  ): Promise<unknown> {
+    throw new Error("Actions are hosted-only and cannot execute in the embedded browser worker.");
+  }
+
+  async handleUpload(url: string, blob: Blob): Promise<{ storageId: string }> {
+    await this.ready;
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    return this.request<{ storageId: string }>(
+      {
+        bytes,
+        clientId: this.clientId,
+        contentType: blob.type || undefined,
+        id: this.allocateId(),
+        op: WorkerCommand.Upload,
+        url,
+      },
+      {
+        timeoutMs: this.requestTimeoutMs,
+        timeoutPolicy: "reject",
+        transfer: [bytes.buffer],
+      },
+    );
+  }
+
+  async devtools(request: RunnerDevtoolsRequest): Promise<unknown> {
+    await this.ready;
+    return this.request(
+      {
+        clientId: this.clientId,
+        id: this.allocateId(),
+        op: WorkerCommand.Devtools,
+        request,
+      },
+      { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+    );
+  }
+
+  subscribeEvents(listener: EmbeddedEventListener): StopOnUpdate {
+    this.eventListeners.add(listener);
+    return () => {
+      this.eventListeners.delete(listener);
+    };
+  }
+
+  invalidate(): void {}
+
+  rerunResults(): void {}
 
   onUpdate(
     ref: FunctionReference,
     args: Record<string, unknown>,
     callback: (value: unknown) => void,
     onError: (error: unknown) => void = () => undefined,
+    options: RunOptions = {},
   ): () => void {
     this.ensureOpen();
     const watchId = this.nextWatchId++;
-    const watch: WatchCallbacks = { callback, onError, started: false, stopped: false };
+    const watch: WatchCallbacks = {
+      callback,
+      lastValue: undefined,
+      onError,
+      started: false,
+      stopped: false,
+    };
     this.watches.set(watchId, watch);
     void this.ready
       .then(async () => {
@@ -186,13 +339,14 @@ export class WorkerRunner implements Runner {
         await this.request(
           {
             args,
+            auth: options.auth,
             clientId: this.clientId,
             id: this.allocateId(),
             name: functionName(ref),
             op: WorkerCommand.WatchStart,
             watchId,
           },
-          { timeoutMs: this.requestTimeoutMs },
+          {},
         );
         if (watch.stopped && !this.closed) {
           await this.request(
@@ -234,6 +388,7 @@ export class WorkerRunner implements Runner {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    let graceful = false;
     try {
       await this.request(
         {
@@ -242,27 +397,37 @@ export class WorkerRunner implements Runner {
           op: WorkerCommand.Close,
         },
         { allowClosed: true, timeoutMs: this.closeTimeoutMs },
-      ).catch(() => undefined);
+      );
+      graceful = true;
+    } catch {
+      // A lost close response means the worker may be wedged, so disposal below still terminates it.
     } finally {
-      this.dispose(new Error("ConvexEmbeddedClient has already been closed."));
+      this.dispose(new Error("ConvexEmbeddedClient has already been closed."), {
+        terminate: !graceful,
+      });
     }
   }
 
-  private request(
+  private request<T = unknown>(
     message: WorkerRequest,
     options: {
       allowClosed?: boolean;
       onAccepted?(this: void, mutationId: string): void;
+      onTiming?(this: void, timing: RunMutationTiming): void;
       timeoutMs?: number;
       /**
        * What a timeout means: `"fatal"` (default) treats a lost response as a wedged worker
        * and disposes the runner; `"reject"` fails only this request.
        */
       timeoutPolicy?: "fatal" | "reject";
+      /** Buffers moved into the worker for one-way ownership transfers. */
+      transfer?: object[];
     } = {},
-  ): Promise<unknown> {
+  ): Promise<T> {
     if (!options.allowClosed) this.ensureOpen();
     return new Promise((resolve, reject) => {
+      const resolveUnknown = (value: unknown) => resolve(value as T);
+      const requestStartedAt = getTimerTime();
       const timer =
         options.timeoutMs === undefined
           ? undefined
@@ -286,14 +451,18 @@ export class WorkerRunner implements Runner {
       this.pending.set(message.id, {
         accepted: false,
         onAccepted: options.onAccepted,
+        onTiming: options.onTiming,
+        requestStartedAt,
         reject,
-        resolve,
+        resolve: resolveUnknown,
         timer,
         op: message.op,
       });
       try {
-        // Do not transfer buffers here: query/mutation args remain caller-owned after the send.
-        this.worker.postMessage(message);
+        // Query/mutation args remain caller-owned after the send. Upload bytes are the one safe
+        // transfer point: the caller has already materialized a Blob body and no longer needs the
+        // ArrayBuffer after the runtime owns it.
+        this.worker.postMessage(message, options.transfer);
       } catch (error) {
         if (timer !== undefined) clearTimeout(timer);
         this.pending.delete(message.id);
@@ -312,16 +481,16 @@ export class WorkerRunner implements Runner {
     }
   }
 
-  private dispose(error: Error): void {
+  private dispose(error: Error, options: { terminate?: boolean } = {}): void {
     if (this.closed) return;
     this.closed = true;
     this.worker.removeEventListener("message", this.onMessage);
     this.worker.removeEventListener("error", this.onWorkerError);
     this.worker.removeEventListener("messageerror", this.onWorkerError);
-    if (this.heartbeatTimer !== undefined) clearInterval(this.heartbeatTimer);
-    this.heartbeatTimer = undefined;
-    this.worker.close?.();
-    this.worker.terminate?.();
+    if (options.terminate ?? true) {
+      this.worker.close?.();
+      this.worker.terminate?.();
+    }
     for (const pending of this.pending.values()) {
       if (pending.timer !== undefined) clearTimeout(pending.timer);
       pending.reject(
@@ -359,6 +528,7 @@ export class WorkerRunner implements Runner {
       if (!pending) return;
       this.pending.delete(message.id);
       if (pending.timer !== undefined) clearTimeout(pending.timer);
+      if (message.timing) pending.onTiming?.(message.timing);
       if (message.error) pending.reject(deserializeError(message.error));
       else pending.resolve(message.result);
     }
@@ -388,7 +558,28 @@ export class WorkerRunner implements Runner {
   handleWatchUpdated(message: Partial<WorkerResponse>): void {
     if (message.op === WorkerEvent.WatchUpdated && typeof message.watchId === "number") {
       const watch = this.watches.get(message.watchId);
-      if (!watch?.stopped) watch?.callback(message.value);
+      if (!watch || watch.stopped) return;
+      watch.lastValue = message.value;
+      watch.callback(message.value);
+    }
+  }
+
+  handleWatchPatched(message: Partial<WorkerResponse>): void {
+    if (
+      message.op !== WorkerEvent.WatchPatched ||
+      typeof message.watchId !== "number" ||
+      !message.patch
+    ) {
+      return;
+    }
+    const watch = this.watches.get(message.watchId);
+    if (!watch || watch.stopped) return;
+    try {
+      const value = applyWatchPatch(watch.lastValue, message.patch);
+      watch.lastValue = value;
+      watch.callback(value);
+    } catch (error) {
+      watch.onError(error);
     }
   }
 
@@ -409,9 +600,73 @@ export class WorkerRunner implements Runner {
     }
   }
 
+  handleEvent(message: Partial<WorkerResponse>): void {
+    if (message.op !== WorkerEvent.Event || !message.event) return;
+    for (const listener of Array.from(this.eventListeners)) {
+      try {
+        listener(message.event);
+      } catch (error) {
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
+  }
+
+  handleAuthTokenRequest(message: Partial<WorkerResponse>): void {
+    if (message.op !== WorkerEvent.AuthTokenRequest || typeof message.authRequestId !== "number") {
+      return;
+    }
+    const id = this.allocateId();
+    const forceRefreshToken = message.forceRefreshToken === true;
+    void Promise.resolve()
+      .then(async () => (await this.remoteAuth?.({ forceRefreshToken })) ?? null)
+      .then(
+        (token) => {
+          this.worker.postMessage({
+            authRequestId: message.authRequestId,
+            clientId: this.clientId,
+            id,
+            op: WorkerCommand.AuthTokenResult,
+            token,
+          });
+        },
+        (error) => {
+          this.worker.postMessage({
+            authRequestId: message.authRequestId,
+            clientId: this.clientId,
+            error: serializeError(error),
+            id,
+            op: WorkerCommand.AuthTokenResult,
+          });
+        },
+      );
+  }
+
   private readonly onWorkerError = (event: unknown): void => {
-    this.dispose(workerEventError(event));
+    const error = workerEventError(event);
+    this.emitRuntimeFailed(error);
+    this.dispose(error);
   };
+
+  private emitRuntimeFailed(error: Error): void {
+    if (this.closed) return;
+    const event: EmbeddedRuntimeEvent = {
+      at: getTimerTime(),
+      degradation: "failed",
+      error: error.message,
+      type: "runtime",
+    };
+    for (const listener of Array.from(this.eventListeners)) {
+      try {
+        listener(event);
+      } catch (listenerError) {
+        queueMicrotask(() => {
+          throw listenerError;
+        });
+      }
+    }
+  }
 
   private rejectAcceptedMutation(id: number): void {
     const pending = this.pending.get(id);
@@ -426,10 +681,6 @@ export class WorkerRunner implements Runner {
   }
 }
 
-function functionName(ref: FunctionReference): string {
-  return typeof ref === "string" ? ref : getFunctionName(ref);
-}
-
 function commandName(op: WorkerCommandCode): string {
   return workerCommandNames.get(op) ?? `unknown:${op}`;
 }
@@ -438,27 +689,69 @@ const workerCommandNames = new Map<WorkerCommandCode, string>([
   [WorkerCommand.Init, "init"],
   [WorkerCommand.Query, "query"],
   [WorkerCommand.Mutation, "mutation"],
+  [WorkerCommand.Upload, "upload"],
+  [WorkerCommand.Devtools, "devtools"],
   [WorkerCommand.WatchStart, "watchStart"],
   [WorkerCommand.WatchStop, "watchStop"],
   [WorkerCommand.Close, "close"],
-  [WorkerCommand.Heartbeat, "heartbeat"],
+  [WorkerCommand.AuthTokenResult, "authTokenResult"],
+  [WorkerCommand.Route, "route"],
+  [WorkerCommand.IdentityRead, "identityRead"],
+  [WorkerCommand.IdentityWrite, "identityWrite"],
+  [WorkerCommand.RemoteIdentityRead, "remoteIdentityRead"],
 ]);
 
 function workerEventError(event: unknown): Error {
-  const value = event as { error?: unknown; message?: string; type?: string };
+  const value = event as {
+    colno?: unknown;
+    error?: unknown;
+    filename?: unknown;
+    lineno?: unknown;
+    message?: unknown;
+    type?: unknown;
+  };
   if (value.error instanceof Error) return value.error;
-  if (typeof value.message === "string" && value.message.length > 0) {
-    return new Error(value.message);
+  const message = typeof value.message === "string" ? value.message : "";
+  const location = workerEventLocation(value);
+  if (message.length > 0) {
+    return new Error(location ? `${message} (${location})` : message);
   }
-  return new Error(`ConvexEmbeddedClient worker failed${value.type ? `: ${value.type}` : ""}.`);
+  const type = typeof value.type === "string" && value.type.length > 0 ? value.type : "error";
+  return new Error(
+    `ConvexEmbeddedClient worker failed: ${type}${location ? ` (${location})` : ""}.`,
+  );
+}
+
+function workerEventLocation(value: {
+  colno?: unknown;
+  filename?: unknown;
+  lineno?: unknown;
+}): string {
+  if (typeof value.filename !== "string" || value.filename.length === 0) return "";
+  const line = typeof value.lineno === "number" ? value.lineno : undefined;
+  const column = typeof value.colno === "number" ? value.colno : undefined;
+  if (line === undefined) return value.filename;
+  return column === undefined ? `${value.filename}:${line}` : `${value.filename}:${line}:${column}`;
 }
 
 function callWatchError(watch: WatchCallbacks, error: Error): void {
   try {
     watch.onError(error);
-  } catch {
-    // User callbacks cannot be allowed to interrupt worker cleanup.
+  } catch {}
+}
+
+function applyWatchPatch(value: unknown, patch: WatchPatch): unknown {
+  if (patch.kind !== "arrayRows" || !Array.isArray(value) || value.length !== patch.length) {
+    throw new Error("Embedded watch patch cannot be applied to the cached query result.");
   }
+  const next = value.slice();
+  for (const change of patch.changes) {
+    if (!Number.isInteger(change.index) || change.index < 0 || change.index >= next.length) {
+      throw new Error("Embedded watch patch contains an invalid row index.");
+    }
+    next[change.index] = change.value;
+  }
+  return next;
 }
 
 function debugHook():

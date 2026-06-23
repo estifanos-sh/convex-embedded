@@ -49,6 +49,8 @@ export const RejectCode = {
   IdentityMismatch: 1,
   StoragePathMismatch: 2,
   Internal: 3,
+  RemoteMismatch: 4,
+  DeploymentMismatch: 5,
 } as const;
 
 export type RejectCodeValue = (typeof RejectCode)[keyof typeof RejectCode];
@@ -58,9 +60,10 @@ export class AttachRejection extends Error {
   constructor(
     readonly code: RejectCodeValue,
     message: string,
+    name = "ConvexEmbeddedAttachRejection",
   ) {
     super(message);
-    this.name = "ConvexEmbeddedAttachRejection";
+    this.name = name;
   }
 }
 
@@ -70,6 +73,7 @@ export type ControlMessage =
       identity: RuntimeIdentity;
       op: typeof ControlOp.SeekLeader;
       protocol: typeof CoordinatorProtocol;
+      scope: string;
       storagePath: string;
       workerId: string;
     }
@@ -79,6 +83,7 @@ export type ControlMessage =
       leaderId: string;
       op: typeof ControlOp.BroadcastLeader;
       protocol: typeof CoordinatorProtocol;
+      scope: string;
     };
 
 export type PeerMessage =
@@ -87,6 +92,8 @@ export type PeerMessage =
       identity: RuntimeIdentity;
       op: typeof PeerOp.Attach;
       protocol: typeof CoordinatorProtocol;
+      remote?: InitRequest["remote"];
+      scope: string;
       storagePath: string;
       workerId: string;
     }
@@ -131,6 +138,7 @@ const controlValidators = new Map<ControlOpCode, Validator>([
     (value) =>
       typeof value.clientId === "string" &&
       isRuntimeIdentity(value.identity) &&
+      typeof value.scope === "string" &&
       typeof value.storagePath === "string" &&
       typeof value.workerId === "string",
   ],
@@ -139,7 +147,8 @@ const controlValidators = new Map<ControlOpCode, Validator>([
     (value) =>
       isRuntimeIdentity(value.identity) &&
       typeof value.leaderEpoch === "string" &&
-      typeof value.leaderId === "string",
+      typeof value.leaderId === "string" &&
+      typeof value.scope === "string",
   ],
 ]);
 
@@ -149,6 +158,8 @@ const peerValidators = new Map<PeerOpCode, Validator>([
     (value) =>
       typeof value.clientId === "string" &&
       isRuntimeIdentity(value.identity) &&
+      (value.remote === undefined || isRemoteInit(value.remote)) &&
+      typeof value.scope === "string" &&
       typeof value.storagePath === "string" &&
       typeof value.workerId === "string",
   ],
@@ -180,8 +191,8 @@ const peerValidators = new Map<PeerOpCode, Validator>([
   ],
 ]);
 
-export function controlChannelName(scope: string): string {
-  return `${scope}:control`;
+export function controlChannelName(storageId: string): string {
+  return `convex-embedded:storage:${safe(storageId)}:control`;
 }
 
 export function storageOwnerLockName(identity: RuntimeIdentity): string {
@@ -226,6 +237,7 @@ function isRuntimeIdentity(value: unknown): value is RuntimeIdentity {
     typeof value.protocolVersion === "number" &&
     typeof value.schemaHash === "string" &&
     typeof value.storageId === "string" &&
+    typeof value.storeFormatVersion === "number" &&
     typeof value.wasmAbiVersion === "number"
   );
 }
@@ -236,6 +248,19 @@ function isWorkerRequest(value: unknown): value is WorkerRequest {
     typeof value.id === "number" &&
     typeof value.op === "number" &&
     workerCommands.has(value.op)
+  );
+}
+
+function isRemoteInit(value: unknown): value is NonNullable<InitRequest["remote"]> {
+  return (
+    isRecord(value) &&
+    typeof value.authFetchToken === "boolean" &&
+    typeof value.moduleGraphHash === "string" &&
+    (value.operationTimeoutMs === undefined || typeof value.operationTimeoutMs === "number") &&
+    (value.receiveTimeoutMs === undefined || typeof value.receiveTimeoutMs === "number") &&
+    typeof value.protocolVersion === "number" &&
+    typeof value.schemaHash === "string" &&
+    typeof value.url === "string"
   );
 }
 

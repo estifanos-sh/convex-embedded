@@ -2,6 +2,10 @@ import { instantiateNapiModuleSync, MessageHandler, WASI } from "@napi-rs/wasm-r
 
 import { opfsStubImports } from "./opfs";
 
+(
+  globalThis as typeof globalThis & { __CONVEX_EMBEDDED_THREAD_WORKER_BUILD__?: string }
+).__CONVEX_EMBEDDED_THREAD_WORKER_BUILD__ = "isolation-20260701";
+
 const handler = new MessageHandler({
   onLoad({ wasmMemory, wasmModule }: { wasmMemory: unknown; wasmModule: unknown }) {
     const wasi = new WASI({

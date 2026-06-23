@@ -1,53 +1,40 @@
-import { deferred, type Deferred } from "../../util";
-import { WorkerCommand, WorkerEvent, type WorkerRequest, type WorkerResponse } from "../protocol";
-import { serializeErrorLike } from "./state";
+import { deferred, type Deferred } from "../../promise";
+import {
+  serializeError,
+  WorkerCommand,
+  WorkerEvent,
+  type WorkerRequest,
+  type WorkerResponse,
+} from "../protocol";
 import type { Timer } from "./protocol";
-
-export const MAX_LEDGER_REQUESTS = 1_000;
-export const MAX_DESIRED_WATCHES = 1_000;
 
 export type WatchStartRequest = Extract<WorkerRequest, { op: typeof WorkerCommand.WatchStart }>;
 
-export interface LedgerEntry {
+export interface OutboxEntry {
   accepted: boolean;
-  acknowledged: boolean;
+  confirmed: boolean;
   request: WorkerRequest;
   sent: boolean;
 }
 
-interface StoredEntry extends LedgerEntry {
+interface StoredEntry extends OutboxEntry {
   ackTimer?: Timer;
   settled: Deferred<void>;
 }
 
-export interface RequestLedgerOptions {
+export interface RequestOutboxOptions {
   clearTimer(timer: Timer): void;
   post(response: WorkerResponse): void;
   setTimer(callback: () => void, ms: number): Timer;
 }
 
-export class RequestLedger {
+export class RequestOutbox {
   private readonly desired = new Map<number, WatchStartRequest>();
   private readonly entries = new Map<number, StoredEntry>();
 
-  constructor(private readonly options: RequestLedgerOptions) {}
+  constructor(private readonly options: RequestOutboxOptions) {}
 
-  record(request: WorkerRequest): LedgerEntry | undefined {
-    if (request.op === WorkerCommand.Heartbeat) return undefined;
-    // Validate both ceilings BEFORE mutating any state, so a thrown limit error never strands a
-    // half-recorded desired watch (which would otherwise replay forever).
-    if (
-      request.op === WorkerCommand.WatchStart &&
-      !this.desired.has(request.watchId) &&
-      this.desired.size >= MAX_DESIRED_WATCHES
-    ) {
-      throw new Error(`ConvexEmbeddedClient has too many active watches (${MAX_DESIRED_WATCHES}).`);
-    }
-    if (!this.entries.has(request.id) && this.entries.size >= MAX_LEDGER_REQUESTS) {
-      throw new Error(
-        `ConvexEmbeddedClient queued too many requests while the browser runtime is changing owners (${MAX_LEDGER_REQUESTS}).`,
-      );
-    }
+  record(request: WorkerRequest): OutboxEntry | undefined {
     if (request.op === WorkerCommand.WatchStart) {
       this.desired.set(request.watchId, request);
     }
@@ -64,19 +51,19 @@ export class RequestLedger {
     if (entry) entry.sent = true;
   }
 
-  acknowledge(requestId: number): void {
+  confirm(requestId: number): void {
     const entry = this.entries.get(requestId);
     if (!entry) return;
-    entry.acknowledged = true;
+    entry.confirmed = true;
     this.clearAckTimer(entry);
   }
 
-  settle(response: WorkerResponse): void {
+  complete(response: WorkerResponse): void {
     if (response.op === WorkerEvent.MutationAccepted) {
       const entry = this.entries.get(response.id);
       if (!entry) return;
       entry.accepted = true;
-      this.acknowledge(response.id);
+      this.confirm(response.id);
       return;
     }
     if (response.op !== WorkerEvent.Result) return;
@@ -93,7 +80,7 @@ export class RequestLedger {
     this.clearAckTimer(entry);
     entry.ackTimer = this.options.setTimer(() => {
       const current = this.entries.get(requestId);
-      if (!current?.ackTimer) return;
+      if (current?.ackTimer === undefined) return;
       current.ackTimer = undefined;
       onTimeout();
     }, ms);
@@ -107,11 +94,23 @@ export class RequestLedger {
     return [...this.desired.values()];
   }
 
-  replayableRequests(): WorkerRequest[] {
+  ownershipRequests(): WorkerRequest[] {
     const requests: WorkerRequest[] = [...this.desired.values()];
-    for (const entry of this.entries.values()) {
+    for (const [requestId, entry] of this.entries) {
       const request = entry.request;
       if (request.op === WorkerCommand.WatchStart && this.desired.has(request.watchId)) continue;
+      if (entry.sent && !isOwnershipReplaySafe(request)) {
+        const error = indeterminateOperationError(request);
+        this.clearAckTimer(entry);
+        this.entries.delete(requestId);
+        this.options.post({
+          error: serializeError(error),
+          id: request.id,
+          op: WorkerEvent.Result,
+        });
+        entry.settled.reject(error);
+        continue;
+      }
       requests.push(request);
     }
     return requests;
@@ -128,7 +127,7 @@ export class RequestLedger {
           ? indeterminateMutationError()
           : error;
       this.options.post({
-        error: serializeErrorLike(settleError),
+        error: serializeError(settleError),
         id: entry.request.id,
         op: WorkerEvent.Result,
       });
@@ -137,7 +136,7 @@ export class RequestLedger {
     this.entries.clear();
     for (const request of this.desired.values()) {
       this.options.post({
-        error: serializeErrorLike(error),
+        error: serializeError(error),
         op: WorkerEvent.WatchFailed,
         watchId: request.watchId,
       });
@@ -154,7 +153,7 @@ export class RequestLedger {
     if (existing) return existing;
     const entry: StoredEntry = {
       accepted: false,
-      acknowledged: false,
+      confirmed: false,
       request,
       sent: false,
       settled: deferred(),
@@ -177,7 +176,7 @@ export class RequestLedger {
   }
 
   private clearAckTimer(entry: StoredEntry): void {
-    if (!entry.ackTimer) return;
+    if (entry.ackTimer === undefined) return;
     this.options.clearTimer(entry.ackTimer);
     entry.ackTimer = undefined;
   }
@@ -192,10 +191,41 @@ function indeterminateMutationError(): Error {
   return error;
 }
 
-function publicEntry(entry: StoredEntry): LedgerEntry {
+function indeterminateOperationError(request: WorkerRequest): Error {
+  const operation =
+    request.op === WorkerCommand.Route ? `hosted ${request.kind}` : "browser operation";
+  const error = new Error(
+    `The ${operation} may have completed before browser runtime ownership changed; Embedded will not execute it again.`,
+  );
+  error.name = "ConvexEmbeddedOperationIndeterminateError";
+  return error;
+}
+
+function isOwnershipReplaySafe(request: WorkerRequest): boolean {
+  switch (request.op) {
+    case WorkerCommand.Query:
+    case WorkerCommand.Mutation:
+    case WorkerCommand.WatchStart:
+    case WorkerCommand.WatchStop:
+    case WorkerCommand.Close:
+    case WorkerCommand.IdentityRead:
+    case WorkerCommand.IdentityWrite:
+    case WorkerCommand.RemoteIdentityRead:
+      return true;
+    case WorkerCommand.Route:
+      return request.kind === "query";
+    case WorkerCommand.Init:
+    case WorkerCommand.Upload:
+    case WorkerCommand.Devtools:
+    case WorkerCommand.AuthTokenResult:
+      return false;
+  }
+}
+
+function publicEntry(entry: StoredEntry): OutboxEntry {
   return {
     accepted: entry.accepted,
-    acknowledged: entry.acknowledged,
+    confirmed: entry.confirmed,
     request: entry.request,
     sent: entry.sent,
   };

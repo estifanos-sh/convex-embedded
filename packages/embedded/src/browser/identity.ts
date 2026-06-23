@@ -1,13 +1,16 @@
 import type { RuntimeIdentity } from "./protocol";
 import { browserStorageId } from "./storage";
 import { WASM_API_VERSION } from "./artifact";
+import { EMBEDDED_STORE_FORMAT_VERSION } from "../abi";
+import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
 
-// Replaced with the real package version at build time (see `tsdown.config.ts` `define`). Falls
-// back to "0.0.0" in unbundled/test contexts where the define is absent.
+/**
+ * Replaced with the real package version at build time (see `tsdown.config.ts` `define`). Falls
+ * back to "0.0.0" in unbundled/test contexts where the define is absent.
+ */
 declare const __EMBEDDED_PACKAGE_VERSION__: string | undefined;
 const PACKAGE_VERSION =
   typeof __EMBEDDED_PACKAGE_VERSION__ === "string" ? __EMBEDDED_PACKAGE_VERSION__ : "0.0.0";
-const PROTOCOL_VERSION = 3;
 let embeddedIdentity:
   | {
       moduleGraphHash: string;
@@ -35,15 +38,16 @@ export function setEmbeddedIdentity(identity: {
 export function createRuntimeIdentity(storageId = browserStorageId()): RuntimeIdentity {
   if (!embeddedIdentity) {
     throw new Error(
-      "ConvexEmbeddedClient requires the @convex-dev/embedded bundler plugin to provide runtime identity.",
+      "ConvexEmbeddedClient requires the @convex-dev/embedded Vite or unplugin adapter to provide runtime identity.",
     );
   }
   return {
     moduleGraphHash: embeddedIdentity.moduleGraphHash,
     packageVersion: PACKAGE_VERSION,
-    protocolVersion: PROTOCOL_VERSION,
+    protocolVersion: EMBEDDED_PROTOCOL_VERSION,
     schemaHash: embeddedIdentity.schemaHash,
     storageId,
+    storeFormatVersion: EMBEDDED_STORE_FORMAT_VERSION,
     wasmAbiVersion: WASM_API_VERSION,
   };
 }
@@ -80,9 +84,28 @@ export function assertSameRuntimeIdentity(
     (key) => actual[key] !== expected[key],
   );
   if (!mismatches.length) return;
-  throw new Error(
-    `ConvexEmbeddedClient cannot attach to an existing browser runtime with a different identity: ${mismatches.join(", ")}.`,
-  );
+  throw new RuntimeIdentityMismatchError(mismatches);
+}
+
+/** An existing storage owner was opened by a different app deployment. @internal */
+export class RuntimeIdentityMismatchError extends Error {
+  constructor(readonly mismatches: Array<keyof RuntimeIdentity>) {
+    const fields = mismatches.map(identityFieldLabel).join(", ");
+    super(
+      `Another tab is running a different version of this embedded app (${fields}). Close or reload all tabs for this site, then reopen the app.`,
+    );
+    this.name = "ConvexEmbeddedDeploymentMismatchError";
+  }
+}
+
+function identityFieldLabel(field: keyof RuntimeIdentity): string {
+  if (field === "moduleGraphHash") return "app code";
+  if (field === "schemaHash") return "schema";
+  if (field === "packageVersion") return "package";
+  if (field === "protocolVersion") return "protocol";
+  if (field === "wasmAbiVersion") return "WASM runtime";
+  if (field === "storeFormatVersion") return "store format";
+  return "storage";
 }
 
 function safe(value: string): string {

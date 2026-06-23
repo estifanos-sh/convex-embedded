@@ -1,3 +1,9 @@
+import { ConvexError } from "convex/values";
+
+import { decodeError, encodeError } from "../runtime/codec";
+import type { RunnerDevtoolsRequest, RunMutationTiming } from "../runtime/runner";
+import type { EmbeddedEvent } from "../events";
+
 /**
  * Minimal worker shape used by the browser embedded runtime.
  *
@@ -32,6 +38,7 @@ export interface RuntimeIdentity {
   protocolVersion: number;
   schemaHash: string;
   storageId: string;
+  storeFormatVersion: number;
   wasmAbiVersion: number;
 }
 
@@ -42,7 +49,13 @@ export const WorkerCommand = {
   WatchStart: 4,
   WatchStop: 5,
   Close: 6,
-  Heartbeat: 7,
+  Upload: 9,
+  Devtools: 10,
+  AuthTokenResult: 11,
+  Route: 12,
+  IdentityRead: 13,
+  IdentityWrite: 14,
+  RemoteIdentityRead: 15,
 } as const;
 
 export type WorkerCommandCode = (typeof WorkerCommand)[keyof typeof WorkerCommand];
@@ -53,12 +66,9 @@ export const WorkerEvent = {
   WatchUpdated: 3,
   WatchFailed: 4,
   Debug: 5,
-} as const;
-
-export type WorkerEventCode = (typeof WorkerEvent)[keyof typeof WorkerEvent];
-
-export const PortCommand = {
-  Connect: 1,
+  Event: 6,
+  AuthTokenRequest: 7,
+  WatchPatched: 8,
 } as const;
 
 export type WorkerRequest =
@@ -68,10 +78,29 @@ export type WorkerRequest =
       id: number;
       identity?: RuntimeIdentity;
       op: typeof WorkerCommand.Init;
+      remote?: {
+        authFetchToken: boolean;
+        clientId?: string;
+        moduleGraphHash: string;
+        operationTimeoutMs?: number;
+        protocolVersion: number;
+        receiveTimeoutMs?: number;
+        schemaHash: string;
+        url: string;
+      };
       storagePath: string;
     }
   | {
+      authRequestId: number;
+      clientId?: string;
+      error?: SerializedError;
+      id: number;
+      op: typeof WorkerCommand.AuthTokenResult;
+      token?: string | null;
+    }
+  | {
       args: Record<string, unknown>;
+      auth?: unknown;
       clientId?: string;
       id: number;
       name: string;
@@ -79,6 +108,7 @@ export type WorkerRequest =
     }
   | {
       args: Record<string, unknown>;
+      auth?: unknown;
       clientId?: string;
       id: number;
       /**
@@ -86,11 +116,53 @@ export type WorkerRequest =
        * replays after a leader change reuse the same key and the store dedups across epochs.
        */
       mutationId: string;
+      mutationFresh?: boolean;
       name: string;
       op: typeof WorkerCommand.Mutation;
+      /** Stable random source for deterministic hosted replay across leader changes. */
+      rngSeed: string;
     }
   | {
       args: Record<string, unknown>;
+      clientId?: string;
+      id: number;
+      kind: "query" | "mutation" | "action";
+      name: string;
+      op: typeof WorkerCommand.Route;
+    }
+  | {
+      clientId?: string;
+      id: number;
+      op: typeof WorkerCommand.IdentityRead;
+    }
+  | {
+      clientId?: string;
+      id: number;
+      identityKey: string;
+      op: typeof WorkerCommand.IdentityWrite;
+    }
+  | {
+      clientId?: string;
+      id: number;
+      op: typeof WorkerCommand.RemoteIdentityRead;
+    }
+  | {
+      bytes: Uint8Array;
+      clientId?: string;
+      contentType?: string;
+      id: number;
+      op: typeof WorkerCommand.Upload;
+      url: string;
+    }
+  | {
+      clientId?: string;
+      id: number;
+      op: typeof WorkerCommand.Devtools;
+      request: RunnerDevtoolsRequest;
+    }
+  | {
+      args: Record<string, unknown>;
+      auth?: unknown;
       clientId?: string;
       id: number;
       name: string;
@@ -107,17 +179,7 @@ export type WorkerRequest =
       clientId?: string;
       id: number;
       op: typeof WorkerCommand.Close;
-    }
-  | {
-      clientId: string;
-      id: number;
-      op: typeof WorkerCommand.Heartbeat;
     };
-
-export type WorkerPortRequest = {
-  op: typeof PortCommand.Connect;
-  port: EmbeddedWorker;
-};
 
 export type WorkerResponse =
   | {
@@ -125,6 +187,7 @@ export type WorkerResponse =
       id: number;
       op: typeof WorkerEvent.Result;
       result?: unknown;
+      timing?: RunMutationTiming;
     }
   | {
       id: number;
@@ -137,6 +200,11 @@ export type WorkerResponse =
       watchId: number;
     }
   | {
+      op: typeof WorkerEvent.WatchPatched;
+      patch: WatchPatch;
+      watchId: number;
+    }
+  | {
       error: SerializedError;
       op: typeof WorkerEvent.WatchFailed;
       watchId: number;
@@ -145,15 +213,36 @@ export type WorkerResponse =
       detail?: unknown;
       op: typeof WorkerEvent.Debug;
       phase: string;
+    }
+  | {
+      event: EmbeddedEvent;
+      op: typeof WorkerEvent.Event;
+    }
+  | {
+      authRequestId: number;
+      forceRefreshToken: boolean;
+      op: typeof WorkerEvent.AuthTokenRequest;
     };
 
 export interface SerializedError {
   message: string;
   name?: string;
   stack?: string;
+  convex?: string;
 }
 
+export type WatchPatch = {
+  changes: Array<{ index: number; value: unknown }>;
+  kind: "arrayRows";
+  length: number;
+};
+
 export function deserializeError(error: SerializedError): Error {
+  if (error.convex !== undefined) {
+    const out = decodeError(error.convex);
+    if (error.stack !== undefined) out.stack = error.stack;
+    return out;
+  }
   const out = new Error(error.message);
   out.name = error.name ?? "Error";
   out.stack = error.stack;
@@ -161,6 +250,14 @@ export function deserializeError(error: SerializedError): Error {
 }
 
 export function serializeError(error: unknown): SerializedError {
+  if (error instanceof ConvexError) {
+    return {
+      convex: encodeError(error),
+      message: error.message,
+      name: error.name,
+      stack: error.stack,
+    };
+  }
   if (error instanceof Error) {
     return {
       message: error.message,

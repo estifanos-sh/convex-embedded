@@ -9,24 +9,45 @@
  * @packageDocumentation
  */
 import type { ConvexModules } from "../client";
+import type {
+  EmbeddedEventListener,
+  EmbeddedRuntimeDegradation,
+  EmbeddedRuntimeEvent,
+  EmbeddedRuntimePhase,
+} from "../events";
+import { EMBEDDED_ERROR_CODES, EmbeddedClientRetiredError, errorMessage } from "../error";
+import { randomId } from "../id/random";
 import { createRunner, type Runner } from "../runtime/runner";
-import type { ConvexEmbeddedSchema } from "../schema";
-import { toStoreSchema } from "../schema";
-import type { StoreSchema } from "../storage/types";
-import { loadWasmModule, type WasmSource } from "./artifact";
-import { OpfsDirectory, registerTursoFiles } from "./opfs";
+import { consumeRemoteTick, remoteTickHasWork } from "../rev";
+import { toRuntimeStoreSchema } from "../schema";
+import type {
+  RemoteStartOptions,
+  RemoteScope,
+  RemoteTick,
+  RemoteTransportHost,
+  StoreSchema,
+} from "../storage/types";
+import { getElapsedTime, getTimerTime } from "../time";
+import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
+import { REMOTE_CLIENT_RETIRED_PREFIX, RotationBreaker } from "../retirement";
+import { loadWasmModule, PthreadRegistry, type WasmSource } from "./artifact";
+import { type StoreRecovery } from "./recovery";
 import {
-  PortCommand,
-  serializeError,
+  OpfsDirectory,
+  registerTursoFiles,
+  resetTursoFiles,
+} from "./opfs";
+import {
+  deserializeError,
   type EmbeddedWorker,
   WorkerCommand,
   WorkerEvent,
-  type WorkerPortRequest,
   type WorkerRequest,
   type WorkerResponse,
 } from "./protocol";
-import { browserStoragePath } from "./storage";
 import { WasmStore } from "./store";
+import { readUploadToken } from "../upload";
+import { remoteConfigKey } from "./remote";
 
 declare const self: {
   close?: () => void;
@@ -35,200 +56,141 @@ declare const self: {
 };
 
 /**
- * Configuration for the worker-owned embedded runtime.
- *
- * @internal
- */
-export interface ConvexEmbeddedWorkerOptions {
-  /**
-   * Convex schema definition used to configure embedded storage indexes.
-   *
-   * @remarks
-   * Pass the default export from the app's `convex/schema` module.
-   */
-  schema: ConvexEmbeddedSchema;
-
-  /**
-   * Convex function modules executed by this worker.
-   *
-   * @remarks
-   * Keys are Convex module paths and values are module exports or lazy module
-   * loaders.
-   */
-  modules: ConvexModules;
-
-  /**
-   * Generated Rust/WASM storage module.
-   *
-   * By default the packaged artifact is loaded from this package. This option is for tests or
-   * custom bundler artifact loading.
-   */
-  wasm?: WasmSource;
-}
-
-/**
  * Runtime state owned by an embedded browser worker.
  *
  * @internal
  */
 export interface WorkerState {
+  /** Runtime event cleanup callback. */
+  eventStop?: () => void;
+  /** Runtime event sink used by runner and remote lifecycle events. */
+  emit?: EmbeddedEventListener;
   /** OPFS bridge used by the Rust/WASM storage imports. */
   opfs: OpfsDirectory;
   /** Local Convex function runner. */
   runner: Runner;
+  /** Stops the worker-owned remote replication scheduler. */
+  remoteStop?: () => void;
+  /** Wakes the worker-owned remote replication scheduler. */
+  remoteWake?: () => void;
+  /** Resets remote replication so identity negotiation runs before another pull or push. */
+  remoteReset?: () => Promise<void>;
+  /** Resolves after the configured remote client has started. */
+  remoteReady?: Promise<void>;
+  /** Consecutive failed remote starts used to bound reconnect backoff. */
+  remoteStartAttempt?: number;
+  /** Deferred remote startup timer, if remote was configured during init. */
+  remoteStartTimer?: ReturnType<typeof setTimeout>;
+  /** Canonical remote configuration key owned by this worker runtime. */
+  remoteKey?: string;
+  /** Live remote transport; retained so a rebuild/offline suspect can close its socket synchronously. */
+  remoteTransport?: RemoteTransportHost;
+  /** Auth token requests awaiting a main-thread response. */
+  remoteAuthPending?: Map<number, RemoteAuthPending>;
+  /** True after close begins, so delayed remote startup cannot reopen work. */
+  closed?: boolean;
+  /** True once the instance is abandoned dead; close must not await its store/remote operations. */
+  abandoned?: boolean;
   /** WASM-backed embedded store. */
   store: WasmStore;
   /** Active watch cleanup callbacks keyed by watch ID. */
   stops: Map<number, () => void>;
+  /** Loaded WASM storage ABI version for artifact freshness diagnostics. */
+  wasmApiVersion?: number;
+  /** emnapi pthread pool for the live store instance; recovery terminates it before a graft. */
+  pthreads?: PthreadRegistry;
+  /** Store-instance recovery controller; when present, lane ops are watchdog-covered. */
+  recovery?: StoreRecovery;
+  /** Bounds retired-client rotation churn; a tripped breaker surfaces the terminal retirement signal. */
+  rotationBreaker?: RotationBreaker;
+  /**
+   * Terminates the wedged instance and grafts a fresh store/runner in place over the retained OPFS
+   * directory. Leader re-wiring of watches and the remote loop happens after this resolves.
+   */
+  rebuild?: () => Promise<void>;
 }
 
-type WorkerCommandHandler<T extends WorkerRequest = WorkerRequest> = (
-  state: WorkerState,
-  request: T,
-  postResponse: (message: WorkerResponse) => void,
-) => Promise<void> | void;
-
-const workerCommandHandlers = new Map<number, WorkerCommandHandler>([
-  [WorkerCommand.Query, (state, request, post) => handleQuery(state, request as never, post)],
-  [WorkerCommand.Mutation, (state, request, post) => handleMutation(state, request as never, post)],
-  [
-    WorkerCommand.WatchStart,
-    (state, request, post) => handleWatchStart(state, request as never, post),
-  ],
-  [
-    WorkerCommand.WatchStop,
-    (state, request, post) => handleWatchStop(state, request as never, post),
-  ],
-]);
-
-/**
- * Starts a worker-owned embedded Convex runtime.
- *
- * @remarks
- * Import this from a module worker and pass the same schema/modules you would
- * pass to the Node client. The main-thread {@link ConvexEmbeddedClient} talks
- * to this worker over `postMessage`.
- *
- * @param options - Schema, modules, and optional WASM artifact source.
- * @returns Nothing. The function installs a worker `onmessage` handler.
- * @internal
- */
-export function createConvexEmbeddedWorker(options: ConvexEmbeddedWorkerOptions): void {
-  start(init(options));
+interface RemoteAuthPending {
+  reject(error: unknown): void;
+  resolve(token: string | null): void;
 }
 
 /**
- * Starts the package-owned worker runtime. The main-thread client sends the schema and module URLs
- * as an internal init message.
- *
- * @internal
+ * A store open/replay slower than this emits a `slow-open` degradation so a UI can show a
+ * still-loading notice instead of a dead spinner. Pure observability: it changes no boot timing.
  */
-export function createConvexEmbeddedWorkerFromMessage(): void {
-  let state: Promise<WorkerState> | undefined;
-  // A worker hosts exactly one runtime, so it serves exactly one transport: either the implicit
-  // `self` channel or a single bound port. A second port would share this `state` closure and
-  // silently interleave two clients' requests over one runtime, so we bind at most one.
-  let bound = false;
-  const bind = (port: EmbeddedWorker, postResponse: (message: WorkerResponse) => void): void => {
-    port.start?.();
-    port.addEventListener("message", (event) => {
-      const request = event.data as WorkerRequest;
-      if (request.op === WorkerCommand.Init) {
-        if (state) {
-          postResponse({
-            error: serializeError(new Error("Convex embedded worker is already initialized.")),
-            id: request.id,
-            op: WorkerEvent.Result,
-          });
-          return;
-        }
-        postDebug(request.debug, "worker:init:received", undefined, postResponse);
-        state = initFromMessage(request, postResponse);
-        void state.then(
-          () => {
-            postDebug(request.debug, "worker:init:ready", undefined, postResponse);
-            postResponse({ id: request.id, op: WorkerEvent.Result });
-          },
-          (error) => {
-            postDebug(request.debug, "worker:init:error", describeError(error), postResponse);
-            postResponse({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
-          },
-        );
-        return;
-      }
-      if (!state) {
-        postResponse({
-          error: serializeError(new Error("Convex embedded worker has not been initialized")),
-          id: request.id,
-          op: WorkerEvent.Result,
-        });
-        return;
-      }
-      void handleWorkerRequest(state, request, postResponse);
+const STORAGE_WAIT_NOTICE_MS = 3_000;
+const REMOTE_DEPLOYMENT_MISMATCH_PREFIX = "remote deployment mismatch:";
+
+/**
+ * A pull that only sent outbound work (a connect or subscription) leaves an unanswered server
+ * response in flight. The loop is otherwise woken by the transport's `onmessage`, but an idle
+ * worker whose event loop holds no pending timer can have that delivery suspended by the host
+ * (observed on iOS Safari, where a hot blocking push settles while a dormant pull never does).
+ * While a response is outstanding the loop keeps a bounded timer pending instead of going fully
+ * dormant, so the awaited transition is drained even when `onmessage` is throttled. A multi-step
+ * bootstrap re-sends on the same tick it receives a chunk, so the timer stays armed until an
+ * inbound tick queues no further outbound work.
+ */
+const REMOTE_RESPONSE_KEEPALIVE_MS = 500;
+
+/** Sink for boot-lifecycle and degradation events surfaced during {@link initRuntime}. */
+export type RuntimeEventSink = (event: EmbeddedRuntimeEvent) => void;
+
+const RUNTIME_PHASE_BY_DEBUG: Record<string, EmbeddedRuntimePhase> = {
+  "worker:opfs:register:start": "opfs-register",
+  "worker:wasm:load:start": "wasm-load",
+  "worker:store:open:start": "store-open",
+  "worker:store:setup:start": "store-setup",
+  "worker:store:checkpoint:start": "store-checkpoint",
+};
+
+function runtimeEventFromDebug(phase: string, detail: unknown): EmbeddedRuntimeEvent | undefined {
+  const mapped = RUNTIME_PHASE_BY_DEBUG[phase];
+  if (mapped) return { at: getTimerTime(), phase: mapped, type: "runtime" };
+  if (phase === "worker:opfs:acquire:retry" || phase === "worker:opfs:acquire:reclaimed") {
+    const record = (detail ?? {}) as { attempt?: number; waitedMs?: number };
+    return {
+      at: getTimerTime(),
+      attempt: record.attempt,
+      degradation:
+        phase === "worker:opfs:acquire:retry" ? "opfs-acquire-retry" : "opfs-acquire-reclaimed",
+      type: "runtime",
+      waitedMs: record.waitedMs,
+    };
+  }
+  if (phase === "worker:wasm:thread:error" || phase === "worker:wasm:thread:messageerror") {
+    const record = (detail ?? {}) as { message?: string };
+    return runtimeDegradation("failed", {
+      error: record.message ?? "embedded storage worker thread crashed",
     });
-  };
+  }
+  return undefined;
+}
 
-  self.onmessage = (event) => {
-    if (isWorkerPortRequest(event.data)) {
-      const port = event.data.port ?? event.ports?.[0];
-      if (!port) return;
-      if (bound) {
-        port.postMessage({
-          error: serializeError(
-            new Error("Convex embedded worker is already bound to a port and hosts one runtime."),
-          ),
-          id: -1,
-          op: WorkerEvent.Result,
-        });
-        return;
-      }
-      bound = true;
-      bind(port, (message) => port.postMessage(message));
-      return;
-    }
-    const request = event.data as WorkerRequest;
-    if (request.op === WorkerCommand.Init) {
-      if (state) {
-        post({
-          error: serializeError(new Error("Convex embedded worker is already initialized.")),
-          id: request.id,
-          op: WorkerEvent.Result,
-        });
-        return;
-      }
-      postDebug(request.debug, "worker:init:received");
-      state = initFromMessage(request);
-      void state.then(
-        () => {
-          postDebug(request.debug, "worker:init:ready");
-          post({ id: request.id, op: WorkerEvent.Result });
-        },
-        (error) => {
-          postDebug(request.debug, "worker:init:error", describeError(error));
-          post({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
-        },
-      );
-      return;
-    }
-    if (!state) {
-      post({
-        error: serializeError(new Error("Convex embedded worker has not been initialized")),
-        id: request.id,
-        op: WorkerEvent.Result,
-      });
-      return;
-    }
-    void handleWorkerRequest(state, request);
+function runtimeDegradation(
+  degradation: EmbeddedRuntimeDegradation,
+  detail: { error?: string; waitedMs?: number } = {},
+): EmbeddedRuntimeEvent {
+  return {
+    at: getTimerTime(),
+    degradation,
+    error: detail.error,
+    type: "runtime",
+    waitedMs: detail.waitedMs,
   };
 }
 
-async function init(options: ConvexEmbeddedWorkerOptions): Promise<WorkerState> {
-  return initRuntime({
-    modules: options.modules,
-    storagePath: browserStoragePath(),
-    storeSchema: toStoreSchema(options.schema),
-    wasm: options.wasm,
-  });
+function deploymentMismatchMessage(error: unknown): string | undefined {
+  const message = errorMessage(error);
+  return message.startsWith(REMOTE_DEPLOYMENT_MISMATCH_PREFIX) ? message : undefined;
+}
+
+function emitDeploymentMismatch(state: WorkerState, error: unknown): boolean {
+  const message = deploymentMismatchMessage(error);
+  if (!message) return false;
+  state.emit?.(runtimeDegradation("deployment-mismatch", { error: message }));
+  return true;
 }
 
 /**
@@ -244,6 +206,7 @@ async function init(options: ConvexEmbeddedWorkerOptions): Promise<WorkerState> 
 export async function initFromMessage(
   request: Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>,
   postResponse: (message: WorkerResponse) => void = post,
+  options: { events?: boolean } = {},
 ): Promise<WorkerState> {
   postDebug(request.debug, "worker:bundle:import:start", undefined, postResponse);
   const embedded = await importEmbeddedBundle();
@@ -256,31 +219,796 @@ export async function initFromMessage(
     },
     postResponse,
   );
-  return initRuntime({
+  const runtimeStoreSchema = toRuntimeStoreSchema(schema);
+  const state = await initRuntime({
     debug: request.debug,
+    emit:
+      options.events === false
+        ? undefined
+        : (event) => postResponse({ event, op: WorkerEvent.Event }),
     modules: embedded.modules,
+    moduleGraphHash: request.identity?.moduleGraphHash,
+    onRuntimeEvent: (event) => postResponse({ event, op: WorkerEvent.Event }),
+    setupSchema: runtimeStoreSchema,
     storagePath: request.storagePath,
-    storeSchema: toStoreSchema(schema),
+    storeSchema: runtimeStoreSchema,
+    remote: request.remote !== undefined,
   });
+  if (request.remote) {
+    postResponse({
+      event: { at: getTimerTime(), phase: "remote-attach", type: "runtime" },
+      op: WorkerEvent.Event,
+    });
+    state.remoteReady = ensureWorkerRemoteStarted(
+      state,
+      request.remote,
+      request.debug,
+      postResponse,
+    );
+  }
+  return state;
 }
 
 async function importEmbeddedBundle(): Promise<typeof import("virtual:convex-embedded")> {
   try {
+    const browserWindow = (
+      globalThis as typeof globalThis & {
+        window?: { __convexAllowFunctionsInBrowser?: boolean };
+      }
+    ).window;
+    if (browserWindow) browserWindow.__convexAllowFunctionsInBrowser = true;
     return await import("virtual:convex-embedded");
   } catch (cause) {
     throw Object.assign(
       new Error(
-        "ConvexEmbeddedClient requires the @convex-dev/embedded bundler plugin so the browser worker can load your Convex schema and functions.",
+        "ConvexEmbeddedClient requires the @convex-dev/embedded Vite or unplugin adapter so the browser worker can load your Convex schema and functions.",
       ),
       { cause },
     );
   }
 }
 
+async function startWorkerRemote(
+  state: WorkerState,
+  remote: NonNullable<Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>["remote"]>,
+  debug: boolean | undefined,
+  postResponse: (message: WorkerResponse) => void,
+): Promise<void> {
+  if (!state.store.remote) {
+    throw new Error("Browser remote replication requires a WASM artifact with remote support.");
+  }
+  let nextAuthRequestId = 1;
+  state.remoteAuthPending = new Map();
+  const auth: RemoteStartOptions["auth"] | undefined = remote.authFetchToken
+    ? ({ forceRefreshToken }) =>
+        new Promise<string | null>((resolve, reject) => {
+          const authRequestId = nextAuthRequestId++;
+          state.remoteAuthPending?.set(authRequestId, { reject, resolve });
+          postResponse({
+            authRequestId,
+            forceRefreshToken,
+            op: WorkerEvent.AuthTokenRequest,
+          });
+        })
+    : undefined;
+
+  postDebug(debug, "worker:remote:store-start:before", undefined, postResponse);
+  const generation = state.recovery?.remoteGeneration ?? 0;
+  const stale = () => (state.recovery?.remoteGeneration ?? 0) !== generation;
+  const transport = createRemoteTransport(
+    remote.operationTimeoutMs ?? 30_000,
+    (phase, detail) => postDebug(debug, phase, detail, postResponse),
+    () => state.remoteWake?.(),
+    (url, blob) => state.runner.handleUpload(url, blob),
+    () => state.recovery?.transportActive(generation),
+    () => state.recovery?.progress(generation),
+  );
+  state.remoteTransport = transport;
+  await state.store.remote.start({
+    auth,
+    clientId: remote.clientId,
+    moduleGraphHash: remote.moduleGraphHash,
+    operationTimeoutMs: remote.operationTimeoutMs,
+    protocolVersion: remote.protocolVersion,
+    receiveTimeoutMs: remote.receiveTimeoutMs,
+    schemaHash: remote.schemaHash,
+    transport,
+    url: remote.url,
+  });
+  if (stale()) return;
+  if (!state.store.remote.identity) {
+    throw new Error("Browser remote replication requires identity negotiation support.");
+  }
+  const disarm = state.recovery?.arm("remote-start");
+  try {
+    await state.store.remote.identity();
+    if (stale()) return;
+    await state.runner.remote?.scope.write();
+  } finally {
+    disarm?.();
+  }
+  if (stale()) return;
+  postDebug(debug, "worker:remote:store-start:after", undefined, postResponse);
+
+  postDebug(debug, "worker:remote:loop:start", undefined, postResponse);
+  state.remoteStop = startWorkerRemoteLoop(
+    state,
+    (phase, detail) => postDebug(debug, phase, detail, postResponse),
+    () => {
+      void rotateRetiredClient(state, remote, debug, postResponse);
+    },
+  );
+}
+
+/**
+ * Rotates a retired client incarnation: tears the current remote down, mints a fresh clientId, and
+ * restarts the remote so a fresh complete pull re-establishes accepted heads. Unresolved local work
+ * survives teardown as dirty rows in the retained store and re-pushes under the new author.
+ *
+ * @internal
+ */
+export async function rotateRetiredClient(
+  state: WorkerState,
+  remote: NonNullable<Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>["remote"]>,
+  debug: boolean | undefined,
+  postResponse: (message: WorkerResponse) => void,
+): Promise<void> {
+  const breaker = (state.rotationBreaker ??= new RotationBreaker());
+  if (breaker.record(getTimerTime())) {
+    postDebug(
+      debug,
+      "worker:remote:retired:exhausted",
+      { clientId: remote.clientId },
+      postResponse,
+    );
+    await stopWorkerRemote(state);
+    state.emit?.(
+      runtimeDegradation("retired", { error: EMBEDDED_ERROR_CODES.EMBEDDED_CLIENT_RETIRED }),
+    );
+    return;
+  }
+  const previous = remote.clientId;
+  remote.clientId = randomId("client");
+  postDebug(debug, "worker:remote:retired", { next: remote.clientId, previous }, postResponse);
+  await stopWorkerRemote(state);
+  if (state.closed) return;
+  await ensureWorkerRemoteStarted(state, remote, debug, postResponse);
+}
+
+function emitWorkerRemoteEvent(
+  state: WorkerState,
+  status: "starting" | "started" | "tick" | "idle" | "error" | "closed",
+  detail: {
+    attempt?: number;
+    durationMs?: number;
+    error?: unknown;
+    foreground?: { actorQueueDepth: number; actorQueueMs: number };
+    nextRunIn?: number;
+    tick?: RemoteTick;
+  } = {},
+): void {
+  const now = getTimerTime();
+  state.emit?.({
+    at: now,
+    attempt: detail.attempt ?? 0,
+    durationMs: detail.durationMs,
+    error: detail.error === undefined ? undefined : errorMessage(detail.error),
+    foreground: detail.foreground,
+    nextRunAt: detail.nextRunIn === undefined ? undefined : now + detail.nextRunIn,
+    status,
+    tick: detail.tick
+      ? { ...detail.tick, retainedRevisions: detail.tick.retainedRevisions.length }
+      : undefined,
+    type: "remote",
+    wasmApiVersion: state.wasmApiVersion,
+  });
+}
+
+export function ensureWorkerRemoteStarted(
+  state: WorkerState,
+  remote: NonNullable<Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>["remote"]>,
+  debug: boolean | undefined,
+  postResponse: (message: WorkerResponse) => void,
+): Promise<void> {
+  if (!state.remoteReset) {
+    state.remoteReset = async () => {
+      await stopWorkerRemote(state);
+      if (state.closed) return;
+      await ensureWorkerRemoteStarted(state, remote, debug, postResponse);
+    };
+  }
+  const key = remoteConfigKey(remote);
+  if (state.remoteKey !== undefined && state.remoteKey !== key) {
+    throw new Error(
+      "ConvexEmbeddedClient cannot attach to an existing browser runtime with a different remote configuration.",
+    );
+  }
+  state.remoteKey = key;
+  if (state.remoteReady) return state.remoteReady;
+  const generation = state.recovery?.remoteGeneration ?? 0;
+  const stale = () => (state.recovery?.remoteGeneration ?? 0) !== generation;
+  let ready: Promise<void> | undefined;
+  ready = (async () => {
+    if (state.closed) return;
+    postDebug(debug, "worker:remote:start", undefined, postResponse);
+    emitWorkerRemoteEvent(state, "starting");
+    try {
+      await startWorkerRemote(state, remote, debug, postResponse);
+      if (stale()) return;
+      state.remoteStartAttempt = 0;
+      emitWorkerRemoteEvent(state, "started");
+    } catch (error) {
+      if (stale()) return;
+      postDebug(debug, "worker:remote:error", describeError(error), postResponse);
+      emitWorkerRemoteEvent(state, "error", { error });
+      if (ready !== undefined && state.remoteReady === ready) state.remoteReady = undefined;
+      await state.store.remote?.close().catch(() => undefined);
+      if (stale()) return;
+      if (!emitDeploymentMismatch(state, error)) {
+        scheduleWorkerRemoteStart(state, remote, debug, postResponse);
+      }
+    }
+  })();
+  ready.catch(() => undefined);
+  state.remoteReady = ready;
+  return ready;
+}
+
+function scheduleWorkerRemoteStart(
+  state: WorkerState,
+  remote: NonNullable<Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>["remote"]>,
+  debug: boolean | undefined,
+  postResponse: (message: WorkerResponse) => void,
+): void {
+  if (state.closed || state.remoteStartTimer !== undefined) return;
+  const attempt = (state.remoteStartAttempt ?? 0) + 1;
+  state.remoteStartAttempt = attempt;
+  const delayMs = Math.min(30_000, 500 * 2 ** Math.min(attempt - 1, 6));
+  state.remoteStartTimer = setTimeout(() => {
+    state.remoteStartTimer = undefined;
+    void ensureWorkerRemoteStarted(state, remote, debug, postResponse);
+  }, delayMs);
+}
+
+/**
+ * Synchronously tears down the remote replication loop of a suspect instance without touching its
+ * store: the loop stop clears timers and unsubscribes only, and the wedged `store.remote.close()`
+ * is deliberately never awaited (spec §2 — never await a suspect promise). Remote fields are reset
+ * so a post-graft {@link ensureWorkerRemoteStarted} starts a fresh loop.
+ *
+ * @internal
+ */
+export function abandonWorkerRemote(state: WorkerState): void {
+  if (state.remoteStartTimer !== undefined) {
+    clearTimeout(state.remoteStartTimer);
+    state.remoteStartTimer = undefined;
+  }
+  const transport = state.remoteTransport;
+  state.remoteTransport = undefined;
+  void transport?.close();
+  const stop = state.remoteStop;
+  state.remoteStop = undefined;
+  stop?.();
+  state.remoteReady = undefined;
+  state.remoteReset = undefined;
+  state.remoteStartAttempt = 0;
+  state.remoteKey = undefined;
+  state.remoteWake = undefined;
+  rejectPendingRemoteAuth(state, new Error("Browser remote replication rebuilding."));
+}
+
+/**
+ * Synchronously closes the live remote socket while leaving the replication loop running, so a
+ * hung receive settles and the loop reconnects on its own backoff. Used by the recovery
+ * controller's offline (transport-suspect) verdict: the store is healthy, only the network is down.
+ *
+ * @internal
+ */
+export function closeWorkerRemoteSocket(state: WorkerState): void {
+  void state.remoteTransport?.close();
+}
+
+export async function stopWorkerRemote(state: WorkerState): Promise<void> {
+  if (state.remoteStartTimer !== undefined) {
+    clearTimeout(state.remoteStartTimer);
+    state.remoteStartTimer = undefined;
+  }
+  const stop = state.remoteStop;
+  state.remoteStop = undefined;
+  stop?.();
+  state.remoteReady = undefined;
+  state.remoteStartAttempt = 0;
+  state.remoteKey = undefined;
+  state.remoteWake = undefined;
+  state.remoteTransport = undefined;
+  rejectPendingRemoteAuth(state, new Error("Browser remote replication closed."));
+  await state.store.remote?.close().catch(() => undefined);
+}
+
+/**
+ * Transfers a claimed pending upload's bytes during `drain_uploads`. `embedded:upload` mints the
+ * upload URL: in a fully local runtime it is an embedded token route handled in-process, while
+ * against a live Convex deployment it is a real storage URL that must be POSTed over the network.
+ * Routing by URL shape lets in-browser replication complete uploads to either target — the remote
+ * branch mirrors the native HttpRemoteUploader (POST bytes, parse `storageId` from the JSON body).
+ *
+ * @internal
+ */
+export async function transferRemoteUpload(
+  args: { uploadUrl: string; bytes: Uint8Array; contentType?: string },
+  handleUpload: (url: string, blob: Blob) => Promise<{ storageId: string }>,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch.bind(globalThis),
+): Promise<{ storageId: string }> {
+  const { uploadUrl, bytes, contentType } = args;
+  const owned = new Uint8Array(bytes.byteLength);
+  owned.set(bytes);
+  const blob = new Blob([owned], contentType ? { type: contentType } : undefined);
+  if (readUploadToken(uploadUrl) !== undefined) {
+    return handleUpload(uploadUrl, blob);
+  }
+  const response = await fetchImpl(uploadUrl, {
+    body: blob,
+    headers: contentType ? { "content-type": contentType } : undefined,
+    method: "POST",
+    signal: AbortSignal.timeout(60_000),
+  });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`upload POST failed with status ${response.status}: ${body}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch (cause) {
+    throw Object.assign(new Error("upload response was not JSON"), { cause });
+  }
+  const storageId =
+    parsed && typeof parsed === "object"
+      ? (parsed as { storageId?: unknown }).storageId
+      : undefined;
+  if (typeof storageId !== "string") {
+    throw new Error("upload response missing storageId");
+  }
+  return { storageId };
+}
+
+export function createRemoteTransport(
+  connectTimeoutMs: number,
+  debug: (phase: string, detail?: unknown) => void,
+  onWake: () => void = () => undefined,
+  handleUpload: (url: string, blob: Blob) => Promise<{ storageId: string }>,
+  onTransportActivity: () => void = () => undefined,
+  onLaneProgress: () => void = () => undefined,
+): RemoteTransportHost {
+  let socket: WebSocket | undefined;
+  let generation = 0;
+  let pendingConnectReject: ((error: Error) => void) | undefined;
+  const inbox: Array<{ kind: "closed"; reason?: string } | { kind: "message"; message: string }> =
+    [];
+  const waiters: Array<() => void> = [];
+
+  const wake = () => {
+    for (const waiter of waiters.splice(0)) waiter();
+    onWake();
+  };
+  const receiveInbox = () => {
+    // Arrival owns the wake. Reading an item is already part of the active Rust
+    // actor turn and must not manufacture a redundant follow-up pull.
+    return inbox.shift();
+  };
+
+  return {
+    close: async () => {
+      debug("worker:remote:transport:close");
+      generation += 1;
+      const rejectPending = pendingConnectReject;
+      pendingConnectReject = undefined;
+      const current = socket;
+      socket = undefined;
+      if (current) {
+        current.onclose = null;
+        current.onerror = null;
+        current.onmessage = null;
+        current.onopen = null;
+        current.close();
+      }
+      rejectPending?.(new Error("websocket closed during connect"));
+      inbox.push({ kind: "closed", reason: "client closed" });
+      wake();
+    },
+    connect: ({ url }) =>
+      new Promise<void>((resolve, reject) => {
+        debug("worker:remote:transport:connect:start", { url });
+        generation += 1;
+        const socketGeneration = generation;
+        const rejectPrevious = pendingConnectReject;
+        pendingConnectReject = undefined;
+        const previous = socket;
+        if (previous) {
+          previous.onclose = null;
+          previous.onerror = null;
+          previous.onmessage = null;
+          previous.onopen = null;
+          previous.close();
+        }
+        rejectPrevious?.(new Error("websocket connect superseded"));
+        inbox.splice(0);
+        const current = new WebSocket(url);
+        let settled = false;
+        const isCurrent = () => socket === current && generation === socketGeneration;
+        const timer = setTimeout(() => {
+          if (!isCurrent()) return;
+          rejectOnce(new Error(`websocket connect timed out after ${connectTimeoutMs}ms`));
+          current.close();
+        }, connectTimeoutMs);
+        const resolveOnce = () => {
+          if (settled) return;
+          settled = true;
+          if (pendingConnectReject === rejectOnce) pendingConnectReject = undefined;
+          clearTimeout(timer);
+          debug("worker:remote:transport:connect:open", { url });
+          resolve();
+        };
+        const rejectOnce = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          if (pendingConnectReject === rejectOnce) pendingConnectReject = undefined;
+          clearTimeout(timer);
+          debug("worker:remote:transport:connect:error", { message: error.message, url });
+          reject(error);
+        };
+        pendingConnectReject = rejectOnce;
+        socket = current;
+        current.onopen = () => {
+          if (!isCurrent()) return;
+          onTransportActivity();
+          resolveOnce();
+        };
+        current.onerror = () => {
+          if (!isCurrent()) return;
+          if (!settled) {
+            rejectOnce(new Error("websocket error"));
+            return;
+          }
+          inbox.push({ kind: "closed", reason: "websocket error" });
+          wake();
+        };
+        current.onclose = (event) => {
+          if (!isCurrent()) return;
+          socket = undefined;
+          rejectOnce(new Error(event.reason || `websocket closed with code ${event.code}`));
+          inbox.push({
+            kind: "closed",
+            reason: event.reason || `websocket closed with code ${event.code}`,
+          });
+          wake();
+        };
+        current.onmessage = (event) => {
+          if (!isCurrent()) return;
+          if (typeof event.data === "string") {
+            debug("worker:remote:transport:message", { bytes: event.data.length });
+            onTransportActivity();
+            inbox.push({ kind: "message", message: event.data });
+            wake();
+          }
+        };
+      }),
+    monotonicMs: getTimerTime,
+    nowMs: getTimerTime,
+    receive: async ({ timeoutMs }) => {
+      const event = receiveInbox();
+      if (event) {
+        debug("worker:remote:transport:receive", { kind: event.kind });
+        return event;
+      }
+      return await new Promise((resolve) => {
+        let timer: ReturnType<typeof setTimeout>;
+        const done = () => {
+          clearTimeout(timer);
+          const next = receiveInbox() ?? { kind: "timeout" as const };
+          debug("worker:remote:transport:receive", { kind: next.kind });
+          resolve(next);
+        };
+        timer = setTimeout(() => {
+          const index = waiters.indexOf(done);
+          if (index >= 0) waiters.splice(index, 1);
+          debug("worker:remote:transport:receive", { kind: "timeout" });
+          resolve({ kind: "timeout" });
+        }, timeoutMs);
+        waiters.push(done);
+      });
+    },
+    runStoreJob: () => undefined,
+    send: async ({ message }) => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        throw new Error("websocket is not connected");
+      }
+      try {
+        debug("worker:remote:transport:send", { bytes: message.length });
+        socket.send(message);
+        onTransportActivity();
+      } catch (cause) {
+        throw Object.assign(new Error("websocket send failed"), { cause });
+      }
+    },
+    upload: async ({ uploadUrl, bytes, contentType }) => {
+      debug("worker:remote:transport:upload", { bytes: bytes.byteLength });
+      onLaneProgress();
+      const uploaded = await transferRemoteUpload({ bytes, contentType, uploadUrl }, handleUpload);
+      onLaneProgress();
+      return uploaded;
+    },
+  };
+}
+
+export function handleWorkerRemoteAuthResult(
+  state: WorkerState,
+  request: Extract<WorkerRequest, { op: typeof WorkerCommand.AuthTokenResult }>,
+): void {
+  const pending = state.remoteAuthPending?.get(request.authRequestId);
+  if (!pending) return;
+  state.remoteAuthPending?.delete(request.authRequestId);
+  if (request.error) {
+    pending.reject(deserializeError(request.error));
+  } else {
+    pending.resolve(request.token ?? null);
+  }
+}
+
+export function startWorkerRemoteLoop(
+  state: WorkerState,
+  debug: (phase: string, detail?: unknown) => void = () => undefined,
+  onRetired: () => void = () => undefined,
+): () => void {
+  const remote = state.store.remote;
+  if (!remote) {
+    throw new Error("Browser remote replication requires a WASM artifact with remote support.");
+  }
+  if (!remote.pull) {
+    throw new Error("Browser remote replication requires a WASM artifact that exports remotePull.");
+  }
+  const pull = remote.pull.bind(remote);
+  const push = remote.doc?.push.bind(remote.doc);
+  const generation = state.recovery?.remoteGeneration ?? 0;
+  let attempt = 0;
+  let consecutiveErrors = 0;
+  let stopped = false;
+  let running = false;
+  let wakePending = false;
+  let localProgressPending = true;
+  let awaitingResponse = false;
+  let nextAllowedRunAt = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let microtaskPending = false;
+  let pushRunning = false;
+  let pushRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let pushConsecutiveErrors = 0;
+  const scope = remote.scope;
+  const scopeWrite = scope?.write.bind(scope);
+  let scheduledScopeWrite: ((next: RemoteScope) => Promise<void>) | undefined;
+  const backlogPush = { commitSeq: 0, id: "", table: "" };
+  let pushPending: { commitSeq: number; id: string; table: string } | undefined = push
+    ? backlogPush
+    : undefined;
+  const emit = (
+    status: "started" | "tick" | "idle" | "error" | "closed",
+    detail: {
+      durationMs?: number;
+      error?: unknown;
+      foreground?: { actorQueueDepth: number; actorQueueMs: number };
+      nextRunIn?: number;
+      tick?: Awaited<ReturnType<typeof pull>>;
+    } = {},
+  ) => emitWorkerRemoteEvent(state, status, { ...detail, attempt });
+  const schedule = (delay: number) => {
+    if (stopped) return;
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (delay <= 0) {
+      if (microtaskPending) return;
+      microtaskPending = true;
+      queueMicrotask(() => {
+        microtaskPending = false;
+        run();
+      });
+      return;
+    }
+    timer = setTimeout(run, delay);
+  };
+  const wake = () => {
+    if (stopped) return;
+    if (running) {
+      wakePending = true;
+      return;
+    }
+    schedule(Math.max(0, nextAllowedRunAt - getTimerTime()));
+  };
+  if (scope && scopeWrite) {
+    scheduledScopeWrite = async (next) => {
+      await scopeWrite(next);
+      wake();
+    };
+    scope.write = scheduledScopeWrite;
+  }
+  const pushRun = () => {
+    if (stopped || pushRunning || !push || !pushPending) return;
+    if (pushRetryTimer !== undefined) {
+      clearTimeout(pushRetryTimer);
+      pushRetryTimer = undefined;
+    }
+    const pending = pushPending;
+    pushPending = undefined;
+    pushRunning = true;
+    attempt += 1;
+    const startedAt = getTimerTime();
+    const disarmPush = state.recovery?.arm("push");
+    state.recovery?.onRemoteActive();
+    void push(pending.table, pending.id, {
+      firstCommitSeq: pending.commitSeq,
+      updatedCommitSeq: pending.commitSeq,
+    })
+      .then((result) => {
+        pushConsecutiveErrors = 0;
+        if (result.state === "stale") pushPending ??= backlogPush;
+        consumeWorkerRemoteTick(state, result.tick);
+        const active = remoteTickHasWork(result.tick);
+        emit(active ? "tick" : "idle", {
+          durationMs: getElapsedTime(startedAt),
+          foreground: {
+            actorQueueDepth: result.actorQueueDepth ?? 0,
+            actorQueueMs: result.actorQueueMs ?? 0,
+          },
+          nextRunIn: 0,
+          tick: result.tick,
+        });
+      })
+      .catch((error) => {
+        if (handleRetirement(startedAt, error)) return;
+        pushConsecutiveErrors += 1;
+        const delay = Math.min(1_000 * 2 ** (pushConsecutiveErrors - 1), 60_000);
+        pushPending ??= pending;
+        emit("error", { durationMs: getElapsedTime(startedAt), error, nextRunIn: delay });
+        pushRetryTimer = setTimeout(pushRun, delay);
+      })
+      .finally(() => {
+        pushRunning = false;
+        disarmPush?.();
+        if (pushRetryTimer === undefined && pushPending) {
+          queueMicrotask(pushRun);
+        } else if (pushRetryTimer === undefined && !pushPending && !running && !wakePending) {
+          state.recovery?.onRemoteIdle();
+        }
+      });
+  };
+  const eventStop = state.runner.subscribeEvents?.((event) => {
+    if (event.type !== "data" || event.source !== "local") return;
+    if (event.changedTables.includes("_pending_uploads")) {
+      localProgressPending = true;
+      wake();
+    }
+    const row = event.upserts[0] ?? event.deletes[0];
+    if (!push || row === undefined || event.commitSeq === undefined) return;
+    pushPending = { commitSeq: event.commitSeq, id: row.id, table: row.table };
+    queueMicrotask(pushRun);
+  });
+  const remoteWakeStop = state.runner.remote?.wake?.subscribe(() => {
+    localProgressPending = true;
+    pushPending ??= backlogPush;
+    queueMicrotask(pushRun);
+    wake();
+  });
+  state.remoteWake = wake;
+  let torndown = false;
+  const teardown = () => {
+    if (torndown) return;
+    torndown = true;
+    stopped = true;
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (pushRetryTimer !== undefined) {
+      clearTimeout(pushRetryTimer);
+      pushRetryTimer = undefined;
+    }
+    if (scope && scopeWrite && scope.write === scheduledScopeWrite) scope.write = scopeWrite;
+    eventStop?.();
+    remoteWakeStop?.();
+    if (state.remoteWake === wake) state.remoteWake = undefined;
+  };
+  const handleRetirement = (startedAt: number, error: unknown): boolean => {
+    if (!errorMessage(error).startsWith(REMOTE_CLIENT_RETIRED_PREFIX)) return false;
+    if (torndown) return true;
+    teardown();
+    emit("error", {
+      durationMs: getElapsedTime(startedAt),
+      error: new EmbeddedClientRetiredError(),
+    });
+    onRetired();
+    return true;
+  };
+  const run = () => {
+    if (stopped || running) return;
+    debug("worker:remote:loop:run");
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    running = true;
+    wakePending = false;
+    const localProgress = localProgressPending;
+    localProgressPending = false;
+    attempt += 1;
+    const startedAt = getTimerTime();
+    const disarmPull = state.recovery?.arm("pull");
+    state.recovery?.onRemoteActive();
+    let nextDelay: number | undefined;
+    void pull(localProgress)
+      .then((tick) => {
+        state.recovery?.progress(generation);
+        nextAllowedRunAt = 0;
+        consecutiveErrors = 0;
+        consumeWorkerRemoteTick(state, tick);
+        const active = remoteTickHasWork(tick);
+        if (tick.sent > 0) awaitingResponse = true;
+        else if (active) awaitingResponse = false;
+        if (!active && !awaitingResponse && !wakePending && pushPending === undefined) {
+          state.recovery?.onRemoteIdle();
+        }
+        const delay = wakePending ? 0 : awaitingResponse ? REMOTE_RESPONSE_KEEPALIVE_MS : undefined;
+        emit(active ? "tick" : "idle", {
+          durationMs: getElapsedTime(startedAt),
+          nextRunIn: delay,
+          tick,
+        });
+        nextDelay = delay;
+      })
+      .catch((error) => {
+        localProgressPending ||= localProgress;
+        if (handleRetirement(startedAt, error)) return;
+        if (emitDeploymentMismatch(state, error)) {
+          stopped = true;
+          eventStop?.();
+          remoteWakeStop?.();
+          if (state.remoteWake === wake) state.remoteWake = undefined;
+          emit("error", { durationMs: getElapsedTime(startedAt), error });
+          return;
+        }
+        consecutiveErrors += 1;
+        const delay = Math.min(5_000 * 2 ** (consecutiveErrors - 1), 60_000);
+        nextAllowedRunAt = getTimerTime() + delay;
+        emit("error", { durationMs: getElapsedTime(startedAt), error, nextRunIn: delay });
+        nextDelay = delay;
+      })
+      .finally(() => {
+        running = false;
+        disarmPull?.();
+        if (wakePending) {
+          schedule(Math.max(0, nextAllowedRunAt - getTimerTime()));
+        } else if (nextDelay !== undefined) {
+          schedule(nextDelay);
+        }
+      });
+  };
+  emit("started", { nextRunIn: 0 });
+  if (pushPending) queueMicrotask(pushRun);
+  queueMicrotask(run);
+  return () => {
+    teardown();
+    emit("closed");
+  };
+}
+
+export function consumeWorkerRemoteTick(state: WorkerState, tick: RemoteTick): void {
+  consumeRemoteTick(tick, state.runner, (event) => state.emit?.(event));
+}
+
 /**
  * Creates the worker runtime from already-resolved modules and storage schema.
  *
- * @param options - Modules, storage path, store schema, and optional diagnostics.
+ * @param options - Modules, storage path, setup schema, store schema, and diagnostics.
  * @returns Worker state containing the OPFS bridge, store, runner, and active watches.
  * @throws If OPFS registration, WASM loading, store opening, or schema setup fails.
  *
@@ -288,87 +1016,170 @@ async function importEmbeddedBundle(): Promise<typeof import("virtual:convex-emb
  */
 export async function initRuntime(options: {
   debug?: boolean;
+  emit?: EmbeddedEventListener;
   modules: ConvexModules;
+  moduleGraphHash?: string;
+  onDebug?: (phase: string, detail?: unknown) => void;
+  onRuntimeEvent?: RuntimeEventSink;
+  setupSchema: StoreSchema;
+  remote?: boolean;
+  storageWaitNoticeMs?: number;
   storagePath: string;
   storeSchema: StoreSchema;
   wasm?: WasmSource;
 }): Promise<WorkerState> {
-  const opfs = new OpfsDirectory((phase, detail) => postDebug(options.debug, phase, detail));
+  const runtimeEvent = options.onRuntimeEvent;
+  const holder: { state?: WorkerState } = {};
+  const debug = (phase: string, detail?: unknown): void => {
+    postDebug(options.debug, phase, detail);
+    options.onDebug?.(phase, detail);
+    if (runtimeEvent) {
+      const event = runtimeEventFromDebug(phase, detail);
+      if (event) runtimeEvent(event);
+    }
+  };
+  const instanceDebug =
+    (generation: number) =>
+    (phase: string, detail?: unknown): void => {
+      if (phase === "worker:wasm:thread:error" || phase === "worker:wasm:thread:messageerror") {
+        holder.state?.recovery?.reportThreadError(generation);
+      }
+      debug(phase, detail);
+    };
+  const openStartedAt = getTimerTime();
+  const slowOpenTimer = runtimeEvent
+    ? setTimeout(() => {
+        runtimeEvent(runtimeDegradation("slow-open", { waitedMs: getTimerTime() - openStartedAt }));
+      }, options.storageWaitNoticeMs ?? STORAGE_WAIT_NOTICE_MS)
+    : undefined;
+  const opfs = new OpfsDirectory((phase, detail) => debug(phase, detail));
   let store: WasmStore | undefined;
   try {
-    postDebug(options.debug, "worker:opfs:register:start");
-    await registerTursoFiles(opfs, options.storagePath);
-    postDebug(options.debug, "worker:opfs:register:done");
-    postDebug(options.debug, "worker:wasm:load:start");
-    const wasm = await loadWasmModule(options.wasm, {
-      debug: (phase, detail) => postDebug(options.debug, phase, detail),
-      opfs,
+    const opened = await openStoreInstance(opfs, {
+      debug: instanceDebug(0),
+      setupSchema: options.setupSchema,
+      storagePath: options.storagePath,
+      wasm: options.wasm,
     });
-    postDebug(options.debug, "worker:wasm:load:done");
-    postDebug(options.debug, "worker:store:open:start");
-    store = await WasmStore.openWith(wasm.Store, options.storagePath);
-    postDebug(options.debug, "worker:store:open:done");
-    postDebug(options.debug, "worker:store:setup:start");
-    await store.setup(options.storeSchema);
-    postDebug(options.debug, "worker:store:setup:done");
-    return {
+    store = opened.store;
+    const runner = createRunner(options.modules, store, options.storeSchema, {
+      deferNotify: (run) => {
+        setTimeout(run, 0);
+      },
+      emit: options.emit,
+      moduleGraphHash: options.moduleGraphHash,
+      remote: options.remote,
+    });
+    if (slowOpenTimer !== undefined) clearTimeout(slowOpenTimer);
+    runtimeEvent?.({ at: getTimerTime(), phase: "ready", type: "runtime" });
+    const state: WorkerState = {
+      emit: options.emit,
       opfs,
-      runner: createRunner(options.modules, store, options.storeSchema),
+      pthreads: opened.pthreads,
+      runner,
       stops: new Map(),
       store,
+      wasmApiVersion: opened.wasmApiVersion,
     };
+    holder.state = state;
+    state.rebuild = async () => {
+      state.pthreads?.terminateAll();
+      opfs.closeAll();
+      const reopened = await openStoreInstance(opfs, {
+        debug: instanceDebug(state.recovery?.remoteGeneration ?? 0),
+        setupSchema: options.setupSchema,
+        storagePath: options.storagePath,
+        wasm: options.wasm,
+      });
+      state.store = reopened.store;
+      state.pthreads = reopened.pthreads;
+      state.wasmApiVersion = reopened.wasmApiVersion;
+      state.runner = createRunner(options.modules, reopened.store, options.storeSchema, {
+        deferNotify: (run) => {
+          setTimeout(run, 0);
+        },
+        emit: options.emit,
+        moduleGraphHash: options.moduleGraphHash,
+        remote: options.remote,
+      });
+    };
+    return state;
   } catch (error) {
+    if (slowOpenTimer !== undefined) clearTimeout(slowOpenTimer);
+    runtimeEvent?.(
+      runtimeDegradation(isUnreadableStoreError(error) ? "corrupt" : "failed", {
+        error: errorMessage(error),
+      }),
+    );
     await store?.close().catch(() => undefined);
     opfs.closeAll();
     throw error;
   }
 }
 
-function start(state: Promise<WorkerState>): void {
-  self.onmessage = (event) => {
-    void handleWorkerRequest(state, event.data as WorkerRequest);
-  };
-}
-
 /**
- * Handles one internal request sent to an embedded browser worker.
- *
- * @param statePromise - Promise for initialized worker state.
- * @param request - Worker protocol request.
- * @param postResponse - Response sink for result, watch, and error messages.
- * @returns A promise that settles after the request has been handled.
+ * Constructs a fresh store instance over the given OPFS bridge: WASM re-instantiation, OPFS
+ * re-registration, WAL replay, schema reconciliation, and a truncating checkpoint. Used both by
+ * {@link initRuntime} on boot and by the leader graft after a wedged instance is terminated; the
+ * caller owns the {@link OpfsDirectory} lifecycle across both.
  *
  * @internal
  */
-export async function handleWorkerRequest(
-  statePromise: Promise<WorkerState>,
-  request: WorkerRequest,
-  postResponse: (message: WorkerResponse) => void = post,
-): Promise<void> {
-  if (request.op === WorkerCommand.Close) {
-    try {
-      const state = await statePromise;
-      for (const stop of state.stops.values()) stop();
-      state.stops.clear();
-      try {
-        await state.store.close();
-      } finally {
-        state.opfs.closeAll();
-      }
-      postResponse({ id: request.id, op: WorkerEvent.Result });
-      self.close?.();
-    } catch (error) {
-      postResponse({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
-    }
-    return;
-  }
-
+export async function openStoreInstance(
+  opfs: OpfsDirectory,
+  options: {
+    debug?: (phase: string, detail?: unknown) => void;
+    setupSchema: StoreSchema;
+    storagePath: string;
+    wasm?: WasmSource;
+  },
+): Promise<{ store: WasmStore; pthreads: PthreadRegistry; wasmApiVersion: number }> {
+  const debug = options.debug ?? (() => undefined);
+  const pthreads = new PthreadRegistry();
+  debug("worker:opfs:register:start");
+  await registerTursoFiles(opfs, options.storagePath);
+  debug("worker:opfs:register:done");
+  debug("worker:wasm:load:start");
+  const wasm = await loadWasmModule(options.wasm, {
+    debug: (phase, detail) => debug(phase, detail),
+    opfs,
+    registry: pthreads,
+  });
+  const wasmApiVersion = wasm.apiVersion();
+  debug("worker:wasm:load:done");
+  const openAndSetup = async (): Promise<WasmStore> => {
+    debug("worker:store:open:start");
+    const opened = await WasmStore.openWith(wasm.Store, options.storagePath, {
+      defaultIdentityKey: EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY,
+      selectorKey: options.storagePath,
+    });
+    debug("worker:store:open:done");
+    debug("worker:store:setup:start");
+    await opened.setup(options.setupSchema);
+    debug("worker:store:setup:done");
+    return opened;
+  };
+  let store: WasmStore;
   try {
-    const state = await statePromise;
-    await workerCommandHandlers.get(request.op)?.(state, request as never, postResponse);
+    store = await openAndSetup();
   } catch (error) {
-    postResponse({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
+    if (!RESET_UNREADABLE_STORE || !isUnreadableStoreError(error)) throw error;
+    // The pre-existing store's physical bytes are unreadable — an incompatible format (e.g. written
+    // by a prior turso release), not same-format corruption of an openable store. While v5 is
+    // pre-release this resets to the current empty format; the current authority repopulates rows.
+    debug("worker:store:reset:start", describeError(error));
+    await resetTursoFiles(opfs, options.storagePath);
+    store = await openAndSetup();
+    debug("worker:store:reset:done");
   }
+  try {
+    debug("worker:store:checkpoint:start");
+    await store.checkpoint();
+    debug("worker:store:checkpoint:done");
+  } catch (error) {
+    debug("worker:store:checkpoint:error", describeError(error));
+  }
+  return { pthreads, store, wasmApiVersion };
 }
 
 function post(message: WorkerResponse): void {
@@ -391,63 +1202,29 @@ function describeError(error: unknown): unknown {
   return String(error);
 }
 
-function isWorkerPortRequest(value: unknown): value is WorkerPortRequest {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { op?: unknown }).op === PortCommand.Connect
-  );
+/**
+ * While v5 remains unreleased (V5 "Local Store Evolution"), a store whose physical bytes cannot be
+ * opened is an incompatible format that resets to the current empty state rather than failing
+ * closed. Mirrors the Rust `RESET_UNREADABLE_STORE` seam; at release this becomes a durable-migration
+ * decision.
+ */
+const RESET_UNREADABLE_STORE = true;
+
+/**
+ * A store-open failure that means the on-disk bytes are not a readable current-format store: a
+ * corrupt header or a file that is not a database at all. These are the turso `LimboError::Corrupt`
+ * and `NotADB` messages the Rust storage layer surfaces verbatim across the wasm boundary. A
+ * same-format integrity failure discovered after a clean open does not match, so it stays fail-closed.
+ */
+function isUnreadableStoreError(error: unknown): boolean {
+  const message = errorMessage(error);
+  return message.includes("Corrupt database") || message.includes("File is not a database");
 }
 
-async function handleQuery(
-  state: WorkerState,
-  request: Extract<WorkerRequest, { op: typeof WorkerCommand.Query }>,
-  postResponse: (message: WorkerResponse) => void,
-): Promise<void> {
-  const result = await state.runner.runQuery(request.name, request.args);
-  postResponse({ id: request.id, result, op: WorkerEvent.Result });
-}
-
-async function handleMutation(
-  state: WorkerState,
-  request: Extract<WorkerRequest, { op: typeof WorkerCommand.Mutation }>,
-  postResponse: (message: WorkerResponse) => void,
-): Promise<void> {
-  const result = await state.runner.runMutation(request.name, request.args, {
-    mutationId: request.mutationId,
-    onAccepted: (mutationId) =>
-      postResponse({ id: request.id, mutationId, op: WorkerEvent.MutationAccepted }),
-  });
-  postResponse({ id: request.id, result, op: WorkerEvent.Result });
-}
-
-function handleWatchStart(
-  state: WorkerState,
-  request: Extract<WorkerRequest, { op: typeof WorkerCommand.WatchStart }>,
-  postResponse: (message: WorkerResponse) => void,
-): void {
-  state.stops.get(request.watchId)?.();
-  const stop = state.runner.onUpdate(
-    request.name,
-    request.args,
-    (value) => postResponse({ op: WorkerEvent.WatchUpdated, value, watchId: request.watchId }),
-    (error) =>
-      postResponse({
-        error: serializeError(error),
-        op: WorkerEvent.WatchFailed,
-        watchId: request.watchId,
-      }),
-  );
-  state.stops.set(request.watchId, stop);
-  postResponse({ id: request.id, op: WorkerEvent.Result });
-}
-
-function handleWatchStop(
-  state: WorkerState,
-  request: Extract<WorkerRequest, { op: typeof WorkerCommand.WatchStop }>,
-  postResponse: (message: WorkerResponse) => void,
-): void {
-  state.stops.get(request.watchId)?.();
-  state.stops.delete(request.watchId);
-  postResponse({ id: request.id, op: WorkerEvent.Result });
+export function rejectPendingRemoteAuth(state: WorkerState, error: unknown): void {
+  const pending = state.remoteAuthPending;
+  if (!pending) return;
+  state.remoteAuthPending = undefined;
+  for (const request of pending.values()) request.reject(error);
+  pending.clear();
 }

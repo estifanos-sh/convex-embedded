@@ -7,6 +7,8 @@ import { StoreAdapter, type StoreBinding } from "../storage/binding";
  */
 export interface WasmStoreOptions {
   identityKey?: string;
+  selectorKey?: string;
+  defaultIdentityKey?: string;
 }
 
 /**
@@ -34,10 +36,12 @@ export class WasmStore extends StoreAdapter {
    * @internal
    */
   static async openWith(
-    Store: { open(name: string, identityKey?: string): unknown },
+    Store: { open(name: string, selectorKey?: string, defaultIdentityKey?: string): unknown },
     name: string,
     options: WasmStoreOptions = {},
   ): Promise<WasmStore> {
-    return new WasmStore((await Store.open(name, options.identityKey)) as StoreBinding);
+    const selectorKey = options.selectorKey ?? options.identityKey;
+    const defaultIdentityKey = options.defaultIdentityKey ?? options.identityKey;
+    return new WasmStore((await Store.open(name, selectorKey, defaultIdentityKey)) as StoreBinding);
   }
 }

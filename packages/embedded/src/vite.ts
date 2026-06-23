@@ -25,6 +25,14 @@ export type { ConvexEmbeddedPluginOptions };
 type VitePlugin = {
   config?: () => Record<string, unknown>;
   name: string;
+  transformIndexHtml?: {
+    handler: () => Array<{
+      children: string;
+      injectTo: "head-prepend";
+      tag: "script";
+    }>;
+    order: "pre";
+  };
 };
 
 /**
@@ -47,11 +55,21 @@ export default convexEmbedded;
 function convexEmbeddedViteConfig(options?: ConvexEmbeddedPluginOptions): VitePlugin {
   return {
     name: "convex-embedded:vite-config",
+    transformIndexHtml: {
+      order: "pre",
+      handler: () => [
+        {
+          children: "window.__convexAllowFunctionsInBrowser = true;",
+          injectTo: "head-prepend",
+          tag: "script",
+        },
+      ],
+    },
     config() {
       return {
         optimizeDeps: {
           exclude: ["@convex-dev/embedded", "@convex-dev/embedded/browser"],
-          include: ["@napi-rs/wasm-runtime", "convex/values"],
+          include: ["@napi-rs/wasm-runtime", "convex", "convex/server", "convex/values"],
         },
         worker: {
           plugins: () => [convexEmbeddedUnplugin.vite(options)],

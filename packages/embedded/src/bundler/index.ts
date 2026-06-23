@@ -9,7 +9,7 @@
  * @packageDocumentation
  */
 import type { Dirent } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -70,7 +70,11 @@ export interface EmbeddedBundleResult {
 
 const DEFAULT_CONVEX_DIR = "convex";
 const DEFAULT_SCHEMA_PATH = "schema.ts";
-const TS_EXTENSIONS = /\.(?:ts|tsx|mts|cts)$/;
+const EMBEDDED_ENTRYPOINT_PATH = "embedded.ts";
+const SOURCE_EXTENSIONS = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+const SYSTEM_MODULE_RE =
+  /^(?:convex\.config|auth\.config|crons|http)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+const GENERATED_MODULE_RE = /^embedded\.generated\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
 /**
  * Discovers Convex schema and function module files for embedded bundler adapters.
@@ -93,13 +97,17 @@ export async function createEmbeddedBundle(
   const root = path.resolve(input.root ?? process.cwd());
   const convexDir = resolveInputPath(root, input.convexDir ?? DEFAULT_CONVEX_DIR);
   const schemaPath = resolveInputPath(convexDir, input.schemaPath ?? DEFAULT_SCHEMA_PATH);
+  const embeddedPath = resolveInputPath(convexDir, EMBEDDED_ENTRYPOINT_PATH);
   await assertSchemaFile(schemaPath);
+  await assertEmbeddedEntrypoint(embeddedPath);
   const files = await listConvexFiles(convexDir);
   const modules: Record<string, string> = {};
   const seen = new Map<string, string>();
 
   for (const file of files) {
-    if (path.resolve(file) === schemaPath) continue;
+    const resolved = path.resolve(file);
+    if (resolved === schemaPath || resolved === embeddedPath) continue;
+    if (hasUseNodeDirective(await readFile(file, "utf8"))) continue;
     const moduleId = toModuleId(convexDir, file);
     const existing = seen.get(moduleId);
     if (existing !== undefined) {
@@ -115,6 +123,58 @@ export async function createEmbeddedBundle(
   };
 }
 
+function hasUseNodeDirective(source: string): boolean {
+  let offset = skipTrivia(source, 0);
+  while (source[offset] === '"' || source[offset] === "'") {
+    const quote = source[offset];
+    let value = "";
+    let index = offset + 1;
+    while (index < source.length && source[index] !== quote) {
+      if (source[index] === "\\") {
+        index += 1;
+        if (index >= source.length) return false;
+      }
+      value += source[index];
+      index += 1;
+    }
+    if (source[index] !== quote) return false;
+    index += 1;
+    while (source[index] === " " || source[index] === "\t") index += 1;
+    if (source[index] === ";") index += 1;
+    else if (source[index] !== "\n" && source[index] !== "\r" && index < source.length) {
+      return false;
+    }
+    if (value === "use node") return true;
+    offset = skipTrivia(source, index);
+  }
+  return false;
+}
+
+function skipTrivia(source: string, start: number): number {
+  let offset = start;
+  if (offset === 0 && source.charCodeAt(0) === 0xfeff) offset += 1;
+  if (offset === 0 && source.startsWith("#!")) {
+    offset = source.indexOf("\n");
+    if (offset === -1) return source.length;
+  }
+  while (offset < source.length) {
+    if (/\s/.test(source[offset] ?? "")) {
+      offset += 1;
+      continue;
+    }
+    if (source.startsWith("//", offset)) {
+      const next = source.indexOf("\n", offset + 2);
+      return next === -1 ? source.length : skipTrivia(source, next + 1);
+    }
+    if (source.startsWith("/*", offset)) {
+      const next = source.indexOf("*/", offset + 2);
+      return next === -1 ? source.length : skipTrivia(source, next + 2);
+    }
+    break;
+  }
+  return offset;
+}
+
 /**
  * Converts a file path under `convexDir` into a canonical Convex module ID.
  *
@@ -122,7 +182,7 @@ export async function createEmbeddedBundle(
  * @param filePath - Source file path inside `convexDir`.
  * @returns Convex module ID without the TypeScript extension.
  *
- * @internal
+ * @public
  */
 export function toModuleId(convexDir: string, filePath: string): string {
   return normalizePath(path.relative(convexDir, filePath)).replace(/\.[^.]+$/, "");
@@ -153,8 +213,10 @@ async function listConvexFiles(root: string): Promise<string[]> {
         return listConvexFiles(next);
       }
       if (!entry.isFile()) return [] as string[];
-      if (!TS_EXTENSIONS.test(entry.name)) return [] as string[];
+      if (!SOURCE_EXTENSIONS.test(entry.name)) return [] as string[];
       if (isDeclarationFile(entry.name)) return [] as string[];
+      if (SYSTEM_MODULE_RE.test(entry.name)) return [] as string[];
+      if (GENERATED_MODULE_RE.test(entry.name)) return [] as string[];
       return [next];
     }),
   );
@@ -171,6 +233,16 @@ async function assertSchemaFile(schemaPath: string): Promise<void> {
     if (schema.isFile()) return;
   } catch {}
   throw new Error(`Could not find Convex schema at ${schemaPath}`);
+}
+
+async function assertEmbeddedEntrypoint(embeddedPath: string): Promise<void> {
+  try {
+    const entrypoint = await stat(embeddedPath);
+    if (entrypoint.isFile()) return;
+  } catch {}
+  throw new Error(
+    `Could not find Convex embedded entrypoint at ${embeddedPath}. Create convex/embedded.ts and export pull and push.`,
+  );
 }
 
 function isDeclarationFile(name: string): boolean {

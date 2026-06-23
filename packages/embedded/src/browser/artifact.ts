@@ -15,19 +15,56 @@ import {
   WASI,
 } from "@napi-rs/wasm-runtime";
 import { OpfsDirectory, opfsImports } from "./opfs";
+import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
+import { EmbeddedError } from "../error";
 
 type BrowserWorker = {
   addEventListener(type: "message", callback: (event: unknown) => void): void;
+  addEventListener(type: "error" | "messageerror", callback: (event: unknown) => void): void;
   postMessage(message: unknown): void;
   removeEventListener(type: "message", callback: (event: unknown) => void): void;
+  terminate?(): void;
 };
 
+/**
+ * Tracks the emnapi async-work pthreads spawned for one store instance so store-instance recovery
+ * can terminate the whole pool before grafting a fresh instance into the retained runtime.
+ *
+ * @internal
+ */
+export class PthreadRegistry {
+  private readonly workers = new Set<BrowserWorker>();
+
+  register(worker: BrowserWorker): void {
+    this.workers.add(worker);
+  }
+
+  terminateAll(): void {
+    for (const worker of this.workers) {
+      try {
+        worker.terminate?.();
+      } catch {}
+    }
+    this.workers.clear();
+  }
+
+  get size(): number {
+    return this.workers.size;
+  }
+}
+
 declare const Worker: new (url: URL, options: { name?: string; type: "module" }) => BrowserWorker;
+interface WasmCompiledModule {
+  readonly __wasmCompiledModule: unique symbol;
+}
 declare const WebAssembly: {
   Memory: new (options: { initial: number; maximum: number; shared: boolean }) => {
     buffer: ArrayBufferLike;
   };
+  compileStreaming?: (source: Promise<Response>) => Promise<WasmCompiledModule>;
 };
+
+type WasmProgram = ArrayBuffer | Uint8Array | WasmCompiledModule;
 
 interface WasmInstance {
   exports: Record<string, unknown>;
@@ -44,7 +81,7 @@ export interface WasmModule {
   /** Store constructor exported by the Rust/WASM module. */
   Store: {
     /** Opens an embedded store for the given browser storage path. */
-    open(name: string, identityKey?: string): unknown;
+    open(name: string, selectorKey?: string, defaultIdentityKey?: string): unknown;
   };
 }
 
@@ -78,11 +115,13 @@ export interface LoadWasmOptions {
   debug?: (phase: string, detail?: unknown) => void;
   /**
    * Initial shared-memory size in 64KiB pages. Defaults to the artifact's declared minimum plus
-   * headroom; shared memory grows on demand up to the 4GiB maximum.
+   * headroom; shared memory grows on demand up to the 512 MiB maximum.
    */
   initialMemoryPages?: number;
   /** Optional OPFS directory bridge used by the WASM imports. */
   opfs?: OpfsDirectory;
+  /** Optional registry that collects spawned pthreads so recovery can terminate the pool. */
+  registry?: PthreadRegistry;
 }
 
 /**
@@ -90,7 +129,26 @@ export interface LoadWasmOptions {
  *
  * @internal
  */
-export const WASM_API_VERSION = 6;
+export const WASM_API_VERSION = EMBEDDED_STORAGE_ABI_VERSION;
+
+/**
+ * Thrown when the shared linear memory backing the store cannot be reserved because the device
+ * memory budget is exhausted. WebKit charges a shared memory's whole `maximum` at construction, so
+ * this is the visible boot failure on memory-constrained iOS Safari. Surfaces through the runtime's
+ * boot-error path with an actionable message instead of the raw engine `RangeError`.
+ *
+ * @internal
+ */
+export class EmbeddedInsufficientMemoryError extends EmbeddedError {
+  constructor(cause?: unknown) {
+    super(
+      "EMBEDDED_STORAGE",
+      "Insufficient memory to start the embedded store on this device. Close other tabs or apps and reload.",
+      { cause },
+    );
+    this.name = "EmbeddedInsufficientMemoryError";
+  }
+}
 
 /**
  * Loads and validates the browser Rust/WASM storage artifact.
@@ -113,16 +171,14 @@ export async function loadWasmModule(
     return validateWasmModule(module);
   }
   const options = isLoadOptions(source) ? source : {};
-  loadOptions.debug?.("worker:wasm:fetch:start");
-  const bytes = options.bytes ?? (await fetchPackagedWasm());
-  loadOptions.debug?.("worker:wasm:fetch:done", { bytes: bytes.byteLength });
   loadOptions.debug?.("worker:wasm:instantiate:start");
   const napiModule = await instantiateStorageModule(
-    bytes,
-    options.worker ?? defaultWorker,
+    options.bytes,
+    options.worker ?? (() => defaultWorker(loadOptions.debug)),
     loadOptions.opfs,
     loadOptions.debug,
     loadOptions.initialMemoryPages,
+    loadOptions.registry,
   );
   loadOptions.debug?.("worker:wasm:instantiate:done");
   return validateWasmModule(napiModule.exports);
@@ -131,67 +187,140 @@ export async function loadWasmModule(
 /** Headroom on top of the artifact's declared memory minimum: thread stacks and early heap. */
 const MEMORY_HEADROOM_PAGES = 256;
 
-/** Fallback when the artifact's declared minimum cannot be parsed. */
-const FALLBACK_INITIAL_PAGES = 4000;
+/**
+ * Reviewed memory-import minimum (64KiB pages) of the packaged storage artifact. Sizes the shared
+ * memory on the streaming path, where module bytes are never buffered for parsing. An artifact whose
+ * minimum grows past this fails loudly at instantiation, which the browser runtime test exercises
+ * against the real artifact.
+ */
+const PACKAGED_ARTIFACT_MEMORY_PAGES = 1009;
 
-const MAX_MEMORY_PAGES = 65536;
+/**
+ * Shared linear memory ceiling: 512 MiB. A shared memory cannot relocate when it grows, so WebKit
+ * reserves this whole `maximum` at construction; iOS Safari OOMs on shared maxima at or above 2 GiB.
+ * A client store's working set is tens of MB, so 512 MiB is ample while keeping the reservation
+ * inside every device's budget. Raise uniformly if a real workload needs it — never fork by platform.
+ */
+const MAX_MEMORY_PAGES = 8192;
 
 async function instantiateStorageModule(
-  wasm: ArrayBuffer | Uint8Array,
+  bytes: ArrayBuffer | Uint8Array | undefined,
   worker: () => BrowserWorker,
   opfs: OpfsDirectory | undefined,
   debug: ((phase: string, detail?: unknown) => void) | undefined,
   initialMemoryPages?: number,
+  registry?: PthreadRegistry,
 ): Promise<NapiModule> {
   assertCrossOriginIsolated();
   const context = getDefaultContext();
   const wasi = new WASI({ version: "preview1" });
-  // napi-rs requires shared WASM memory so worker-pool and OPFS imports see the same store.
-  const declared = declaredMemoryPages(wasm);
-  const initial = Math.min(
-    initialMemoryPages ??
-      (declared === undefined ? FALLBACK_INITIAL_PAGES : declared + MEMORY_HEADROOM_PAGES),
-    MAX_MEMORY_PAGES,
-  );
-  debug?.("worker:wasm:memory", { declared, initial });
-  const memory = new WebAssembly.Memory({
+  const program = await resolveWasmProgram(bytes, debug);
+  const initial = Math.min(initialMemoryPages ?? program.initialPages, MAX_MEMORY_PAGES);
+  debug?.("worker:wasm:memory", {
     initial,
     maximum: MAX_MEMORY_PAGES,
-    shared: true,
+    streamed: program.streamed,
   });
-  const { napiModule } = await instantiateNapiModule(wasm, {
-    asyncWorkPoolSize: 1,
-    context,
-    onCreateWorker: worker,
-    wasi,
-    beforeInit({ instance }: { instance: WasmInstance }) {
-      debug?.("worker:wasm:before-init:start");
-      for (const name of Object.keys(instance.exports)) {
-        if (name.startsWith("__napi_register__")) {
-          debug?.("worker:wasm:napi-register:start", { name });
-          const register = instance.exports[name];
-          if (typeof register === "function") register();
-          debug?.("worker:wasm:napi-register:done", { name });
-        }
+  const memory = createSharedMemory(initial);
+  const trackedWorker = registry
+    ? () => {
+        const spawned = worker();
+        registry.register(spawned);
+        return spawned;
       }
-      debug?.("worker:wasm:before-init:done");
+    : worker;
+  const { napiModule } = await instantiateNapiModule(
+    program.source as Parameters<typeof instantiateNapiModule>[0],
+    {
+      asyncWorkPoolSize: 4,
+      context,
+      onCreateWorker: trackedWorker,
+      wasi,
+      beforeInit({ instance }: { instance: WasmInstance }) {
+        debug?.("worker:wasm:before-init:start");
+        for (const name of Object.keys(instance.exports)) {
+          if (name.startsWith("__napi_register__")) {
+            debug?.("worker:wasm:napi-register:start", { name });
+            const register = instance.exports[name];
+            if (typeof register === "function") register();
+            debug?.("worker:wasm:napi-register:done", { name });
+          }
+        }
+        debug?.("worker:wasm:before-init:done");
+      },
+      overwriteImports(importObject: {
+        env?: Record<string, unknown>;
+        napi?: object;
+        emnapi?: object;
+      }) {
+        importObject.env = {
+          ...importObject.env,
+          ...importObject.napi,
+          ...importObject.emnapi,
+          ...(opfs ? opfsImports(opfs, memory) : {}),
+          memory,
+        };
+        return importObject;
+      },
     },
-    overwriteImports(importObject: {
-      env?: Record<string, unknown>;
-      napi?: object;
-      emnapi?: object;
-    }) {
-      importObject.env = {
-        ...importObject.env,
-        ...importObject.napi,
-        ...importObject.emnapi,
-        ...(opfs ? opfsImports(opfs, memory) : {}),
-        memory,
-      };
-      return importObject;
-    },
-  });
+  );
   return napiModule;
+}
+
+async function resolveWasmProgram(
+  bytes: ArrayBuffer | Uint8Array | undefined,
+  debug: ((phase: string, detail?: unknown) => void) | undefined,
+): Promise<{ source: WasmProgram; initialPages: number; streamed: boolean }> {
+  if (bytes !== undefined) {
+    return {
+      source: bytes,
+      initialPages: initialMemoryPagesFromDeclared(declaredMemoryPages(bytes)),
+      streamed: false,
+    };
+  }
+  const url = new URL("./wasm/index.wasm", import.meta.url);
+  if (typeof WebAssembly.compileStreaming === "function") {
+    try {
+      debug?.("worker:wasm:fetch:stream:start");
+      const source = await WebAssembly.compileStreaming(fetch(url));
+      debug?.("worker:wasm:fetch:stream:done");
+      return {
+        source,
+        initialPages: PACKAGED_ARTIFACT_MEMORY_PAGES + MEMORY_HEADROOM_PAGES,
+        streamed: true,
+      };
+    } catch (error) {
+      debug?.("worker:wasm:fetch:stream:fallback", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  debug?.("worker:wasm:fetch:buffered:start");
+  const buffered = await fetchPackagedWasm(url);
+  debug?.("worker:wasm:fetch:buffered:done", { bytes: buffered.byteLength });
+  return {
+    source: buffered,
+    initialPages: initialMemoryPagesFromDeclared(declaredMemoryPages(buffered)),
+    streamed: false,
+  };
+}
+
+function createSharedMemory(initial: number): { buffer: ArrayBufferLike } {
+  try {
+    return new WebAssembly.Memory({ initial, maximum: MAX_MEMORY_PAGES, shared: true });
+  } catch (error) {
+    throw new EmbeddedInsufficientMemoryError(error);
+  }
+}
+
+function initialMemoryPagesFromDeclared(declared: number | undefined): number {
+  if (declared === undefined) {
+    throw new Error(
+      "browser WASM artifact memory import could not be parsed; pass initialMemoryPages only " +
+        "for an explicitly reviewed custom artifact.",
+    );
+  }
+  return declared + MEMORY_HEADROOM_PAGES;
 }
 
 const IMPORT_KIND_FUNCTION = 0x00;
@@ -204,7 +333,8 @@ const IMPORT_KIND_GLOBAL = 0x03;
  * 8-byte header, then each section until the import section, then each import entry (two
  * length-prefixed names, a kind byte, and the kind's payload) until the memory import's limits.
  * `WebAssembly.Module.imports()` does not expose limits, so this walks the binary directly.
- * Returns `undefined` on any parse surprise — the caller falls back to a safe default.
+ * Returns `undefined` on any parse surprise; the caller then refuses to guess unless an explicit
+ * reviewed memory size was provided.
  */
 function declaredMemoryPages(wasm: ArrayBuffer | Uint8Array): number | undefined {
   try {
@@ -223,6 +353,10 @@ function declaredMemoryPages(wasm: ArrayBuffer | Uint8Array): number | undefined
         shift += 7;
       }
     };
+    const skipName = (): void => {
+      const length = leb();
+      offset += length;
+    };
     while (offset < bytes.length) {
       const sectionId = bytes[offset];
       offset += 1;
@@ -234,8 +368,8 @@ function declaredMemoryPages(wasm: ArrayBuffer | Uint8Array): number | undefined
       }
       const importCount = leb();
       for (let i = 0; i < importCount; i += 1) {
-        offset += leb();
-        offset += leb();
+        skipName();
+        skipName();
         const kind = bytes[offset];
         offset += 1;
         switch (kind) {
@@ -280,21 +414,35 @@ function assertCrossOriginIsolated(): void {
   );
 }
 
-async function fetchPackagedWasm(): Promise<ArrayBuffer> {
-  const url = new URL("./wasm/index.wasm", import.meta.url);
+async function fetchPackagedWasm(url: URL): Promise<ArrayBuffer> {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`failed to load browser WASM storage artifact: ${response.status}`);
   }
-  // The ArrayBuffer is owned by the module instantiator after fetch; callers do not retain it.
   return response.arrayBuffer();
 }
 
-function defaultWorker(): BrowserWorker {
-  return new Worker(new URL("./browser-worker.mjs", import.meta.url), {
+function defaultWorker(debug?: (phase: string, detail?: unknown) => void): BrowserWorker {
+  const url = new URL("./thread/browser-worker.mjs", import.meta.url);
+  debug?.("worker:wasm:thread:create", { url: url.toString() });
+  const worker = new Worker(url, {
     name: "convex-embedded",
     type: "module",
   });
+  worker.addEventListener("error", (event) => {
+    debug?.("worker:wasm:thread:error", { message: threadEventMessage(event) });
+  });
+  worker.addEventListener("messageerror", (event) => {
+    debug?.("worker:wasm:thread:messageerror", { message: threadEventMessage(event) });
+  });
+  return worker;
+}
+
+function threadEventMessage(event: unknown): string {
+  const value = event as { error?: unknown; message?: unknown };
+  if (value.error instanceof Error) return value.error.message;
+  if (typeof value.message === "string" && value.message.length > 0) return value.message;
+  return "embedded storage worker thread crashed";
 }
 
 function validateWasmModule(value: unknown): WasmModule {

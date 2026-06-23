@@ -1,3 +1,5 @@
+import { getTimerTime } from "../time";
+
 type SyncAccessHandle = {
   close(): void;
   flush(): void;
@@ -21,15 +23,20 @@ declare const navigator:
   | {
       storage?: {
         getDirectory?: () => Promise<DirectoryHandle>;
+        persist?: () => Promise<boolean>;
+        persisted?: () => Promise<boolean>;
       };
     };
 
 declare const DedicatedWorkerGlobalScope: undefined | (new () => unknown);
 declare const self: unknown;
 
-const ACCESS_HANDLE_RETRY_DELAYS_MS = [10, 25, 50];
+const ACCESS_HANDLE_RETRY_BASE_MS = 10;
+const ACCESS_HANDLE_RETRY_MAX_MS = 250;
+const ACCESS_HANDLE_RETRY_BUDGET_MS = 15_000;
 
 type OpfsDebug = (phase: string, detail?: unknown) => void;
+type OpfsRoot = () => Promise<DirectoryHandle>;
 
 /**
  * OPFS file registry used by the Rust Turso IO bridge.
@@ -41,29 +48,24 @@ export class OpfsDirectory {
   private readonly byHandle = new Map<number, SyncAccessHandle>();
   private readonly byPath = new Map<string, { handle: number; sync: SyncAccessHandle }>();
 
-  constructor(private readonly debug?: OpfsDebug) {}
+  constructor(
+    private readonly debug?: OpfsDebug,
+    private readonly root: OpfsRoot = opfsRoot,
+  ) {}
 
   async registerFile(path: string): Promise<void> {
     if (this.byPath.has(path)) return;
-    const root = await opfsRoot();
+    const root = await this.root();
     const file = await root.getFileHandle(path, { create: true });
     if (typeof file.createSyncAccessHandle !== "function") {
       throw new Error(
         "ConvexEmbeddedClient browser storage requires OPFS createSyncAccessHandle support.",
       );
     }
-    const sync = await createSyncAccessHandleWithRetry(file);
+    const sync = await createSyncAccessHandleWithRetry(file, this.debug);
     this.nextHandle += 1;
     this.byPath.set(path, { handle: this.nextHandle, sync });
     this.byHandle.set(this.nextHandle, sync);
-  }
-
-  async unregisterFile(path: string): Promise<void> {
-    const file = this.byPath.get(path);
-    if (!file) return;
-    this.byPath.delete(path);
-    this.byHandle.delete(file.handle);
-    file.sync.close();
   }
 
   closeFile(handle: number): number {
@@ -95,9 +97,7 @@ export class OpfsDirectory {
     for (const file of this.byPath.values()) {
       try {
         file.sync.close();
-      } catch {
-        // Best-effort cleanup; callers are already tearing down the worker-owned store.
-      }
+      } catch {}
     }
     this.byPath.clear();
     this.byHandle.clear();
@@ -108,12 +108,10 @@ export class OpfsDirectory {
   }
 
   read(handle: number, buffer: Uint8Array, offset: number): number {
-    // The view aliases WASM memory only for the synchronous OPFS call. Nothing retains it.
     return this.file(handle).read(buffer, { at: Number(offset) });
   }
 
   write(handle: number, buffer: Uint8Array, offset: number): number {
-    // OPFS copies from this borrowed WASM-memory view before returning.
     return this.file(handle).write(buffer, { at: Number(offset) });
   }
 
@@ -139,6 +137,21 @@ export class OpfsDirectory {
   }
 }
 
+/**
+ * Asks the browser to mark this origin's storage persistent so OPFS is exempt from Safari's 7-day
+ * ITP eviction of an idle origin. iOS grants silently from interaction history; the result is
+ * advisory, so this is fire-and-forget and never blocks or fails store open.
+ *
+ * @internal
+ */
+export function requestStoragePersistence(debug?: OpfsDebug): void {
+  if (typeof navigator === "undefined" || typeof navigator.storage?.persist !== "function") return;
+  void navigator.storage
+    .persist()
+    .then((granted) => debug?.("worker:opfs:persist", { granted }))
+    .catch(() => undefined);
+}
+
 async function opfsRoot(): Promise<DirectoryHandle> {
   if (typeof navigator === "undefined" || typeof navigator.storage?.getDirectory !== "function") {
     throw new Error(
@@ -148,18 +161,27 @@ async function opfsRoot(): Promise<DirectoryHandle> {
   return navigator.storage.getDirectory();
 }
 
-async function createSyncAccessHandleWithRetry(file: {
-  createSyncAccessHandle(options?: { mode: "readwrite" }): Promise<SyncAccessHandle>;
-}): Promise<SyncAccessHandle> {
+async function createSyncAccessHandleWithRetry(
+  file: {
+    createSyncAccessHandle(options?: { mode: "readwrite" }): Promise<SyncAccessHandle>;
+  },
+  debug?: OpfsDebug,
+): Promise<SyncAccessHandle> {
+  const startedAt = now();
   for (let attempt = 0; ; attempt += 1) {
     try {
-      // Exclusive mode is required because the elected runtime leader owns the only Turso/OPFS
-      // handle set; multi-handle mode would break the WAL/SHM coherence Turso assumes.
-      return await file.createSyncAccessHandle({ mode: "readwrite" });
+      const sync = await openExclusiveSyncAccessHandle(file);
+      if (attempt > 0) {
+        debug?.("worker:opfs:acquire:reclaimed", { attempt, waitedMs: now() - startedAt });
+      }
+      return sync;
     } catch (error) {
-      const delay = ACCESS_HANDLE_RETRY_DELAYS_MS[attempt];
       if (!isNoModificationAllowedError(error)) throw error;
-      if (delay === undefined) {
+      // A dead predecessor's exclusive handle outlives its Web Lock until the browser reclaims it.
+      // The storage-owner lock already serializes LIVE owners, so a NoModificationAllowedError here
+      // is a reclaim race, not a live conflict: back off and wait for the reclaim, capped by budget.
+      const waitedMs = now() - startedAt;
+      if (waitedMs >= ACCESS_HANDLE_RETRY_BUDGET_MS) {
         throw Object.assign(
           new Error(
             "ConvexEmbeddedClient browser storage is already open in another tab or stale runtime. Close or reload other tabs using this embedded database.",
@@ -167,9 +189,29 @@ async function createSyncAccessHandleWithRetry(file: {
           { cause: error },
         );
       }
+      const delay = Math.min(
+        ACCESS_HANDLE_RETRY_MAX_MS,
+        ACCESS_HANDLE_RETRY_BASE_MS * 2 ** attempt,
+      );
+      debug?.("worker:opfs:acquire:retry", { attempt, delayMs: delay, waitedMs });
       await sleep(delay);
     }
   }
+}
+
+async function openExclusiveSyncAccessHandle(file: {
+  createSyncAccessHandle(options?: { mode: "readwrite" }): Promise<SyncAccessHandle>;
+}): Promise<SyncAccessHandle> {
+  try {
+    return await file.createSyncAccessHandle({ mode: "readwrite" });
+  } catch (error) {
+    if (isNoModificationAllowedError(error)) throw error;
+    return file.createSyncAccessHandle();
+  }
+}
+
+function now(): number {
+  return getTimerTime();
 }
 
 function isNoModificationAllowedError(error: unknown): boolean {
@@ -190,9 +232,32 @@ function sleep(ms: number): Promise<void> {
  * @internal
  */
 export async function registerTursoFiles(opfs: OpfsDirectory, path: string): Promise<void> {
-  await opfs.registerFile(path);
-  await opfs.registerFile(`${path}-wal`);
-  await opfs.registerFile(`${path}-shm`);
+  try {
+    await opfs.registerFile(path);
+    await opfs.registerFile(`${path}-wal`);
+    await opfs.registerFile(`${path}-shm`);
+  } catch (error) {
+    opfs.closeAll();
+    throw error;
+  }
+}
+
+/**
+ * Clears the database, WAL, and SHM files for a storage path back to empty so a fresh
+ * current-format store can be created in their place. The OPFS sync-access handles are owned by
+ * this JS registry (the Rust IO bridge can only look them up, never re-register), so a store whose
+ * physical bytes an incompatible build left unreadable is reset here rather than in Rust. Truncating
+ * the WAL alongside the database matters: a leftover WAL from the old format would re-corrupt the
+ * fresh database on replay.
+ *
+ * @internal
+ */
+export async function resetTursoFiles(opfs: OpfsDirectory, path: string): Promise<void> {
+  opfs.closeAll();
+  await registerTursoFiles(opfs, path);
+  for (const suffix of ["", "-wal", "-shm"]) {
+    opfs.removeFile(`${path}${suffix}`);
+  }
 }
 
 /**

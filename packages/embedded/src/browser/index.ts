@@ -22,13 +22,34 @@ import { setEmbeddedIdentity } from "./identity";
 setEmbeddedIdentity(embeddedIdentity);
 
 export { ConvexEmbeddedClient } from "./client";
+export {
+  EMBEDDED_UPLOAD_PATH,
+  createConvexEmbeddedUploadFetch,
+  type ConvexEmbeddedUploadFetch,
+  type ConvexEmbeddedUploadFetchOptions,
+} from "./upload";
 export type {
+  AuthTokenFetcher,
   ConvexEmbeddedClientOptions,
   ConvexEmbeddedMutationOptions,
   ConvexEmbeddedSchema,
-  MutationOptions,
-  OptimisticLocalStore,
-  OptimisticUpdate,
+  EmbeddedDataDelete,
+  EmbeddedDataEvent,
+  EmbeddedDataUpsert,
+  EmbeddedConnectionState,
+  EmbeddedEvent,
+  EmbeddedEventListener,
+  EmbeddedOperationEvent,
+  EmbeddedOperationKind,
+  EmbeddedOperationPhase,
+  EmbeddedRuntimeDegradation,
+  EmbeddedRuntimeEvent,
+  EmbeddedRuntimePhase,
+  EmbeddedRemoteEvent,
+  EmbeddedRemoteStatus,
+  EmbeddedSchedulerEvent,
+  EmbeddedSpanEvent,
+  EmbeddedSpanPhase,
+  EmbeddedStorageEvent,
   Watch,
-  WatchQueryOptions,
 } from "./client";
