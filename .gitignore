@@ -33,3 +33,13 @@ dist-ssr
 *.sw?
 :memory:
 :memory:-wal
+
+# build/crash artifacts
+rustc-ice-*.txt
+**/.out/
+*.db
+*.db-wal
+*.db-shm
+
+# Local documentation
+/docs/
