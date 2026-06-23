@@ -1,38 +1,30 @@
 # @convex-dev/embedded · browser · vite demo
 
-A multi-tab todos app demonstrating `@convex-dev/embedded/browser` — the local-first Convex execution engine running entirely in the browser via SharedWorker + OPFS.
+A document editor demonstrating `@convex-dev/embedded/browser`: local-first Convex execution in the browser with BlockNote editing, OPFS persistence, optional remote sync, and a Notion-style revision history panel.
 
 ## Run
 
 ```sh
-# from repo root (canonical)
-pnpm dev:browser:vite
-pnpm build:browser:vite     # production build
-pnpm preview:browser:vite   # preview the production build
+# from repo root
+pnpm build:browser:vite
+pnpm preview:browser:vite
 
-# or from this directory
-vp dev
+# dev server is normally started by the workspace owner
+pnpm dev:browser:vite
 ```
 
 ## Try it
 
-1. Open the printed URL in **two tabs side by side**.
-2. Add a todo in tab A — it appears in tab B within milliseconds.
-3. Toggle / delete from either tab; the other follows.
-4. Hard-reload either tab — the list persists (OPFS).
-5. Open DevTools → Application → Shared Workers to see the per-origin runtime.
-6. Open the Network tab — there are **no** outbound requests. Everything is local.
+1. Edit the document body.
+2. Open the same URL in another tab and watch the local document settle there too.
+3. Click **Snapshot** to save a revision.
+4. Select a revision in the history panel and restore it.
+5. Hard-reload the page; the document and revisions are still available from browser storage.
 
 ## What's in here
 
-- `src/lib/client.ts` — the `ConvexEmbeddedClient` singleton (zero-arg).
-- `src/lib/watch.ts` — ~30-line helper over `client.watchQuery()` that drives a render callback.
-- `src/ui.ts` — dashboard chrome and DOM event wiring.
-- `src/todos.ts` — the todos panel; subscribes once, renders into a DOM list on each update.
-- `vite.config.ts` — `tailwindcss()` + `convexEmbedded({ convexDir })`. The latter handles COOP/COEP for you.
+- `src/app.tsx` — BlockNote editor, local draft writes, revision history, and restore controls.
+- `src/lib/client.ts` — `ConvexEmbeddedClient` setup and optional remote configuration.
+- `vite.config.ts` — React, Tailwind, `convexEmbedded({ convexDir })`, and embedded devtools.
 
-## Shared Convex folder
-
-The schema and functions live at the **workspace root** in `convex/` so every demo (this one, the future `demos/browser/nextjs/`, etc.) consumes the same backend. `vite.config.ts` points `convexEmbedded()` at `../../../convex`, and the TypeScript `~convex/*` path alias resolves there too.
-
-The Vite plugin bundles function modules into a virtual registry and emits a stable identity hash so the SharedWorker only attaches to clients with the same schema.
+The schema and functions live at the workspace root in `convex/`. The Vite plugin bundles those functions into the browser worker and emits a stable identity hash so compatible tabs attach to the same local runtime.

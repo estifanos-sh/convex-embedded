@@ -10,14 +10,24 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@blocknote/ariakit": "^0.47.2",
+    "@blocknote/core": "^0.47.2",
+    "@blocknote/react": "^0.47.2",
     "@convex-dev/embedded": "workspace:*",
+    "@convex-dev/static-hosting": "^0.1.4",
     "@fontsource-variable/inter": "catalog:",
     "@tailwindcss/forms": "catalog:",
     "@tailwindcss/vite": "catalog:",
     "convex": "catalog:",
+    "lucide-react": "^0.577.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
     "tailwindcss": "catalog:"
   },
   "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vite-plus": "catalog:"

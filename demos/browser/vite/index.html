@@ -5,10 +5,25 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
-    <title>Todos · @convex-dev/embedded</title>
+    <title>Documents · @convex-dev/embedded</title>
   </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
+  <body style="margin: 0; background: #0a0a0a; color: #e5e5e5">
+    <div id="app">
+      <div style="display: flex; height: 100vh; font-family: system-ui, sans-serif">
+        <aside style="width: 240px; border-right: 1px solid #1f1f1f; padding: 16px; box-sizing: border-box">
+          <div style="height: 20px; width: 60%; border-radius: 6px; background: #1a1a1a; margin-bottom: 24px"></div>
+          <div style="height: 12px; width: 80%; border-radius: 6px; background: #161616; margin-bottom: 12px"></div>
+          <div style="height: 12px; width: 70%; border-radius: 6px; background: #161616; margin-bottom: 12px"></div>
+          <div style="height: 12px; width: 75%; border-radius: 6px; background: #161616"></div>
+        </aside>
+        <main style="flex: 1; padding: 32px 48px; box-sizing: border-box">
+          <div style="height: 28px; width: 320px; max-width: 60%; border-radius: 6px; background: #1a1a1a; margin-bottom: 28px"></div>
+          <div style="height: 14px; width: 90%; border-radius: 6px; background: #141414; margin-bottom: 14px"></div>
+          <div style="height: 14px; width: 82%; border-radius: 6px; background: #141414; margin-bottom: 14px"></div>
+          <div style="height: 14px; width: 88%; border-radius: 6px; background: #141414"></div>
+        </main>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
