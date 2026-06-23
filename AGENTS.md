@@ -20,52 +20,71 @@ Docs are local at `node_modules/vite-plus/docs` or online at https://viteplus.de
 
 <!--VITE PLUS END-->
 
-## Lexicon - canonical verb dictionary for @convex-dev/embedded
+## Lexicon — minimal verb/noun dictionary for @convex-dev/embedded
 
-Use this lexicon for authored code in this repo. Convex API names, platform API
-names, generated files, and package/tool-required config names may keep their
-native spellings.
+Authored code uses one small vocabulary, shared identically across the Rust and
+TypeScript layers, in `noun.[noun.]verb` shape. Keep it small on purpose: reach
+for a new noun (or a nested noun) before a new verb. Convex API names, platform
+API names, generated files, and tool-required config names keep their native
+spellings.
 
-| Domain                          | Canonical verb                | Meaning                                                          | Avoid / rewrite                                               |
-| ------------------------------- | ----------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------- |
-| Access current state            | `get*`                        | Cheap in-memory or already-local lookup                          | `fetch*`, `load*`                                             |
-| Read from storage               | `read*`                       | May touch local storage or durable state                         | `lookup*`, `find*`                                            |
-| Load dependency/subsystem       | `load*`                       | Bring module, artifact, native binding, or subsystem into memory | `init*` unless mutating setup, `resolve*`                     |
-| Remote/network retrieval        | `fetch*`                      | Actual network request                                           | `get*`                                                        |
-| Gather many values              | `gather*`                     | Aggregate from multiple local sources                            | `collect*` except Convex query terminals                      |
-| Extract part of a value         | `extract*`                    | Pull a field/sub-value from a structure                          | `get*` when transformation occurs                             |
-| Convex query terminal           | `collect`                     | Terminal that materializes a Convex query                        | Non-query `collect*`                                          |
-| Add new durable data            | `insert*`                     | Create a record that must not already exist                      | `add*`, `put*`                                                |
-| Replace whole value             | `replace*`                    | Whole-record overwrite                                           | `update*`, `put*`                                             |
-| Partial change                  | `patch*`                      | Partial durable update                                           | `modify*`, `update*`                                          |
-| Delete durable data             | `delete*`                     | Remove persisted record                                          | `remove*` for durable data                                    |
-| Detach local reference          | `remove*` / `detach*`         | Remove from set/map/listener without deleting durable data       | `delete*`                                                     |
-| Empty collection                | `clear*`                      | Remove every local entry or reset local collection               | `deleteAll*`                                                  |
-| Persist local data              | `store*` / `write*`           | Store object or write bytes                                      | `persist*`, `put*`                                            |
-| Construct object                | `create*`                     | Make a new instance/value with identity or lifecycle             | `make*`                                                       |
-| Construct derived config/result | `build*`                      | Assemble derived object without durable identity                 | `make*`                                                       |
-| Convert value                   | `to*`                         | Synchronous type/shape conversion                                | `resolve*`                                                    |
-| Binary/text codec               | `encode*` / `decode*`         | Bytes or transport encoding                                      | `serialize*` / `deserialize*` unless external API requires it |
-| Parse input                     | `parse*`                      | String/unknown input to validated typed value                    | `decode*` unless bytes/protocol                               |
-| Predicates                      | `is*`, `has*`, `should*`      | Boolean checks                                                   | `check*` for pure predicates                                  |
-| Execute user/runtime work       | `run*`                        | Run a task/job/test body                                         | `execute*` unless external API requires it                    |
-| Handle event/request            | `handle*` / `on*`             | Event/request handler                                            | `process*` for simple dispatch                                |
-| Schedule later work             | `schedule*`                   | Timer/background enqueue                                         | `queue*` only for queue data structure                        |
-| Format display/debug text       | `format*`                     | Human-readable string formatting                                 | `fmt*`                                                        |
-| Subscribe lifecycle             | `subscribe*` / `unsubscribe*` | Register/unregister reactive listener                            | `listen*`, `unsub*`                                           |
-| Replication                     | `replicate*` / `pull*`        | Sync engine protocol or remote replication                       | Generic `sync*`                                               |
+### Storage-shaped verbs (the whole set)
 
-Authored file and folder names under package source, tests, and scripts should
-be one lowercase word. Use folders for broad, meaningful scopes instead of
-kebab-case, camelCase, snake_case, or folder-per-test segmentation.
+| Verb                | Meaning                                                        | Absorbs — do not use                                                                                                       |
+| ------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `read`              | Read one value, a range/page, or a count                       | `get`, `scan`, `list`, `gather`, `project`, `count`, `lookup`, `find`, local `fetch`                                       |
+| `write`             | Persist a value or bytes — new, whole, partial, or lease state | `store`, `set`, `insert`, `replace`, `patch`, `stage`, `import`, `put`, `persist`, `claim`, `renew`, `release`, `complete` |
+| `delete`            | Remove a durable record                                        | `drop`, `prune`, durable `remove`, `deleteAll`                                                                             |
+| `clear`             | Reset or empty a whole collection/scope                        | `deleteAll`, `truncate`                                                                                                    |
+| `encode` / `decode` | Bytes/transport codec                                          | `serialize`, `deserialize`                                                                                                 |
+| `is` / `has`        | Boolean predicate                                              | `check`, `should`, `due`                                                                                                   |
+| `push` / `pull`     | Remote wire transfer (the only replication verbs)              | `replicate`, `sync`, `apply`, `ack`, `settle`                                                                              |
 
-Internal storage-shaped surfaces group operations as one-word noun namespaces
-whose methods are one-word lexicon verbs — `doc.read`, `key.scan`, `blob.write`,
-`ledger.prune`, `mutation.begin`/`fail`, `clock.next` — mirroring the `sql/`
-folder scopes. Whole-store, transaction-scope operations (`setup`, `commit`,
-`clear`, `close`) stay at the root. Layers that cannot nest flatten the same
-taxonomy mechanically: `blob.read` → `blobRead` (napi/binding) → `blob_read`
+Whole-store / transaction-scope roots stay bare verbs: `open`, `setup`,
+`commit`, `close`. Durable-record lifecycle transitions stay named —
+`complete` / `fail` / `cancel` (the terminal states a scheduled job, upload, or
+mutation moves through) — a small fixed set, like the transaction roots above
+(this is the one carve-out from `complete` being absorbed by `write`).
+
+### Nouns (namespaces)
+
+`doc`, `key`, `blob`, `file`, `id`, `rev`, `ledger`, `mutation`, `clock`,
+`schedule`, `upload`, `remote`. Push specificity into nested nouns rather than
+new verbs: `rev.frontier.read`, `remote.cursor.write`, `upload.lease.write`. The
+versioned-document concept is `rev` (revision) everywhere — never `branch` or
+`ref` (`ref` is a Rust keyword and collides with Convex's `FunctionReference`).
+
+### Grammar and layers
+
+`noun.[noun.]verb`, identical per layer and flattened mechanically across the
+FFI: `rev.read` (TS) → `revRead` (napi/binding) → `rev_read` / `rev::read`
 (Rust).
+
+Three surfaces keep three vocabularies — do not force one into another:
+
+- Storage-shaped layer (Rust store, napi/wasm binding, TS `storage/`): the verb
+  table above and nothing else.
+- Public client and server-wrapper APIs (app-authorized `components.embedded.rev.*`,
+  `embedded.storage.rebuild`): product verbs, like `@convex-dev/stream`'s
+  `append` / `finish` / `cancel`.
+- Convex-facing code (`runtime/`, `component/`): Convex's native `insert`,
+  `patch`, `replace`, `delete`, `get`, `query`, `collect`.
+
+Authored file and folder names under package source, tests, and scripts are one
+lowercase word; use folders for broad, meaningful scopes instead of kebab-case,
+camelCase, snake_case, or folder-per-test segmentation.
+
+## Layout
+
+Generated and scratch paths stay out of source control (see `.gitignore`): build
+outputs live in `dist/` (bundles) and `target/` (Rust), and bench artifacts write
+to `packages/embedded/tests/bench/.out/`, never the package root. Root tool config
+is `.fallowrc.json` (dead-code baseline) and `rust-toolchain.toml`. Test harness
+code — Playwright page installers, bench orchestrators, and option/env readers —
+lives in `packages/embedded/tests/browser/harness/` and
+`packages/embedded/tests/bench/harness/`; the per-project vitest definitions sit
+under `packages/embedded/vite/`, so `vite.config.ts` is imports plus one
+`defineConfig` assembly and nothing else.
 
 <!-- convex-ai-start -->
 
