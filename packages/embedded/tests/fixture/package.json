@@ -1,0 +1,10 @@
+{
+  "name": "@convex-dev/embedded-fixture",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@convex-dev/embedded": "workspace:*",
+    "@convex-dev/migrations": "^0.3.5",
+    "convex": "^1.42.1"
+  }
+}

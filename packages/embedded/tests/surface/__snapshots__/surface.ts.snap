@@ -1,0 +1,143 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`public package surface > _generated/component.js entry exports only its intended surface 1`] = `
+[
+  "ComponentApi",
+]
+`;
+
+exports[`public package surface > browser entry exports only its intended surface 1`] = `
+[
+  "AuthTokenFetcher",
+  "ConvexEmbeddedClient",
+  "ConvexEmbeddedClientOptions",
+  "ConvexEmbeddedMutationOptions",
+  "ConvexEmbeddedSchema",
+  "ConvexEmbeddedUploadFetch",
+  "ConvexEmbeddedUploadFetchOptions",
+  "EMBEDDED_UPLOAD_PATH",
+  "EmbeddedConnectionState",
+  "EmbeddedDataDelete",
+  "EmbeddedDataEvent",
+  "EmbeddedDataUpsert",
+  "EmbeddedEvent",
+  "EmbeddedEventListener",
+  "EmbeddedOperationEvent",
+  "EmbeddedOperationKind",
+  "EmbeddedOperationPhase",
+  "EmbeddedRemoteEvent",
+  "EmbeddedRemoteStatus",
+  "EmbeddedRuntimeDegradation",
+  "EmbeddedRuntimeEvent",
+  "EmbeddedRuntimePhase",
+  "EmbeddedSchedulerEvent",
+  "EmbeddedSpanEvent",
+  "EmbeddedSpanPhase",
+  "EmbeddedStorageEvent",
+  "Watch",
+  "createConvexEmbeddedUploadFetch",
+]
+`;
+
+exports[`public package surface > bundler entry exports only its intended surface 1`] = `
+[
+  "EmbeddedBundleInput",
+  "EmbeddedBundleResult",
+  "createEmbeddedBundle",
+  "toModuleId",
+]
+`;
+
+exports[`public package surface > convex.config entry exports only its intended surface 1`] = `
+[
+  "default",
+]
+`;
+
+exports[`public package surface > convex.config.js entry exports only its intended surface 1`] = `
+[
+  "default",
+]
+`;
+
+exports[`public package surface > devtools entry exports only its intended surface 1`] = `
+[
+  "EmbeddedDevtoolsSource",
+  "MountEmbeddedDevtoolsOptions",
+  "MountedEmbeddedDevtools",
+  "createEmbeddedDevtoolsSource",
+  "mountEmbeddedDevtools",
+]
+`;
+
+exports[`public package surface > devtools/vite entry exports only its intended surface 1`] = `
+[
+  "EmbeddedDevtoolsVitePlugin",
+  "EmbeddedDevtoolsVitePlugins",
+  "embeddedDevtools",
+]
+`;
+
+exports[`public package surface > node entry exports only its intended surface 1`] = `
+[
+  "AuthTokenFetcher",
+  "ConvexEmbeddedClient",
+  "ConvexEmbeddedClientOptions",
+  "ConvexEmbeddedMutationOptions",
+  "ConvexEmbeddedSchema",
+  "ConvexEmbeddedUploadFetch",
+  "ConvexEmbeddedUploadFetchOptions",
+  "ConvexModules",
+  "EMBEDDED_UPLOAD_PATH",
+  "EmbeddedConnectionState",
+  "EmbeddedDataDelete",
+  "EmbeddedDataEvent",
+  "EmbeddedDataUpsert",
+  "EmbeddedEvent",
+  "EmbeddedEventListener",
+  "EmbeddedOperationEvent",
+  "EmbeddedOperationKind",
+  "EmbeddedOperationPhase",
+  "EmbeddedRemoteEvent",
+  "EmbeddedRemoteStatus",
+  "EmbeddedSchedulerEvent",
+  "EmbeddedSpanEvent",
+  "EmbeddedSpanPhase",
+  "EmbeddedStorageEvent",
+  "Watch",
+  "createConvexEmbeddedUploadFetch",
+]
+`;
+
+exports[`public package surface > server entry exports only its intended surface 1`] = `
+[
+  "DefineEmbeddedOptions",
+  "defineEmbedded",
+]
+`;
+
+exports[`public package surface > unplugin entry exports only its intended surface 1`] = `
+[
+  "ConvexEmbeddedPluginOptions",
+  "ConvexEmbeddedUnplugin",
+  "convexEmbedded",
+  "convexEmbeddedUnplugin",
+  "default",
+]
+`;
+
+exports[`public package surface > values entry exports only its intended surface 1`] = `
+[
+  "count",
+  "set",
+  "text",
+]
+`;
+
+exports[`public package surface > vite entry exports only its intended surface 1`] = `
+[
+  "ConvexEmbeddedPluginOptions",
+  "convexEmbedded",
+  "default",
+]
+`;
