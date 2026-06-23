@@ -1,5 +1,12 @@
 import type { GenericDataModel, TableNamesInDataModel, WithoutSystemFields } from "convex/server";
 import type {
+  ColEntries,
+  CrdtOp,
+  CrdtRestore,
+  FileSurface,
+  DeleteIn,
+  IdMapping,
+  OneUpsertCommit,
   RuntimeStorageReader,
   RuntimeStorageWriter,
   StoreSchema,
@@ -7,7 +14,18 @@ import type {
   UpsertIn,
   WriteBatch,
 } from "../storage/types";
-import { cloneTree } from "./codec";
+import { hashDocument, hashValue } from "../hash";
+import { cloneTree, equals } from "./codec";
+import {
+  assertFiniteDelta,
+  assertIntentField,
+  hasUnpairedSurrogate,
+  isHighSurrogate,
+  isLowSurrogate,
+  validateCountAdd,
+  validateSetField,
+  validateTextSplice,
+} from "../crdt/intent";
 import type { Doc, Id } from "./model";
 import { type Query, QueryBuilder, type QueryOverlay, type ReadTracker } from "./query";
 import { validateJson } from "./validate";
@@ -15,12 +33,14 @@ import {
   assertNoSystemFieldConflict,
   createId,
   dataOf,
-  extractCols,
+  extractColEntries,
+  isLocalIdForTable,
+  isLocalIdShape,
   materialize,
   type RawDoc,
   type StagedDoc,
   tableFromId,
-} from "./values";
+} from "./doc";
 
 /**
  * Runtime lookup map for storage table definitions.
@@ -63,6 +83,14 @@ export interface DatabaseReader<DM extends GenericDataModel> {
  * @internal
  */
 export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseReader<DM> {
+  count: {
+    add<T extends TableNamesInDataModel<DM>>(
+      table: T,
+      id: Id<T>,
+      field: string,
+      delta: number,
+    ): Promise<void>;
+  };
   insert<T extends TableNamesInDataModel<DM>>(
     table: T,
     value: WithoutSystemFields<Doc<DM, T>>,
@@ -85,6 +113,28 @@ export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseRea
     id: Id<T>,
     value: WithoutSystemFields<Doc<DM, T>>,
   ): Promise<void>;
+  set: {
+    add<T extends TableNamesInDataModel<DM>>(
+      table: T,
+      id: Id<T>,
+      field: string,
+      value: unknown,
+    ): Promise<void>;
+    delete<T extends TableNamesInDataModel<DM>>(
+      table: T,
+      id: Id<T>,
+      field: string,
+      value: unknown,
+    ): Promise<void>;
+  };
+  text: {
+    splice<T extends TableNamesInDataModel<DM>>(
+      table: T,
+      id: Id<T>,
+      field: string,
+      change: { delete: number; index: number; insert: string },
+    ): Promise<void>;
+  };
   delete(id: Id<TableNamesInDataModel<DM>>): Promise<void>;
   delete<T extends TableNamesInDataModel<DM>>(table: T, id: Id<T>): Promise<void>;
   table<T extends TableNamesInDataModel<DM>>(
@@ -105,13 +155,80 @@ function tableDef(schema: Schema, table: string): TableDef {
   return def;
 }
 
+function colsEqual(
+  left: readonly [string, unknown][],
+  right: readonly [string, unknown][],
+): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    const l = left[index]!;
+    const r = right[index]!;
+    if (l[0] !== r[0] || !equals(l[1], r[1])) return false;
+  }
+  return true;
+}
+
+function explicitCrdtField(
+  def: TableDef,
+  field: string,
+): NonNullable<TableDef["crdtFields"]>[number] | undefined {
+  return def.crdtFields?.find((candidate) => candidate.field === field);
+}
+
+function assertCrdtField(def: TableDef, field: string, kind: "count" | "set" | "text"): void {
+  assertIntentField(def.name, field, kind, explicitCrdtField(def, field)?.kind);
+}
+
+function assertNoExplicitCrdtWrite(
+  def: TableDef,
+  operation: "patch" | "replace",
+  value: Record<string, unknown>,
+): void {
+  const fields = def.crdtFields ?? [];
+  if (!fields.length) return;
+  if (operation === "replace") {
+    throw new Error(
+      `replace cannot write embedded CRDT fields on ${def.name}; use ctx.db.count/set/text intent APIs`,
+    );
+  }
+  const patched = new Set(Object.keys(value));
+  const blocked = fields.find((field) => patched.has(field.field.split(".")[0]!));
+  if (blocked) {
+    throw new Error(
+      `patch cannot write embedded ${blocked.kind} field ${def.name}.${blocked.field}; use ctx.db.${blocked.kind} intent APIs`,
+    );
+  }
+}
+
+function patchTouchesIndexedColumn(def: TableDef, partial: Record<string, unknown>): boolean {
+  if (def.columns.length === 0) return false;
+  const patched = new Set(Object.keys(partial));
+  return def.columns.some((column) => patched.has((column.field ?? column.name).split(".")[0]!));
+}
+
+async function crdtReadWitnesses(
+  store: RuntimeStorageReader,
+  def: TableDef,
+  document: Record<string, unknown> | undefined,
+) {
+  if (document === undefined) return [];
+  return await Promise.all(
+    (def.crdtFields ?? []).map(async ({ field }) => ({
+      field,
+      epoch: 0,
+      headSeq: (await store.doc.crdt.read(def.name, String(document._id), field)) ?? 0,
+      projectionHash: await hashValue(valueAtPath(document, field) ?? null),
+    })),
+  );
+}
+
 /**
  * Creates a database reader bound to runtime storage.
  *
  * @internal
  */
 export function createReader<DM extends GenericDataModel>(
-  store: RuntimeStorageReader,
+  store: RuntimeStorageReader & Partial<{ file: FileSurface }>,
   schema: Schema,
   tracker?: ReadTracker,
 ): DatabaseReader<DM> {
@@ -121,11 +238,39 @@ export function createReader<DM extends GenericDataModel>(
       maybeId?: Id<T>,
     ): Promise<Doc<DM, T> | null> {
       const { table, id } = getArgs(tableOrId as string, maybeId as string | undefined);
-      tableDef(schema, table);
-      ensureIdBelongsToTable("get", table, id);
+      if (table === "" && store.remote !== undefined && !isLocalIdShape(id)) {
+        tracker?.authority?.readPoint(false);
+        return null;
+      }
+      const def = tableDef(schema, table);
       tracker?.table(table);
-      const stored = await store.doc.read(table, id);
-      return stored ? (stored as unknown as Doc<DM, T>) : null;
+      const readPoint = async (localId: string): Promise<Doc<DM, T> | null> => {
+        tracker?.doc?.(localId);
+        const stored = await store.doc.read(table, localId);
+        tracker?.authority?.readPoint(stored !== undefined && stored !== null);
+        const version = stored ? ((await store.doc.version.read(table, localId)) ?? 0) : 0;
+        tracker?.point?.({
+          table,
+          id: localId,
+          version,
+          crdt: await crdtReadWitnesses(store, def, stored),
+          contentHash: await hashDocument(
+            stored,
+            (def.crdtFields ?? []).map((field) => field.field),
+          ),
+        });
+        return stored ? (stored as unknown as Doc<DM, T>) : null;
+      };
+      if (isLocalIdForTable(table, id)) return readPoint(id);
+      if (isLocalIdShape(id)) {
+        throw new Error(`get: id does not belong to table ${table}`);
+      }
+      if (store.remote !== undefined) {
+        const localId = await hostedToLocal(store, table, id);
+        if (localId !== undefined) return readPoint(localId);
+      }
+      tracker?.authority?.readPoint(false);
+      return null;
     },
     normalizeId<T extends TableNamesInDataModel<DM>>(table: T, id: string): Id<T> | null {
       return isLocalIdForTable(table, id) ? (id as Id<T>) : null;
@@ -134,7 +279,7 @@ export function createReader<DM extends GenericDataModel>(
       return new QueryBuilder<DM, T>(store, tableDef(schema, table), undefined, tracker);
     },
     get system(): DatabaseReader<DM> {
-      return unsupportedSystemReader<DM>();
+      return systemReader<DM>(store);
     },
     table<T extends TableNamesInDataModel<DM>>(table: T) {
       tableDef(schema, table);
@@ -153,19 +298,47 @@ export function createReader<DM extends GenericDataModel>(
  * @internal
  */
 export function createWriter<DM extends GenericDataModel>(
-  store: RuntimeStorageWriter,
+  store: RuntimeStorageWriter & Partial<{ file: FileSurface }>,
   schema: Schema,
   tracker?: ReadTracker,
 ): {
   db: DatabaseWriter<DM>;
+  crdtRestore(restore: CrdtRestore): void;
+  revisionRestore(expectation: {
+    table: string;
+    rowId: string;
+    deleted: boolean;
+    value?: Record<string, unknown>;
+  }): void;
+  restoreDocument(
+    table: string,
+    id: string,
+    value: Record<string, unknown>,
+    creationTime: number,
+    existingMapping?: IdMapping,
+  ): void;
   restore(snapshot: WriterSnapshot): void;
   snapshot(): WriterSnapshot;
+  oneUpsert: () => OneUpsertCommit | undefined;
   toBatch: () => WriteBatch;
 } {
-  const upsertsByTable = new Map<string, Map<string, { input: UpsertIn; doc: StagedDoc }>>();
+  const upsertsByTable = new Map<
+    string,
+    Map<string, { crdtOnly: boolean; dataOnly: boolean; input: UpsertIn; doc: StagedDoc }>
+  >();
   const deletesByTable = new Map<string, Set<string>>();
+  const crdtOps: CrdtOp[] = [];
+  const crdtRestores: CrdtRestore[] = [];
+  const freshIds: DeleteIn[] = [];
+  const idMappings: IdMapping[] = [];
+  const revisionRestores = new Map<
+    string,
+    { table: string; rowId: string; deleted: boolean; value?: Record<string, unknown> }
+  >();
 
-  const tableUpserts = (table: string): Map<string, { input: UpsertIn; doc: StagedDoc }> => {
+  const tableUpserts = (
+    table: string,
+  ): Map<string, { crdtOnly: boolean; dataOnly: boolean; input: UpsertIn; doc: StagedDoc }> => {
     let map = upsertsByTable.get(table);
     if (!map) {
       map = new Map();
@@ -188,11 +361,22 @@ export function createWriter<DM extends GenericDataModel>(
     id: string,
     data: Record<string, unknown>,
     creationTime: number,
+    options: { cols?: ColEntries; crdtOnly?: boolean; dataOnly?: boolean } = {},
   ): void => {
     if (def.document) validateJson(data, def.document, def.name);
     deletesByTable.get(def.name)?.delete(id);
-    tableUpserts(def.name).set(id, {
-      input: { table: def.name, id, data, cols: extractCols(def, data), creationTime },
+    const upserts = tableUpserts(def.name);
+    const previous = upserts.get(id);
+    upserts.set(id, {
+      crdtOnly: options.crdtOnly === true && previous?.crdtOnly !== false,
+      dataOnly: options.dataOnly === true,
+      input: {
+        table: def.name,
+        id,
+        data,
+        cols: options.cols ?? (options.dataOnly === true ? [] : extractColEntries(def, data)),
+        creationTime,
+      },
       doc: { _id: id, _creationTime: creationTime, data },
     });
   };
@@ -202,7 +386,19 @@ export function createWriter<DM extends GenericDataModel>(
     if (deletesByTable.get(table)?.has(id)) return null;
     const staged = upsertsByTable.get(table)?.get(id);
     if (staged) return cloneTree(materialize(staged.doc));
+    tracker?.doc?.(id);
     const stored = await store.doc.read(table, id);
+    const version = stored ? ((await store.doc.version.read(table, id)) ?? 0) : 0;
+    tracker?.point?.({
+      table,
+      id,
+      version,
+      crdt: await crdtReadWitnesses(store, tableDef(schema, table), stored),
+      contentHash: await hashDocument(
+        stored,
+        (tableDef(schema, table).crdtFields ?? []).map((field) => field.field),
+      ),
+    });
     return stored ?? null;
   };
 
@@ -214,13 +410,44 @@ export function createWriter<DM extends GenericDataModel>(
   });
 
   const db: DatabaseWriter<DM> = {
+    count: {
+      async add(
+        table: TableNamesInDataModel<DM>,
+        id: Id<TableNamesInDataModel<DM>>,
+        field: string,
+        delta: number,
+      ): Promise<void> {
+        if (tableFromId(id) !== table) throw new Error(`count.add: id is not in ${table}`);
+        const def = tableDef(schema, table);
+        assertCrdtField(def, field, "count");
+        assertFiniteDelta(table, field, delta);
+        const current = await read(id);
+        const decision = validateCountAdd(table, id, field, current, delta);
+        if (!decision.consume) return;
+        stage(
+          def,
+          id,
+          dataOf(withValueAtPath(current!, field, decision.next)),
+          current!._creationTime,
+          {
+            crdtOnly: true,
+          },
+        );
+        crdtOps.push({ table, id, field, kind: "count.add", delta });
+      },
+    },
     async get<T extends TableNamesInDataModel<DM>>(
       tableOrId: T | Id<T>,
       maybeId?: Id<T>,
     ): Promise<Doc<DM, T> | null> {
       const { table, id: parsedId } = getArgs(tableOrId as string, maybeId as string | undefined);
-      ensureIdBelongsToTable("get", table, parsedId);
-      return (await read(parsedId)) as unknown as Doc<DM, T> | null;
+      if (isLocalIdForTable(table, parsedId)) {
+        return (await read(parsedId)) as unknown as Doc<DM, T> | null;
+      }
+      if (isLocalIdShape(parsedId)) {
+        throw new Error(`get: id does not belong to table ${table}`);
+      }
+      return null;
     },
     normalizeId<T extends TableNamesInDataModel<DM>>(table: T, id: string): Id<T> | null {
       return isLocalIdForTable(table, id) ? (id as Id<T>) : null;
@@ -234,7 +461,7 @@ export function createWriter<DM extends GenericDataModel>(
       );
     },
     get system(): DatabaseReader<DM> {
-      return unsupportedSystemReader<DM>();
+      return systemReader<DM>(store);
     },
     table<T extends TableNamesInDataModel<DM>>(table: T) {
       tableDef(schema, table);
@@ -249,19 +476,25 @@ export function createWriter<DM extends GenericDataModel>(
           db.replace(table, id, value),
       };
     },
-    async insert<T extends TableNamesInDataModel<DM>>(
+    insert<T extends TableNamesInDataModel<DM>>(
       table: T,
       value: WithoutSystemFields<Doc<DM, T>>,
     ): Promise<Id<T>> {
       const id = createId(table);
       assertNoSystemFieldConflict("insert", value as Record<string, unknown>);
-      stage(
-        tableDef(schema, table),
-        id,
-        dataOf(value as Record<string, unknown>),
-        store.clock.next(),
-      );
-      return id as Id<T>;
+      const def = tableDef(schema, table);
+      assertCrdtInitialValues(def, value as Record<string, unknown>);
+      const creationTime = store.clock.read();
+      freshIds.push({ table, id });
+      idMappings.push({
+        table,
+        localId: id,
+        mapping: "local",
+        createdTime: creationTime,
+        updatedTime: creationTime,
+      });
+      stage(def, id, dataOf(value as Record<string, unknown>), creationTime);
+      return Promise.resolve(id as Id<T>);
     },
     async patch<T extends TableNamesInDataModel<DM>>(
       tableOrId: T | Id<T>,
@@ -274,8 +507,28 @@ export function createWriter<DM extends GenericDataModel>(
       if (!current) throw new Error(`patch: document not found: ${id}`);
       const partial = (maybePartial ?? idOrPartial) as Record<string, unknown>;
       assertNoSystemFieldConflict("patch", partial, { creationTime: current._creationTime, id });
+      const def = tableDef(schema, table);
+      assertNoExplicitCrdtWrite(def, "patch", partial);
       const merged = { ...current, ...partial };
-      stage(tableDef(schema, table), id, dataOf(merged), current._creationTime);
+      const mergedData = dataOf(merged);
+      const previous = upsertsByTable.get(table)?.get(id);
+      if (!patchTouchesIndexedColumn(def, partial)) {
+        const fresh = freshIds.some((row) => row.table === table && row.id === id);
+        const previousCols =
+          previous && !previous.dataOnly && Array.isArray(previous.input.cols)
+            ? previous.input.cols
+            : undefined;
+        stage(def, id, mergedData, current._creationTime, {
+          cols: previousCols,
+          dataOnly: !fresh && !previousCols,
+        });
+        return;
+      }
+      const mergedCols = extractColEntries(def, mergedData);
+      stage(def, id, mergedData, current._creationTime, {
+        cols: mergedCols,
+        dataOnly: colsEqual(extractColEntries(def, current), mergedCols),
+      });
     },
     async replace<T extends TableNamesInDataModel<DM>>(
       tableOrId: T | Id<T>,
@@ -289,7 +542,80 @@ export function createWriter<DM extends GenericDataModel>(
       if (!current) throw new Error(`replace: document not found: ${id}`);
       const value = (maybeValue ?? idOrValue) as Record<string, unknown>;
       assertNoSystemFieldConflict("replace", value, { creationTime: current._creationTime, id });
-      stage(tableDef(schema, table), id, dataOf(value), current._creationTime);
+      const def = tableDef(schema, table);
+      const restore = revisionRestores.get(`${table}\u0000${id}`);
+      const allowedRestore =
+        restore !== undefined &&
+        !restore.deleted &&
+        equals(dataOf(value), restore.value as Record<string, unknown>);
+      if (!allowedRestore) assertNoExplicitCrdtWrite(def, "replace", value);
+      stage(def, id, dataOf(value), current._creationTime);
+      if (allowedRestore) revisionRestores.delete(`${table}\u0000${id}`);
+    },
+    set: {
+      async add(
+        table: TableNamesInDataModel<DM>,
+        id: Id<TableNamesInDataModel<DM>>,
+        field: string,
+        value: unknown,
+      ): Promise<void> {
+        if (tableFromId(id) !== table) throw new Error(`set.add: id is not in ${table}`);
+        const def = tableDef(schema, table);
+        assertCrdtField(def, field, "set");
+        const current = await read(id);
+        const next = [...validateSetField("set.add", table, id, field, current)];
+        if (!next.some((member) => equals(member, value))) next.push(cloneTree(value));
+        stage(def, id, dataOf(withValueAtPath(current!, field, next)), current!._creationTime, {
+          crdtOnly: true,
+        });
+        crdtOps.push({ table, id, field, kind: "set.add", value: cloneTree(value) });
+      },
+      async delete(
+        table: TableNamesInDataModel<DM>,
+        id: Id<TableNamesInDataModel<DM>>,
+        field: string,
+        value: unknown,
+      ): Promise<void> {
+        if (tableFromId(id) !== table) throw new Error(`set.delete: id is not in ${table}`);
+        const def = tableDef(schema, table);
+        assertCrdtField(def, field, "set");
+        const current = await read(id);
+        const next = validateSetField("set.delete", table, id, field, current).filter(
+          (member) => !equals(member, value),
+        );
+        stage(def, id, dataOf(withValueAtPath(current!, field, next)), current!._creationTime, {
+          crdtOnly: true,
+        });
+        crdtOps.push({ table, id, field, kind: "set.delete", value: cloneTree(value) });
+      },
+    },
+    text: {
+      async splice(
+        table: TableNamesInDataModel<DM>,
+        id: Id<TableNamesInDataModel<DM>>,
+        field: string,
+        change: { delete: number; index: number; insert: string },
+      ): Promise<void> {
+        if (tableFromId(id) !== table) throw new Error(`text.splice: id is not in ${table}`);
+        const def = tableDef(schema, table);
+        assertCrdtField(def, field, "text");
+        const current = await read(id);
+        const source = validateTextSplice(table, id, field, current, change);
+        const end = change.index + change.delete;
+        const next = source.slice(0, change.index) + change.insert + source.slice(end);
+        stage(def, id, dataOf(withValueAtPath(current!, field, next)), current!._creationTime, {
+          crdtOnly: true,
+        });
+        crdtOps.push({
+          table,
+          id,
+          field,
+          kind: "text.splice",
+          index: codePointLength(source.slice(0, change.index)),
+          delete: codePointLength(source.slice(change.index, end)),
+          insert: change.insert,
+        });
+      },
     },
     async delete(
       tableOrId: TableNamesInDataModel<DM> | Id<TableNamesInDataModel<DM>>,
@@ -301,20 +627,122 @@ export function createWriter<DM extends GenericDataModel>(
         throw new Error(`delete: id does not belong to table ${table}`);
       const current = await read(id);
       if (!current) throw new Error(`delete: document not found: ${id}`);
+      const existingMapping = await store.id.read(table, id);
+      const convexId =
+        existingMapping?.mapping === "mapped" || existingMapping?.mapping === "deleted"
+          ? existingMapping.convexId
+          : undefined;
+      const restore = revisionRestores.get(`${table}\u0000${id}`);
       upsertsByTable.get(table)?.delete(id);
       tableDeletes(table).add(id);
+      for (let index = crdtOps.length - 1; index >= 0; index -= 1) {
+        const op = crdtOps[index]!;
+        if (op.table === table && op.id === id) crdtOps.splice(index, 1);
+      }
+      idMappings.push({
+        table,
+        localId: id,
+        ...(convexId === undefined ? {} : { convexId }),
+        mapping: "deleted",
+        createdTime: existingMapping?.createdTime ?? current._creationTime,
+        updatedTime: store.clock.read(),
+      });
+      if (restore?.deleted) revisionRestores.delete(`${table}\u0000${id}`);
     },
   };
 
-  const toBatch = (): WriteBatch => ({
-    upserts: [...upsertsByTable.values()].flatMap((map) => [...map.values()].map((e) => e.input)),
-    deletes: [...deletesByTable.entries()].flatMap(([table, ids]) =>
-      [...ids].map((id) => ({ table, id })),
-    ),
-  });
+  const restoreDocument = (
+    table: string,
+    id: string,
+    value: Record<string, unknown>,
+    creationTime: number,
+    existingMapping?: IdMapping,
+  ): void => {
+    const def = tableDef(schema, table);
+    if (tableFromId(id) !== table) throw new Error(`restore: id does not belong to table ${table}`);
+    assertNoSystemFieldConflict("restore", value, { creationTime, id });
+    stage(def, id, dataOf(value), creationTime);
+    const updatedTime = store.clock.read();
+    const convexId = existingMapping?.mapping === "mapped" ? existingMapping.convexId : undefined;
+    idMappings.push({
+      table,
+      localId: id,
+      ...(convexId === undefined
+        ? { mapping: "local" as const }
+        : { mapping: "mapped" as const, convexId }),
+      createdTime: existingMapping?.createdTime ?? Math.trunc(creationTime),
+      updatedTime,
+    });
+  };
+
+  const toBatch = (): WriteBatch => {
+    const upserts: UpsertIn[] = [];
+    const crdtOnlyIds: DeleteIn[] = [];
+    const dataOnlyIds: DeleteIn[] = [];
+    for (const map of upsertsByTable.values()) {
+      for (const entry of map.values()) {
+        upserts.push(entry.input);
+        if (entry.crdtOnly) {
+          crdtOnlyIds.push({ table: entry.input.table, id: entry.input.id });
+        }
+        if (entry.dataOnly) {
+          dataOnlyIds.push({ table: entry.input.table, id: entry.input.id });
+        }
+      }
+    }
+    const deletes: DeleteIn[] = [];
+    for (const [table, ids] of deletesByTable) {
+      for (const id of ids) deletes.push({ table, id });
+    }
+    return {
+      crdtOps: [...crdtOps],
+      crdtOnlyIds,
+      crdtRestores: [...crdtRestores],
+      dataOnlyIds,
+      deletes,
+      freshIds: [...freshIds],
+      idMappings: [...idMappings],
+      upserts,
+    };
+  };
+
+  const oneUpsert = (): OneUpsertCommit | undefined => {
+    if (
+      crdtOps.length > 0 ||
+      crdtRestores.length > 0 ||
+      idMappings.length > 0 ||
+      deletesByTable.size > 0
+    ) {
+      return undefined;
+    }
+    if (upsertsByTable.size !== 1) return undefined;
+    const entries = [...upsertsByTable.values()][0];
+    if (!entries || entries.size !== 1) return undefined;
+    const entry = [...entries.values()][0];
+    if (!entry) return undefined;
+    const fresh =
+      freshIds.length === 0
+        ? false
+        : freshIds.length === 1 &&
+            freshIds[0]?.table === entry.input.table &&
+            freshIds[0].id === entry.input.id
+          ? true
+          : undefined;
+    if (fresh === undefined) return undefined;
+    return {
+      dataOnly: entry.dataOnly,
+      fresh,
+      upsert: entry.input,
+    };
+  };
 
   const snapshot = (): WriterSnapshot => ({
     deletes: new Map([...deletesByTable].map(([table, ids]) => [table, new Set(ids)])),
+    freshIds: [...freshIds],
+    crdtOps: [...crdtOps],
+    crdtRestores: [...crdtRestores],
+    idMappings: [...idMappings],
+    revisionRestores: new Map(revisionRestores),
     upserts: new Map([...upsertsByTable].map(([table, map]) => [table, new Map(map)])),
   });
 
@@ -323,16 +751,109 @@ export function createWriter<DM extends GenericDataModel>(
     for (const [table, map] of snapshot.upserts) upsertsByTable.set(table, new Map(map));
     deletesByTable.clear();
     for (const [table, ids] of snapshot.deletes) deletesByTable.set(table, new Set(ids));
+    freshIds.length = 0;
+    freshIds.push(...snapshot.freshIds);
+    crdtOps.length = 0;
+    crdtOps.push(...snapshot.crdtOps);
+    crdtRestores.length = 0;
+    crdtRestores.push(...snapshot.crdtRestores);
+    idMappings.length = 0;
+    idMappings.push(...snapshot.idMappings);
+    revisionRestores.clear();
+    for (const [key, expectation] of snapshot.revisionRestores) {
+      revisionRestores.set(key, expectation);
+    }
   };
 
-  return { db, restore, snapshot, toBatch };
+  const revisionRestore = (expectation: {
+    table: string;
+    rowId: string;
+    deleted: boolean;
+    value?: Record<string, unknown>;
+  }): void => {
+    revisionRestores.set(`${expectation.table}\u0000${expectation.rowId}`, expectation);
+  };
+
+  return {
+    db,
+    crdtRestore: (crdtRestore) => crdtRestores.push(crdtRestore),
+    revisionRestore,
+    restoreDocument,
+    restore,
+    snapshot,
+    oneUpsert,
+    toBatch,
+  };
 }
 
 const EMPTY_DELETES: ReadonlySet<string> = new Set();
 
+/** Count Unicode scalars in a boundary-aligned substring, the position unit the Loro boundary expects. */
+function codePointLength(text: string): number {
+  let count = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (isHighSurrogate(text.charCodeAt(i)) && isLowSurrogate(text.charCodeAt(i + 1))) i += 1;
+    count += 1;
+  }
+  return count;
+}
+
+function assertCrdtInitialValues(def: TableDef, value: Record<string, unknown>): void {
+  for (const meta of def.crdtFields ?? []) {
+    const initial = valueAtPath(value, meta.field);
+    if (initial === undefined) continue;
+    if (meta.kind === "count" && (typeof initial !== "number" || !Number.isFinite(initial))) {
+      throw new Error(`insert: ${def.name}.${meta.field} initial count must be a finite number`);
+    }
+    if (meta.kind === "text" && typeof initial === "string" && hasUnpairedSurrogate(initial)) {
+      throw new Error(
+        `insert: ${def.name}.${meta.field} initial text is not valid Unicode (contains an unpaired surrogate)`,
+      );
+    }
+  }
+}
+
+function valueAtPath(value: Record<string, unknown>, field: string): unknown {
+  let cursor: unknown = value;
+  for (const segment of field.split(".")) {
+    if (typeof cursor !== "object" || cursor === null) return undefined;
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  return cursor;
+}
+
+function withValueAtPath(
+  value: Record<string, unknown>,
+  field: string,
+  next: unknown,
+): Record<string, unknown> {
+  const segments = field.split(".");
+  const root = cloneTree(value) as Record<string, unknown>;
+  let cursor = root;
+  for (const segment of segments.slice(0, -1)) {
+    const child = cursor[segment];
+    const object = typeof child === "object" && child !== null ? child : {};
+    cursor[segment] = cloneTree(object) as Record<string, unknown>;
+    cursor = cursor[segment] as Record<string, unknown>;
+  }
+  cursor[segments.at(-1)!] = cloneTree(next);
+  return root;
+}
+
 export interface WriterSnapshot {
+  crdtOps: CrdtOp[];
+  crdtRestores: CrdtRestore[];
   deletes: Map<string, Set<string>>;
-  upserts: Map<string, Map<string, { input: UpsertIn; doc: StagedDoc }>>;
+  freshIds: DeleteIn[];
+  idMappings: IdMapping[];
+  revisionRestores: Map<
+    string,
+    { table: string; rowId: string; deleted: boolean; value?: Record<string, unknown> }
+  >;
+  upserts: Map<
+    string,
+    Map<string, { crdtOnly: boolean; dataOnly: boolean; input: UpsertIn; doc: StagedDoc }>
+  >;
 }
 
 function getArgs(tableOrId: string, maybeId?: string): { table: string; id: string } {
@@ -362,12 +883,65 @@ function unsupportedSystemReader<DM extends GenericDataModel>(): DatabaseReader<
   };
 }
 
-function ensureIdBelongsToTable(method: string, table: string, id: string): void {
-  if (!isLocalIdForTable(table, id)) {
-    throw new Error(`${method}: id does not belong to table ${table}`);
-  }
+function systemReader<DM extends GenericDataModel>(
+  store: RuntimeStorageReader & Partial<{ file: FileSurface }>,
+): DatabaseReader<DM> {
+  return {
+    async get<T extends TableNamesInDataModel<DM>>(
+      tableOrId: T | Id<T>,
+      maybeId?: Id<T>,
+    ): Promise<Doc<DM, T> | null> {
+      const { table, id } = getArgs(tableOrId as string, maybeId as string | undefined);
+      if (table !== "_storage") {
+        throw new Error(`Convex embedded runtime does not support system table ${table}.`);
+      }
+      if (!store.file) {
+        throw new Error("Convex embedded runtime storage backend does not support file metadata.");
+      }
+      const metadata = await store.file.read(id);
+      if (!metadata) return null;
+      return {
+        _id: metadata.storageId,
+        _creationTime: metadata.createdTime,
+        contentType: metadata.contentType,
+        sha256: metadata.sha256,
+        size: metadata.size,
+      } as unknown as Doc<DM, T>;
+    },
+    normalizeId<T extends TableNamesInDataModel<DM>>(table: T, id: string): Id<T> | null {
+      return table === "_storage" && isLocalIdForTable(table, id) ? (id as Id<T>) : null;
+    },
+    query: (table) => unsupportedSystemReader<DM>().query(table),
+    get system(): DatabaseReader<DM> {
+      return this;
+    },
+    table<T extends TableNamesInDataModel<DM>>(table: T) {
+      if (table !== ("_storage" as T)) {
+        throw new Error(`Convex embedded runtime does not support system table ${String(table)}.`);
+      }
+      return {
+        get: (id: Id<T>) => this.get(table, id),
+        query: () => this.query(table),
+      };
+    },
+  };
 }
 
-function isLocalIdForTable(table: string, id: string): boolean {
-  return tableFromId(id) === table && /^[^|]+\|[0-9a-f]{32}$/.test(id);
+/**
+ * Resolves a hosted Convex id to its local id for `table`, honoring both mapped and deleted
+ * mappings, or `undefined` when the row was never disclosed locally.
+ *
+ * @internal
+ */
+export async function hostedToLocal(
+  store: RuntimeStorageReader,
+  table: string,
+  hostedId: string,
+): Promise<string | undefined> {
+  for (const mapping of (await store.id?.page.read(table)) ?? []) {
+    const convexId =
+      mapping.mapping === "mapped" || mapping.mapping === "deleted" ? mapping.convexId : undefined;
+    if (convexId === hostedId) return mapping.localId;
+  }
+  return undefined;
 }

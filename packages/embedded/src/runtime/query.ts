@@ -12,23 +12,113 @@ import type {
 import { convexToJson, jsonToConvex } from "convex/values";
 import type { JSONValue, Value } from "convex/values";
 import {
-  DEFAULT_SCAN_PAGE,
+  DEFAULT_READ_PAGE,
   type Bound,
   type ColValue,
   type RuntimeStorageReader,
   type TableDef,
 } from "../storage/types";
-import { compare as compareConvex, equals as equalsConvex } from "./codec";
+import { hashDocument, hashValue } from "../hash";
+import type { ReadAuthority } from "./cache";
+import { compare as compareConvex, equals as equalsConvex, freezeNormalizedTree } from "./codec";
 import type { Doc } from "./model";
-import { compileFieldPath, readFieldPath, type RawDoc } from "./values";
+import { compileFieldPath, readFieldPath, type RawDoc } from "./doc";
 
 /**
- * Tracks tables read by a query so watched queries can be invalidated.
+ * One index-range bound on the wire. `value` is a Convex value serialized as JSON, matching the
+ * projection-field codec so client and server compare bounds identically (contract §2/§4).
+ *
+ * @internal
+ */
+export interface ReadBound {
+  field: string;
+  value: JSONValue;
+  inclusive: boolean;
+}
+
+export interface ReadEquality {
+  field: string;
+  value: JSONValue;
+}
+
+/**
+ * An index-range read: the exact scope a list query depends on (contract §4). Full-table scans carry
+ * no index and are published as `{kind:"all"}`, so a `ReadRange` always names an index.
+ *
+ * @internal
+ */
+export interface ReadRange {
+  table: string;
+  index: string;
+  equality: ReadEquality[];
+  limit?: number;
+  lower?: ReadBound;
+  upper?: ReadBound;
+  order: "asc" | "desc";
+}
+
+/**
+ * One member of the optimistic run's read-set with the version it observed (contract §2). A point
+ * read carries the row id; a range read carries the index bounds plus the ids it saw. `version` is
+ * the remote sequence / adoption clock the local replica held, stamped by the store on capture.
+ *
+ * @internal
+ */
+export type BaseVersion =
+  | {
+      table: string;
+      id: string;
+      version: number;
+      contentHash: string;
+      crdt: Array<{
+        field: string;
+        epoch: number;
+        headSeq: number;
+        projectionHash: string;
+      }>;
+    }
+  | {
+      table: string;
+      index: string;
+      order: "asc" | "desc";
+      equality: ReadEquality[];
+      limit?: number;
+      lower?: ReadBound;
+      upper?: ReadBound;
+      members: string[];
+      memberHashes: string[];
+      membersHash: string;
+      version: number;
+    };
+
+/**
+ * Tracks the read-set of a query: the shared substrate for local invalidation, the pull scope
+ * (`range`, contract §4), and the push read-set (`point`/`range` base-versions, contract §2).
+ *
+ * @remarks
+ * `doc`/`table` drive LOCAL reactive invalidation and are unchanged. `range` publishes the remote
+ * pull scope. `point` records a point base-version. `range` doubles as the range base-version when a
+ * mutation reads over an index. Members and version stamping ride the emitted shapes.
  *
  * @internal
  */
 export interface ReadTracker {
+  doc?(id: string): void;
   table(table: string): void;
+  range?(
+    range: ReadRange,
+    members: string[],
+    memberHashes: string[],
+    membersHash: string,
+    version: number,
+  ): void;
+  point?(base: Extract<BaseVersion, { id: string }>): void;
+  /**
+   * Read-authority sink for the retained-result cache (Cut 7 §4.1): a watch evaluation records
+   * whether each read stays within its own authoritative disclosure. Present only for remote-scoped
+   * watch reruns; local invalidation and push/pull scope leave it undefined.
+   */
+  authority?: ReadAuthority;
 }
 
 /**
@@ -283,13 +373,19 @@ export class QueryBuilder<
   take(n: number): Promise<Doc<DM, T>[]> {
     validateNonNegativeInteger(n, "take");
     if (n === 0) return Promise.resolve([]);
-    return this.consumeForUse().withPlan({ limit: n }).collect();
+    const query = this.consumeForUse().withPlan({ limit: n });
+    return query.collect();
   }
 
   async collect(): Promise<Doc<DM, T>[]> {
     const query = this.consumeForUse();
+    const overlay = query.activeOverlay();
+    const bounds = query.buildBounds();
+    if (query.canUseDirectStorage(bounds, overlay)) {
+      return (await query.collectDirect(bounds, query.limitCount)) as unknown as Doc<DM, T>[];
+    }
     const docs: RawDoc[] = [];
-    for await (const batch of query.batches()) {
+    for await (const batch of query.batches(undefined, undefined, overlay, bounds)) {
       for (const doc of batch) docs.push(doc);
     }
     return docs as unknown as Doc<DM, T>[];
@@ -298,11 +394,12 @@ export class QueryBuilder<
   async count(): Promise<number> {
     const query = this.consumeForUse();
     query.tracker?.table(query.def.name);
+    query.tracker?.authority?.readCount();
     const bounds = query.buildBounds();
-    const overlay = query.overlay?.();
+    const overlay = query.activeOverlay();
     if (boundsAreExact(bounds) && !query.predicates.length) {
       if (!overlay) {
-        const pushed = await query.store.doc.count({
+        const pushed = await query.store.doc.count.read({
           table: query.def.name,
           index: query.indexName,
           bounds,
@@ -318,7 +415,13 @@ export class QueryBuilder<
   }
 
   async first(): Promise<Doc<DM, T> | null> {
-    return (await this.take(1))[0] ?? null;
+    const query = this.consumeForUse().withPlan({ limit: 1 });
+    const overlay = query.activeOverlay();
+    const bounds = query.buildBounds();
+    if (query.canUseDirectStorage(bounds, overlay)) {
+      return ((await query.collectDirect(bounds, 1))[0] as unknown as Doc<DM, T>) ?? null;
+    }
+    return ((await query.collect())[0] as Doc<DM, T>) ?? null;
   }
 
   async unique(): Promise<Doc<DM, T> | null> {
@@ -391,7 +494,9 @@ export class QueryBuilder<
     }
     return {
       continueCursor:
-        exhausted || lastKey === undefined ? PAGE_CURSOR_END : encodePageCursor(lastKey),
+        exhausted || lastKey === undefined
+          ? PAGE_CURSOR_END
+          : encodePageCursor(lastKey, orderFields),
       isDone: exhausted,
       page: page as unknown as Doc<DM, T>[],
       pageStatus: null,
@@ -421,35 +526,44 @@ export class QueryBuilder<
   private async *batches(
     after?: KeyTuple,
     limitHint?: number,
+    overlayArg?: QueryOverlay,
+    boundsArg?: Bound[],
   ): AsyncGenerator<readonly RawDoc[], void, undefined> {
     this.tracker?.table(this.def.name);
     if (this.limitCount === 0) return;
     const orderFields = this.orderFields();
     const byOrder = (a: RawDoc, b: RawDoc): number => this.compareDocs(a, b, orderFields);
-    const overlay = this.overlay?.();
+    const overlay = overlayArg ?? this.activeOverlay();
     const deleted = overlay?.deleted;
     const overridden = overlay ? new Set(overlay.staged.map((d) => d._id)) : undefined;
-    const staged = overlay
-      ? overlay.staged
-          .filter((d) => !overlay.deleted.has(d._id) && this.matchesBounds(d))
-          .sort(byOrder)
-      : [];
+    const staged =
+      overlay && overlay.staged.length
+        ? overlay.staged
+            .filter((d) => !overlay.deleted.has(d._id) && this.matchesBounds(d))
+            .sort(byOrder)
+        : [];
     const slack = overlay ? overlay.deleted.size + overlay.staged.length : 0;
     const hint = limitHint ?? this.limitCount;
     const firstPage =
       hint === undefined
         ? FIRST_PAGE
-        : Math.min(Math.max(hint + slack + 1, MIN_PAGE), DEFAULT_SCAN_PAGE);
+        : Math.min(Math.max(hint + slack + 1, MIN_PAGE), DEFAULT_READ_PAGE);
 
     let emitted = 0;
     let stagedIndex = 0;
     const limit = this.limitCount;
+    const afterId =
+      after !== undefined && typeof after.at(-1) === "string"
+        ? (after.at(-1) as string)
+        : undefined;
     const passes = (doc: RawDoc): boolean =>
       this.matchesBounds(doc) &&
+      doc._id !== afterId &&
       (after === undefined || this.compareKeys(this.keyOf(doc, orderFields), after) > 0) &&
       this.predicates.every((predicate) => predicate(doc));
 
-    for await (const page of this.pages(firstPage, after)) {
+    const bounds = boundsArg ?? this.buildBounds();
+    for await (const page of this.pages(firstPage, after, bounds)) {
       const out: RawDoc[] = [];
       for (const doc of page) {
         while (stagedIndex < staged.length && byOrder(staged[stagedIndex]!, doc) < 0) {
@@ -495,25 +609,97 @@ export class QueryBuilder<
   private async *pages(
     firstPage: number,
     after: KeyTuple | undefined,
+    bounds: Bound[] | undefined = this.buildBounds(),
   ): AsyncGenerator<readonly RawDoc[], void, undefined> {
     const resumeAfterKey = after?.map((value) => value as ColValue);
     let cursor: string | undefined;
     let pageSize = firstPage;
     while (true) {
-      const page = await this.store.doc.scan({
+      const page = await this.store.doc.page.read({
         table: this.def.name,
         index: this.indexName,
-        bounds: this.buildBounds(),
+        bounds,
         order: this.orderDir,
         pageSize,
         cursor,
         resumeAfterKey: cursor === undefined ? resumeAfterKey : undefined,
       });
+      for (const doc of page.docs) this.tracker?.doc?.(doc._id);
+      this.tracker?.authority?.readRange(
+        page.docs.map((doc) => doc._id),
+        this.indexName !== undefined,
+      );
+      await this.captureRange(bounds, page.docs, page.versions);
       if (page.docs.length) yield page.docs;
       if (page.cursor === null) return;
       cursor = page.cursor;
-      pageSize = Math.min(pageSize * 2, DEFAULT_SCAN_PAGE);
+      pageSize = Math.min(pageSize * 2, DEFAULT_READ_PAGE);
     }
+  }
+
+  private async collectDirect(
+    bounds: Bound[] | undefined,
+    limit: number | undefined,
+  ): Promise<RawDoc[]> {
+    this.tracker?.table(this.def.name);
+    if (limit === 0) return [];
+    if (limit !== undefined && limit <= DEFAULT_READ_PAGE) {
+      const page = await this.store.doc.page.read({
+        table: this.def.name,
+        index: this.indexName,
+        bounds,
+        order: this.orderDir,
+        pageSize: limit,
+      });
+      for (const doc of page.docs) this.tracker?.doc?.(doc._id);
+      this.tracker?.authority?.readRange(
+        page.docs.map((doc) => doc._id),
+        this.indexName !== undefined,
+      );
+      await this.captureRange(bounds, page.docs, page.versions);
+      return page.docs;
+    }
+    const docs: RawDoc[] = [];
+    let cursor: string | undefined;
+    do {
+      const remaining = limit === undefined ? DEFAULT_READ_PAGE : limit - docs.length;
+      if (remaining <= 0) break;
+      const page = await this.store.doc.page.read({
+        table: this.def.name,
+        index: this.indexName,
+        bounds,
+        order: this.orderDir,
+        pageSize: Math.min(remaining, DEFAULT_READ_PAGE),
+        cursor,
+      });
+      for (const doc of page.docs) this.tracker?.doc?.(doc._id);
+      this.tracker?.authority?.readRange(
+        page.docs.map((doc) => doc._id),
+        this.indexName !== undefined,
+      );
+      await this.captureRange(bounds, page.docs, page.versions);
+      docs.push(...page.docs);
+      cursor = page.cursor ?? undefined;
+    } while (cursor !== undefined);
+    freezeNormalizedTree(docs);
+    return docs;
+  }
+
+  private canUseDirectStorage(
+    bounds: Bound[] | undefined,
+    overlay: QueryOverlay | undefined,
+  ): boolean {
+    return (
+      this.store.capabilities?.exactScanBounds === true &&
+      !overlay &&
+      !this.predicates.length &&
+      boundsAreExact(bounds)
+    );
+  }
+
+  private activeOverlay(): QueryOverlay | undefined {
+    const overlay = this.overlay?.();
+    return overlay && (overlay.staged.length || overlay.deleted.size) ? overlay : undefined;
   }
 
   /** Counts committed keys (no payload decode) adjusted by the overlay's staged/deleted ids. */
@@ -527,7 +713,7 @@ export class QueryBuilder<
     ).length;
     let cursor: string | undefined;
     do {
-      const page = await this.store.key.scan({
+      const page = await this.store.key.page.read({
         table: this.def.name,
         index: this.indexName,
         bounds,
@@ -572,6 +758,62 @@ export class QueryBuilder<
   private indexFields(): string[] {
     if (!this.indexName) return [];
     return this.def.indexes.find((i) => i.name === this.indexName)?.fields ?? [];
+  }
+
+  private wireBound(field: string, value: ColValue, inclusive: boolean): ReadBound | undefined {
+    if (value === undefined) return undefined;
+    return { field, value: convexToJson(value as Value), inclusive };
+  }
+
+  /**
+   * The wire {@link ReadRange} for this scan, or `undefined` for a full-table scan (which publishes
+   * as `{kind:"all"}`). Bounds map from the last index column: an `eq` pins a point range, a `range`
+   * carries its lower/upper.
+   */
+  private readRangeOf(bounds: Bound[] | undefined): ReadRange | undefined {
+    if (this.indexName === undefined) return undefined;
+    const range: ReadRange = {
+      table: this.def.name,
+      index: this.indexName,
+      equality: [],
+      order: this.orderDir,
+      ...(this.limitCount === undefined ? {} : { limit: this.limitCount }),
+    };
+    const fields = this.indexFields();
+    for (let index = 0; index < (bounds?.length ?? 0); index += 1) {
+      const bound = bounds![index]!;
+      if (bound.kind !== "eq") break;
+      range.equality.push({ field: fields[index]!, value: convexToJson(bound.value as Value) });
+    }
+    const last = bounds?.[bounds.length - 1];
+    if (last?.kind === "range") {
+      const field = fields[(bounds?.length ?? 1) - 1]!;
+      const lower = this.wireBound(field, last.lower as ColValue, last.lowerInclusive ?? true);
+      const upper = this.wireBound(field, last.upper as ColValue, last.upperInclusive ?? true);
+      if (lower !== undefined) range.lower = lower;
+      if (upper !== undefined) range.upper = upper;
+    }
+    return range;
+  }
+
+  private async captureRange(
+    bounds: Bound[] | undefined,
+    members: readonly RawDoc[],
+    versions: Record<string, number> | undefined,
+  ): Promise<void> {
+    if (this.tracker?.range === undefined) return;
+    const range = this.readRangeOf(bounds);
+    if (range === undefined) return;
+    const ids = members.map((doc) => doc._id);
+    const omitted = (this.def.crdtFields ?? []).map((field) => field.field);
+    const memberHashes = await Promise.all(members.map((member) => hashDocument(member, omitted)));
+    this.tracker.range(
+      range,
+      ids,
+      memberHashes,
+      await hashValue(ids.map((id, index) => ({ id, hash: memberHashes[index] }))),
+      readVersion(members, versions),
+    );
   }
 
   private buildBounds(): Bound[] | undefined {
@@ -719,7 +961,7 @@ const PAGE_CURSOR_END = "v1:end";
  * tuple — stable under interleaved writes, O(pageSize) to resume. `undefined` elements (missing
  * index fields) are recorded in a positional mask because Convex JSON cannot carry undefined.
  */
-function encodePageCursor(key: KeyTuple): string {
+function encodePageCursor(key: KeyTuple, fields: readonly OrderField[]): string {
   const missing: number[] = [];
   const values = key.map((value, i) => {
     if (value === undefined) {
@@ -728,7 +970,10 @@ function encodePageCursor(key: KeyTuple): string {
     }
     return convexToJson(value as Value);
   });
-  return PAGE_CURSOR_PREFIX + toBase64Url(JSON.stringify({ k: values, u: missing }));
+  return (
+    PAGE_CURSOR_PREFIX +
+    toBase64Url(JSON.stringify({ f: fields.map((field) => field.field), k: values, u: missing }))
+  );
 }
 
 function decodePageCursor(cursor: string | null): KeyTuple | typeof END | undefined {
@@ -737,20 +982,55 @@ function decodePageCursor(cursor: string | null): KeyTuple | typeof END | undefi
   if (!cursor.startsWith(PAGE_CURSOR_PREFIX)) {
     throw new Error(`invalid pagination cursor: ${cursor}`);
   }
-  let parsed: { k: JSONValue[]; u: number[] };
+  let parsed: { f: string[]; k: JSONValue[]; u: number[] };
   try {
     parsed = JSON.parse(fromBase64Url(cursor.slice(PAGE_CURSOR_PREFIX.length))) as {
+      f: string[];
       k: JSONValue[];
       u: number[];
     };
   } catch {
     throw new Error(`invalid pagination cursor: ${cursor}`);
   }
-  if (!Array.isArray(parsed.k) || !Array.isArray(parsed.u)) {
+  if (
+    !Array.isArray(parsed.f) ||
+    !parsed.f.every((field) => typeof field === "string") ||
+    !Array.isArray(parsed.k) ||
+    parsed.f.length !== parsed.k.length ||
+    !Array.isArray(parsed.u)
+  ) {
     throw new Error(`invalid pagination cursor: ${cursor}`);
   }
   const missing = new Set(parsed.u);
   return parsed.k.map((value, i) => (missing.has(i) ? undefined : jsonToConvex(value)));
+}
+
+export function pageCursorBoundary(cursor: string):
+  | {
+      rowId: string;
+      values: Array<{ field: string; value?: JSONValue; missing?: true }>;
+    }
+  | undefined {
+  if (cursor === PAGE_CURSOR_END) return undefined;
+  if (!cursor.startsWith(PAGE_CURSOR_PREFIX))
+    throw new Error(`invalid pagination cursor: ${cursor}`);
+  const parsed = JSON.parse(fromBase64Url(cursor.slice(PAGE_CURSOR_PREFIX.length))) as {
+    f: string[];
+    k: JSONValue[];
+    u: number[];
+  };
+  decodePageCursor(cursor);
+  const missing = new Set(parsed.u);
+  const rowId = parsed.k.at(-1);
+  if (typeof rowId !== "string" || missing.has(parsed.k.length - 1)) {
+    throw new Error("pagination cursor has no document boundary");
+  }
+  return {
+    rowId,
+    values: parsed.f.map((field, index) =>
+      missing.has(index) ? { field, missing: true } : { field, value: parsed.k[index] },
+    ),
+  };
 }
 
 function toBase64Url(text: string): string {
@@ -769,6 +1049,24 @@ function fromBase64Url(encoded: string): string {
 
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
+}
+
+/**
+ * The version a scan observed: the max adoption seq across the read rows, from the page's `versions`
+ * sidecar (contract §11 D1). Absent entries → 0, which the server treats as "unversioned" and
+ * re-reads authoritatively. The sidecar keeps versions out of the compact app-row JSON.
+ */
+function readVersion(
+  docs: readonly RawDoc[],
+  versions: Record<string, number> | undefined,
+): number {
+  if (versions === undefined) return 0;
+  let version = 0;
+  for (const doc of docs) {
+    const seq = versions[doc._id];
+    if (typeof seq === "number" && seq > version) version = seq;
+  }
+  return version;
 }
 
 function docValue(doc: RawDoc, key: OrderField): unknown {

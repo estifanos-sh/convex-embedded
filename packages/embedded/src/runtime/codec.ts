@@ -7,10 +7,33 @@ import type { JSONValue, Value } from "convex/values";
  * (args → validate → handler; result → validate → encode → commit).
  */
 const normalized = new WeakSet<object>();
+const shareableNormalized = new WeakSet<object>();
 
 const MAX_FIELD_NAME_LENGTH = 1024;
 const MIN_INT64 = -(1n << 63n);
 const MAX_INT64 = (1n << 63n) - 1n;
+const MAX_ARRAY_LENGTH = 8192;
+const MAX_OBJECT_FIELDS = 1024;
+const MAX_NESTING_DEPTH = 16;
+
+const HAS_IS_WELL_FORMED =
+  typeof (String.prototype as { isWellFormed?: () => boolean }).isWellFormed === "function";
+
+function assertWellFormed(value: string, path: string): void {
+  if (HAS_IS_WELL_FORMED && !(value as unknown as { isWellFormed(): boolean }).isWellFormed()) {
+    throw new Error(`${path}: string is not valid Unicode (contains an unpaired surrogate).`);
+  }
+}
+
+/**
+ * Result of freezing a normalized tree for safe sharing.
+ *
+ * @internal
+ */
+export interface FrozenNormalizedTree {
+  bytes: number;
+  shareable: boolean;
+}
 
 /**
  * Encodes a Convex value to JSON text. Values branded by {@link normalizeCopy} skip the
@@ -66,7 +89,7 @@ export function encodeError(error: unknown): string {
 }
 
 /**
- * Reconstructs an error previously serialized by {@link encodeError}. Legacy plain-string payloads
+ * Reconstructs an error previously serialized by {@link encodeError}. Plain-string payloads
  * (or anything that is not our JSON shape) decode to a plain `Error` carrying that text.
  *
  * @internal
@@ -110,7 +133,8 @@ export function isNormalized(value: unknown): boolean {
  * @internal
  */
 export function normalizeCopy(value: unknown): unknown {
-  const out = normalizeCopyInner(value, true, "value");
+  if (isShareableNormalized(value)) return value;
+  const out = normalizeCopyInner(value, true, "value", 0);
   return markNormalized(out);
 }
 
@@ -120,16 +144,110 @@ export function normalizeCopy(value: unknown): unknown {
  *
  * @internal
  */
-export function markNormalized<T>(value: T): T {
+function markNormalized<T>(value: T): T {
   if (typeof value === "object" && value !== null) normalized.add(value);
   return value;
 }
 
-function normalizeCopyInner(value: unknown, topLevel: boolean, path: string): unknown {
+/**
+ * Marks and freezes a normalized tree so it can be safely shared with user code without a
+ * defensive copy. Returns false for mutable byte buffers, which must still be cloned at the edge.
+ *
+ * @internal
+ */
+export function freezeNormalizedTree(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return true;
+  markNormalized(value);
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return false;
+  let shareable = true;
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!freezeNormalizedTree(entry)) shareable = false;
+    }
+  } else {
+    for (const entry of Object.values(value)) {
+      if (!freezeNormalizedTree(entry)) shareable = false;
+    }
+  }
+  Object.freeze(value);
+  if (shareable) shareableNormalized.add(value);
+  return shareable;
+}
+
+/**
+ * Freezes, brands, and estimates a normalized tree in one walk.
+ *
+ * @internal
+ */
+export function freezeNormalizedTreeWithEstimate(value: unknown): FrozenNormalizedTree {
+  if (value === undefined || value === null) return { bytes: 16, shareable: true };
+  switch (typeof value) {
+    case "boolean":
+      return { bytes: 8, shareable: true };
+    case "bigint":
+      return { bytes: 16, shareable: true };
+    case "number":
+      return { bytes: 8, shareable: true };
+    case "string":
+      return { bytes: 24 + value.length * 2, shareable: true };
+    case "object":
+      break;
+    default:
+      return { bytes: 16, shareable: true };
+  }
+  if (value instanceof ArrayBuffer) {
+    markNormalized(value);
+    return { bytes: 24 + value.byteLength, shareable: false };
+  }
+  if (ArrayBuffer.isView(value)) {
+    markNormalized(value);
+    return { bytes: 24 + value.byteLength, shareable: false };
+  }
+  return freezeNormalizedObjectWithEstimate(value);
+}
+
+function freezeNormalizedObjectWithEstimate(value: object): FrozenNormalizedTree {
+  markNormalized(value);
+  let shareable = true;
+  let bytes: number;
+  if (Array.isArray(value)) {
+    bytes = 32 + value.length * 8;
+    for (const entry of value) {
+      const result = freezeNormalizedTreeWithEstimate(entry);
+      bytes += result.bytes;
+      if (!result.shareable) shareable = false;
+    }
+  } else {
+    bytes = 48;
+    for (const [key, entry] of Object.entries(value)) {
+      const result = freezeNormalizedTreeWithEstimate(entry);
+      bytes += 24 + key.length * 2 + result.bytes;
+      if (!result.shareable) shareable = false;
+    }
+  }
+  Object.freeze(value);
+  if (shareable) {
+    shareableNormalized.add(value);
+  }
+  return { bytes, shareable };
+}
+
+function isShareableNormalized(value: unknown): boolean {
+  return typeof value === "object" && value !== null && shareableNormalized.has(value);
+}
+
+function normalizeCopyInner(
+  value: unknown,
+  topLevel: boolean,
+  path: string,
+  depth: number,
+): unknown {
   if (value === undefined) return topLevel ? null : undefined;
   if (value === null) return null;
   switch (typeof value) {
     case "string":
+      assertWellFormed(value, path);
+      return value;
     case "boolean":
     case "number":
       return value;
@@ -142,6 +260,9 @@ function normalizeCopyInner(value: unknown, topLevel: boolean, path: string): un
       break;
     default:
       throw new Error(`${path} is not a valid Convex value: unexpected ${typeof value}`);
+  }
+  if (depth > MAX_NESTING_DEPTH) {
+    throw new Error(`${path}: value nests deeper than the maximum ${MAX_NESTING_DEPTH} levels.`);
   }
   // Byte values cross async storage/runtime boundaries, so detach from caller-owned buffers.
   if (value instanceof ArrayBuffer) return markNormalized(value.slice(0));
@@ -151,36 +272,45 @@ function normalizeCopyInner(value: unknown, topLevel: boolean, path: string): un
     );
   }
   if (Array.isArray(value)) {
+    if (value.length > MAX_ARRAY_LENGTH) {
+      throw new Error(
+        `${path}: array has ${value.length} values, exceeding the maximum ${MAX_ARRAY_LENGTH}.`,
+      );
+    }
     return markNormalized(
       value.map((entry, index) => {
         if (entry === undefined) throw new Error(`undefined array element at ${path}[${index}]`);
-        return normalizeCopyInner(entry, false, `${path}[${index}]`);
+        return normalizeCopyInner(entry, false, `${path}[${index}]`, depth + 1);
       }),
     );
   }
   if (!isSimpleObject(value)) throw new Error(`${path} must be a plain Convex object`);
 
   const out: Record<string, unknown> = {};
+  let fields = 0;
   for (const [key, v] of Object.entries(value)) {
     if (v === undefined) continue;
     assertFieldName(key, path);
-    out[key] = normalizeCopyInner(v, false, `${path}.${key}`);
+    if ((fields += 1) > MAX_OBJECT_FIELDS) {
+      throw new Error(`${path}: object has more than the maximum ${MAX_OBJECT_FIELDS} fields.`);
+    }
+    out[key] = normalizeCopyInner(v, false, `${path}.${key}`, depth + 1);
   }
   return markNormalized(out);
 }
 
 /**
  * Walks a value asserting it satisfies the Convex value constraints, allocating nothing.
- * Branded values short-circuit. Replaces the old encode-and-discard `assertValue`.
+ * Branded values short-circuit.
  *
  * @internal
  */
 export function assertValueWalk(value: unknown, path: string): void {
   if (isNormalized(value)) return;
-  assertValueInner(value, true, path);
+  assertValueInner(value, true, path, 0);
 }
 
-function assertValueInner(value: unknown, topLevel: boolean, path: string): void {
+function assertValueInner(value: unknown, topLevel: boolean, path: string, depth: number): void {
   if (value === undefined) {
     if (!topLevel) throw new Error(`${path} is undefined, which is not a valid Convex value`);
     return;
@@ -188,6 +318,8 @@ function assertValueInner(value: unknown, topLevel: boolean, path: string): void
   if (value === null) return;
   switch (typeof value) {
     case "string":
+      assertWellFormed(value, path);
+      return;
     case "boolean":
     case "number":
       return;
@@ -201,23 +333,38 @@ function assertValueInner(value: unknown, topLevel: boolean, path: string): void
     default:
       throw new Error(`${path} is not a valid Convex value: unexpected ${typeof value}`);
   }
+  if (depth > MAX_NESTING_DEPTH) {
+    throw new Error(`${path}: value nests deeper than the maximum ${MAX_NESTING_DEPTH} levels.`);
+  }
   if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return;
   if (Array.isArray(value)) {
+    if (value.length > MAX_ARRAY_LENGTH) {
+      throw new Error(
+        `${path}: array has ${value.length} values, exceeding the maximum ${MAX_ARRAY_LENGTH}.`,
+      );
+    }
     value.forEach((entry, index) => {
       if (entry === undefined) throw new Error(`undefined array element at ${path}[${index}]`);
-      assertValueInner(entry, false, `${path}[${index}]`);
+      assertValueInner(entry, false, `${path}[${index}]`, depth + 1);
     });
     return;
   }
   if (!isSimpleObject(value)) throw new Error(`${path} must be a plain Convex object`);
+  let fields = 0;
   for (const [key, v] of Object.entries(value)) {
     if (v === undefined) continue;
     assertFieldName(key, path);
-    assertValueInner(v, false, `${path}.${key}`);
+    if ((fields += 1) > MAX_OBJECT_FIELDS) {
+      throw new Error(`${path}: object has more than the maximum ${MAX_OBJECT_FIELDS} fields.`);
+    }
+    assertValueInner(v, false, `${path}.${key}`, depth + 1);
   }
 }
 
 function assertFieldName(key: string, path: string): void {
+  if (key.length === 0) {
+    throw new Error(`${path}: field names must be nonempty.`);
+  }
   if (key.length > MAX_FIELD_NAME_LENGTH) {
     throw new Error(
       `${path}: field name ${key} exceeds maximum field name length ${MAX_FIELD_NAME_LENGTH}.`,

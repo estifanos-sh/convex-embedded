@@ -1,4 +1,4 @@
-import type { ColValue, StoredDoc, TableDef } from "../storage/types";
+import type { ColEntries, ColValue, StoredDoc, TableDef } from "../storage/types";
 import { normalizeObject } from "./codec";
 
 /**
@@ -23,6 +23,8 @@ export interface StagedDoc {
 }
 
 const ID_SEP = "|";
+let localIdPrefix: string | undefined;
+let localIdCounter = 0;
 
 /**
  * Creates a local Convex-style document id.
@@ -30,8 +32,10 @@ const ID_SEP = "|";
  * @internal
  */
 export function createId(table: string): string {
-  const rand = globalThis.crypto.randomUUID().replace(/-/g, "");
-  return `${table}${ID_SEP}${rand}`;
+  localIdPrefix ??= randomHex64();
+  const counter = localIdCounter;
+  localIdCounter += 1;
+  return `${table}${ID_SEP}${localIdPrefix}${counter.toString(16).padStart(16, "0")}`;
 }
 
 /**
@@ -42,6 +46,33 @@ export function createId(table: string): string {
 export function tableFromId(id: string): string {
   const sep = id.indexOf(ID_SEP);
   return sep < 0 ? "" : id.slice(0, sep);
+}
+
+const LOCAL_ID_SHAPE = /^[^|]+\|[0-9a-f]{32}$/;
+
+/** True when `id` has the local `table|<32 hex>` shape; a hosted Convex id never does. @internal */
+export function isLocalIdShape(id: string): boolean {
+  return LOCAL_ID_SHAPE.test(id);
+}
+
+/** True when `id` is locally shaped and belongs to `table`. @internal */
+export function isLocalIdForTable(table: string, id: string): boolean {
+  return isLocalIdShape(id) && tableFromId(id) === table;
+}
+
+function randomHex64(): string {
+  const crypto = globalThis.crypto as
+    | { getRandomValues?: (array: Uint32Array) => Uint32Array }
+    | undefined;
+  const words = new Uint32Array(2);
+  crypto?.getRandomValues?.(words);
+  if (words[0] !== 0 || words[1] !== 0) {
+    return `${words[0]!.toString(16).padStart(8, "0")}${words[1]!.toString(16).padStart(8, "0")}`;
+  }
+  return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)
+    .toString(16)
+    .padStart(16, "0")
+    .slice(0, 16);
 }
 
 /**
@@ -60,17 +91,15 @@ export function materialize(staged: StagedDoc): RawDoc {
 }
 
 /**
- * Extracts indexed column values from a document payload.
+ * Extracts indexed column values as ordered entries.
  *
  * @internal
  */
-export function extractCols(
-  def: TableDef,
-  data: Record<string, unknown>,
-): Record<string, ColValue> {
-  const cols: Record<string, ColValue> = {};
-  for (const col of def.columns) {
-    cols[col.name] = toColValue(readFieldPath(data, compileFieldPath(col.field ?? col.name)));
+export function extractColEntries(def: TableDef, data: Record<string, unknown>): ColEntries {
+  const cols: ColEntries = [];
+  for (let index = 0; index < def.columns.length; index += 1) {
+    const col = def.columns[index]!;
+    cols.push([col.name, toColValue(readFieldPath(data, compileFieldPath(col.field ?? col.name)))]);
   }
   return cols;
 }

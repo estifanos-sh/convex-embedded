@@ -1,6 +1,6 @@
 import type { GenericValidator, PropertyValidators, ValidatorJSON } from "convex/values";
 import { assertValueWalk, equals, fromJson, isNormalized, isSimpleObject } from "./codec";
-import { tableFromId } from "./values";
+import { tableFromId } from "./doc";
 
 /**
  * Validators are implemented as check functions returning the first error message (or
@@ -79,7 +79,7 @@ const checkValueByKind = {
   id(value, validator, path) {
     if (typeof value !== "string") return `${path} must be an id`;
     if (validator.tableName && tableFromId(value) !== validator.tableName) {
-      return `${path} must be an id for table ${validator.tableName}`;
+      return formatIdTableError(path, validator.tableName, value);
     }
     return undefined;
   },
@@ -121,6 +121,8 @@ const checkValueByKind = {
     const shape = checkRecordObject(value, path);
     if (shape !== undefined) return shape;
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      const nameError = recordKeyError(key, path);
+      if (nameError !== undefined) return nameError;
       const keyError = checkValue(key, validator.key, `${path}.${key} key`);
       if (keyError !== undefined) return keyError;
       const error = checkValue(entry, validator.value, `${path}.${key}`);
@@ -155,7 +157,7 @@ const checkJsonByType = {
   id(value, validator, path) {
     if (typeof value !== "string") return `${path} must be an id`;
     if (tableFromId(value) !== validator.tableName) {
-      return `${path} must be an id for table ${validator.tableName}`;
+      return formatIdTableError(path, validator.tableName, value);
     }
     return undefined;
   },
@@ -199,6 +201,8 @@ const checkJsonByType = {
     const shape = checkRecordObject(value, path);
     if (shape !== undefined) return shape;
     for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      const nameError = recordKeyError(key, path);
+      if (nameError !== undefined) return nameError;
       const keyError = checkJson(key, validator.keys, `${path}.${key} key`);
       if (keyError !== undefined) return keyError;
       const error = checkJson(entry, validator.values.fieldType, `${path}.${key}`);
@@ -213,6 +217,10 @@ const checkJsonByType = {
     return `${path} does not match any union member`;
   },
 } satisfies JsonValidatorHandlers;
+
+function formatIdTableError(path: string, tableName: string, value: string): string {
+  return `${path} must be an id for table ${tableName}; received ${JSON.stringify(value)}. If this came from stale local browser data, clear local data for this origin, including OPFS/storage buckets. Clearing only localStorage does not reset the embedded database.`;
+}
 
 function checkJsonFields(
   value: Record<string, unknown>,
@@ -243,6 +251,19 @@ function checkAnyValue(value: unknown, path: string): string | undefined {
 
 function checkRecordObject(value: unknown, path: string): string | undefined {
   return isSimpleObject(value) ? undefined : `${path} must be an object`;
+}
+
+function recordKeyError(key: string, path: string): string | undefined {
+  if (key.length === 0) return `${path}: record keys must be nonempty`;
+  if (key.startsWith("$")) return `${path}: record key "${key}" starts with a reserved '$'`;
+  if (key.startsWith("_")) return `${path}: record key "${key}" starts with a reserved '_'`;
+  for (let i = 0; i < key.length; i += 1) {
+    const code = key.charCodeAt(i);
+    if (code < 32 || code >= 127) {
+      return `${path}: record key "${key}" must contain only non-control ASCII characters`;
+    }
+  }
+  return undefined;
 }
 
 function isOptional(validator: GenericValidator): boolean {
