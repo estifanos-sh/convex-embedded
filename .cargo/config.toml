@@ -1,2 +1,7 @@
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+
+[alias]
+# Run the integration tests, which live behind the `testkit` feature (white-box test support that
+# never ships). Use with `-p`, e.g. `cargo tk -p storage`.
+tk = "test --features testkit"

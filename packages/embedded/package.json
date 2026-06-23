@@ -2,9 +2,35 @@
   "name": "@convex-dev/embedded",
   "version": "0.0.0",
   "private": true,
-  "description": "Embedded — a local-first CRDT engine for Convex. Layer 1: storage.",
+  "description": "Embedded browser runtime and Convex server wrapper for local-first Convex apps.",
   "files": [
-    "dist"
+    "dist/*-*.d.mts",
+    "dist/*-*.mjs",
+    "dist/browser-embedded.d.mts",
+    "dist/browser-embedded.mjs",
+    "dist/browser.d.mts",
+    "dist/browser.mjs",
+    "dist/bundler.d.mts",
+    "dist/bundler.mjs",
+    "dist/component",
+    "dist/devtools",
+    "dist/internal",
+    "dist/native",
+    "dist/node.d.mts",
+    "dist/node.mjs",
+    "dist/server.d.mts",
+    "dist/server.mjs",
+    "dist/thread",
+    "dist/unplugin.d.mts",
+    "dist/unplugin.mjs",
+    "dist/values.d.mts",
+    "dist/values.mjs",
+    "dist/vite.d.mts",
+    "dist/vite.mjs",
+    "dist/wasm",
+    "native",
+    "src/component",
+    "src/time.ts"
   ],
   "type": "module",
   "exports": {
@@ -16,9 +42,41 @@
       "types": "./dist/browser.d.mts",
       "import": "./dist/browser.mjs"
     },
+    "./devtools": {
+      "types": "./dist/devtools/index.d.mts",
+      "import": "./dist/devtools/index.mjs"
+    },
+    "./devtools/vite": {
+      "types": "./dist/devtools/vite.d.mts",
+      "import": "./dist/devtools/vite.mjs"
+    },
     "./node": {
       "types": "./dist/node.d.mts",
       "import": "./dist/node.mjs"
+    },
+    "./values": {
+      "types": "./dist/values.d.mts",
+      "import": "./dist/values.mjs"
+    },
+    "./convex.config": {
+      "@convex-dev/component-source": "./src/component/convex.config.ts",
+      "types": "./dist/component/convex.config.d.mts",
+      "import": "./dist/component/convex.config.js",
+      "default": "./dist/component/convex.config.js"
+    },
+    "./convex.config.js": {
+      "@convex-dev/component-source": "./src/component/convex.config.ts",
+      "types": "./dist/component/convex.config.d.mts",
+      "import": "./dist/component/convex.config.js",
+      "default": "./dist/component/convex.config.js"
+    },
+    "./_generated/component.js": {
+      "types": "./dist/component/_generated/component.d.mts",
+      "import": "./dist/component/_generated/component.mjs"
+    },
+    "./server": {
+      "types": "./dist/server.d.mts",
+      "import": "./dist/server.mjs"
     },
     "./unplugin": {
       "types": "./dist/unplugin.d.mts",
@@ -34,29 +92,80 @@
     "build": "node scripts/build.ts",
     "build:ts": "vp pack",
     "native": "node scripts/native.ts",
+    "size": "node scripts/size.ts",
+    "test:node": "node scripts/node/smoke.ts",
     "wasm": "node scripts/wasm.ts",
     "style": "node scripts/style.ts",
     "dev": "vp pack --watch",
-    "test": "vp test run --project node",
+    "test": "vp pack && vp test run --project unit --project storage --project server --project surface && vp test run --project runtime --maxWorkers=1 && vp test run --project remote",
+    "test:unit": "vp test run --project unit",
+    "test:runtime": "vp test run --project runtime --maxWorkers=1",
+    "test:storage": "vp test run --project storage",
+    "test:server": "vp test run --project server",
+    "test:remote": "vp test run --project remote",
     "test:browser": "node scripts/browser.ts",
+    "test:metal": "vp pack && node scripts/wasm.ts && vp test run --project metal",
+    "test:surface": "vp test run --project surface",
+    "bench": "node scripts/bench.ts",
+    "bench:compare": "node scripts/bench.ts --compare tests/bench/baseline.json",
+    "bench:browser:startup": "node scripts/bench.ts --browser-startup",
+    "bench:browser:remote": "node scripts/bench.ts --browser-remote",
+    "bench:browser:scale": "node scripts/bench.ts --browser-scale",
+    "bench:browser:scale:goal": "node scripts/bench.ts --browser-scale-goal",
+    "bench:browser:scale:manual": "node scripts/bench.ts --browser-scale-matrix --manual",
+    "bench:browser:scale:matrix": "node scripts/bench.ts --browser-scale-matrix",
+    "bench:browser:scale:stress": "node scripts/bench.ts --browser-scale-stress",
+    "bench:browser:scale:stress:manual": "node scripts/bench.ts --browser-scale-stress --manual",
+    "bench:memory": "node scripts/bench.ts --layer memory",
+    "bench:native": "node scripts/bench.ts --layer native",
+    "bench:metal:reconnect": "node scripts/bench.ts --metal-reconnect-volume",
+    "bench:metal:scale": "node scripts/bench.ts --metal-scale",
+    "bench:metal:scale:goal": "node scripts/bench.ts --metal-scale-goal",
+    "bench:metal:scale:manual": "node scripts/bench.ts --metal-scale-matrix --manual",
+    "bench:metal:scale:matrix": "node scripts/bench.ts --metal-scale-matrix",
+    "bench:metal:scale:stress": "node scripts/bench.ts --metal-scale-stress",
+    "bench:metal:scale:stress:manual": "node scripts/bench.ts --metal-scale-stress --manual",
+    "bench:scale": "node scripts/bench.ts --scale",
+    "bench:scale:goal": "node scripts/bench.ts --scale-goal",
+    "bench:scale:manual": "node scripts/bench.ts --scale-matrix --manual",
+    "bench:scale:matrix": "node scripts/bench.ts --scale-matrix",
+    "bench:scale:stress": "node scripts/bench.ts --scale-stress",
+    "bench:scale:stress:manual": "node scripts/bench.ts --scale-stress --manual",
+    "bench:smoke": "node scripts/bench.ts --smoke",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
     "@napi-rs/wasm-runtime": "catalog:",
-    "convex": "catalog:",
+    "convex-helpers": "catalog:",
     "unplugin": "catalog:"
   },
   "devDependencies": {
+    "@convex-dev/migrations": "catalog:",
     "@emnapi/core": "catalog:",
     "@emnapi/runtime": "catalog:",
     "@napi-rs/cli": "catalog:",
     "@types/node": "catalog:",
     "@typescript/native-preview": "catalog:",
+    "binaryen": "catalog:",
+    "convex": "catalog:",
+    "fast-check": "catalog:",
     "playwright": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
+    "vite-plugin-solid": "catalog:",
     "vite-plus": "catalog:",
     "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "convex": "^1.42.1"
+  },
+  "optionalDependencies": {
+    "@codemirror/lang-json": "catalog:",
+    "@codemirror/lint": "catalog:",
+    "@tanstack/devtools": "catalog:",
+    "@tanstack/devtools-vite": "catalog:",
+    "codemirror": "catalog:",
+    "solid-js": "catalog:"
   },
   "engines": {
     "node": ">=24.0.0"

@@ -2,21 +2,24 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   fmt: {
-    ignorePatterns: [".agents/**", ".claude/**", "convex/_generated/**"],
+    ignorePatterns: [".agents/**", ".claude/**", "convex/_generated/**", "vendor/**"],
   },
   lint: {
-    ignorePatterns: [".agents/**", ".claude/**", "convex/_generated/**"],
+    ignorePatterns: [".agents/**", ".claude/**", "convex/_generated/**", "vendor/**"],
     options: { typeAware: true, typeCheck: true },
   },
   staged: {
     "*": "vp check --fix",
   },
   test: {
-    exclude: [
-      "packages/embedded/tests/browser/**/*.ts",
-      "packages/embedded/tests/node/conformance.ts",
-      "packages/embedded/tests/node/native.ts",
+    fileParallelism: false,
+    include: [
+      "packages/embedded/tests/unit/**/*.ts",
+      "packages/embedded/tests/storage/**/*.ts",
+      "packages/embedded/tests/runtime/**/*.ts",
+      "packages/embedded/tests/server/**/*.ts",
+      "packages/embedded/tests/remote/**/*.ts",
+      "packages/embedded/tests/surface/**/*.ts",
     ],
-    include: ["packages/embedded/tests/node/**/*.ts"],
   },
 });

@@ -1,16 +1,27 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { cargoTarget } from "./cargo.ts";
+import { EMBEDDED_PROTOCOL_VERSION } from "../src/protocol.ts";
+import { EMBEDDED_STORAGE_ABI_VERSION } from "../src/abi.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
 const require = createRequire(import.meta.url);
-const nativeApiVersion = 6;
 const target = nativeTarget();
+const cargoTargetDir = cargoTarget(repoRoot);
 const destinationDir = resolve(packageDir, "dist/native", target);
 const destination = resolve(destinationDir, "convex-embedded.node");
 
+execFileSync("cargo", ["build", "-p", "node", "--release", "--locked"], {
+  cwd: repoRoot,
+  env: { ...process.env, CARGO_TARGET_DIR: cargoTargetDir },
+  stdio: "inherit",
+});
 const source = nativeSource();
 mkdirSync(destinationDir, { recursive: true });
 copyFileSync(source, destination);
@@ -18,13 +29,12 @@ loadNativeArtifact(destination);
 console.log(`Copied native artifact: ${destination}`);
 
 function nativeSource(): string {
-  const candidates = nativeSourceCandidates().map((candidate) => resolve(repoRoot, candidate));
-
+  const candidates = nativeSourceCandidates();
   const found = candidates.find((candidate) => existsSync(candidate));
   if (!found) {
     throw new Error(
       [
-        "No release native artifact found. Run `cargo build -p node --release --locked` first.",
+        "Native build completed without a release artifact.",
         "Checked:",
         ...candidates.map((candidate) => `  - ${candidate}`),
       ].join("\n"),
@@ -36,24 +46,36 @@ function nativeSource(): string {
 function nativeSourceCandidates(): string[] {
   const platformArtifact =
     process.platform === "darwin"
-      ? "target/release/libnode.dylib"
+      ? "release/libnode.dylib"
       : process.platform === "win32"
-        ? "target/release/node.dll"
-        : "target/release/libnode.so";
+        ? "release/node.dll"
+        : "release/libnode.so";
   return [
-    platformArtifact,
-    "target/release/convex-embedded.node",
-    "target/release/node.node",
-    "target/release/libnode.dylib",
-    "target/release/libnode.so",
-    "target/release/node.dll",
+    resolve(cargoTargetDir, platformArtifact),
+    resolve(cargoTargetDir, "release/convex-embedded.node"),
+    resolve(cargoTargetDir, "release/node.node"),
+    resolve(cargoTargetDir, "release/libnode.dylib"),
+    resolve(cargoTargetDir, "release/libnode.so"),
+    resolve(cargoTargetDir, "release/node.dll"),
   ];
 }
 
 function loadNativeArtifact(path: string): void {
-  const module = require(path) as { apiVersion?: () => number };
-  if (module.apiVersion?.() !== nativeApiVersion) {
-    throw new Error(`Native artifact API version mismatch after copy: ${path}`);
+  const probe = resolve(tmpdir(), `convex-embedded-native-probe-${process.pid}-${Date.now()}.node`);
+  copyFileSync(path, probe);
+  try {
+    const module = require(probe) as {
+      apiVersion?: () => number;
+      protocolVersion?: () => number;
+    };
+    if (module.apiVersion?.() !== EMBEDDED_STORAGE_ABI_VERSION) {
+      throw new Error(`Native artifact API version mismatch after copy: ${path}`);
+    }
+    if (module.protocolVersion?.() !== EMBEDDED_PROTOCOL_VERSION) {
+      throw new Error(`Native artifact protocol version mismatch after copy: ${path}`);
+    }
+  } finally {
+    unlinkSync(probe);
   }
 }
 

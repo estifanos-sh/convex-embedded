@@ -5,6 +5,12 @@
     "moduleDetection": "force",
     "module": "preserve",
     "moduleResolution": "bundler",
+    "paths": {
+      "@convex-dev/embedded/convex.config": ["./src/component/convex.config.ts"],
+      "@convex-dev/embedded/server": ["./src/server/index.ts"]
+    },
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
     "resolveJsonModule": true,
     "types": ["node"],
     "strict": true,

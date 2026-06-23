@@ -23,13 +23,26 @@ const generatedDirs = new Set([
   "node_modules",
 ]);
 const generatedFiles = new Set(["package.json", "Cargo.toml", "tsconfig.json", "vite.config.ts"]);
+const toolRequiredFiles = new Set([
+  "src/component/convex.config.ts",
+  "tests/browser/vite-env.d.ts",
+  "tests/fixture/convex/convex.config.ts",
+]);
+const generatedPaths = new Set(["tests/bench/results/artifacts"]);
+const rawTimeAllowedFiles = new Set([
+  "crates/storage/src/clock.rs",
+  "convex/time.ts",
+  "packages/embedded/src/component/time.ts",
+  "packages/embedded/tests/fixture/convex/time.ts",
+  "packages/embedded/tests/testkit/time.ts",
+]);
 const testFiles = new Set([
-  "tests/node/browser.ts",
-  "tests/node/bundler.ts",
-  "tests/node/client.ts",
-  "tests/node/runtime.ts",
-  "tests/node/schema.ts",
-  "tests/node/storage.ts",
+  "tests/runtime/client.ts",
+  "tests/runtime/runtime.ts",
+  "tests/runtime/schema.ts",
+  "tests/storage/storage.ts",
+  "tests/surface/browser.ts",
+  "tests/surface/bundler.ts",
 ]);
 const bannedTsNames: BannedName[] = [
   { pattern: /^collect[A-Z]/, replacement: "reserve collect for Convex query terminals" },
@@ -77,6 +90,8 @@ for (const crateRoot of ["crates/storage/src", "crates/node/src"]) {
     auditRustPublicSymbols(file);
   }
 }
+auditRawTimeCalls();
+auditVersionedNames();
 
 if (violations.length > 0) {
   console.error("Style audit failed:");
@@ -93,9 +108,10 @@ function auditPathNames(root: string): void {
   for (const path of walk(root, () => true)) {
     const rel = relative(packageDir, path);
     const name = basename(path);
-    if (isGeneratedPath(rel) || generatedFiles.has(name)) continue;
+    if (isGeneratedPath(rel) || generatedFiles.has(name) || toolRequiredFiles.has(rel)) continue;
     const stats = statSync(path);
     const stem = stats.isDirectory() ? name : fileStem(name);
+    if (rel.startsWith("tests/bench/") && name.endsWith(".bench.ts")) continue;
     if (!/^[a-z][a-z0-9]*$/.test(stem)) {
       violations.push({
         file: rel,
@@ -123,6 +139,73 @@ function auditRustPublicSymbols(file: string): void {
     /\bpub\s+(?:\([^)]*\)\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+"[^"]+"\s+)?(?:fn|struct|enum|trait|type)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
   for (const match of source.matchAll(matcher)) {
     auditSymbol(rel, match[1], bannedRustNames);
+  }
+}
+
+function auditRawTimeCalls(): void {
+  const banned = [
+    { name: `${"Date"}.now`, pattern: new RegExp(`\\b${"Date"}\\.now\\s*\\(`) },
+    {
+      name: `${"performance"}.timeOrigin`,
+      pattern: new RegExp(`\\b${"performance"}\\.timeOrigin\\b`),
+    },
+    { name: `${"SystemTime"}::now`, pattern: new RegExp(`\\b${"SystemTime"}::now\\s*\\(`) },
+  ];
+  const roots = [
+    resolve(packageDir, "src"),
+    resolve(packageDir, "tests"),
+    resolve(packageDir, "scripts"),
+    resolve(packageDir, "vite.config.ts"),
+    resolve(repoDir, "convex"),
+    resolve(repoDir, "demos/browser/vite/src"),
+    resolve(repoDir, "demos/browser/vite/vite.config.ts"),
+    resolve(repoDir, "vite.config.ts"),
+    resolve(repoDir, "crates/storage/src"),
+    resolve(repoDir, "crates/remote/src"),
+    resolve(repoDir, "crates/node/src"),
+  ];
+  for (const root of roots) {
+    for (const file of walk(root, isAuditedSource)) {
+      if (statSync(file).isDirectory()) continue;
+      const rel = relative(repoDir, file);
+      if (isGeneratedPath(rel) || rawTimeAllowedFiles.has(rel)) continue;
+      const source = readFileSync(file, "utf8");
+      for (const rule of banned) {
+        if (!rule.pattern.test(source)) continue;
+        violations.push({
+          file: rel,
+          message: `direct ${rule.name} reads are banned; absolute time is the storage HLC, elapsed time is getTimerTime()`,
+        });
+      }
+    }
+  }
+}
+
+function auditVersionedNames(): void {
+  const roots = [
+    resolve(packageDir, "src"),
+    resolve(packageDir, "tests"),
+    resolve(packageDir, "scripts"),
+    resolve(repoDir, "convex"),
+    resolve(repoDir, "demos/browser/vite/src"),
+    resolve(repoDir, "crates/storage/src"),
+    resolve(repoDir, "crates/remote/src"),
+    resolve(repoDir, "crates/node/src"),
+  ];
+  const pattern = /\b(?:embedded)?[vV]\d+[A-Z_][A-Za-z0-9_]*\b/g;
+  for (const root of roots) {
+    for (const file of walk(root, isAuditedSource)) {
+      if (statSync(file).isDirectory()) continue;
+      const rel = relative(repoDir, file);
+      if (isGeneratedPath(rel)) continue;
+      const source = readFileSync(file, "utf8");
+      for (const match of source.matchAll(pattern)) {
+        violations.push({
+          file: rel,
+          message: `implementation name "${match[0]}" contains a design version; use the stable domain name`,
+        });
+      }
+    }
   }
 }
 
@@ -157,6 +240,14 @@ function fileStem(name: string): string {
   return ext ? name.slice(0, -ext.length) : name;
 }
 
+function isAuditedSource(path: string): boolean {
+  return /\.(?:[cm]?[jt]sx?|rs)$/.test(path);
+}
+
 function isGeneratedPath(path: string): boolean {
-  return path.split("/").some((segment) => segment.startsWith(".") || generatedDirs.has(segment));
+  return (
+    [...generatedPaths].some(
+      (generated) => path === generated || path.startsWith(`${generated}/`),
+    ) || path.split("/").some((segment) => segment.startsWith(".") || generatedDirs.has(segment))
+  );
 }

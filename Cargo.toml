@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/storage", "crates/node"]
+members = ["crates/storage", "crates/remote", "crates/node"]
+exclude = ["vendor/convex"]
 
 [workspace.package]
 version = "0.0.0"
@@ -28,3 +29,10 @@ cast_possible_wrap = "allow"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+
+[patch.crates-io]
+convex = { path = "vendor/convex" }
