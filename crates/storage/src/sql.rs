@@ -12,43 +12,75 @@ use sea_query::{
 use turso_core::Value;
 
 use crate::error::StorageError;
-use crate::types::{Bound, ColValue, CountSpec, Order, ScanSpec, TableDef};
+use crate::types::{Bound, ColValue, CountSpec, Order, ReadSpec, TableDef};
 
-/// Hard ceiling on rows in one page. Mirrors `SCAN_CAP` in the TS.
-pub const SCAN_CAP: usize = 32_768;
+/// Hard ceiling on rows in one page. Mirrors `READ_CAP` in the TS.
+pub const READ_CAP: usize = 32_768;
 
-/// Page size used when `ScanSpec::page_size` is omitted. Mirrors `DEFAULT_SCAN_PAGE` in the TS.
-pub const DEFAULT_SCAN_PAGE: usize = 1_024;
+/// Page size used when `ReadSpec::page_size` is omitted. Mirrors `DEFAULT_READ_PAGE` in the TS.
+pub const DEFAULT_READ_PAGE: usize = 1_024;
 
-/// Applied once per connection by the driver, in order.
-pub(crate) const PRAGMAS: [&str; 3] = [
+/// Applied once per connection by the driver, in order. `cache_size` is negative so turso reads it as
+/// a KiB ceiling (page-size independent, identical on native and wasm): turso defaults the page cache
+/// to 2000 pages on native but 100000 (~400 MiB at the 4 KiB page) on wasm, so leaving it unset let a
+/// browser store grow its cache toward that ceiling. `-16384` bounds both platforms at 16 MiB.
+pub(crate) const PRAGMAS: [&str; 5] = [
     "PRAGMA journal_mode = WAL",
     "PRAGMA synchronous = NORMAL",
+    "PRAGMA cache_size = -16384",
     "PRAGMA temp_store = MEMORY",
+    "PRAGMA locking_mode = EXCLUSIVE",
 ];
 
 /// On-disk storage format version, stamped into the database header via `PRAGMA user_version`.
-/// Bump this whenever the persisted layout changes incompatibly; `setup` drops and recreates every
-/// table when an opened database carries a different version (pre-1.0: reset, no migration).
-/// Format 1 is the order-key BLOB index columns (previously INTEGER/TEXT affinity).
-pub(crate) const STORAGE_FORMAT_VERSION: i64 = 1;
+/// Bump this whenever the package-owned layout changes incompatibly. Released and deployed formats
+/// advance through the explicit startup migration below; unknown formats fail closed.
+pub(crate) const STORAGE_FORMAT_VERSION: i64 = 41;
 
 /// Reads the database's stored format version (0 on a brand-new database).
 pub(crate) const READ_USER_VERSION: &str = "PRAGMA user_version";
 
-/// Lists every table name in the database, for the version-mismatch reset to drop.
+/// While v5 remains unreleased (V5 "Local Store Evolution"), a store whose physical bytes cannot be
+/// opened at all — a corrupt header, a store written by a prior turso release — is an incompatible
+/// *format*, not same-format corruption, and is hard-reset to the current empty format instead of
+/// failing closed. This mirrors the unconditional format-version reset in `EmbeddedStore::setup`;
+/// both are gated only by v5 being pre-release. At release this becomes a durable-migration decision
+/// and this seam flips to preserve, not discard, an unreadable released store.
+pub(crate) const RESET_UNREADABLE_STORE: bool = true;
+
+/// Lists every table name so startup can distinguish a new store from an incompatible one and
+/// reconcile app-owned tables without touching detached data.
 pub(crate) const LIST_TABLES: &str = "SELECT name FROM sqlite_master WHERE type = 'table'";
 
-pub(crate) const BEGIN_IMMEDIATE: &str = "BEGIN IMMEDIATE";
+pub(crate) const BEGIN_TRANSACTION: &str = "BEGIN";
 pub(crate) const COMMIT: &str = "COMMIT";
 pub(crate) const ROLLBACK: &str = "ROLLBACK";
 
 const COMMITS: &str = "__embedded_commits";
+const META: &str = "__embedded_meta";
+pub(crate) const META_TABLE: &str = META;
 const MUTATIONS: &str = "__embedded_mutations";
 const BLOBS: &str = "__embedded_blobs";
+const REVS: &str = "__embedded_revs";
+const REV_LOG: &str = "__embedded_rev_log";
+const DIRTY_HEADS: &str = "__embedded_dirty_heads";
+const CRDT_OPS: &str = "__embedded_crdt_ops";
+const CRDT_FIELD: &str = "__embedded_crdt_field";
+const PEERS: &str = "__embedded_peers";
+const FILES: &str = "__embedded_files";
+const ID_MAPPINGS: &str = "__embedded_id_mappings";
+const UPLOADS: &str = "__embedded_uploads";
+const SCHEDULES: &str = "__embedded_schedules";
+const REMOTE: &str = "__embedded_remote";
+const PROJECTIONS: &str = "__embedded_projections";
+const MEMBERSHIPS: &str = "__embedded_memberships";
+const RESULTS: &str = "__embedded_results";
 const ID: &str = "id";
 const IDENTITY_KEY: &str = "identity_key";
+const TABLE_NAME: &str = "table_name";
 const CREATION_TIME: &str = "creation_time_ms";
+const CREATED_TIME: &str = "created_time_ms";
+const UPDATED_TIME: &str = "updated_time_ms";
 const DATA: &str = "data";
 const COMMIT_SEQ: &str = "commit_seq";
 const SOURCE: &str = "source";
@@ -60,7 +92,63 @@ const STATUS: &str = "status";
 const RESULT: &str = "result";
 const ERROR: &str = "error";
 const KEY: &str = "key";
+const VALUE: &str = "value";
 const BYTES: &str = "bytes";
+const REV_ID: &str = "rev_id";
+const FRONTIER: &str = "frontier";
+const SNAPSHOT: &str = "snapshot";
+const PEER_ID: &str = "peer_id";
+const DOCUMENT_ID: &str = "document_id";
+const LOCAL_ID: &str = "local_id";
+const CONVEX_ID: &str = "convex_id";
+const STATE: &str = "state";
+const SHA256: &str = "sha256";
+const SIZE: &str = "size";
+const CONTENT_TYPE: &str = "content_type";
+const LOCAL_STORAGE_ID: &str = "local_storage_id";
+const OWNER: &str = "owner";
+const LEASE_UNTIL: &str = "lease_until_ms";
+const JOB_ID: &str = "job_id";
+const KIND: &str = "kind";
+const DUE_TIME: &str = "due_time_ms";
+const WATERMARK: &str = "watermark";
+const CURSOR: &str = "cursor";
+const SERVER_DOCUMENT_ID: &str = "server_document_id";
+const SUBSCRIPTION: &str = "subscription";
+const BASE_PROJECTION_HASH: &str = "base_projection_hash";
+const PROJECTION_HASH: &str = "projection_hash";
+const REV_ROOT_ID: &str = "rev_root_id";
+const REV_NODE_ID: &str = "rev_node_id";
+const SERVER_REV_ID: &str = "server_rev_id";
+const BASE_ROOT_ID: &str = "base_root_id";
+const BASE_NODE_ID: &str = "base_node_id";
+const OPERATION: &str = "operation";
+const PARENT: &str = "parent";
+const SERVER_BASE: &str = "server_base";
+const SERVER_ROW: &str = "server_row";
+const LOGICAL_CLOCK: &str = "logical_clock";
+const CURRENT_REV_ID: &str = "current_rev_id";
+const FIRST_COMMIT_SEQ: &str = "first_commit_seq";
+const UPDATED_COMMIT_SEQ: &str = "updated_commit_seq";
+const ORDINAL: &str = "ordinal";
+const SEQ: &str = "seq";
+const FIELD: &str = "field";
+const VALUE_JSON: &str = "value_json";
+const INDEX: &str = "idx";
+const DELETE_COUNT: &str = "delete_count";
+const INSERT_TEXT: &str = "insert_text";
+const DELTA: &str = "delta";
+const IDENTITY: &str = "identity";
+const FUNCTION: &str = "function";
+const SCHEMA_HASH: &str = "schemahash";
+const MODULE_HASH: &str = "modulehash";
+const SKELETON: &str = "skeleton";
+const PATHS: &str = "paths";
+const SKELETON_HASH: &str = "skeletonhash";
+const CLOCK: &str = "clock";
+const RANGE_LOWER: &str = "range_lower";
+const RANGE_UPPER: &str = "range_upper";
+const RANGE_ORDER: &str = "range_order";
 
 static CREATE_COMMITS: LazyLock<String> = LazyLock::new(|| {
     strict(
@@ -72,7 +160,11 @@ static CREATE_COMMITS: LazyLock<String> = LazyLock::new(|| {
             .col(text_col(SOURCE))
             .col(nullable_text_col(MUTATION_ID))
             .col(text_col(CHANGED_TABLES))
-            .primary_key(Index::create().col(alias(IDENTITY_KEY)).col(alias(COMMIT_SEQ)))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(COMMIT_SEQ)),
+            )
             .to_string(SqliteQueryBuilder),
     )
 });
@@ -87,23 +179,43 @@ static CREATE_COMMITS_MUTATION_INDEX: LazyLock<String> = LazyLock::new(|| {
         .and_where(Expr::col(alias(MUTATION_ID)).is_not_null())
         .to_string(SqliteQueryBuilder)
 });
-static INSERT_COMMIT: LazyLock<String> = LazyLock::new(|| {
-    insert(COMMITS, [IDENTITY_KEY, COMMIT_SEQ, SOURCE, MUTATION_ID, CHANGED_TABLES], 5, false)
+static CREATE_META: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(META))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(KEY))
+            .col(text_col(VALUE))
+            .primary_key(Index::create().col(alias(IDENTITY_KEY)).col(alias(KEY)))
+            .to_string(SqliteQueryBuilder),
+    )
 });
-static NEXT_COMMIT_SEQ: LazyLock<String> = LazyLock::new(|| {
-    let next = Expr::expr(Func::coalesce([
-        Expr::expr(Func::max(Expr::col(alias(COMMIT_SEQ)))),
-        Expr::cust("0"),
-    ]))
-    .add(Expr::cust("1"));
-    select_where(COMMITS, [next], [eq(IDENTITY_KEY)])
+static READ_META: LazyLock<String> =
+    LazyLock::new(|| select_where(META, [Expr::col(alias(VALUE))], [eq(IDENTITY_KEY), eq(KEY)]));
+static WRITE_META: LazyLock<String> =
+    LazyLock::new(|| write(META, [IDENTITY_KEY, KEY, VALUE], 3, true));
+static WRITE_COMMIT: LazyLock<String> = LazyLock::new(|| {
+    write(
+        COMMITS,
+        [
+            IDENTITY_KEY,
+            COMMIT_SEQ,
+            SOURCE,
+            MUTATION_ID,
+            CHANGED_TABLES,
+        ],
+        5,
+        false,
+    )
 });
 static MAX_COMMIT_SEQ: LazyLock<String> = LazyLock::new(|| {
-    let max = Expr::expr(Func::coalesce([
-        Expr::expr(Func::max(Expr::col(alias(COMMIT_SEQ)))),
-        Expr::cust("0"),
-    ]));
-    select_where(COMMITS, [max], [eq(IDENTITY_KEY)])
+    format!(
+        "SELECT MAX(seq) FROM (\
+         SELECT COALESCE(MAX({COMMIT_SEQ}), 0) AS seq FROM {COMMITS} WHERE {IDENTITY_KEY} = ? \
+         UNION ALL SELECT COALESCE(MAX({UPDATED_COMMIT_SEQ}), 0) AS seq FROM {DIRTY_HEADS} WHERE {IDENTITY_KEY} = ? \
+         UNION ALL SELECT COALESCE(MAX({COMMIT_SEQ}), 0) AS seq FROM {MUTATIONS} WHERE {IDENTITY_KEY} = ?)"
+    )
 });
 static COMMIT_EXISTS: LazyLock<String> = LazyLock::new(|| {
     select_where(
@@ -112,9 +224,24 @@ static COMMIT_EXISTS: LazyLock<String> = LazyLock::new(|| {
         [eq(IDENTITY_KEY), eq(COMMIT_SEQ)],
     )
 });
+static DIRTY_HEAD_COMMIT_EXISTS: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        DIRTY_HEADS,
+        [Expr::cust("1")],
+        [eq(IDENTITY_KEY), eq(UPDATED_COMMIT_SEQ)],
+    )
+});
+static MUTATION_COMMIT_EXISTS: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        MUTATIONS,
+        [Expr::cust("1")],
+        [eq(IDENTITY_KEY), eq(COMMIT_SEQ)],
+    )
+});
 static PRUNE_COMMITS: LazyLock<String> =
     LazyLock::new(|| delete_where(COMMITS, [eq(IDENTITY_KEY), lte(COMMIT_SEQ)]));
-static CLEAR_COMMITS: LazyLock<String> = LazyLock::new(|| delete_where(COMMITS, [eq(IDENTITY_KEY)]));
+static CLEAR_COMMITS: LazyLock<String> =
+    LazyLock::new(|| delete_where(COMMITS, [eq(IDENTITY_KEY)]));
 
 static CREATE_MUTATIONS: LazyLock<String> = LazyLock::new(|| {
     strict(
@@ -129,12 +256,54 @@ static CREATE_MUTATIONS: LazyLock<String> = LazyLock::new(|| {
             .col(nullable_text_col(RESULT))
             .col(nullable_text_col(ERROR))
             .col(nullable_integer_col(COMMIT_SEQ))
-            .primary_key(Index::create().col(alias(IDENTITY_KEY)).col(alias(MUTATION_ID)))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(MUTATION_ID)),
+            )
             .to_string(SqliteQueryBuilder),
     )
 });
-static INSERT_MUTATION: LazyLock<String> = LazyLock::new(|| {
-    insert(MUTATIONS, [IDENTITY_KEY, MUTATION_ID, NAME, ARGS, STATUS], 5, false)
+static WRITE_MUTATION: LazyLock<String> = LazyLock::new(|| {
+    write(
+        MUTATIONS,
+        [IDENTITY_KEY, MUTATION_ID, NAME, ARGS, STATUS],
+        5,
+        false,
+    )
+});
+static WRITE_COMMITTED_MUTATION_OK: LazyLock<String> = LazyLock::new(|| {
+    write(
+        MUTATIONS,
+        [
+            IDENTITY_KEY,
+            MUTATION_ID,
+            NAME,
+            ARGS,
+            STATUS,
+            RESULT,
+            COMMIT_SEQ,
+        ],
+        7,
+        false,
+    )
+});
+static WRITE_FAILED_MUTATION: LazyLock<String> = LazyLock::new(|| {
+    write(
+        MUTATIONS,
+        [
+            IDENTITY_KEY,
+            MUTATION_ID,
+            NAME,
+            ARGS,
+            STATUS,
+            RESULT,
+            ERROR,
+            COMMIT_SEQ,
+        ],
+        8,
+        false,
+    )
 });
 static READ_MUTATION: LazyLock<String> = LazyLock::new(|| {
     select_where(
@@ -175,18 +344,16 @@ static COMMIT_MUTATION: LazyLock<String> = LazyLock::new(|| {
         .value(alias(RESULT), placeholder())
         .value(alias(ERROR), Expr::cust("NULL"))
         .value(alias(COMMIT_SEQ), placeholder())
-        .cond_where(all([eq(IDENTITY_KEY), eq(MUTATION_ID)]));
+        .cond_where(all([eq(IDENTITY_KEY), eq(MUTATION_ID), eq(STATUS)]));
     query.build(SqliteQueryBuilder).0
 });
 static PRUNE_MUTATIONS: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::delete();
-    query
-        .from_table(alias(MUTATIONS))
-        .cond_where(all([
-            eq(IDENTITY_KEY),
-            Expr::col(alias(COMMIT_SEQ)).is_not_null(),
-            lte(COMMIT_SEQ),
-        ]));
+    query.from_table(alias(MUTATIONS)).cond_where(all([
+        eq(IDENTITY_KEY),
+        Expr::col(alias(COMMIT_SEQ)).is_not_null(),
+        lte(COMMIT_SEQ),
+    ]));
     query.build(SqliteQueryBuilder).0
 });
 static CLEAR_MUTATIONS: LazyLock<String> =
@@ -205,13 +372,1265 @@ static CREATE_BLOBS: LazyLock<String> = LazyLock::new(|| {
     )
 });
 static READ_BLOB: LazyLock<String> = LazyLock::new(|| {
-    select_where(BLOBS, [Expr::col(alias(BYTES))], [eq(IDENTITY_KEY), eq(KEY)])
+    select_where(
+        BLOBS,
+        [Expr::col(alias(BYTES))],
+        [eq(IDENTITY_KEY), eq(KEY)],
+    )
 });
 static WRITE_BLOB: LazyLock<String> =
-    LazyLock::new(|| insert(BLOBS, [IDENTITY_KEY, KEY, BYTES], 3, true));
+    LazyLock::new(|| write(BLOBS, [IDENTITY_KEY, KEY, BYTES], 3, true));
 static DELETE_BLOB: LazyLock<String> =
     LazyLock::new(|| delete_where(BLOBS, [eq(IDENTITY_KEY), eq(KEY)]));
 static CLEAR_BLOBS: LazyLock<String> = LazyLock::new(|| delete_where(BLOBS, [eq(IDENTITY_KEY)]));
+
+static CREATE_REVS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(REVS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(DOCUMENT_ID))
+            .col(text_col(REV_ID))
+            .col(blob_col(SNAPSHOT))
+            .col(blob_col(FRONTIER))
+            .col(text_col(STATUS))
+            .col(nullable_text_col(PARENT))
+            .col(nullable_text_col(SERVER_REV_ID))
+            .col(nullable_text_col(REV_ROOT_ID))
+            .col(nullable_text_col(REV_NODE_ID))
+            .col(nullable_text_col(BASE_ROOT_ID))
+            .col(nullable_text_col(BASE_NODE_ID))
+            .col(integer_col(CREATED_TIME))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(DOCUMENT_ID))
+                    .col(alias(REV_ID)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static UPSERT_REV: LazyLock<String> = LazyLock::new(|| {
+    write(
+        REVS,
+        [
+            IDENTITY_KEY,
+            TABLE_NAME,
+            DOCUMENT_ID,
+            REV_ID,
+            SNAPSHOT,
+            FRONTIER,
+            STATUS,
+            PARENT,
+            SERVER_REV_ID,
+            REV_ROOT_ID,
+            REV_NODE_ID,
+            BASE_ROOT_ID,
+            BASE_NODE_ID,
+            CREATED_TIME,
+            UPDATED_TIME,
+        ],
+        15,
+        true,
+    )
+});
+static READ_REV: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        REVS,
+        [
+            Expr::col(alias(TABLE_NAME)),
+            Expr::col(alias(DOCUMENT_ID)),
+            Expr::col(alias(REV_ID)),
+            Expr::col(alias(SNAPSHOT)),
+            Expr::col(alias(FRONTIER)),
+            Expr::col(alias(STATUS)),
+            Expr::col(alias(PARENT)),
+            Expr::col(alias(SERVER_REV_ID)),
+            Expr::col(alias(REV_ROOT_ID)),
+            Expr::col(alias(REV_NODE_ID)),
+            Expr::col(alias(BASE_ROOT_ID)),
+            Expr::col(alias(BASE_NODE_ID)),
+            Expr::col(alias(UPDATED_TIME)),
+        ],
+        [
+            eq(IDENTITY_KEY),
+            eq(TABLE_NAME),
+            eq(DOCUMENT_ID),
+            eq(REV_ID),
+        ],
+    )
+});
+static READ_DOCUMENT_REVS: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(alias(REV_ID)))
+        .expr(Expr::col(alias(SNAPSHOT)))
+        .expr(Expr::col(alias(FRONTIER)))
+        .expr(Expr::col(alias(STATUS)))
+        .expr(Expr::col(alias(PARENT)))
+        .expr(Expr::col(alias(SERVER_REV_ID)))
+        .expr(Expr::col(alias(REV_ROOT_ID)))
+        .expr(Expr::col(alias(REV_NODE_ID)))
+        .expr(Expr::col(alias(BASE_ROOT_ID)))
+        .expr(Expr::col(alias(BASE_NODE_ID)))
+        .expr(Expr::col(alias(UPDATED_TIME)))
+        .from(alias(REVS))
+        .cond_where(all([eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)]))
+        .order_by(alias(UPDATED_TIME), SqlOrder::Desc)
+        .order_by(alias(REV_ID), SqlOrder::Desc);
+    query.build(SqliteQueryBuilder).0
+});
+#[cfg(any(debug_assertions, test, feature = "testkit"))]
+static READ_REV_FRONTIERS: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(alias(TABLE_NAME)))
+        .expr(Expr::col(alias(DOCUMENT_ID)))
+        .expr(Expr::col(alias(REV_ID)))
+        .expr(Expr::col(alias(FRONTIER)))
+        .from(alias(REVS))
+        .cond_where(eq(IDENTITY_KEY))
+        .order_by(alias(TABLE_NAME), SqlOrder::Asc)
+        .order_by(alias(DOCUMENT_ID), SqlOrder::Asc)
+        .order_by(alias(REV_ID), SqlOrder::Asc);
+    query.build(SqliteQueryBuilder).0
+});
+static DELETE_REV: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        REVS,
+        [
+            eq(IDENTITY_KEY),
+            eq(TABLE_NAME),
+            eq(DOCUMENT_ID),
+            eq(REV_ID),
+        ],
+    )
+});
+static CREATE_REV_LOG: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(REV_LOG))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(DOCUMENT_ID))
+            .col(text_col(REV_ID))
+            .col(integer_col(SEQ))
+            .col(blob_col(BYTES))
+            .col(integer_col(CREATED_TIME))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(DOCUMENT_ID))
+                    .col(alias(REV_ID))
+                    .col(alias(SEQ)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static WRITE_REV_LOG: LazyLock<String> = LazyLock::new(|| {
+    write(
+        REV_LOG,
+        [
+            IDENTITY_KEY,
+            TABLE_NAME,
+            DOCUMENT_ID,
+            REV_ID,
+            SEQ,
+            BYTES,
+            CREATED_TIME,
+        ],
+        7,
+        true,
+    )
+});
+static READ_REV_LOG: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(alias(BYTES)))
+        .from(alias(REV_LOG))
+        .cond_where(eq(IDENTITY_KEY))
+        .cond_where(eq(TABLE_NAME))
+        .cond_where(eq(DOCUMENT_ID))
+        .cond_where(eq(REV_ID))
+        .order_by(alias(SEQ), SqlOrder::Asc);
+    query.build(SqliteQueryBuilder).0
+});
+static DELETE_REV_LOG: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        REV_LOG,
+        [
+            eq(IDENTITY_KEY),
+            eq(TABLE_NAME),
+            eq(DOCUMENT_ID),
+            eq(REV_ID),
+        ],
+    )
+});
+static COUNT_REV_LOG: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT COUNT(*) FROM {REV_LOG} WHERE {IDENTITY_KEY} = ? AND {TABLE_NAME} = ? \
+         AND {DOCUMENT_ID} = ? AND {REV_ID} = ?"
+    )
+});
+static EXISTS_REV: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT 1 FROM {REVS} WHERE {IDENTITY_KEY} = ? AND {TABLE_NAME} = ? \
+         AND {DOCUMENT_ID} = ? AND {REV_ID} = ? LIMIT 1"
+    )
+});
+static UPDATE_REV_META: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::update();
+    query
+        .table(alias(REVS))
+        .value(alias(FRONTIER), placeholder())
+        .value(alias(UPDATED_TIME), placeholder())
+        .cond_where(all([
+            eq(IDENTITY_KEY),
+            eq(TABLE_NAME),
+            eq(DOCUMENT_ID),
+            eq(REV_ID),
+        ]));
+    query.build(SqliteQueryBuilder).0
+});
+static CLEAR_REVS: LazyLock<String> = LazyLock::new(|| delete_where(REVS, [eq(IDENTITY_KEY)]));
+
+static CREATE_DIRTY_HEADS_SEQ_INDEX: LazyLock<String> = LazyLock::new(|| {
+    Index::create()
+        .if_not_exists()
+        .name("ix__embedded_dirty_heads__seq")
+        .table(alias(DIRTY_HEADS))
+        .col(alias(IDENTITY_KEY))
+        .col(alias(UPDATED_COMMIT_SEQ))
+        .col(alias(TABLE_NAME))
+        .col(alias(DOCUMENT_ID))
+        .to_string(SqliteQueryBuilder)
+});
+static CREATE_DIRTY_HEADS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(DIRTY_HEADS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(DOCUMENT_ID))
+            .col(text_col(OPERATION))
+            .col(integer_col(FIRST_COMMIT_SEQ))
+            .col(integer_col(UPDATED_COMMIT_SEQ))
+            .col(integer_col(CREATED_TIME))
+            .col(integer_col(UPDATED_TIME))
+            .col(nullable_text_col(SERVER_DOCUMENT_ID))
+            .col(nullable_text_col(BASE_PROJECTION_HASH))
+            .col(nullable_text_col(BASE_ROOT_ID))
+            .col(nullable_text_col(BASE_NODE_ID))
+            .col(real_col(LOGICAL_CLOCK))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(DOCUMENT_ID)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static WRITE_DIRTY_HEAD_FROM_PROJECTION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "INSERT INTO {DIRTY_HEADS} \
+         ({IDENTITY_KEY}, {TABLE_NAME}, {DOCUMENT_ID}, {OPERATION}, {FIRST_COMMIT_SEQ}, \
+          {UPDATED_COMMIT_SEQ}, {CREATED_TIME}, {UPDATED_TIME}, {SERVER_DOCUMENT_ID}, \
+          {BASE_PROJECTION_HASH}, {BASE_ROOT_ID}, {BASE_NODE_ID}, {LOGICAL_CLOCK}) \
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, \
+          projection.{SERVER_DOCUMENT_ID}, projection.{SERVER_BASE}, projection.{REV_ROOT_ID}, projection.{REV_NODE_ID}, ? \
+         FROM (SELECT 1) \
+         LEFT JOIN ( \
+          SELECT {SERVER_DOCUMENT_ID}, {SERVER_BASE}, {REV_ROOT_ID}, {REV_NODE_ID} \
+          FROM {PROJECTIONS} \
+          WHERE {IDENTITY_KEY} = ? AND {TABLE_NAME} = ? AND {DOCUMENT_ID} = ? \
+         ) AS projection ON 1 = 1 \
+         WHERE 1 = 1 \
+         ON CONFLICT({IDENTITY_KEY}, {TABLE_NAME}, {DOCUMENT_ID}) DO UPDATE SET \
+         {OPERATION} = excluded.{OPERATION}, \
+         {UPDATED_COMMIT_SEQ} = excluded.{UPDATED_COMMIT_SEQ}, \
+         {UPDATED_TIME} = excluded.{UPDATED_TIME}, \
+         {SERVER_DOCUMENT_ID} = excluded.{SERVER_DOCUMENT_ID}, \
+         {BASE_PROJECTION_HASH} = excluded.{BASE_PROJECTION_HASH}, \
+         {BASE_ROOT_ID} = excluded.{BASE_ROOT_ID}, \
+         {BASE_NODE_ID} = excluded.{BASE_NODE_ID}, \
+         {LOGICAL_CLOCK} = excluded.{LOGICAL_CLOCK}"
+    )
+});
+static WRITE_DIRTY_HEAD_FRESH: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "INSERT INTO {DIRTY_HEADS} \
+         ({IDENTITY_KEY}, {TABLE_NAME}, {DOCUMENT_ID}, {OPERATION}, {FIRST_COMMIT_SEQ}, \
+          {UPDATED_COMMIT_SEQ}, {CREATED_TIME}, {UPDATED_TIME}, {LOGICAL_CLOCK}) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT({IDENTITY_KEY}, {TABLE_NAME}, {DOCUMENT_ID}) DO UPDATE SET \
+         {OPERATION} = excluded.{OPERATION}, \
+         {UPDATED_COMMIT_SEQ} = excluded.{UPDATED_COMMIT_SEQ}, \
+         {UPDATED_TIME} = excluded.{UPDATED_TIME}, \
+         {LOGICAL_CLOCK} = excluded.{LOGICAL_CLOCK}"
+    )
+});
+static READ_DIRTY_HEADS: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(alias(TABLE_NAME)))
+        .expr(Expr::col(alias(DOCUMENT_ID)))
+        .expr(Expr::col(alias(OPERATION)))
+        .expr(Expr::col(alias(FIRST_COMMIT_SEQ)))
+        .expr(Expr::col(alias(UPDATED_COMMIT_SEQ)))
+        .expr(Expr::col(alias(CREATED_TIME)))
+        .expr(Expr::col(alias(UPDATED_TIME)))
+        .expr(Expr::col(alias(SERVER_DOCUMENT_ID)))
+        .expr(Expr::col(alias(BASE_PROJECTION_HASH)))
+        .expr(Expr::col(alias(BASE_ROOT_ID)))
+        .expr(Expr::col(alias(BASE_NODE_ID)))
+        .expr(Expr::col(alias(LOGICAL_CLOCK)))
+        .from(alias(DIRTY_HEADS))
+        .cond_where(eq(IDENTITY_KEY))
+        .order_by(alias(UPDATED_COMMIT_SEQ), SqlOrder::Asc)
+        .order_by(alias(TABLE_NAME), SqlOrder::Asc)
+        .order_by(alias(DOCUMENT_ID), SqlOrder::Asc);
+    query.build(SqliteQueryBuilder).0
+});
+static READ_DIRTY_HEAD: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(alias(TABLE_NAME)))
+        .expr(Expr::col(alias(DOCUMENT_ID)))
+        .expr(Expr::col(alias(OPERATION)))
+        .expr(Expr::col(alias(FIRST_COMMIT_SEQ)))
+        .expr(Expr::col(alias(UPDATED_COMMIT_SEQ)))
+        .expr(Expr::col(alias(CREATED_TIME)))
+        .expr(Expr::col(alias(UPDATED_TIME)))
+        .expr(Expr::col(alias(SERVER_DOCUMENT_ID)))
+        .expr(Expr::col(alias(BASE_PROJECTION_HASH)))
+        .expr(Expr::col(alias(BASE_ROOT_ID)))
+        .expr(Expr::col(alias(BASE_NODE_ID)))
+        .expr(Expr::col(alias(LOGICAL_CLOCK)))
+        .from(alias(DIRTY_HEADS))
+        .cond_where(eq(IDENTITY_KEY))
+        .cond_where(eq(TABLE_NAME))
+        .cond_where(eq(DOCUMENT_ID));
+    query.build(SqliteQueryBuilder).0
+});
+
+static DIRTY_HEAD_EXISTS: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        DIRTY_HEADS,
+        [Expr::cust("1")],
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)],
+    )
+});
+/// Identity-scoped existence probe for the dirty-head set. Carries no `ORDER BY`, so the planner
+/// seeks the identity prefix instead of materializing and sorting every dirty head; the caller stops
+/// after the first row. A trailing `LIMIT` is intentionally omitted: under turso 0.6 a limited probe
+/// here leaves the next `INDEXED BY` statement mis-bound (datatype mismatch).
+static DIRTY_HEADS_HAS: LazyLock<String> =
+    LazyLock::new(|| select_where(DIRTY_HEADS, [Expr::cust("1")], [eq(IDENTITY_KEY)]));
+static DELETE_DIRTY_HEAD: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        DIRTY_HEADS,
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)],
+    )
+});
+static CLEAR_DIRTY_HEADS: LazyLock<String> =
+    LazyLock::new(|| delete_where(DIRTY_HEADS, [eq(IDENTITY_KEY)]));
+
+static CREATE_CRDT_OPS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(CRDT_OPS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(DOCUMENT_ID))
+            .col(integer_col(COMMIT_SEQ))
+            .col(integer_col(ORDINAL))
+            .col(text_col(FIELD))
+            .col(text_col(OPERATION))
+            .col(nullable_text_col(VALUE_JSON))
+            .col(nullable_integer_col(INDEX))
+            .col(nullable_integer_col(DELETE_COUNT))
+            .col(nullable_text_col(INSERT_TEXT))
+            .col(nullable_real_col(DELTA))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(DOCUMENT_ID))
+                    .col(alias(COMMIT_SEQ))
+                    .col(alias(ORDINAL)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static WRITE_CRDT_OP: LazyLock<String> = LazyLock::new(|| {
+    write(
+        CRDT_OPS,
+        [
+            IDENTITY_KEY,
+            TABLE_NAME,
+            DOCUMENT_ID,
+            COMMIT_SEQ,
+            ORDINAL,
+            FIELD,
+            OPERATION,
+            VALUE_JSON,
+            INDEX,
+            DELETE_COUNT,
+            INSERT_TEXT,
+            DELTA,
+        ],
+        12,
+        false,
+    )
+});
+#[cfg(any(test, feature = "testkit"))]
+static READ_CRDT_OPS_DEBUG: LazyLock<String> =
+    LazyLock::new(|| select_where(CRDT_OPS, [Expr::cust("1")], [eq(IDENTITY_KEY)]));
+static DELETE_CRDT_OPS_FOR_ROW: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        CRDT_OPS,
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)],
+    )
+});
+static CLEAR_CRDT_OPS: LazyLock<String> =
+    LazyLock::new(|| delete_where(CRDT_OPS, [eq(IDENTITY_KEY)]));
+
+static CREATE_CRDT_FIELD: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(CRDT_FIELD))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(DOCUMENT_ID))
+            .col(text_col(FIELD))
+            .col(text_col(KIND))
+            .col(blob_col(BYTES))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(DOCUMENT_ID))
+                    .col(alias(FIELD)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static WRITE_CRDT_FIELD: LazyLock<String> = LazyLock::new(|| {
+    write(
+        CRDT_FIELD,
+        [
+            IDENTITY_KEY,
+            TABLE_NAME,
+            DOCUMENT_ID,
+            FIELD,
+            KIND,
+            BYTES,
+            UPDATED_TIME,
+        ],
+        7,
+        true,
+    )
+});
+static READ_CRDT_FIELD: LazyLock<String> = LazyLock::new(|| {
+    pin_pk_autoindex(
+        &select_where(
+            CRDT_FIELD,
+            [Expr::col(alias(BYTES))],
+            [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID), eq(FIELD)],
+        ),
+        CRDT_FIELD,
+    )
+});
+static CLEAR_CRDT_FIELD: LazyLock<String> =
+    LazyLock::new(|| delete_where(CRDT_FIELD, [eq(IDENTITY_KEY)]));
+static DELETE_CRDT_FIELD: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        CRDT_FIELD,
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID), eq(FIELD)],
+    )
+});
+
+static CREATE_PROJECTIONS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(PROJECTIONS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(DOCUMENT_ID))
+            .col(text_col(CURRENT_REV_ID))
+            .col(text_col(SERVER_DOCUMENT_ID))
+            .col(text_col(PROJECTION_HASH))
+            .col(nullable_text_col(REV_ROOT_ID))
+            .col(nullable_text_col(REV_NODE_ID))
+            .col(nullable_text_col(SERVER_BASE))
+            .col(nullable_text_col(SERVER_ROW))
+            .col(integer_col(UPDATED_TIME))
+            .col(real_col(LOGICAL_CLOCK))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(DOCUMENT_ID)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static CREATE_PROJECTIONS_SERVER_INDEX: LazyLock<String> = LazyLock::new(|| {
+    Index::create()
+        .if_not_exists()
+        .name("idx__embedded_projections__server")
+        .table(alias(PROJECTIONS))
+        .col(alias(IDENTITY_KEY))
+        .col(alias(TABLE_NAME))
+        .col(alias(SERVER_DOCUMENT_ID))
+        .to_string(SqliteQueryBuilder)
+});
+static UPSERT_PROJECTION: LazyLock<String> = LazyLock::new(|| {
+    write(
+        PROJECTIONS,
+        [
+            IDENTITY_KEY,
+            TABLE_NAME,
+            DOCUMENT_ID,
+            CURRENT_REV_ID,
+            SERVER_DOCUMENT_ID,
+            PROJECTION_HASH,
+            REV_ROOT_ID,
+            REV_NODE_ID,
+            SERVER_BASE,
+            SERVER_ROW,
+            UPDATED_TIME,
+            LOGICAL_CLOCK,
+        ],
+        12,
+        true,
+    )
+});
+static READ_PROJECTION: LazyLock<String> = LazyLock::new(|| {
+    pin_pk_autoindex(
+        &select_where(
+            PROJECTIONS,
+            [
+                Expr::col(alias(CURRENT_REV_ID)),
+                Expr::col(alias(SERVER_DOCUMENT_ID)),
+                Expr::col(alias(PROJECTION_HASH)),
+                Expr::col(alias(REV_ROOT_ID)),
+                Expr::col(alias(REV_NODE_ID)),
+                Expr::col(alias(SERVER_BASE)),
+                Expr::col(alias(SERVER_ROW)),
+                Expr::col(alias(UPDATED_TIME)),
+                Expr::col(alias(LOGICAL_CLOCK)),
+            ],
+            [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)],
+        ),
+        PROJECTIONS,
+    )
+});
+static DELETE_PROJECTION_ROW: LazyLock<String> = LazyLock::new(|| {
+    pin_pk_autoindex(
+        &delete_where(
+            PROJECTIONS,
+            [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)],
+        ),
+        PROJECTIONS,
+    )
+});
+static CLEAR_PROJECTIONS: LazyLock<String> =
+    LazyLock::new(|| delete_where(PROJECTIONS, [eq(IDENTITY_KEY)]));
+
+static CREATE_MEMBERSHIPS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(MEMBERSHIPS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(SUBSCRIPTION))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(SERVER_DOCUMENT_ID))
+            .col(nullable_text_col(RANGE_LOWER))
+            .col(nullable_text_col(RANGE_UPPER))
+            .col(nullable_text_col(RANGE_ORDER))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(SUBSCRIPTION))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(SERVER_DOCUMENT_ID)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static CREATE_MEMBERSHIPS_ROW_INDEX: LazyLock<String> = LazyLock::new(|| {
+    Index::create()
+        .if_not_exists()
+        .name("idx__embedded_memberships__row")
+        .table(alias(MEMBERSHIPS))
+        .col(alias(IDENTITY_KEY))
+        .col(alias(TABLE_NAME))
+        .col(alias(SERVER_DOCUMENT_ID))
+        .to_string(SqliteQueryBuilder)
+});
+static READ_MEMBERSHIP: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        MEMBERSHIPS,
+        [
+            Expr::col(alias(TABLE_NAME)),
+            Expr::col(alias(SERVER_DOCUMENT_ID)),
+        ],
+        [eq(IDENTITY_KEY), eq(SUBSCRIPTION)],
+    )
+});
+static READ_SUBSCRIPTIONS: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .distinct()
+        .column(alias(SUBSCRIPTION))
+        .from(alias(MEMBERSHIPS))
+        .cond_where(eq(IDENTITY_KEY));
+    query.build(SqliteQueryBuilder).0
+});
+static WRITE_MEMBERSHIP: LazyLock<String> = LazyLock::new(|| {
+    write(
+        MEMBERSHIPS,
+        [
+            IDENTITY_KEY,
+            SUBSCRIPTION,
+            TABLE_NAME,
+            SERVER_DOCUMENT_ID,
+            RANGE_LOWER,
+            RANGE_UPPER,
+            RANGE_ORDER,
+        ],
+        7,
+        true,
+    )
+});
+static READ_MEMBERSHIP_RANGE: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        MEMBERSHIPS,
+        [
+            Expr::col(alias(RANGE_LOWER)),
+            Expr::col(alias(RANGE_UPPER)),
+            Expr::col(alias(RANGE_ORDER)),
+        ],
+        [eq(IDENTITY_KEY), eq(SUBSCRIPTION)],
+    )
+});
+static DELETE_SUBSCRIPTION_MEMBERSHIP: LazyLock<String> =
+    LazyLock::new(|| delete_where(MEMBERSHIPS, [eq(IDENTITY_KEY), eq(SUBSCRIPTION)]));
+static MEMBERSHIP_HAS_ROW: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        MEMBERSHIPS,
+        [Expr::cust("1")],
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(SERVER_DOCUMENT_ID)],
+    )
+});
+static READ_PROJECTION_BY_SERVER: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        PROJECTIONS,
+        [Expr::col(alias(DOCUMENT_ID))],
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(SERVER_DOCUMENT_ID)],
+    )
+});
+
+static CREATE_RESULTS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(RESULTS))
+            .if_not_exists()
+            .col(text_col(KEY))
+            .col(text_col(FUNCTION))
+            .col(text_col(ARGS))
+            .col(text_col(IDENTITY))
+            .col(text_col(SCHEMA_HASH))
+            .col(text_col(MODULE_HASH))
+            .col(blob_col(SKELETON))
+            .col(blob_col(PATHS))
+            .col(text_col(SKELETON_HASH))
+            .col(real_col(CLOCK))
+            .primary_key(Index::create().col(alias(KEY)))
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static WRITE_RESULT: LazyLock<String> = LazyLock::new(|| {
+    write(
+        RESULTS,
+        [
+            KEY,
+            FUNCTION,
+            ARGS,
+            IDENTITY,
+            SCHEMA_HASH,
+            MODULE_HASH,
+            SKELETON,
+            PATHS,
+            SKELETON_HASH,
+            CLOCK,
+        ],
+        10,
+        true,
+    )
+});
+static READ_RESULT: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        RESULTS,
+        [
+            Expr::col(alias(FUNCTION)),
+            Expr::col(alias(ARGS)),
+            Expr::col(alias(SCHEMA_HASH)),
+            Expr::col(alias(MODULE_HASH)),
+            Expr::col(alias(SKELETON)),
+            Expr::col(alias(PATHS)),
+            Expr::col(alias(SKELETON_HASH)),
+            Expr::col(alias(CLOCK)),
+        ],
+        [eq(KEY)],
+    )
+});
+static READ_RESULT_SKELETON_HASH: LazyLock<String> =
+    LazyLock::new(|| select_where(RESULTS, [Expr::col(alias(SKELETON_HASH))], [eq(KEY)]));
+static READ_RESULT_STALE: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        RESULTS,
+        [
+            Expr::col(alias(KEY)),
+            Expr::col(alias(SCHEMA_HASH)),
+            Expr::col(alias(MODULE_HASH)),
+        ],
+        [eq(IDENTITY)],
+    )
+});
+static DELETE_RESULT: LazyLock<String> = LazyLock::new(|| delete_where(RESULTS, [eq(KEY)]));
+
+static CREATE_PEERS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(PEERS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(blob_col(PEER_ID))
+            .col(integer_col(CREATED_TIME))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(Index::create().col(alias(IDENTITY_KEY)))
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static READ_PEER: LazyLock<String> =
+    LazyLock::new(|| select_where(PEERS, [Expr::col(alias(PEER_ID))], [eq(IDENTITY_KEY)]));
+static WRITE_PEER: LazyLock<String> = LazyLock::new(|| {
+    write(
+        PEERS,
+        [IDENTITY_KEY, PEER_ID, CREATED_TIME, UPDATED_TIME],
+        4,
+        true,
+    )
+});
+static CLEAR_PEERS: LazyLock<String> = LazyLock::new(|| delete_where(PEERS, [eq(IDENTITY_KEY)]));
+
+static CREATE_ID_MAPPINGS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(ID_MAPPINGS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(LOCAL_ID))
+            .col(nullable_text_col(CONVEX_ID))
+            .col(text_col(STATE))
+            .col(integer_col(CREATED_TIME))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(LOCAL_ID)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static CREATE_ID_MAPPINGS_CONVEX_INDEX: LazyLock<String> = LazyLock::new(|| {
+    Index::create()
+        .unique()
+        .if_not_exists()
+        .name("ux__embedded_id_mappings__convex")
+        .table(alias(ID_MAPPINGS))
+        .col(alias(IDENTITY_KEY))
+        .col(alias(TABLE_NAME))
+        .col(alias(CONVEX_ID))
+        .and_where(
+            all([
+                Expr::col(alias(CONVEX_ID)).is_not_null(),
+                Expr::col(alias(STATE)).ne("deleted"),
+            ])
+            .into(),
+        )
+        .to_string(SqliteQueryBuilder)
+});
+static CREATE_ID_MAPPINGS_DELETED_INDEX: LazyLock<String> = LazyLock::new(|| {
+    Index::create()
+        .if_not_exists()
+        .name("ix__embedded_id_mappings__convex_deleted")
+        .table(alias(ID_MAPPINGS))
+        .col(alias(IDENTITY_KEY))
+        .col(alias(TABLE_NAME))
+        .col(alias(CONVEX_ID))
+        .and_where(
+            all([
+                Expr::col(alias(CONVEX_ID)).is_not_null(),
+                Expr::col(alias(STATE)).eq("deleted"),
+            ])
+            .into(),
+        )
+        .to_string(SqliteQueryBuilder)
+});
+static READ_DELETED_ID_MAPPINGS_BY_CONVEX_ID: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(alias(TABLE_NAME)))
+        .expr(Expr::col(alias(LOCAL_ID)))
+        .expr(Expr::col(alias(CONVEX_ID)))
+        .expr(Expr::col(alias(STATE)))
+        .expr(Expr::col(alias(CREATED_TIME)))
+        .expr(Expr::col(alias(UPDATED_TIME)))
+        .from(alias(ID_MAPPINGS))
+        .cond_where(all([
+            eq(IDENTITY_KEY),
+            eq(TABLE_NAME),
+            eq(CONVEX_ID),
+            Expr::col(alias(CONVEX_ID)).is_not_null(),
+            Expr::cust("\"state\" = 'deleted'"),
+        ]))
+        .order_by(alias(CREATED_TIME), SqlOrder::Asc)
+        .order_by(alias(LOCAL_ID), SqlOrder::Asc);
+    pin_index(
+        &query.build(SqliteQueryBuilder).0,
+        ID_MAPPINGS,
+        "ix__embedded_id_mappings__convex_deleted",
+    )
+});
+static WRITE_ID_MAPPING: LazyLock<String> = LazyLock::new(|| {
+    write(
+        ID_MAPPINGS,
+        [
+            IDENTITY_KEY,
+            TABLE_NAME,
+            LOCAL_ID,
+            CONVEX_ID,
+            STATE,
+            CREATED_TIME,
+            UPDATED_TIME,
+        ],
+        7,
+        true,
+    )
+});
+static READ_ID_MAPPING: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        ID_MAPPINGS,
+        [
+            Expr::col(alias(TABLE_NAME)),
+            Expr::col(alias(LOCAL_ID)),
+            Expr::col(alias(CONVEX_ID)),
+            Expr::col(alias(STATE)),
+            Expr::col(alias(CREATED_TIME)),
+            Expr::col(alias(UPDATED_TIME)),
+        ],
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(LOCAL_ID)],
+    )
+});
+static READ_ID_MAPPINGS: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(alias(TABLE_NAME)))
+        .expr(Expr::col(alias(LOCAL_ID)))
+        .expr(Expr::col(alias(CONVEX_ID)))
+        .expr(Expr::col(alias(STATE)))
+        .expr(Expr::col(alias(CREATED_TIME)))
+        .expr(Expr::col(alias(UPDATED_TIME)))
+        .from(alias(ID_MAPPINGS))
+        .cond_where(all([eq(IDENTITY_KEY), eq(TABLE_NAME)]))
+        .order_by(alias(CREATED_TIME), SqlOrder::Asc)
+        .order_by(alias(LOCAL_ID), SqlOrder::Asc);
+    query.build(SqliteQueryBuilder).0
+});
+static READ_ID_MAPPING_BY_CONVEX_ID: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        ID_MAPPINGS,
+        [
+            Expr::col(alias(TABLE_NAME)),
+            Expr::col(alias(LOCAL_ID)),
+            Expr::col(alias(CONVEX_ID)),
+            Expr::col(alias(STATE)),
+            Expr::col(alias(CREATED_TIME)),
+            Expr::col(alias(UPDATED_TIME)),
+        ],
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(CONVEX_ID), ne(STATE)],
+    )
+});
+static DELETE_ID_MAPPING: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        ID_MAPPINGS,
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(LOCAL_ID)],
+    )
+});
+static CLEAR_ID_MAPPINGS: LazyLock<String> =
+    LazyLock::new(|| delete_where(ID_MAPPINGS, [eq(IDENTITY_KEY)]));
+
+static CREATE_FILES: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(FILES))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(LOCAL_STORAGE_ID))
+            .col(text_col(SHA256))
+            .col(integer_col(SIZE))
+            .col(nullable_text_col(CONTENT_TYPE))
+            .col(nullable_text_col(SOURCE))
+            .col(integer_col(CREATED_TIME))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(LOCAL_STORAGE_ID)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static WRITE_FILE: LazyLock<String> = LazyLock::new(|| {
+    write(
+        FILES,
+        [
+            IDENTITY_KEY,
+            LOCAL_STORAGE_ID,
+            SHA256,
+            SIZE,
+            CONTENT_TYPE,
+            SOURCE,
+            CREATED_TIME,
+            UPDATED_TIME,
+        ],
+        8,
+        true,
+    )
+});
+static READ_FILE: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        FILES,
+        [
+            Expr::col(alias(LOCAL_STORAGE_ID)),
+            Expr::col(alias(SHA256)),
+            Expr::col(alias(SIZE)),
+            Expr::col(alias(CONTENT_TYPE)),
+            Expr::col(alias(SOURCE)),
+            Expr::col(alias(CREATED_TIME)),
+            Expr::col(alias(UPDATED_TIME)),
+        ],
+        [eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID)],
+    )
+});
+static DELETE_FILE: LazyLock<String> =
+    LazyLock::new(|| delete_where(FILES, [eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID)]));
+static CLEAR_FILES: LazyLock<String> = LazyLock::new(|| delete_where(FILES, [eq(IDENTITY_KEY)]));
+
+static CREATE_UPLOADS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(UPLOADS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(LOCAL_STORAGE_ID))
+            .col(text_col(SHA256))
+            .col(integer_col(SIZE))
+            .col(nullable_text_col(CONTENT_TYPE))
+            .col(text_col(STATE))
+            .col(nullable_text_col(OWNER))
+            .col(nullable_integer_col(LEASE_UNTIL))
+            .col(integer_col(CREATED_TIME))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(LOCAL_STORAGE_ID)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static PUSH_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+    write(
+        UPLOADS,
+        [
+            IDENTITY_KEY,
+            LOCAL_STORAGE_ID,
+            SHA256,
+            SIZE,
+            CONTENT_TYPE,
+            STATE,
+            OWNER,
+            LEASE_UNTIL,
+            CREATED_TIME,
+            UPDATED_TIME,
+        ],
+        10,
+        false,
+    )
+});
+static READ_UPLOADS: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    upload_select(&mut query);
+    query
+        .from(alias(UPLOADS))
+        .cond_where(eq(IDENTITY_KEY))
+        .order_by(alias(CREATED_TIME), SqlOrder::Asc)
+        .order_by(alias(LOCAL_STORAGE_ID), SqlOrder::Asc);
+    query.build(SqliteQueryBuilder).0
+});
+static HAS_UPLOADS: LazyLock<String> =
+    LazyLock::new(|| select_where(UPLOADS, [Expr::cust("1")], [eq(IDENTITY_KEY)]));
+static READ_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    upload_select(&mut query);
+    query
+        .from(alias(UPLOADS))
+        .cond_where(all([eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID)]));
+    query.build(SqliteQueryBuilder).0
+});
+static CLAIMABLE_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    upload_select(&mut query);
+    let mut condition = all([eq(IDENTITY_KEY)]);
+    condition = condition.add(any([
+        expr(eq(STATE)),
+        expr(Expr::col(alias(LEASE_UNTIL)).is_null()),
+        expr(lte(LEASE_UNTIL)),
+    ]));
+    query
+        .from(alias(UPLOADS))
+        .cond_where(condition)
+        .order_by(alias(CREATED_TIME), SqlOrder::Asc)
+        .order_by(alias(LOCAL_STORAGE_ID), SqlOrder::Asc)
+        .limit(1);
+    query.build(SqliteQueryBuilder).0
+});
+static CLAIM_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::update();
+    let mut condition = all([eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID)]);
+    condition = condition.add(any([
+        expr(eq(STATE)),
+        expr(Expr::col(alias(LEASE_UNTIL)).is_null()),
+        expr(lte(LEASE_UNTIL)),
+    ]));
+    query
+        .table(alias(UPLOADS))
+        .value(alias(STATE), placeholder())
+        .value(alias(OWNER), placeholder())
+        .value(alias(LEASE_UNTIL), placeholder())
+        .value(alias(UPDATED_TIME), placeholder())
+        .cond_where(condition);
+    query.build(SqliteQueryBuilder).0
+});
+static RENEW_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::update();
+    query
+        .table(alias(UPLOADS))
+        .value(alias(LEASE_UNTIL), placeholder())
+        .value(alias(UPDATED_TIME), placeholder())
+        .cond_where(all([
+            eq(IDENTITY_KEY),
+            eq(LOCAL_STORAGE_ID),
+            eq(OWNER),
+            eq(STATE),
+        ]));
+    query.build(SqliteQueryBuilder).0
+});
+static RELEASE_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::update();
+    query
+        .table(alias(UPLOADS))
+        .value(alias(STATE), placeholder())
+        .value(alias(OWNER), Expr::cust("NULL"))
+        .value(alias(LEASE_UNTIL), Expr::cust("NULL"))
+        .value(alias(UPDATED_TIME), placeholder())
+        .cond_where(all([eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID), eq(OWNER)]));
+    query.build(SqliteQueryBuilder).0
+});
+static DELETE_UPLOAD: LazyLock<String> =
+    LazyLock::new(|| delete_where(UPLOADS, [eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID)]));
+static COMPLETE_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        UPLOADS,
+        [eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID), eq(OWNER), eq(STATE)],
+    )
+});
+static CLEAR_UPLOADS: LazyLock<String> =
+    LazyLock::new(|| delete_where(UPLOADS, [eq(IDENTITY_KEY)]));
+
+static CREATE_REMOTE: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(REMOTE))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(WATERMARK))
+            .col(integer_col(COMMIT_SEQ))
+            .col(nullable_text_col(CURSOR))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(WATERMARK)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static READ_REMOTE_CURSOR: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        REMOTE,
+        [Expr::col(alias(CURSOR))],
+        [eq(IDENTITY_KEY), eq(WATERMARK)],
+    )
+});
+static READ_REMOTE_COMMIT_SEQ: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        REMOTE,
+        [Expr::col(alias(COMMIT_SEQ))],
+        [eq(IDENTITY_KEY), eq(WATERMARK)],
+    )
+});
+static REMOTE_PROGRESS_HAS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT 1 FROM \"{REMOTE}\" WHERE \"{IDENTITY_KEY}\" = ? AND \"{WATERMARK}\" LIKE ? AND \"{CURSOR}\" IS NOT NULL LIMIT 1"
+    )
+});
+static WRITE_REMOTE_CURSOR: LazyLock<String> = LazyLock::new(|| {
+    write(
+        REMOTE,
+        [IDENTITY_KEY, WATERMARK, COMMIT_SEQ, CURSOR, UPDATED_TIME],
+        5,
+        true,
+    )
+});
+static DELETE_REMOTE_CURSOR: LazyLock<String> =
+    LazyLock::new(|| delete_where(REMOTE, [eq(IDENTITY_KEY), eq(WATERMARK)]));
+static READ_REMOTE_PUSH_ENVELOPES: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT \"{WATERMARK}\", \"{CURSOR}\" FROM \"{REMOTE}\" WHERE \"{IDENTITY_KEY}\" = ? AND \"{WATERMARK}\" >= ? AND \"{WATERMARK}\" < ? AND \"{CURSOR}\" IS NOT NULL ORDER BY \"{COMMIT_SEQ}\" ASC, \"{WATERMARK}\" ASC"
+    )
+});
+static CLEAR_REMOTE: LazyLock<String> = LazyLock::new(|| delete_where(REMOTE, [eq(IDENTITY_KEY)]));
+
+static CREATE_SCHEDULES: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(SCHEDULES))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(JOB_ID))
+            .col(text_col(KIND))
+            .col(text_col(NAME))
+            .col(text_col(ARGS))
+            .col(integer_col(DUE_TIME))
+            .col(text_col(STATE))
+            .col(nullable_integer_col(LEASE_UNTIL))
+            .col(integer_col(CREATED_TIME))
+            .col(integer_col(UPDATED_TIME))
+            .primary_key(Index::create().col(alias(IDENTITY_KEY)).col(alias(JOB_ID)))
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static WRITE_SCHEDULE: LazyLock<String> = LazyLock::new(|| {
+    write(
+        SCHEDULES,
+        [
+            IDENTITY_KEY,
+            JOB_ID,
+            KIND,
+            NAME,
+            ARGS,
+            DUE_TIME,
+            STATE,
+            LEASE_UNTIL,
+            CREATED_TIME,
+            UPDATED_TIME,
+        ],
+        10,
+        true,
+    )
+});
+static READ_DUE_SCHEDULES: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    schedule_select(&mut query);
+    query
+        .from(alias(SCHEDULES))
+        .cond_where(merge(
+            expr(eq(IDENTITY_KEY)),
+            any([
+                all([eq(STATE), lte(DUE_TIME)]),
+                all([eq(STATE), lt(LEASE_UNTIL)]),
+            ]),
+        ))
+        .order_by(alias(DUE_TIME), SqlOrder::Asc)
+        .order_by(alias(JOB_ID), SqlOrder::Asc);
+    query.build(SqliteQueryBuilder).0
+});
+static READ_SCHEDULES: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    schedule_select(&mut query);
+    query
+        .from(alias(SCHEDULES))
+        .cond_where(eq(IDENTITY_KEY))
+        .order_by(alias(DUE_TIME), SqlOrder::Asc)
+        .order_by(alias(JOB_ID), SqlOrder::Asc);
+    query.build(SqliteQueryBuilder).0
+});
+static READ_SCHEDULE: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::select();
+    schedule_select(&mut query);
+    query
+        .from(alias(SCHEDULES))
+        .cond_where(all([eq(IDENTITY_KEY), eq(JOB_ID)]));
+    query.build(SqliteQueryBuilder).0
+});
+static WRITE_SCHEDULE_STATE: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::update();
+    query
+        .table(alias(SCHEDULES))
+        .value(alias(STATE), placeholder())
+        .value(alias(UPDATED_TIME), placeholder())
+        .value(alias(LEASE_UNTIL), placeholder())
+        .cond_where(all([eq(IDENTITY_KEY), eq(JOB_ID), eq(STATE)]));
+    query.build(SqliteQueryBuilder).0
+});
+static SCHEDULE_LEASE_WRITE: LazyLock<String> = LazyLock::new(|| {
+    let mut query = Query::update();
+    query
+        .table(alias(SCHEDULES))
+        .value(alias(STATE), placeholder())
+        .value(alias(UPDATED_TIME), placeholder())
+        .value(alias(LEASE_UNTIL), placeholder())
+        .cond_where(merge(
+            all([eq(IDENTITY_KEY), eq(JOB_ID)]),
+            any([
+                all([eq(STATE), lte(DUE_TIME)]),
+                all([eq(STATE), lt(LEASE_UNTIL)]),
+            ]),
+        ));
+    query.build(SqliteQueryBuilder).0
+});
+static CLEAR_SCHEDULES: LazyLock<String> =
+    LazyLock::new(|| delete_where(SCHEDULES, [eq(IDENTITY_KEY)]));
 
 /// Column names every document table owns; user-declared columns may not collide with them.
 pub(crate) const RESERVED: [&str; 4] = [ID, IDENTITY_KEY, CREATION_TIME, DATA];
@@ -224,23 +1643,39 @@ pub(crate) fn create_commits_mutation_index() -> &'static str {
     &CREATE_COMMITS_MUTATION_INDEX
 }
 
-pub(crate) fn insert_commit() -> &'static str {
-    &INSERT_COMMIT
+pub(crate) fn create_meta() -> &'static str {
+    &CREATE_META
 }
 
-pub(crate) fn next_commit_seq() -> &'static str {
-    &NEXT_COMMIT_SEQ
+pub(crate) fn read_meta() -> &'static str {
+    &READ_META
+}
+
+pub(crate) fn write_meta() -> &'static str {
+    &WRITE_META
+}
+
+pub(crate) fn write_commit() -> &'static str {
+    &WRITE_COMMIT
 }
 
 pub(crate) fn max_commit_seq() -> &'static str {
     &MAX_COMMIT_SEQ
 }
 
-pub(crate) fn commit_exists() -> &'static str {
+pub(crate) fn commit_has() -> &'static str {
     &COMMIT_EXISTS
 }
 
-pub(crate) fn prune_commits() -> &'static str {
+pub(crate) fn dirty_head_commit_has() -> &'static str {
+    &DIRTY_HEAD_COMMIT_EXISTS
+}
+
+pub(crate) fn mutation_commit_has() -> &'static str {
+    &MUTATION_COMMIT_EXISTS
+}
+
+pub(crate) fn delete_commits() -> &'static str {
     &PRUNE_COMMITS
 }
 
@@ -252,8 +1687,16 @@ pub(crate) fn create_mutations() -> &'static str {
     &CREATE_MUTATIONS
 }
 
-pub(crate) fn insert_mutation() -> &'static str {
-    &INSERT_MUTATION
+pub(crate) fn write_mutation() -> &'static str {
+    &WRITE_MUTATION
+}
+
+pub(crate) fn write_committed_mutation_ok() -> &'static str {
+    &WRITE_COMMITTED_MUTATION_OK
+}
+
+pub(crate) fn write_failed_mutation() -> &'static str {
+    &WRITE_FAILED_MUTATION
 }
 
 pub(crate) fn read_mutation() -> &'static str {
@@ -272,7 +1715,7 @@ pub(crate) fn commit_mutation() -> &'static str {
     &COMMIT_MUTATION
 }
 
-pub(crate) fn prune_mutations() -> &'static str {
+pub(crate) fn delete_mutations() -> &'static str {
     &PRUNE_MUTATIONS
 }
 
@@ -300,6 +1743,416 @@ pub(crate) fn clear_blobs() -> &'static str {
     &CLEAR_BLOBS
 }
 
+pub(crate) fn create_revs() -> &'static str {
+    &CREATE_REVS
+}
+
+pub(crate) fn create_rev_log() -> &'static str {
+    &CREATE_REV_LOG
+}
+
+pub(crate) fn write_rev_log() -> &'static str {
+    &WRITE_REV_LOG
+}
+
+pub(crate) fn read_rev_log() -> &'static str {
+    &READ_REV_LOG
+}
+
+pub(crate) fn delete_rev_log() -> &'static str {
+    &DELETE_REV_LOG
+}
+
+pub(crate) fn count_rev_log() -> &'static str {
+    &COUNT_REV_LOG
+}
+
+pub(crate) fn exists_rev() -> &'static str {
+    &EXISTS_REV
+}
+
+pub(crate) fn update_rev_meta() -> &'static str {
+    &UPDATE_REV_META
+}
+
+pub(crate) fn create_dirty_heads() -> &'static str {
+    &CREATE_DIRTY_HEADS
+}
+
+pub(crate) fn create_dirty_heads_seq_index() -> &'static str {
+    &CREATE_DIRTY_HEADS_SEQ_INDEX
+}
+
+pub(crate) fn write_dirty_head_from_projection() -> &'static str {
+    &WRITE_DIRTY_HEAD_FROM_PROJECTION
+}
+
+pub(crate) fn write_dirty_head_fresh() -> &'static str {
+    &WRITE_DIRTY_HEAD_FRESH
+}
+
+pub(crate) fn read_dirty_heads() -> &'static str {
+    &READ_DIRTY_HEADS
+}
+
+pub(crate) fn read_dirty_head() -> &'static str {
+    &READ_DIRTY_HEAD
+}
+
+pub(crate) fn dirty_head_has() -> &'static str {
+    &DIRTY_HEAD_EXISTS
+}
+
+pub(crate) fn dirty_heads_has() -> &'static str {
+    &DIRTY_HEADS_HAS
+}
+
+pub(crate) fn delete_dirty_head() -> &'static str {
+    &DELETE_DIRTY_HEAD
+}
+
+pub(crate) fn clear_dirty_heads() -> &'static str {
+    &CLEAR_DIRTY_HEADS
+}
+
+pub(crate) fn create_crdt_ops() -> &'static str {
+    &CREATE_CRDT_OPS
+}
+
+pub(crate) fn write_crdt_op() -> &'static str {
+    &WRITE_CRDT_OP
+}
+
+#[cfg(any(test, feature = "testkit"))]
+pub(crate) fn read_crdt_ops_debug() -> &'static str {
+    &READ_CRDT_OPS_DEBUG
+}
+
+pub(crate) fn delete_crdt_ops_for_row() -> &'static str {
+    &DELETE_CRDT_OPS_FOR_ROW
+}
+
+pub(crate) fn clear_crdt_ops() -> &'static str {
+    &CLEAR_CRDT_OPS
+}
+
+pub(crate) fn create_peers() -> &'static str {
+    &CREATE_PEERS
+}
+
+pub(crate) fn write_rev() -> &'static str {
+    &UPSERT_REV
+}
+
+pub(crate) fn read_rev() -> &'static str {
+    &READ_REV
+}
+
+#[cfg(any(debug_assertions, test, feature = "testkit"))]
+pub(crate) fn read_rev_frontiers() -> &'static str {
+    &READ_REV_FRONTIERS
+}
+
+pub(crate) fn read_document_revs() -> &'static str {
+    &READ_DOCUMENT_REVS
+}
+
+pub(crate) fn delete_rev() -> &'static str {
+    &DELETE_REV
+}
+
+pub(crate) fn clear_revs() -> &'static str {
+    &CLEAR_REVS
+}
+
+pub(crate) fn clear_peers() -> &'static str {
+    &CLEAR_PEERS
+}
+
+pub(crate) fn create_crdt_field() -> &'static str {
+    &CREATE_CRDT_FIELD
+}
+
+pub(crate) fn write_crdt_field() -> &'static str {
+    &WRITE_CRDT_FIELD
+}
+
+pub(crate) fn read_crdt_field() -> &'static str {
+    &READ_CRDT_FIELD
+}
+
+pub(crate) fn clear_crdt_field() -> &'static str {
+    &CLEAR_CRDT_FIELD
+}
+
+pub(crate) fn delete_crdt_field() -> &'static str {
+    &DELETE_CRDT_FIELD
+}
+
+pub(crate) fn create_projections() -> &'static str {
+    &CREATE_PROJECTIONS
+}
+
+pub(crate) fn create_projections_server_index() -> &'static str {
+    &CREATE_PROJECTIONS_SERVER_INDEX
+}
+
+pub(crate) fn write_projection() -> &'static str {
+    &UPSERT_PROJECTION
+}
+
+pub(crate) fn read_projection() -> &'static str {
+    &READ_PROJECTION
+}
+
+pub(crate) fn delete_projection_row() -> &'static str {
+    &DELETE_PROJECTION_ROW
+}
+
+pub(crate) fn clear_projections() -> &'static str {
+    &CLEAR_PROJECTIONS
+}
+
+pub(crate) fn create_memberships() -> &'static str {
+    &CREATE_MEMBERSHIPS
+}
+
+pub(crate) fn create_memberships_row_index() -> &'static str {
+    &CREATE_MEMBERSHIPS_ROW_INDEX
+}
+
+pub(crate) fn read_membership() -> &'static str {
+    &READ_MEMBERSHIP
+}
+
+pub(crate) fn read_subscriptions() -> &'static str {
+    &READ_SUBSCRIPTIONS
+}
+
+pub(crate) fn write_membership() -> &'static str {
+    &WRITE_MEMBERSHIP
+}
+
+pub(crate) fn delete_subscription_membership() -> &'static str {
+    &DELETE_SUBSCRIPTION_MEMBERSHIP
+}
+
+pub(crate) fn membership_has_row() -> &'static str {
+    &MEMBERSHIP_HAS_ROW
+}
+
+pub(crate) fn read_membership_range() -> &'static str {
+    &READ_MEMBERSHIP_RANGE
+}
+
+pub(crate) fn create_results() -> &'static str {
+    &CREATE_RESULTS
+}
+
+pub(crate) fn write_result() -> &'static str {
+    &WRITE_RESULT
+}
+
+pub(crate) fn read_result() -> &'static str {
+    &READ_RESULT
+}
+
+pub(crate) fn read_result_skeleton_hash() -> &'static str {
+    &READ_RESULT_SKELETON_HASH
+}
+
+pub(crate) fn read_result_delete_stale() -> &'static str {
+    &READ_RESULT_STALE
+}
+
+pub(crate) fn delete_result() -> &'static str {
+    &DELETE_RESULT
+}
+
+pub(crate) fn read_projection_by_server() -> &'static str {
+    &READ_PROJECTION_BY_SERVER
+}
+
+pub(crate) fn read_peer() -> &'static str {
+    &READ_PEER
+}
+
+pub(crate) fn write_peer() -> &'static str {
+    &WRITE_PEER
+}
+
+pub(crate) fn create_id_mappings() -> &'static str {
+    &CREATE_ID_MAPPINGS
+}
+
+pub(crate) fn create_id_mappings_convex_index() -> &'static str {
+    &CREATE_ID_MAPPINGS_CONVEX_INDEX
+}
+
+pub(crate) fn write_id_mapping() -> &'static str {
+    &WRITE_ID_MAPPING
+}
+
+pub(crate) fn read_id_mapping() -> &'static str {
+    &READ_ID_MAPPING
+}
+
+pub(crate) fn read_id_mappings() -> &'static str {
+    &READ_ID_MAPPINGS
+}
+
+pub(crate) fn read_id_mapping_by_convex_id() -> &'static str {
+    &READ_ID_MAPPING_BY_CONVEX_ID
+}
+
+pub(crate) fn create_id_mappings_deleted_index() -> &'static str {
+    &CREATE_ID_MAPPINGS_DELETED_INDEX
+}
+
+pub(crate) fn read_deleted_id_mappings_by_convex_id() -> &'static str {
+    &READ_DELETED_ID_MAPPINGS_BY_CONVEX_ID
+}
+
+pub(crate) fn delete_id_mapping() -> &'static str {
+    &DELETE_ID_MAPPING
+}
+
+pub(crate) fn clear_id_mappings() -> &'static str {
+    &CLEAR_ID_MAPPINGS
+}
+
+pub(crate) fn create_files() -> &'static str {
+    &CREATE_FILES
+}
+
+pub(crate) fn write_file() -> &'static str {
+    &WRITE_FILE
+}
+
+pub(crate) fn read_file() -> &'static str {
+    &READ_FILE
+}
+
+pub(crate) fn delete_file() -> &'static str {
+    &DELETE_FILE
+}
+
+pub(crate) fn clear_files() -> &'static str {
+    &CLEAR_FILES
+}
+
+pub(crate) fn create_uploads() -> &'static str {
+    &CREATE_UPLOADS
+}
+
+pub(crate) fn write_upload() -> &'static str {
+    &PUSH_UPLOAD
+}
+
+pub(crate) fn read_uploads() -> &'static str {
+    &READ_UPLOADS
+}
+
+pub(crate) fn uploads_has() -> &'static str {
+    &HAS_UPLOADS
+}
+
+pub(crate) fn read_upload() -> &'static str {
+    &READ_UPLOAD
+}
+
+pub(crate) fn read_claimable_upload() -> &'static str {
+    &CLAIMABLE_UPLOAD
+}
+
+pub(crate) fn write_upload_claim() -> &'static str {
+    &CLAIM_UPLOAD
+}
+
+pub(crate) fn write_upload_renew() -> &'static str {
+    &RENEW_UPLOAD
+}
+
+pub(crate) fn write_upload_release() -> &'static str {
+    &RELEASE_UPLOAD
+}
+
+pub(crate) fn delete_upload() -> &'static str {
+    &DELETE_UPLOAD
+}
+
+pub(crate) fn complete_upload() -> &'static str {
+    &COMPLETE_UPLOAD
+}
+
+pub(crate) fn clear_uploads() -> &'static str {
+    &CLEAR_UPLOADS
+}
+
+pub(crate) fn create_remote() -> &'static str {
+    &CREATE_REMOTE
+}
+
+pub(crate) fn read_remote_cursor() -> &'static str {
+    &READ_REMOTE_CURSOR
+}
+
+pub(crate) fn read_remote_commit_seq() -> &'static str {
+    &READ_REMOTE_COMMIT_SEQ
+}
+
+pub(crate) fn remote_progress_has() -> &'static str {
+    &REMOTE_PROGRESS_HAS
+}
+
+pub(crate) fn write_remote_cursor() -> &'static str {
+    &WRITE_REMOTE_CURSOR
+}
+
+pub(crate) fn delete_remote_cursor() -> &'static str {
+    &DELETE_REMOTE_CURSOR
+}
+
+pub(crate) fn read_remote_push_envelopes() -> &'static str {
+    &READ_REMOTE_PUSH_ENVELOPES
+}
+
+pub(crate) fn clear_remote() -> &'static str {
+    &CLEAR_REMOTE
+}
+
+pub(crate) fn create_schedules() -> &'static str {
+    &CREATE_SCHEDULES
+}
+
+pub(crate) fn write_schedule() -> &'static str {
+    &WRITE_SCHEDULE
+}
+
+pub(crate) fn read_due_schedules() -> &'static str {
+    &READ_DUE_SCHEDULES
+}
+
+pub(crate) fn read_schedules() -> &'static str {
+    &READ_SCHEDULES
+}
+
+pub(crate) fn read_schedule() -> &'static str {
+    &READ_SCHEDULE
+}
+
+pub(crate) fn write_schedule_state() -> &'static str {
+    &WRITE_SCHEDULE_STATE
+}
+
+pub(crate) fn write_schedule_lease() -> &'static str {
+    &SCHEDULE_LEASE_WRITE
+}
+
+pub(crate) fn clear_schedules() -> &'static str {
+    &CLEAR_SCHEDULES
+}
+
 pub(crate) fn create_doc_table(def: &TableDef) -> String {
     let mut table = Table::create();
     table
@@ -311,13 +2164,77 @@ pub(crate) fn create_doc_table(def: &TableDef) -> String {
         .col(json_col(DATA))
         .primary_key(Index::create().col(alias(IDENTITY_KEY)).col(alias(ID)));
     for c in &def.columns {
-        // User-extracted index columns store the order-preserving key from `ColValue::encode_key`
-        // as a BLOB, so the SQLite B-tree is already in exact Convex order. System columns
-        // (`creation_time_ms` REAL, `id` TEXT) keep native types — they are type-fixed, so native
-        // SQLite order already matches Convex for them.
         table.col(blob_col(&c.name));
     }
     strict(&table.to_string(SqliteQueryBuilder))
+}
+
+pub(crate) fn read_doc_columns(table: &str) -> Result<String, StorageError> {
+    validate_bare_ident(table)?;
+    let table = doc_table(table);
+    validate_bare_ident(&table)?;
+    Ok(format!("PRAGMA table_info({})", quote_ident(&table)))
+}
+
+pub(crate) fn doc_table_name(table: &str) -> Result<String, StorageError> {
+    validate_bare_ident(table)?;
+    let name = doc_table(table);
+    validate_bare_ident(&name)?;
+    Ok(name)
+}
+
+pub(crate) fn write_doc_column(table: &str, column: &str) -> Result<String, StorageError> {
+    let table = doc_table_name(table)?;
+    validate_bare_ident(column)?;
+    Ok(format!(
+        "ALTER TABLE {} ADD COLUMN {} BLOB NOT NULL DEFAULT X'00'",
+        quote_ident(&table),
+        quote_ident(column)
+    ))
+}
+
+pub(crate) fn read_doc_rows(table: &str) -> Result<String, StorageError> {
+    let table = doc_table_name(table)?;
+    Ok(format!(
+        "SELECT {}, {}, {} FROM {}",
+        quote_ident(IDENTITY_KEY),
+        quote_ident(ID),
+        quote_ident(DATA),
+        quote_ident(&table)
+    ))
+}
+
+pub(crate) fn write_doc_column_value(table: &str, column: &str) -> Result<String, StorageError> {
+    let table = doc_table_name(table)?;
+    validate_bare_ident(column)?;
+    Ok(format!(
+        "UPDATE {} SET {} = ? WHERE {} = ? AND {} = ?",
+        quote_ident(&table),
+        quote_ident(column),
+        quote_ident(IDENTITY_KEY),
+        quote_ident(ID)
+    ))
+}
+
+pub(crate) fn read_doc_indexes(table: &str) -> Result<String, StorageError> {
+    let table = doc_table_name(table)?;
+    Ok(format!("PRAGMA index_list({})", quote_ident(&table)))
+}
+
+pub(crate) fn read_doc_index_columns(table: &str, index: &str) -> Result<String, StorageError> {
+    validate_bare_ident(table)?;
+    validate_bare_ident(index)?;
+    let name = format!("ix__{table}__{index}");
+    validate_bare_ident(&name)?;
+    Ok(format!("PRAGMA index_info({})", quote_ident(&name)))
+}
+
+pub(crate) fn delete_doc_index(table: &str, index: &str) -> Result<String, StorageError> {
+    validate_bare_ident(table)?;
+    validate_bare_ident(index)?;
+    let name = format!("ix__{table}__{index}");
+    validate_bare_ident(&name)?;
+    Ok(format!("DROP INDEX IF EXISTS {}", quote_ident(&name)))
 }
 
 pub(crate) fn create_doc_index(
@@ -339,17 +2256,20 @@ pub(crate) fn create_doc_index(
         indexed_columns.push(column);
     }
 
-    // SeaQuery's quoted SQLite index columns are valid SQLite, but the current browser/WASM Turso
-    // parser rejects quoted expressions in CREATE INDEX. This validated bare-identifier shape is
-    // intentionally limited to document secondary indexes.
     Ok(format!(
-        "CREATE INDEX IF NOT EXISTS {name} ON {table} ({})",
-        indexed_columns.join(", ")
+        "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+        quote_ident(&name),
+        quote_ident(&table),
+        indexed_columns
+            .iter()
+            .map(|column| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
 pub(crate) fn read_doc(table: &str) -> String {
-    select_where(
+    let sql = select_where(
         doc_table(table),
         [
             Expr::col(alias(ID)),
@@ -357,12 +2277,39 @@ pub(crate) fn read_doc(table: &str) -> String {
             Expr::col(alias(DATA)),
         ],
         [eq(IDENTITY_KEY), eq(ID)],
+    );
+    let doc = doc_table(table);
+    pin_index(&sql, &doc, &format!("ix__{table}__by_id"))
+}
+
+pub(crate) fn write_doc(def: &TableDef) -> String {
+    let columns = doc_write_columns(def);
+    for column in &columns {
+        debug_assert!(is_bare_ident(column));
+    }
+    let table = doc_table(&def.name);
+    debug_assert!(is_bare_ident(&table));
+    let placeholders = std::iter::repeat_n("?", columns.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assignments = columns
+        .iter()
+        .filter(|column| column.as_str() != ID && column.as_str() != IDENTITY_KEY)
+        .map(|column| format!("{column} = excluded.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO {table} ({}) VALUES ({placeholders}) \
+         ON CONFLICT({IDENTITY_KEY}, {ID}) DO UPDATE SET {assignments}",
+        columns.join(", ")
     )
 }
 
-pub(crate) fn upsert_doc(def: &TableDef) -> String {
-    let columns = doc_insert_columns(def);
-    insert(doc_table(&def.name), columns, 4 + def.columns.len(), true)
+pub(crate) fn update_doc_data(table: &str) -> String {
+    format!(
+        "UPDATE {} INDEXED BY ix__{table}__by_id SET {DATA} = ? WHERE {IDENTITY_KEY} = ? AND {ID} = ?",
+        doc_table(table)
+    )
 }
 
 pub(crate) fn delete_doc(table: &str) -> String {
@@ -383,7 +2330,7 @@ pub(crate) fn doc_watermark(table: &str) -> String {
 
 /// A compiled scan/count plan.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ScanPlan {
+pub(crate) struct ReadPlan {
     pub sql: String,
     /// The physical order columns (`index columns…, creation_time_ms, id`). Empty for counts.
     pub columns: Vec<String>,
@@ -403,12 +2350,12 @@ pub(crate) enum Projection {
 /// predicate is appended). User index columns are BLOB order-keys (never SQL NULL) and system
 /// columns are NOT NULL, so the keyset predicate is the textbook lexicographic form with no
 /// null-mask.
-pub(crate) fn compile_scan(
-    spec: &ScanSpec,
+pub(crate) fn compile_page_read(
+    spec: &ReadSpec,
     table: &TableDef,
     projection: Projection,
     resume: bool,
-) -> Result<ScanPlan, StorageError> {
+) -> Result<ReadPlan, StorageError> {
     let cols = plan_columns(spec.index.as_deref(), table)?;
     let order_cols = order_columns(&cols);
     let bounds = bounds_condition(spec.bounds.as_deref().unwrap_or(&[]), &cols)?;
@@ -419,11 +2366,12 @@ pub(crate) fn compile_scan(
         condition = merge(condition, cursor_condition(&order_cols, spec.order));
     }
 
+    let doc = doc_table(&table.name);
     let mut query = Query::select();
     for expr in select_list(projection, &order_cols) {
         query.expr(expr);
     }
-    query.from(alias(doc_table(&table.name))).cond_where(condition);
+    query.from(alias(&doc)).cond_where(condition);
     for column in &order_cols {
         query.order_by(
             alias(column),
@@ -434,35 +2382,46 @@ pub(crate) fn compile_scan(
         );
     }
     query.limit(0);
-    Ok(ScanPlan {
-        sql: placeholder_limit_sql(&query.build(SqliteQueryBuilder).0),
+    let mut sql = placeholder_limit_sql(&query.build(SqliteQueryBuilder).0);
+    if let Some(index) = spec.index.as_deref() {
+        validate_bare_ident(index)?;
+        sql = pin_index(&sql, &doc, &format!("ix__{}__{index}", table.name));
+    }
+    Ok(ReadPlan {
+        sql,
         columns: order_cols,
         exact: bounds.exact,
     })
 }
 
 /// Compile a count.
-pub(crate) fn compile_count(spec: &CountSpec, table: &TableDef) -> Result<ScanPlan, StorageError> {
+pub(crate) fn compile_count(spec: &CountSpec, table: &TableDef) -> Result<ReadPlan, StorageError> {
     let cols = plan_columns(spec.index.as_deref(), table)?;
     let bounds = bounds_condition(spec.bounds.as_deref().unwrap_or(&[]), &cols)?;
+    let doc = doc_table(&table.name);
     let mut query = Query::select();
     query
         .expr_as(Func::count(Expr::col(Asterisk)), alias("n"))
-        .from(alias(doc_table(&table.name)))
+        .from(alias(&doc))
         .cond_where(merge(all([eq(IDENTITY_KEY)]), bounds.condition));
-    Ok(ScanPlan {
-        sql: query.build(SqliteQueryBuilder).0,
+    let mut sql = query.build(SqliteQueryBuilder).0;
+    if let Some(index) = spec.index.as_deref() {
+        validate_bare_ident(index)?;
+        sql = pin_index(&sql, &doc, &format!("ix__{}__{index}", table.name));
+    }
+    Ok(ReadPlan {
+        sql,
         columns: Vec::new(),
         exact: bounds.exact,
     })
 }
 
 /// The bound params for a scan in placeholder order: bounds, cursor key values, page limit.
-/// Mirrors the placeholder order produced by `compile_scan`. The limit fetches one past the
+/// Mirrors the placeholder order produced by `compile_page_read`. The limit fetches one past the
 /// page so the store can detect a next page and mint its cursor. User index columns bind as
 /// BLOB order-keys; system columns bind native.
-pub(crate) fn scan_params(
-    spec: &ScanSpec,
+pub(crate) fn read_page_params(
+    spec: &ReadSpec,
     table: &TableDef,
     cursor_values: Option<&[ColValue]>,
     page_size: usize,
@@ -477,7 +2436,10 @@ pub(crate) fn scan_params(
 }
 
 /// The bound params for a count. Mirrors `countParams`.
-pub(crate) fn count_params(spec: &CountSpec, table: &TableDef) -> Result<Vec<Value>, StorageError> {
+pub(crate) fn read_count_params(
+    spec: &CountSpec,
+    table: &TableDef,
+) -> Result<Vec<Value>, StorageError> {
     let cols = plan_columns(spec.index.as_deref(), table)?;
     Ok(bounds_params(spec.bounds.as_deref().unwrap_or(&[]), &cols))
 }
@@ -496,7 +2458,7 @@ fn bind_col(col: &str, value: &ColValue) -> Value {
 /// Baked into the cursor and checked on decode, so a cursor minted under one set of bound values
 /// is rejected by a scan with different values of the same structural shape.
 #[must_use]
-pub(crate) fn scan_shape(spec: &ScanSpec) -> String {
+pub(crate) fn read_page_shape(spec: &ReadSpec) -> String {
     format!(
         "{}|{}|{}|{}|{}",
         spec.table,
@@ -512,7 +2474,7 @@ pub(crate) fn scan_shape(spec: &ScanSpec) -> String {
 /// in the cache key — same-shape different-value scans reuse one cached statement (only the binds
 /// differ) — but it IS in the cursor shape so cursors cannot cross value sets.
 #[must_use]
-pub(crate) fn scan_key(spec: &ScanSpec, projection: Projection, resume: bool) -> String {
+pub(crate) fn read_page_key(spec: &ReadSpec, projection: Projection, resume: bool) -> String {
     let proj = match projection {
         Projection::Docs => "d",
         Projection::Keys => "k",
@@ -559,7 +2521,7 @@ fn push_value_hex(out: &mut String, value: &ColValue) {
 
 /// Shape-keyed cache key for a count plan. Mirrors `countKey`.
 #[must_use]
-pub(crate) fn count_key(spec: &CountSpec) -> String {
+pub(crate) fn read_count_key(spec: &CountSpec) -> String {
     format!(
         "c|{}|{}|{}",
         spec.table,
@@ -629,8 +2591,6 @@ fn bounds_condition(bounds: &[Bound], cols: &[String]) -> Result<BoundsCondition
             "more bounds than indexed columns".to_owned(),
         ));
     }
-    // Every value (including null/undefined) encodes to an exact order key, so bounds are always
-    // exact — there is no widening. An absent range endpoint simply contributes no clause.
     let mut condition = Cond::all();
     let mut seen_range = false;
     for (i, b) in bounds.iter().enumerate() {
@@ -739,9 +2699,8 @@ pub(crate) fn encode_cursor(shape: &str, values: &[ColValue]) -> String {
                 out.push(';');
             }
             ColValue::Bool(b) => {
-                out.push('i');
-                out.push_str(if *b { "1" } else { "0" });
-                out.push(';');
+                out.push('b');
+                out.push(if *b { '1' } else { '0' });
             }
             ColValue::Real(f) => {
                 use std::fmt::Write;
@@ -790,6 +2749,15 @@ pub(crate) fn decode_cursor(
         match tag {
             b'u' => values.push(ColValue::Undefined),
             b'n' => values.push(ColValue::Null),
+            b'b' => {
+                let value = match rest.as_bytes().first().copied() {
+                    Some(b'1') => true,
+                    Some(b'0') => false,
+                    _ => return Err(invalid("bad bool")),
+                };
+                rest = &rest[1..];
+                values.push(ColValue::Bool(value));
+            }
             b'i' => {
                 let (digits, tail) = rest
                     .split_once(';')
@@ -827,7 +2795,7 @@ pub(crate) fn decode_cursor(
 }
 
 /// The keyset "strictly after the cursor key" predicate, plus a redundant leading sargable bound
-/// on the first column so the planner seeks the index near the cursor. No null branches: user
+/// on the first column so the planner seeks the index near the cursor. No null revs: user
 /// columns are BLOB order-keys and system columns are NOT NULL, so no order column is ever SQL
 /// NULL. `cursor_params` mirrors this placeholder order exactly.
 fn cursor_condition(cols: &[String], order: Order) -> Cond {
@@ -891,6 +2859,12 @@ fn real_col(name: &str) -> SqlColumnDef {
     col
 }
 
+fn nullable_real_col(name: &str) -> SqlColumnDef {
+    let mut col = SqlColumnDef::new(alias(name));
+    col.custom("REAL");
+    col
+}
+
 fn blob_col(name: &str) -> SqlColumnDef {
     let mut col = SqlColumnDef::new(alias(name));
     col.custom("BLOB").not_null();
@@ -903,7 +2877,7 @@ fn json_col(name: &str) -> SqlColumnDef {
     col
 }
 
-fn insert<I, S>(table: S, columns: I, value_count: usize, replace: bool) -> String
+fn write<I, S>(table: S, columns: I, value_count: usize, replace: bool) -> String
 where
     I: IntoIterator,
     I::Item: AsRef<str>,
@@ -948,7 +2922,33 @@ where
     query.build(SqliteQueryBuilder).0
 }
 
-fn doc_insert_columns(def: &TableDef) -> Vec<String> {
+fn upload_select(query: &mut sea_query::SelectStatement) {
+    query
+        .expr(Expr::col(alias(LOCAL_STORAGE_ID)))
+        .expr(Expr::col(alias(SHA256)))
+        .expr(Expr::col(alias(SIZE)))
+        .expr(Expr::col(alias(CONTENT_TYPE)))
+        .expr(Expr::col(alias(STATE)))
+        .expr(Expr::col(alias(OWNER)))
+        .expr(Expr::col(alias(LEASE_UNTIL)))
+        .expr(Expr::col(alias(CREATED_TIME)))
+        .expr(Expr::col(alias(UPDATED_TIME)));
+}
+
+fn schedule_select(query: &mut sea_query::SelectStatement) {
+    query
+        .expr(Expr::col(alias(JOB_ID)))
+        .expr(Expr::col(alias(KIND)))
+        .expr(Expr::col(alias(NAME)))
+        .expr(Expr::col(alias(ARGS)))
+        .expr(Expr::col(alias(DUE_TIME)))
+        .expr(Expr::col(alias(STATE)))
+        .expr(Expr::col(alias(LEASE_UNTIL)))
+        .expr(Expr::col(alias(CREATED_TIME)))
+        .expr(Expr::col(alias(UPDATED_TIME)));
+}
+
+fn doc_write_columns(def: &TableDef) -> Vec<String> {
     let mut columns = vec![
         ID.to_owned(),
         IDENTITY_KEY.to_owned(),
@@ -969,29 +2969,67 @@ fn doc_table(table: &str) -> String {
 
 /// Stamps the current `STORAGE_FORMAT_VERSION` into the database header. The value cannot be a bind
 /// parameter in a PRAGMA, so it is a trusted in-process constant baked into the literal.
-pub(crate) fn set_user_version() -> String {
+pub(crate) fn write_user_version() -> String {
     format!("PRAGMA user_version = {STORAGE_FORMAT_VERSION}")
 }
 
-/// Drops a table by name during a format-version reset. The name comes from `sqlite_master` (our own
-/// `doc__*`/`__embedded_*` tables); it is double-quoted defensively.
-pub(crate) fn drop_table(name: &str) -> String {
-    format!("DROP TABLE IF EXISTS \"{name}\"")
+pub(crate) fn drop_table(table: &str) -> String {
+    Table::drop()
+        .table(alias(table))
+        .if_exists()
+        .to_string(SqliteQueryBuilder)
 }
 
 fn alias(name: impl AsRef<str>) -> Alias {
     Alias::new(name.as_ref())
 }
 
+fn quote_ident(name: &str) -> String {
+    debug_assert!(is_bare_ident(name) && !is_sql_keyword(name));
+    format!("\"{name}\"")
+}
+
 fn placeholder() -> Expr {
     Expr::val(0)
 }
 
-// SeaQuery 1.0 only exposes literal SELECT limits; scans keep page size as a Turso bind value so
-// the same statement cache entry works across page sizes.
+/// `SeaQuery` 1.0 only exposes literal SELECT limits; scans keep page size as a Turso bind value so
+/// the same statement cache entry works across page sizes.
 fn placeholder_limit_sql(sql: &str) -> String {
     sql.strip_suffix(" LIMIT 0")
         .map_or_else(|| sql.to_owned(), |prefix| format!("{prefix} LIMIT ?"))
+}
+
+/// Splice `INDEXED BY <index>` after a single-table `FROM "<from_table>"` clause (SELECT or DELETE).
+/// `from_table` is the unaliased table name `SeaQuery` emits double-quoted; `index` is a bare,
+/// already-validated identifier matching turso's unquoted `INDEXED BY` grammar.
+fn pin_index(sql: &str, from_table: &str, index: &str) -> String {
+    sql.replacen(
+        &format!("FROM \"{from_table}\""),
+        &format!("FROM \"{from_table}\" INDEXED BY {index}"),
+        1,
+    )
+}
+
+/// Pin the composite-PK auto-index for a point read/delete keyed on a PK prefix of `table`.
+///
+/// turso 0.6 otherwise mis-costs that auto-index against a FULL (non-partial) secondary index that
+/// shares the PK's leading columns and seeks only the shared prefix, residual-filtering the remaining
+/// PK columns across the whole `identity_key` partition.
+///
+/// `sqlite_autoindex_<table>_1` is `SQLite`'s stable name for the implicit index backing a composite
+/// `PRIMARY KEY` (these tables carry rowids, so the PK is a separate unique index, not the rowid).
+/// Pinning it adds no storage and needs no schema change, so `STORAGE_FORMAT_VERSION` is untouched —
+/// every database that ever created these tables already carries the auto-index. This differs from
+/// the doc-table `by_id` fix, which builds an *explicit* index: that one is also reused by
+/// `withIndex("by_id")` and its PK is only two columns, so duplication is cheap and earns its keep;
+/// here an explicit index would duplicate the entire (often 5-column) PK for no extra reach.
+///
+/// The cost is coupling to the auto-index name. A future turso rename would fail `prepare` loudly
+/// rather than silently regressing the plan, and `tests/explain.rs` pins the plan so the rename
+/// surfaces at CI. `read_doc` keeps its own explicit-index pin (different index, different rationale).
+fn pin_pk_autoindex(sql: &str, table: &str) -> String {
+    pin_index(sql, table, &format!("sqlite_autoindex_{table}_1"))
 }
 
 fn validate_bare_ident(name: &str) -> Result<(), StorageError> {

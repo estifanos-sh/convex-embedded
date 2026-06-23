@@ -1,5 +1,4 @@
-//! Data shapes mirroring the TS `storage/types.ts`. Field names, affinities, and bound encodings
-//! must stay byte-parity with the TypeScript source of truth.
+use serde::{Deserialize, Serialize};
 
 /// A value extracted for an indexed/queryable column or bound. User-extracted index columns are
 /// stored as the order-preserving byte key produced by [`ColValue::encode_key`] (see below);
@@ -104,14 +103,14 @@ impl From<ColValue> for turso_core::Value {
 /// A user-declared, extracted index column. Mirrors the TS `ColumnDef`. Index columns store the
 /// order-preserving key from [`ColValue::encode_key`] as a `BLOB`, so they carry no affinity —
 /// any value type sorts correctly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ColumnDef {
     pub name: String,
     pub field: Option<String>,
 }
 
 /// A secondary index over one or more extracted columns. Mirrors the TS `IndexDef`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexDef {
     pub name: String,
     pub fields: Vec<String>,
@@ -119,15 +118,29 @@ pub struct IndexDef {
 }
 
 /// A table: its document store plus extracted columns and indexes. Mirrors the TS `TableDef`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    pub crdt_fields: Vec<CrdtFieldDef>,
     pub indexes: Vec<IndexDef>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CrdtFieldDef {
+    pub field: String,
+    pub kind: CrdtFieldKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum CrdtFieldKind {
+    Count,
+    Set,
+    Text,
+}
+
 /// The full schema handed to `setup`. Mirrors the TS `StoreSchema`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StoreSchema {
     pub tables: Vec<TableDef>,
 }
@@ -136,10 +149,14 @@ pub struct StoreSchema {
 /// materialized documents (`[{"_id":…,"_creationTime":…,…fields}, …]`); for key scans it is
 /// `{"ids":[…],"cts":[…]}`. One string crosses the JS boundary per page and one `JSON.parse`
 /// decodes it — never one per document. `cursor` is `None` when the scan is exhausted.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Page {
     pub text: String,
     pub cursor: Option<String>,
+    /// Sidecar per-row adoption version (`localId -> pull seq`) for a document page (§11 D1). Kept
+    /// beside the compact app-row JSON so rows stay clean; the runtime read-set capture reads it,
+    /// absent id => version `0`. Empty for key pages.
+    pub versions: std::collections::BTreeMap<String, i64>,
 }
 
 /// An upsert: the document plus its extracted column values. Mirrors the TS `UpsertIn`.
@@ -168,78 +185,164 @@ pub struct DeleteIn {
 pub struct WriteBatch {
     pub upserts: Vec<UpsertIn>,
     pub deletes: Vec<DeleteIn>,
+    pub crdt_ops: Vec<CrdtOp>,
+    pub crdt_restores: Vec<CrdtRestore>,
+    pub fresh_ids: Vec<RowKey>,
+    pub data_only_ids: Vec<RowKey>,
+    pub id_mappings: Vec<IdMapping>,
+    pub schedules: Vec<super::ScheduledJob>,
 }
 
-/// Private metadata attached to a commit.
 #[derive(Debug, Clone)]
-pub struct CommitOptions {
-    pub source: String,
-    pub mutation_id: Option<String>,
-    pub mutation_result: Option<String>,
+pub struct CrdtRestore {
+    pub row: RowKey,
+    pub field: String,
+    pub kind: CrdtFieldKind,
+    pub head_seq: i64,
+    pub projection_hash: String,
+    pub bytes: Vec<u8>,
+    pub hash: String,
 }
 
-impl Default for CommitOptions {
-    fn default() -> Self {
-        Self {
-            source: "local".to_owned(),
-            mutation_id: None,
-            mutation_result: None,
-        }
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrdtOp {
+    pub row: RowKey,
+    pub field: String,
+    pub operation: CrdtOperation,
 }
 
-/// Metadata returned after a batch commits.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CrdtOperation {
+    CountAdd {
+        delta: f64,
+    },
+    SetAdd {
+        value_json: String,
+    },
+    SetDelete {
+        value_json: String,
+    },
+    TextSplice {
+        index: i64,
+        delete: i64,
+        insert: String,
+    },
+}
+
+/// One row-level change produced by a committed batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitResult {
-    pub commit_seq: i64,
-    pub changed_tables: Vec<String>,
+pub struct RowChange {
+    pub op: RowChangeOp,
+    pub table: String,
+    pub id: String,
+    /// Materialized document JSON for upserts; absent for deletes.
+    pub row: Option<String>,
 }
 
-/// Durable mutation call metadata.
-#[derive(Debug, Clone)]
-pub struct MutationCall {
-    pub args: String,
-    pub mutation_id: String,
-    pub name: String,
-}
-
-/// Durable mutation state used to make local retries idempotent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MutationRecord {
-    pub commit_seq: Option<i64>,
-    pub error: Option<String>,
-    pub mutation_id: String,
-    pub result: Option<String>,
-    pub status: MutationStatus,
-}
-
-/// Durable mutation lifecycle status.
+/// Row change operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationStatus {
-    Accepted,
-    Committed,
-    Failed,
+pub enum RowChangeOp {
+    Upsert,
+    Delete,
 }
 
-impl MutationStatus {
+impl RowChangeOp {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Accepted => "accepted",
-            Self::Committed => "committed",
-            Self::Failed => "failed",
+            Self::Upsert => "upsert",
+            Self::Delete => "delete",
         }
     }
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "accepted" => Some(Self::Accepted),
-            "committed" => Some(Self::Committed),
-            "failed" => Some(Self::Failed),
+            "upsert" => Some(Self::Upsert),
+            "delete" => Some(Self::Delete),
             _ => None,
         }
     }
+}
+
+/// Durable mapping between a locally-created id and the eventual Convex server id.
+///
+/// TODO(sync): add translation operations that can walk encoded mutation args/results and replace
+/// local ids with mapped Convex ids at remote replay boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdMapping {
+    pub table: String,
+    pub local_id: String,
+    pub mapping: IdMappingContent,
+    pub created_time: i64,
+    pub updated_time: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdMappingContent {
+    Local,
+    Mapped { convex_id: String },
+    Deleted { convex_id: Option<String> },
+}
+
+impl IdMappingContent {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Mapped { .. } => "mapped",
+            Self::Deleted { .. } => "deleted",
+        }
+    }
+
+    #[must_use]
+    pub fn decode(state: &str, convex_id: Option<String>) -> Option<Self> {
+        match (state, convex_id) {
+            ("local", None) => Some(Self::Local),
+            ("mapped", Some(convex_id)) => Some(Self::Mapped { convex_id }),
+            ("deleted", convex_id) => Some(Self::Deleted { convex_id }),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn convex_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Mapped { convex_id } => Some(convex_id),
+            Self::Deleted { convex_id } => convex_id.as_deref(),
+        }
+    }
+}
+
+impl IdMapping {
+    #[must_use]
+    pub fn convex_id(&self) -> Option<&str> {
+        self.mapping.convex_id()
+    }
+}
+
+/// Row identity for one projected Loro document.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RowKey {
+    pub table: String,
+    pub document_id: String,
+}
+
+/// Internal dirty-head diagnostic row exposed to devtools and metal benchmarks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirtyHeadDebug {
+    pub row: RowKey,
+    pub op: RowChangeOp,
+    pub first_commit_seq: i64,
+    pub updated_commit_seq: i64,
+    pub created_time: i64,
+    pub updated_time: i64,
+    pub server_document_id: Option<String>,
+    pub base_projection_hash: Option<String>,
+    pub base_root_id: Option<String>,
+    pub base_node_id: Option<String>,
+    pub logical_clock: f64,
 }
 
 /// A per-column bound for a scan/count. Mirrors the TS `Bound` union.
@@ -264,7 +367,7 @@ pub enum Order {
     Desc,
 }
 
-/// A paged scan request. Mirrors the TS `ScanSpec`.
+/// A paged scan request. Mirrors the TS `ReadSpec`.
 ///
 /// Scans are total: every `(table, index, bounds, order)` compiles. Bounds the SQL layer cannot
 /// represent exactly are widened (worst case dropped), so a page may over-approximate — callers
@@ -275,12 +378,12 @@ pub enum Order {
 /// the visited prefix; a row whose key columns are patched mid-pagination may be seen twice or
 /// skipped, matching Convex pagination semantics.
 #[derive(Debug, Clone, Default)]
-pub struct ScanSpec {
+pub struct ReadSpec {
     pub table: String,
     pub index: Option<String>,
     pub bounds: Option<Vec<Bound>>,
     pub order: Order,
-    /// Max rows in this page, `1..=SCAN_CAP`. Defaults to `DEFAULT_SCAN_PAGE`.
+    /// Max rows in this page, `1..=READ_CAP`. Defaults to `DEFAULT_READ_PAGE`.
     pub page_size: Option<usize>,
     /// Opaque continuation token from a prior page of the same
     /// (table, index, bounds-shape, order). Produced and parsed only by this crate.
@@ -288,13 +391,6 @@ pub struct ScanSpec {
     /// Alternative to `cursor`: resume strictly after this explicit key tuple, one value per
     /// physical order column (`index columns…, creation_time_ms, id`).
     pub resume_after_key: Option<Vec<ColValue>>,
-}
-
-/// Rows removed by `ledger_prune`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PruneResult {
-    pub commits_deleted: i64,
-    pub mutations_deleted: i64,
 }
 
 /// A count request. Mirrors the TS `CountSpec`.

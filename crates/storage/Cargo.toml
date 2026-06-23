@@ -10,11 +10,24 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+# White-box test support (oracle, fixtures, fault injection) compiled into the crate only for tests.
+# Never enabled by the napi/wasm/native builds, so it stays out of the shipped binary.
+testkit = []
+
 [dependencies]
+base64 = "0.13"
+loro = { version = "^1", default-features = false, features = ["counter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sea-query = { version = "1.0.1", default-features = false, features = ["backend-sqlite"] }
-turso_core = "0.6"
+sha2 = "0.10"
+# `uuid` is still required by turso_core 0.7 incremental internals even when SQL UUID helpers are
+# not product-facing. Keep it until upstream gates that path separately.
+turso_core = { version = "0.7", default-features = false, features = ["fs", "json", "uuid"] }
 thiserror = "2"
 rustc-hash = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Transitive wasm dependencies currently require all three getrandom lines; prune once turso/uuid
@@ -25,5 +38,17 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 uuid = { version = "1", features = ["rng-getrandom"] }
 
 [dev-dependencies]
+criterion = "0.5"
+proptest = "1.11"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Benchmarks measure the hot paths over the public store API (no testkit). A regression here is the
+# perf expression of the same correctness the tests assert on these reads and writes.
+[[bench]]
+name = "read"
+harness = false
+
+[[bench]]
+name = "doc"
+harness = false

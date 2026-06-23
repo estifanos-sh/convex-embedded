@@ -26,7 +26,12 @@ impl Clock {
         let next = if wall > self.last {
             wall
         } else {
-            self.last + EPSILON
+            let candidate = self.last + EPSILON;
+            if candidate > self.last {
+                candidate
+            } else {
+                next_f64(self.last)
+            }
         };
         self.last = next;
         next
@@ -40,13 +45,23 @@ impl Clock {
     }
 }
 
+fn next_f64(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    if value < 0.0 {
+        return 0.0;
+    }
+    f64::from_bits(value.to_bits() + 1)
+}
+
 impl Default for Clock {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Wall clock in integer milliseconds since the unix epoch (matching JS `Date.now()`).
+/// Wall clock in integer milliseconds since the Unix epoch.
 pub fn wall_ms() -> Result<f64, StorageError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)

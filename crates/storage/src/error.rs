@@ -20,6 +20,9 @@ pub enum StorageError {
     #[error("reserved column name: {0}")]
     ReservedColumn(String),
 
+    #[error("incompatible store: {0}")]
+    IncompatibleStore(String),
+
     #[error("unsatisfiable: {0}")]
     Unsatisfiable(String),
 
@@ -35,6 +38,23 @@ pub enum StorageError {
 
     #[error("system clock is before the unix epoch")]
     Clock,
+}
+
+impl StorageError {
+    /// True when the physical bytes on disk are not a readable current-format store: the header is
+    /// corrupt or the file is not a database at all. This is a *format* incompatibility (e.g. a store
+    /// written by a prior turso release), not same-format corruption of an already-openable store, so
+    /// the opener resets it rather than failing closed (V5 "Local Store Evolution").
+    pub(crate) fn is_unreadable_store(&self) -> bool {
+        matches!(
+            self,
+            Self::Turso(error)
+                if matches!(
+                    error.as_ref(),
+                    turso_core::LimboError::Corrupt(_) | turso_core::LimboError::NotADB
+                )
+        )
+    }
 }
 
 /// The turso error is boxed to keep `StorageError` (and every `Result` in the crate) small.
