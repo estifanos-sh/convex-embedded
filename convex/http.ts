@@ -1,6 +1,6 @@
 import { httpRouter } from "convex/server";
 
-import { components } from "./_generated/api";
+import { components, internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { httpAction, type ActionCtx } from "./_generated/server";
 
@@ -86,6 +86,35 @@ const serveStaticFile = httpAction(async (ctx, request) => {
   return response(blob, 200, headers);
 });
 
+const serveAttachment = httpAction(async (ctx, request) => {
+  const token = new URL(request.url).searchParams.get("token");
+  if (!token) {
+    return response("Attachment token is required", 400, {
+      "Content-Type": "text/plain",
+    });
+  }
+
+  const attachment = await ctx.runQuery(internal.files.serve, { token });
+  if (!attachment) {
+    return response("Attachment not found", 404, {
+      "Content-Type": "text/plain",
+    });
+  }
+
+  const blob = await ctx.storage.get(attachment.storageId);
+  if (!blob) {
+    return response("Attachment data not found", 404, {
+      "Content-Type": "text/plain",
+    });
+  }
+
+  return response(blob, 200, {
+    "Cache-Control": "private, max-age=2592000, immutable",
+    "Content-Type": attachment.contentType,
+    "X-Content-Type-Options": "nosniff",
+  });
+});
+
 const ENCODING_EXTENSION: Record<string, string> = {
   br: "br",
   gzip: "gz",
@@ -102,6 +131,12 @@ function negotiateEncoding(acceptEncoding: string | null): "br" | "gzip" | undef
 function isCompressiblePath(path: string): boolean {
   return /\.(?:js|mjs|css|html|json|wasm|svg|txt|map|xml|webmanifest)$/i.test(path);
 }
+
+http.route({
+  path: "/attachment",
+  method: "GET",
+  handler: serveAttachment,
+});
 
 http.route({
   pathPrefix: "/",

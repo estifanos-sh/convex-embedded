@@ -11,6 +11,7 @@
 import type * as crdt from "../crdt.js";
 import type * as documents from "../documents.js";
 import type * as embedded from "../embedded.js";
+import type * as files from "../files.js";
 import type * as hosted from "../hosted.js";
 import type * as http from "../http.js";
 import type * as migrations from "../migrations.js";
@@ -27,6 +28,7 @@ declare const fullApi: ApiFromModules<{
   crdt: typeof crdt;
   documents: typeof documents;
   embedded: typeof embedded;
+  files: typeof files;
   hosted: typeof hosted;
   http: typeof http;
   migrations: typeof migrations;

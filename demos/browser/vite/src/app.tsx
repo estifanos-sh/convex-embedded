@@ -1,27 +1,41 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import type { Block, PartialBlock } from "@blocknote/core";
+import { filterSuggestionItems } from "@blocknote/core/extensions";
 import { BlockNoteView } from "@blocknote/ariakit";
-import { useCreateBlockNote, useEditorChange } from "@blocknote/react";
+import {
+  getDefaultReactSlashMenuItems,
+  useCreateBlockNote,
+  useEditorChange,
+} from "@blocknote/react";
 import type { FunctionReference } from "convex/server";
 import {
+  ArrowLeft,
+  CircleCheck,
   Clock3,
+  Cloud,
+  CloudOff,
   FileText,
   History,
   Loader2,
+  Paperclip,
   Plus,
   RotateCcw,
   Save,
   Search,
   Trash2,
+  TriangleAlert,
   X,
 } from "lucide-react";
 
-import type { EmbeddedConnectionState } from "@convex-dev/embedded/browser";
+import {
+  createConvexEmbeddedUploadFetch,
+  type EmbeddedConnectionState,
+} from "@convex-dev/embedded/browser";
 
 import { api } from "~convex/_generated/api";
 import type { Id } from "~convex/_generated/dataModel";
-import { client } from "./lib/client";
+import { client, subscribeBrowserDebug } from "./lib/client";
 import { readQuery, type QueryState } from "./lib/query";
 
 const diffDelayMs = 90;
@@ -36,6 +50,12 @@ const historyDocumentsQuery = api.documents.history;
 const revisionDocumentQuery = api.documents.revision;
 const restoreDocumentMutation = api.documents.restore;
 const removeDocumentMutation = api.documents.remove;
+const fileAttachMutation = api.files.attach;
+const fileUploadUrlMutation = api.files.generateUploadUrl;
+const fileHostedUrlQuery = api.files.hostedUrl;
+const fileUrlQuery = api.files.resolve;
+const embeddedFilePath = "/__convex_embedded/file/";
+const uploadFetch = createConvexEmbeddedUploadFetch(client);
 
 type StoredDoc = Record<string, unknown>;
 
@@ -123,6 +143,29 @@ type HistoryGroup = {
   rev: EmbeddedRev;
 };
 
+type UploadNotice = {
+  fileName: string;
+  phase: "saving" | "local" | "syncing" | "synced" | "failed";
+  token?: string;
+};
+
+type SlashPaletteState = { blockId: string; query: string; x: number; y: number };
+type SlashPaletteItem = ReturnType<typeof getDefaultReactSlashMenuItems>[number];
+type MediaBlockType = "audio" | "file" | "image" | "video";
+type PendingUploadBlock = {
+  blockId: string;
+  documentId: Id<"documents">;
+  type: MediaBlockType;
+};
+
+const uploadAccept = "image/*,audio/*,video/*,application/pdf,text/plain";
+const mediaUploadAccept: Record<MediaBlockType, string> = {
+  audio: "audio/*",
+  file: "*/*",
+  image: "image/*",
+  video: "video/*",
+};
+
 const emptyBlocks: PartialBlock[] = [
   {
     type: "heading",
@@ -133,8 +176,78 @@ const emptyBlocks: PartialBlock[] = [
 ];
 
 export function App(): ReactElement {
-  const editor = useCreateBlockNote({ initialContent: emptyBlocks });
   const [selectedDocumentId, setSelectedDocumentId] = useState<Id<"documents"> | null>(null);
+  const selectedDocumentIdRef = useRef(selectedDocumentId);
+  selectedDocumentIdRef.current = selectedDocumentId;
+  const [appError, setAppError] = useState<string | null>(null);
+  const [uploadNotice, setUploadNotice] = useState<UploadNotice | null>(null);
+  const uploadNoticeRef = useRef<UploadNotice | null>(null);
+  const uploadVerifyRef = useRef<string | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingUploadBlockRef = useRef<PendingUploadBlock | null>(null);
+  const documentPanelRef = useRef<HTMLElement | null>(null);
+  const slashFrameRef = useRef<number | undefined>(undefined);
+  const writeUploadNotice = useCallback((notice: UploadNotice | null) => {
+    uploadNoticeRef.current = notice;
+    setUploadNotice(notice);
+  }, []);
+  const uploadFile = useCallback(
+    async (file: File): Promise<string> => {
+      uploadVerifyRef.current = null;
+      const documentId = selectedDocumentIdRef.current;
+      if (documentId === null) throw new Error("Choose a document before attaching a file.");
+      if (file.size > 8 * 1024 * 1024) throw new Error("Choose a file smaller than 8 MB.");
+      writeUploadNotice({ fileName: file.name, phase: "saving" });
+      try {
+        const uploadUrl = (await client.mutation(fileUploadUrlMutation, {})) as string;
+        const response = await uploadFetch(uploadUrl, {
+          body: file,
+          headers: { "content-type": file.type || "application/octet-stream" },
+          method: "POST",
+        });
+        if (!response.ok) throw new Error(await uploadResponseError(response));
+        const { storageId } = (await response.json()) as { storageId: string };
+        if (selectedDocumentIdRef.current !== documentId) {
+          throw new Error("The active document changed before the file was attached.");
+        }
+        const token = crypto.randomUUID();
+        await client.mutation(fileAttachMutation, {
+          contentType: file.type || "application/octet-stream",
+          documentId,
+          name: file.name,
+          size: file.size,
+          storageId: storageId as Id<"_storage">,
+          token,
+        });
+        writeUploadNotice({ fileName: file.name, phase: "local", token });
+        return `${embeddedFilePath}${encodeURIComponent(token)}`;
+      } catch (error) {
+        writeUploadNotice({ fileName: file.name, phase: "failed" });
+        throw error;
+      }
+    },
+    [writeUploadNotice],
+  );
+  const resolveFileUrl = useCallback(async (url: string) => {
+    const token = embeddedFileToken(url);
+    if (token === null) return url;
+    const resolved = (await client.query(fileUrlQuery, { token })) as string | null;
+    if (resolved !== null && isLocalFileUrl(resolved)) return resolved;
+    const hosted = new URL("/attachment", globalThis.location.origin);
+    hosted.searchParams.set("token", token);
+    return hosted.href;
+  }, []);
+  const editor = useCreateBlockNote({ initialContent: emptyBlocks, resolveFileUrl, uploadFile });
+  const [slashPalette, setSlashPalette] = useState<SlashPaletteState | null>(null);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const slashItems = useMemo(
+    () =>
+      slashPalette
+        ? filterSuggestionItems(getDefaultReactSlashMenuItems(editor), slashPalette.query)
+        : [],
+    [editor, slashPalette],
+  );
+  const [mobilePane, setMobilePane] = useState<"documents" | "editor">("documents");
   const documentsQuery = useEmbeddedQuery<DocumentSummary[]>(
     listDocuments,
     useMemo(() => ({}), []),
@@ -167,7 +280,6 @@ export function App(): ReactElement {
   const [currentBody, setCurrentBody] = useState(JSON.stringify(emptyBlocks));
   const [currentDelta, setCurrentDelta] = useState<DiffResult | null>(null);
   const [historyBusy, setHistoryBusy] = useState(false);
-  const [appError, setAppError] = useState<string | null>(null);
   const diffTimerRef = useRef<number | undefined>(undefined);
   const draftTrailingTimerRef = useRef<number | undefined>(undefined);
   const draftMaxTimerRef = useRef<number | undefined>(undefined);
@@ -177,6 +289,7 @@ export function App(): ReactElement {
   const baselineRef = useRef<Baseline | null>(null);
   const previewCacheRef = useRef(new Map<string, HistoryPreview>());
   const selectedHistoryRevIdRef = useRef<string | null>(null);
+  const snapshotPendingRef = useRef(false);
   const lastAppliedBodyRef = useRef("");
   const lastAppliedDocIdRef = useRef<Id<"documents"> | null>(null);
   const applyingRemoteRef = useRef(false);
@@ -192,17 +305,67 @@ export function App(): ReactElement {
     [],
   );
 
+  useEffect(
+    () =>
+      client.subscribeInternalEvents((event) => {
+        if (event.type !== "remote" || event.tick === undefined) return;
+        const pending = event.tick.pending?.uploads;
+        if (pending === undefined) return;
+        const current = uploadNoticeRef.current;
+        if (current === null || current.phase === "failed" || current.phase === "synced") return;
+        if (pending > 0 && current.phase === "local") {
+          writeUploadNotice({ ...current, phase: "syncing" });
+          return;
+        }
+        if (
+          event.status === "idle" &&
+          pending === 0 &&
+          current.phase !== "saving" &&
+          current.token !== undefined &&
+          uploadVerifyRef.current !== current.token
+        ) {
+          const { fileName, token } = current;
+          uploadVerifyRef.current = token;
+          void client
+            .query(fileHostedUrlQuery, { token })
+            .then((url) => {
+              if (typeof url !== "string" || uploadNoticeRef.current?.token !== token) return;
+              writeUploadNotice({ fileName, phase: "synced", token });
+            })
+            .catch(() => {
+              if (uploadVerifyRef.current === token) uploadVerifyRef.current = null;
+            });
+        }
+      }),
+    [writeUploadNotice],
+  );
+
+  const selectedQueryDocument =
+    selectedDocumentQuery.query === "ready" ? selectedDocumentQuery.value : null;
   const selectedDocument =
-    selectedDocumentQuery.query === "ready"
-      ? selectedDocumentQuery.value
+    selectedQueryDocument?._id === selectedDocumentId
+      ? selectedQueryDocument
       : createdFallback?._id === selectedDocumentId
         ? createdFallback
         : null;
+  const selectedDocumentPending =
+    selectedDocumentId !== null &&
+    (selectedDocumentQuery.query === "loading" ||
+      (selectedQueryDocument !== null && selectedQueryDocument._id !== selectedDocumentId));
+  const keepsPreviousEditor =
+    selectedDocumentPending && lastAppliedDocIdRef.current !== null && selectedDocument === null;
+  const selectedSummary = documents.find((document) => document._id === selectedDocumentId);
   const currentTitle = selectedDocument
     ? titleFromBlocks(parseBlocks(selectedDocument.body))
-    : "No document selected";
+    : selectedDocumentPending
+      ? (selectedSummary?.title ?? titleFromBlocks(editor.document))
+      : "No document selected";
+  const titleBlock = editor.document.at(0);
+  const editableTitle =
+    (selectedDocument || keepsPreviousEditor) && titleBlock ? blockText(titleBlock) : currentTitle;
   const currentRev = useMemo(() => currentRevFromList(revs), [revs]);
   const historyGroups = useMemo(() => groupSavedRevs(revs), [revs]);
+  const historyConnected = connection.remote === "ready" || connection.remote === "connected";
 
   const setBaseline = useCallback(
     (next: Baseline | null, bodyForDiff = JSON.stringify(editor.document)) => {
@@ -227,6 +390,10 @@ export function App(): ReactElement {
       return documents[0]?._id ?? createdFallback?._id ?? null;
     });
   }, [createdFallback, documents]);
+
+  useLayoutEffect(() => {
+    editor.isEditable = selectedDocument !== null;
+  }, [editor, selectedDocument !== null]);
 
   useLayoutEffect(() => {
     if (!selectedDocument) return;
@@ -298,14 +465,29 @@ export function App(): ReactElement {
   );
 
   useEffect(() => {
-    if (!selectedDocument) return;
+    if (!selectedDocument || !historyOpen || !historyConnected) return;
     void refreshHistory(true).catch((error) => setAppError(errorMessage(error)));
-  }, [selectedDocument?._id]);
+  }, [historyConnected, historyOpen, refreshHistory, selectedDocument]);
 
   useEffect(() => {
-    if (!historyOpen || !selectedDocument) return;
-    void refreshHistory(false).catch((error) => setAppError(errorMessage(error)));
-  }, [historyOpen, selectedDocument?._id, refreshHistory]);
+    if (!selectedDocument || !historyOpen || !historyConnected) return;
+    const watch = client.watchQuery(historyDocumentsQuery, {
+      id: selectedDocument._id,
+      cursor: null,
+      numItems: 256,
+    });
+    const read = () => {
+      try {
+        const result = watch.localQueryResult() as { page: RevisionWire[] } | undefined;
+        if (result) setRevs(sortRevs(result.page.map(revisionFromWire)));
+      } catch (error) {
+        setAppError(errorMessage(error));
+      }
+    };
+    const unsubscribe = watch.onUpdate(read);
+    read();
+    return unsubscribe;
+  }, [historyConnected, historyOpen, selectedDocument]);
 
   const updateCurrentDelta = useCallback((body: string) => {
     const current = baselineRef.current;
@@ -366,8 +548,107 @@ export function App(): ReactElement {
     [flushDraftDocument],
   );
 
+  const updateSlashPalette = useCallback(
+    (currentEditor: typeof editor) => {
+      const query = slashQueryFromEditor(currentEditor);
+      if (slashFrameRef.current !== undefined) window.cancelAnimationFrame(slashFrameRef.current);
+      if (query === null) {
+        setSlashPalette(null);
+        return;
+      }
+      const blockId = currentEditor.getTextCursorPosition().block.id;
+      slashFrameRef.current = window.requestAnimationFrame(() => {
+        const panel = documentPanelRef.current?.getBoundingClientRect();
+        const selection = window.getSelection();
+        const cursor =
+          selection && selection.rangeCount > 0
+            ? selection.getRangeAt(0).getBoundingClientRect()
+            : undefined;
+        const panelWidth = panel?.width ?? window.innerWidth;
+        const panelHeight = panel?.height ?? window.innerHeight;
+        const x = Math.max(
+          12,
+          Math.min(
+            (cursor?.left ?? (panel?.left ?? 0) + 48) - (panel?.left ?? 0),
+            panelWidth - 372,
+          ),
+        );
+        const y = Math.max(
+          70,
+          Math.min(
+            (cursor?.bottom ?? (panel?.top ?? 0) + 120) - (panel?.top ?? 0) + 8,
+            panelHeight - 340,
+          ),
+        );
+        setSlashPalette((current) => {
+          if (current?.query !== query || current.blockId !== blockId) setSlashIndex(0);
+          return { blockId, query, x, y };
+        });
+      });
+    },
+    [editor],
+  );
+
+  const runSlashItem = useCallback(
+    (item: SlashPaletteItem) => {
+      const block =
+        (slashPalette ? editor.getBlock(slashPalette.blockId) : undefined) ??
+        editor.getTextCursorPosition().block;
+      editor.setTextCursorPosition(block);
+      setSlashPalette(null);
+      const menu = editor.dictionary.slash_menu;
+      const mediaType: MediaBlockType | null =
+        item.title === menu.image.title
+          ? "image"
+          : item.title === menu.video.title
+            ? "video"
+            : item.title === menu.audio.title
+              ? "audio"
+              : item.title === menu.file.title
+                ? "file"
+                : null;
+      if (mediaType !== null) {
+        const documentId = selectedDocumentIdRef.current;
+        if (documentId === null) return;
+        editor.updateBlock(block, { content: "" });
+        pendingUploadBlockRef.current = { blockId: block.id, documentId, type: mediaType };
+        const input = uploadInputRef.current;
+        if (input !== null) {
+          input.accept = mediaUploadAccept[mediaType];
+          input.click();
+        }
+        return;
+      }
+      if (slashPalette?.query) editor.updateBlock(block, { content: "/" });
+      item.onItemClick();
+    },
+    [editor, slashPalette],
+  );
+
+  useEffect(() => {
+    if (slashPalette === null) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSlashPalette(null);
+      } else if (event.key === "ArrowDown" && slashItems.length > 0) {
+        event.preventDefault();
+        setSlashIndex((current) => (current + 1) % slashItems.length);
+      } else if (event.key === "ArrowUp" && slashItems.length > 0) {
+        event.preventDefault();
+        setSlashIndex((current) => (current - 1 + slashItems.length) % slashItems.length);
+      } else if (event.key === "Enter" && slashItems[slashIndex]) {
+        event.preventDefault();
+        runSlashItem(slashItems[slashIndex]);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [runSlashItem, slashIndex, slashItems, slashPalette]);
+
   useEditorChange((currentEditor) => {
     if (!selectedDocument || applyingRemoteRef.current) return;
+    updateSlashPalette(currentEditor);
     const body = JSON.stringify(currentEditor.document);
     setCurrentBody(body);
     if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
@@ -379,6 +660,7 @@ export function App(): ReactElement {
   useEffect(() => {
     return () => {
       if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
+      if (slashFrameRef.current !== undefined) window.cancelAnimationFrame(slashFrameRef.current);
       flushDraftDocument();
     };
   }, [flushDraftDocument]);
@@ -407,11 +689,61 @@ export function App(): ReactElement {
       const created = (await client.mutation(createDocumentMutation, {})) as DocumentDoc;
       setCreatedFallback(created);
       setSelectedDocumentId(created._id);
+      setMobilePane("editor");
       setSearchQuery("");
     } catch (error) {
       setAppError(errorMessage(error));
     }
   }, [documentsQuery.query]);
+
+  const insertUploadedFile = useCallback(
+    async (file: File) => {
+      if (!selectedDocument) return;
+      const pendingBlock = pendingUploadBlockRef.current;
+      const documentId = pendingBlock?.documentId ?? selectedDocument._id;
+      const anchor = pendingBlock === null ? editor.getTextCursorPosition().block : null;
+      setAppError(null);
+      try {
+        const url = await uploadFile(file);
+        if (selectedDocumentIdRef.current !== documentId) {
+          throw new Error("The active document changed before the file was inserted.");
+        }
+        if (pendingBlock !== null) {
+          editor.updateBlock(pendingBlock.blockId, {
+            type: pendingBlock.type,
+            props: { name: file.name, url },
+          } as PartialBlock);
+          return;
+        }
+        const type = file.type.startsWith("image/")
+          ? "image"
+          : file.type.startsWith("audio/")
+            ? "audio"
+            : file.type.startsWith("video/")
+              ? "video"
+              : "file";
+        editor.insertBlocks(
+          [
+            {
+              type,
+              props: { name: file.name, url },
+            } as PartialBlock,
+          ],
+          anchor!,
+          "after",
+        );
+      } catch (error) {
+        setAppError(errorMessage(error));
+      } finally {
+        pendingUploadBlockRef.current = null;
+        if (uploadInputRef.current) {
+          uploadInputRef.current.accept = uploadAccept;
+          uploadInputRef.current.value = "";
+        }
+      }
+    },
+    [editor, selectedDocument, uploadFile],
+  );
 
   const deleteDocument = useCallback(async () => {
     if (!selectedDocument) return;
@@ -423,6 +755,7 @@ export function App(): ReactElement {
       await settleDraftDocument();
       await client.mutation(removeDocumentMutation, { id: selectedDocument._id });
       setSelectedDocumentId(nextDocument?._id ?? null);
+      setMobilePane(nextDocument ? "editor" : "documents");
       if (createdFallback?._id === selectedDocument._id) setCreatedFallback(null);
       setHistoryOpen(false);
       setDeleteOpen(false);
@@ -434,7 +767,8 @@ export function App(): ReactElement {
   }, [createdFallback, documents, selectedDocument, settleDraftDocument]);
 
   const createSnapshot = useCallback(async () => {
-    if (!selectedDocument) return;
+    if (!selectedDocument || snapshotPendingRef.current) return;
+    snapshotPendingRef.current = true;
     setHistoryBusy(true);
     setAppError(null);
     try {
@@ -466,9 +800,17 @@ export function App(): ReactElement {
     } catch (error) {
       setAppError(errorMessage(error));
     } finally {
+      snapshotPendingRef.current = false;
       setHistoryBusy(false);
     }
-  }, [editor, queueDraftDocument, refreshHistory, selectedDocument, setBaseline, settleDraftDocument]);
+  }, [
+    editor,
+    queueDraftDocument,
+    refreshHistory,
+    selectedDocument,
+    setBaseline,
+    settleDraftDocument,
+  ]);
 
   const selectRev = useCallback(
     async (rev: EmbeddedRev) => {
@@ -557,12 +899,13 @@ export function App(): ReactElement {
     if (!query) return documents;
     return documents.filter((document) => document.title.toLowerCase().includes(query));
   }, [documents, searchQuery]);
+  const uploadBusy = uploadNotice?.phase === "saving";
 
   return (
     <div className="demoShell">
       <DebugOverlay connection={connection} />
       <main className="demoMain">
-        <div className="documentsLayout">
+        <div className="documentsLayout" data-mobile-pane={mobilePane}>
           <aside className="panel documentsSidebar">
             <div className="searchToolbar">
               <div className="searchRow">
@@ -570,7 +913,7 @@ export function App(): ReactElement {
                   <Search className="shrink-0" size={15} />
                   <input
                     aria-label="Search documents"
-                    className="min-w-0 flex-1 border-0 bg-transparent p-0 text-sm text-content-primary placeholder:text-content-tertiary focus:ring-0"
+                    className="mobileSearchInput min-w-0 flex-1 border-0 bg-transparent p-0 text-sm text-content-primary placeholder:text-content-tertiary focus:ring-0"
                     value={searchQuery}
                     onChange={(event) => setSearchQuery(event.target.value)}
                     placeholder="Search documents"
@@ -592,7 +935,7 @@ export function App(): ReactElement {
                   type="button"
                   aria-label="Create document"
                   title="New document"
-                  disabled={documentsQuery.query !== "ready"}
+                  disabled={documentsQuery.query !== "ready" || uploadBusy}
                   onClick={() => void createDocument()}
                 >
                   <Plus size={16} />
@@ -613,7 +956,11 @@ export function App(): ReactElement {
                     key={document._id}
                     active={document._id === selectedDocumentId}
                     document={document}
-                    onSelect={() => setSelectedDocumentId(document._id)}
+                    onSelect={() => {
+                      if (uploadBusy) return;
+                      setSelectedDocumentId(document._id);
+                      setMobilePane("editor");
+                    }}
                   />
                 ))
               )}
@@ -629,17 +976,86 @@ export function App(): ReactElement {
             ) : null}
           </aside>
 
-          <section className="panel documentPanel">
+          <section ref={documentPanelRef} className="panel documentPanel">
             <header className="panelHeader">
+              <button
+                className="iconButton mobileBack"
+                type="button"
+                aria-label="Back to documents"
+                disabled={uploadBusy}
+                onClick={() => setMobilePane("documents")}
+              >
+                <ArrowLeft size={18} />
+              </button>
               <div className="documentPanelTitle">
                 <FileText className="shrink-0" size={15} />
                 <div>
-                  <h2 className="truncate">{currentTitle}</h2>
-                  <p>{selectedDocument ? "Saved automatically" : "Choose a document to begin"}</p>
+                  <input
+                    className="documentTitleInput"
+                    aria-label="Document title"
+                    disabled={!selectedDocument}
+                    placeholder="Untitled"
+                    title={currentTitle}
+                    value={editableTitle}
+                    onBlur={() => {
+                      const first = editor.document.at(0);
+                      if (first && !blockText(first).trim()) {
+                        editor.updateBlock(first, { content: "Untitled" });
+                      }
+                    }}
+                    onChange={(event) => {
+                      const first = editor.document.at(0);
+                      if (first) editor.updateBlock(first, { content: event.currentTarget.value });
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.currentTarget.blur();
+                        return;
+                      }
+                      if (event.key !== "Enter") return;
+                      event.preventDefault();
+                      const bodyBlock = editor.document.at(1);
+                      if (bodyBlock) {
+                        editor.setTextCursorPosition(bodyBlock, "start");
+                        editor.focus();
+                      }
+                    }}
+                  />
                 </div>
               </div>
               <div className="flex items-center gap-1">
                 <RemoteStatus connection={connection} />
+                <input
+                  ref={uploadInputRef}
+                  className="sr-only"
+                  type="file"
+                  accept={uploadAccept}
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    if (file) void insertUploadedFile(file);
+                  }}
+                />
+                <button
+                  className="iconButton"
+                  type="button"
+                  aria-label="Attach a file"
+                  disabled={!selectedDocument || uploadBusy}
+                  onClick={() => {
+                    pendingUploadBlockRef.current = null;
+                    const input = uploadInputRef.current;
+                    if (input !== null) {
+                      input.accept = uploadAccept;
+                      input.click();
+                    }
+                  }}
+                  title="Attach a file offline"
+                >
+                  {uploadNotice?.phase === "saving" ? (
+                    <Loader2 className="animate-spin" size={16} />
+                  ) : (
+                    <Paperclip size={16} />
+                  )}
+                </button>
                 <button
                   className="iconButton"
                   type="button"
@@ -651,6 +1067,9 @@ export function App(): ReactElement {
                   title="Snapshot history"
                 >
                   <History size={16} />
+                  {historyGroups.length > 0 ? (
+                    <span className="historyBadge">{historyGroups.length}</span>
+                  ) : null}
                 </button>
                 <button
                   className="iconButton danger"
@@ -665,10 +1084,63 @@ export function App(): ReactElement {
               </div>
             </header>
 
+            {slashPalette ? (
+              <div
+                className="commandPalette"
+                role="listbox"
+                aria-label="Block commands"
+                style={{ left: slashPalette.x, top: slashPalette.y }}
+              >
+                {slashItems.length > 0 ? (
+                  slashItems.map((item, index) => (
+                    <div className="commandPaletteEntry" key={`${item.group}:${item.title}`}>
+                      {index === 0 || slashItems[index - 1]?.group !== item.group ? (
+                        <div className="commandPaletteGroup">{item.group}</div>
+                      ) : null}
+                      <button
+                        className="commandPaletteItem"
+                        type="button"
+                        role="option"
+                        aria-selected={index === slashIndex}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => runSlashItem(item)}
+                      >
+                        <span className="commandPaletteIcon">{item.icon}</span>
+                        <span className="commandPaletteCopy">
+                          <strong>{item.title}</strong>
+                          {item.subtext ? <small>{item.subtext}</small> : null}
+                        </span>
+                        {item.badge ? <kbd>{item.badge}</kbd> : null}
+                      </button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="commandPaletteEmpty">No matching commands</div>
+                )}
+              </div>
+            ) : null}
+
+            {uploadNotice ? <UploadStatus notice={uploadNotice} connection={connection} /> : null}
+
             <div className="documentViewport">
-              {selectedDocument ? (
-                <div className="editor-shell documentEnter" key={selectedDocument._id}>
-                  <BlockNoteView editor={editor} data-theming-css-demo />
+              {selectedDocument || keepsPreviousEditor ? (
+                <div
+                  aria-busy={selectedDocumentPending}
+                  className="editor-shell documentEnter"
+                  key={selectedDocument?._id ?? lastAppliedDocIdRef.current}
+                >
+                  <BlockNoteView
+                    editor={editor}
+                    data-theming-css-demo
+                    emojiPicker={false}
+                    filePanel={false}
+                    formattingToolbar={false}
+                    linkToolbar={false}
+                    sideMenu={false}
+                    slashMenu={false}
+                    tableHandles={false}
+                    theme="dark"
+                  />
                 </div>
               ) : (
                 <EmptyDocumentState
@@ -687,12 +1159,16 @@ export function App(): ReactElement {
             currentDelta={currentDelta}
             currentRev={currentRev}
             currentTitle={currentTitle}
-            error={appError}
+            error={
+              historyConnected ? appError : "Snapshot history becomes available when connected."
+            }
             preview={preview}
             groups={historyGroups}
             selectedRevId={selectedHistoryRevId}
             onClose={() => setHistoryOpen(false)}
-            onRefresh={() => void refreshHistory(true)}
+            onRefresh={() => {
+              if (historyConnected) void refreshHistory(true);
+            }}
             onRestore={() => void restorePreview()}
             onCreateSnapshot={() => void createSnapshot()}
             onSelect={(rev) => void selectRev(rev)}
@@ -746,11 +1222,24 @@ function useConnectionState(): EmbeddedConnectionState {
   useEffect(() => {
     let active = true;
     let timer: number | undefined = window.setInterval(sync, 500);
-    const unsubscribe = client.onRuntimeEvent(sync);
+    const unsubscribe = client.subscribeEvents((event) => {
+      if (event.type === "remote" || event.type === "runtime") sync();
+    });
+    const onFocus = (): void => sync();
+    const onPageShow = (): void => sync();
+    const onVisibility = (): void => {
+      if (document.visibilityState === "visible") sync();
+    };
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("pageshow", onPageShow);
+    document.addEventListener("visibilitychange", onVisibility);
     sync();
     return () => {
       active = false;
       unsubscribe();
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("pageshow", onPageShow);
+      document.removeEventListener("visibilitychange", onVisibility);
       if (timer !== undefined) window.clearInterval(timer);
     };
     function sync(): void {
@@ -770,14 +1259,23 @@ const debugEnabled =
   typeof window !== "undefined" && new URLSearchParams(window.location.search).has("debug");
 
 function DebugOverlay(props: { connection: EmbeddedConnectionState }): ReactElement | null {
-  const [lines, setLines] = useState<string[]>([]);
+  const [lines, setLines] = useState<string[]>(() =>
+    (globalThis.__CONVEX_EMBEDDED_DEBUG_EVENTS__ ?? []).slice(-20).map(debugLine),
+  );
   useEffect(() => {
     if (!debugEnabled) return;
-    return client.subscribeInternalEvents((event) => {
+    const unsubscribeInternal = client.subscribeInternalEvents((event) => {
       const stamp = new Date().toISOString().slice(11, 23);
       const summary = JSON.stringify(event).slice(0, 160);
       setLines((prior) => [...prior.slice(-19), `${stamp} ${summary}`]);
     });
+    const unsubscribeBrowser = subscribeBrowserDebug((event) => {
+      setLines((prior) => [...prior.slice(-19), debugLine(event)]);
+    });
+    return () => {
+      unsubscribeInternal();
+      unsubscribeBrowser();
+    };
   }, []);
   if (!debugEnabled) return null;
   const { connection } = props;
@@ -809,6 +1307,47 @@ function DebugOverlay(props: { connection: EmbeddedConnectionState }): ReactElem
   );
 }
 
+function debugLine(event: { detail?: unknown; phase: string; source: string }): string {
+  const stamp = new Date().toISOString().slice(11, 23);
+  const detail = event.detail === undefined ? "" : ` ${JSON.stringify(event.detail).slice(0, 180)}`;
+  return `${stamp} [${event.source}] ${event.phase}${detail}`;
+}
+
+function UploadStatus(props: {
+  connection: EmbeddedConnectionState;
+  notice: UploadNotice;
+}): ReactElement {
+  const { connection, notice } = props;
+  const offline = connection.remote === "offline" || connection.remote === "closed";
+  const label =
+    notice.phase === "saving"
+      ? "Saving locally"
+      : notice.phase === "local"
+        ? offline
+          ? "Saved offline · queued"
+          : "Saved locally · queued"
+        : notice.phase === "syncing"
+          ? "Uploading to Convex"
+          : notice.phase === "synced"
+            ? "Available everywhere"
+            : "Upload failed";
+  return (
+    <div className={`uploadStatus uploadStatus--${notice.phase}`} role="status">
+      {notice.phase === "saving" || notice.phase === "syncing" ? (
+        <Loader2 className="animate-spin" size={15} />
+      ) : notice.phase === "failed" ? (
+        <TriangleAlert size={15} />
+      ) : (
+        <CircleCheck size={15} />
+      )}
+      <span>
+        <strong>{label}</strong>
+        <small>{notice.fileName}</small>
+      </span>
+    </div>
+  );
+}
+
 function RemoteStatus(props: { connection: EmbeddedConnectionState }): ReactElement | null {
   const { connection } = props;
   if (connection.remote === "disabled") return null;
@@ -816,19 +1355,36 @@ function RemoteStatus(props: { connection: EmbeddedConnectionState }): ReactElem
   const label =
     connection.remote === "ready"
       ? "Synced"
-      : connection.remote === "starting"
-        ? "Connecting"
-        : connection.remote === "closed"
+      : connection.remote === "connected"
+        ? "Online"
+        : connection.remote === "offline"
           ? "Offline"
-          : "Sync error";
+          : connection.remote === "starting"
+            ? "Connecting"
+            : connection.remote === "closed"
+              ? "Offline"
+              : "Sync error";
+  const icon =
+    connection.remote === "ready" || connection.remote === "connected" ? (
+      <Cloud size={15} strokeWidth={2} />
+    ) : connection.remote === "starting" ? (
+      <Loader2 className="animate-spin" size={15} />
+    ) : connection.remote === "offline" || connection.remote === "closed" ? (
+      <CloudOff size={15} strokeWidth={2} />
+    ) : (
+      <TriangleAlert size={15} />
+    );
   return (
     <span
       className={`syncStatus syncStatus--${connection.remote}`}
       title={remoteError ?? label}
       aria-label={remoteError ? `Sync error: ${remoteError}` : label}
+      role="status"
     >
-      <span className="syncDot" aria-hidden="true" />
-      {label}
+      <span className="syncStatusIcon" aria-hidden="true">
+        {icon}
+      </span>
+      <span className="syncStatusLabel">{label}</span>
     </span>
   );
 }
@@ -987,15 +1543,57 @@ function HistoryModal(props: {
         ? "Live local document with snapshot changes"
         : "Live local document";
 
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      props.onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => document.removeEventListener("keydown", closeOnEscape, true);
+  }, [props.onClose]);
+
   return (
-    <div className="historyModal" role="dialog" aria-modal="true" aria-label="Snapshot history">
-      <div className="historyModalShell panel">
+    <div
+      className="historyModal"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Snapshot history"
+      onPointerDown={(event) => {
+        if (!(event.target instanceof Element)) return;
+        if (!event.target.closest(".historyModalShell")) props.onClose();
+      }}
+    >
+      <div className="historyModalBackdrop" aria-hidden="true" onClick={props.onClose} />
+      <div
+        className="historyModalShell panel"
+        data-mobile-view={props.selectedRevId === null ? "list" : "preview"}
+      >
         <div className="historyPreview">
           <div className="panelHeader">
-            <div>
+            <button
+              className="iconButton mobileHistoryPreviewBack"
+              type="button"
+              aria-label="Back to snapshot history"
+              onClick={props.onSelectCurrent}
+            >
+              <ArrowLeft size={18} />
+            </button>
+            <div className="historyPreviewTitle">
               <h2>{detailTitle}</h2>
               <p>{detailTime}</p>
             </div>
+            {canRestore ? (
+              <button
+                className="iconButton mobileHistoryRestore"
+                type="button"
+                disabled={props.busy}
+                aria-label="Restore snapshot"
+                onClick={props.onRestore}
+              >
+                <RotateCcw size={17} />
+              </button>
+            ) : null}
           </div>
           <div className="historyPreviewBody">
             {loadingSelectedVersion ? (
@@ -1521,6 +2119,18 @@ function blockText(block: PartialBlock | Block): string {
     .join("");
 }
 
+function slashQueryFromEditor(editor: {
+  getTextCursorPosition(): { block: Block };
+}): string | null {
+  try {
+    const text = blockText(editor.getTextCursorPosition().block);
+    const match = /^\/([^\n]*)$/.exec(text);
+    return match?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function formatTime(value: number): string {
   return new Intl.DateTimeFormat(undefined, {
     day: "numeric",
@@ -1528,6 +2138,34 @@ function formatTime(value: number): string {
     minute: "2-digit",
     month: "short",
   }).format(value);
+}
+
+function embeddedFileToken(url: string): string | null {
+  const path = (() => {
+    try {
+      return new URL(url, globalThis.location?.origin).pathname;
+    } catch {
+      return url;
+    }
+  })();
+  if (!path.startsWith(embeddedFilePath)) return null;
+  try {
+    return decodeURIComponent(path.slice(embeddedFilePath.length));
+  } catch {
+    return null;
+  }
+}
+
+function isLocalFileUrl(url: string): boolean {
+  return url.startsWith("blob:") || url.startsWith("data:");
+}
+
+async function uploadResponseError(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    if (typeof body.error === "string") return body.error;
+  } catch {}
+  return `File upload failed with status ${response.status}.`;
 }
 
 function errorMessage(error: unknown): string {

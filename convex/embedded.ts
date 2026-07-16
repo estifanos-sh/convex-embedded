@@ -8,4 +8,4 @@ export const embedded = defineEmbedded({
   schema,
 });
 
-export const { query, mutation, internalQuery, internalMutation, push, pull } = embedded;
+export const { query, mutation, internalQuery, internalMutation, upload, push, pull } = embedded;

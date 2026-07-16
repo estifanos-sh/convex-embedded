@@ -1,6 +1,7 @@
 import { type GenericId, type Infer, v } from "convex/values";
 import { components, internal } from "./_generated/api";
 import { internalMutation, mutation, query } from "./embedded";
+import { read as readTime } from "./time";
 
 const documentValidator = v.object({
   _creationTime: v.number(),
@@ -29,7 +30,7 @@ const revisionValidator = v.object({
     v.literal("displaced"),
     v.literal("delete"),
   ),
-  status: v.union(v.literal("active"), v.literal("retained"), v.literal("acknowledged")),
+  status: v.union(v.literal("active"), v.literal("retained")),
   parentRevId: v.optional(v.string()),
   createdAt: v.number(),
   deleted: v.boolean(),
@@ -95,8 +96,7 @@ export const summaries = query({
         ? documents
         : documents.filter(
             (document) =>
-              document.title >= (args.prefix as string) &&
-              document.title < `${args.prefix}\uffff`,
+              document.title >= (args.prefix as string) && document.title < `${args.prefix}\uffff`,
           );
     matched.sort((left, right) => right.updatedAt - left.updatedAt);
     return matched.slice(0, limit).map((document) => ({
@@ -142,7 +142,7 @@ export const create = mutation({
   returns: documentValidator,
   handler: async (ctx, args) => {
     const title = args.title ?? "Untitled";
-    const updatedAt = args.updatedAt ?? Date.now();
+    const updatedAt = args.updatedAt ?? readTime();
     const id = await ctx.db.insert("documents", {
       body: args.body ?? emptyBody,
       slug: args.slug ?? "untitled",
@@ -229,6 +229,7 @@ export const savepoint = mutation({
 });
 
 export const history = query({
+  local: false,
   args: {
     id: v.id("documents"),
     cursor: v.union(v.string(), v.null()),
@@ -246,6 +247,7 @@ export const history = query({
 });
 
 export const revision = query({
+  local: false,
   args: { id: v.id("documents"), revId: v.string() },
   returns: v.any(),
   handler: async (ctx, args) => {
@@ -259,6 +261,7 @@ export const revision = query({
 });
 
 export const restore = mutation({
+  local: false,
   args: { id: v.id("documents"), revId: v.string() },
   returns: v.object({
     document: documentValidator,
@@ -266,7 +269,7 @@ export const restore = mutation({
   }),
   handler: async (ctx, args) => {
     if (!(await ctx.db.get(args.id))) throw new Error("Document not found.");
-    const revision = await ctx.runMutation(components.embedded.rev.set, {
+    const revision = await ctx.runMutation(components.embedded.rev.restore, {
       table: "documents",
       rowId: args.id,
       revId: args.revId,
@@ -283,6 +286,16 @@ export const remove = mutation({
   args: { id: v.id("documents") },
   returns: v.null(),
   handler: async (ctx, args) => {
+    const attachments = await ctx.db
+      .query("attachments")
+      .withIndex("by_documentId", (q) => q.eq("documentId", args.id))
+      .take(512);
+    if (attachments.length === 512) {
+      throw new Error("Delete attachments before deleting this document.");
+    }
+    for (const attachment of attachments) {
+      await ctx.db.delete(attachment._id);
+    }
     await ctx.db.delete(args.id);
     return null;
   },
@@ -330,7 +343,7 @@ export const scheduledAppend = internalMutation({
     const document = await ctx.db.get(args.id);
     if (!document) return null;
     const title = `${document.title}!`;
-    const updatedAt = Date.now();
+    const updatedAt = readTime();
     await ctx.db.patch(args.id, { title, updatedAt });
     return null;
   },
