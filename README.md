@@ -4,9 +4,6 @@ Embedded is a local-first runtime for Convex. Application schemas, functions, au
 data remain ordinary Convex code. The installed component owns private replication metadata; the
 local SQLite runtime owns the device projection and all Loro computation.
 
-The authoritative design and invariants are in
-[`packages/embedded/V5.md`](packages/embedded/V5.md).
-
 ## Convex Setup
 
 Install the component once:
@@ -74,9 +71,17 @@ function-builder parameters in app code.
 
 ## Revisions
 
-Revisions are component-owned CAS snapshots reached through app-authored functions. The app function
-performs authorization, calls `components.embedded.rev.*`, and writes the selected value with normal
-`ctx.db` operations in the same transaction.
+Revisions are retained document versions. They are not the compare-and-swap mechanism used by
+replication, and they are not the internal CRDT checkpoints used to compact operation history.
+
+Embedded uses optimistic validation while pushing a local mutation. That validation decides whether
+the mutation still applies to the current Convex state. If concurrent work displaced a value, the
+component can retain that value as a conflict revision; it does not create a revision merely because
+a comparison occurred. Apps can also create explicit savepoints.
+
+Revision access always goes through an app-authored function. The app function performs
+authorization, calls `components.embedded.rev.*`, and, when restoring, writes the selected value with
+normal `ctx.db` operations in the same transaction.
 
 ```ts
 import { v } from "convex/values";
@@ -102,7 +107,7 @@ export const restore = mutation({
   args: { id: v.id("documents"), revId: v.string() },
   handler: async (ctx, { id, revId }) => {
     await requireOwnedDocument(ctx, id);
-    const revision = await ctx.runMutation(components.embedded.rev.set, {
+    const revision = await ctx.runMutation(components.embedded.rev.restore, {
       table: "documents",
       rowId: id,
       revId,
@@ -113,8 +118,23 @@ export const restore = mutation({
 });
 ```
 
-The component also exposes `get`, paginated `list`, `ack`, and bounded `delete`. Retention and
-cleanup are app policy expressed as ordinary functions, internal mutations, and crons.
+The public revision surface is deliberately small:
+
+- `create` makes an explicit savepoint.
+- `get` reads one revision.
+- `list` pages through a row's history or through retention candidates.
+- `restore` selects a revision; the app wrapper updates its live row in the same transaction.
+- `delete` removes one non-active revision.
+
+Deletion is bounded because one revision can reference many CRDT records and a Convex mutation has
+finite work limits. Pass `numItems` and repeat the call against the same revision until it returns
+`{ isDone: true, deleted }`. There is no deletion cursor: every call removes the next remaining
+records, so a cursor over the old state would be incorrect. The same `{ isDone, deleted }` result is
+used by every bounded destructive component API.
+
+The component does not expose a separate maintenance state or retention command. An app defines retention
+policy by listing eligible retained revisions and scheduling bounded `delete` calls. The active
+revision cannot be deleted.
 
 ## CRDT Fields
 
@@ -147,10 +167,24 @@ that authorize revision access.
 The package also exports `vite`, `devtools`, `devtools/vite`, `values`, `server`, and
 `convex.config` entrypoints. `unplugin` and `bundler` are low-level adapter surfaces.
 
-## Develop
+### Browser storage
 
-```bash
-vp install
-vp check
-vp test
-```
+The browser client opens durable SQLite storage in OPFS when the browser allows it. It tests the
+real open operation instead of inferring support from the user agent or the presence of
+`navigator.storage.getDirectory`.
+
+If the browser denies OPFS, the client opens the same SQLite schema with Turso's in-memory backend
+and emits a `runtime` event with `degradation: "temporary-storage"`. This occurs in current Safari
+and Firefox private browsing. Chromium supplies an in-memory filesystem for incognito profiles, so
+the OPFS path can still open there; Chromium deletes that profile storage when the incognito session
+ends.
+
+Temporary storage lasts only as long as its worker context. A reload, tab discard, browser exit, or
+private-session close may erase local documents and unsent mutations. A configured remote can pull
+authoritative data into a new temporary store, but it cannot recover an offline mutation that the
+browser erased before push.
+
+`localStorage` holds only the small browser storage selector. It is not a database fallback: it is
+synchronous, string-only, quota-limited, and lacks the transactions and file semantics SQLite
+needs. Private browsers clear or isolate it too. An IndexedDB-backed SQLite VFS would be a separate
+storage backend, not a safe use of `localStorage`.
