@@ -36,6 +36,7 @@ catalog:
   fast-check: ^4.8.0
   convex-helpers: ^0.1.120
   "@convex-dev/migrations": ^0.3.5
+  pkg-pr-new: 0.0.75
 overrides:
   vite: "catalog:"
   vitest: "catalog:"

@@ -1,7 +1,6 @@
 {
   "name": "@convex-dev/embedded",
   "version": "0.0.0",
-  "private": true,
   "description": "Embedded browser runtime and Convex server wrapper for local-first Convex apps.",
   "files": [
     "dist/*-*.d.mts",
@@ -29,8 +28,7 @@
     "dist/vite.mjs",
     "dist/wasm",
     "native",
-    "src/component",
-    "src/time.ts"
+    "src"
   ],
   "type": "module",
   "exports": {
@@ -88,9 +86,13 @@
     },
     "./package.json": "./package.json"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "node scripts/build.ts",
     "build:ts": "vp pack",
+    "prepack": "vp run build",
     "native": "node scripts/native.ts",
     "size": "node scripts/size.ts",
     "test:node": "node scripts/node/smoke.ts",

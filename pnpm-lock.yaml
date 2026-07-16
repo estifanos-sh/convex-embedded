@@ -63,6 +63,9 @@ catalogs:
     fast-check:
       specifier: ^4.8.0
       version: 4.8.0
+    pkg-pr-new:
+      specifier: 0.0.75
+      version: 0.0.75
     playwright:
       specifier: ^1.56.0
       version: 1.60.0
@@ -112,6 +115,9 @@ importers:
         specifier: 'catalog:'
         version: 1.42.1(react@19.2.7)
     devDependencies:
+      pkg-pr-new:
+        specifier: 'catalog:'
+        version: 0.0.75
       vite:
         specifier: npm:@voidzero-dev/vite-plus-core@0.1.24
         version: '@voidzero-dev/vite-plus-core@0.1.24(@types/node@25.9.1)(esbuild@0.27.0)(jiti@2.7.0)(terser@5.49.0)(typescript@6.0.3)(yaml@2.9.0)'
@@ -2821,6 +2827,10 @@ packages:
 
   pixelmatch@7.2.0:
     resolution: {integrity: sha512-xhcb4yHu9sM/G7foGzoLtXYcC0zHEaOXXjRKhGup0fw78Nf2Tkiapv4EQyMzrbcmQPsllAI7DbFY2UT7PlI9Pg==}
+    hasBin: true
+
+  pkg-pr-new@0.0.75:
+    resolution: {integrity: sha512-u9mdErTewKSMsr+ceCt8VcNuNP0ro5AXiPXhUVApuEyqr2Zlvt+DdCFBcm+yGWN8mhOdZJ27meIDbnoZgfzpOw==}
     hasBin: true
 
   playwright-core@1.60.0:
@@ -5724,6 +5734,8 @@ snapshots:
   pixelmatch@7.2.0:
     dependencies:
       pngjs: 7.0.0
+
+  pkg-pr-new@0.0.75: {}
 
   playwright-core@1.60.0: {}
 

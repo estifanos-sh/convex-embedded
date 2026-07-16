@@ -1,0 +1,72 @@
+name: Preview package
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  preview:
+    name: Test and publish preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Node setup
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Expose local binaries
+        run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Check
+        run: vp check
+
+      - name: Build and inspect package
+        run: pnpm --filter @convex-dev/embedded pack --dry-run
+
+      - name: Test embedded
+        run: |
+          vp run @convex-dev/embedded#test:unit
+          vp run @convex-dev/embedded#test:storage
+          vp run @convex-dev/embedded#test:server
+          vp run @convex-dev/embedded#test:surface
+          vp run @convex-dev/embedded#test:runtime
+
+      - name: Test packaged Node entrypoint
+        run: vp run @convex-dev/embedded#test:node
+
+      - name: Publish preview package
+        run: >
+          vp exec pkg-pr-new publish ./packages/embedded
+          --pnpm
+          --no-compact
+          --comment=update
+          --commentWithSha
+          --packageManager=npm
