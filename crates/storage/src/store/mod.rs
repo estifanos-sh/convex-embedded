@@ -18,12 +18,12 @@ use crate::types::RevFrontier;
 use crate::types::{
     AuthoritativeApplyResult, AuthoritativeRow, ColValue, CommitOptions, CommitResult,
     CommitSource, CountSpec, CrdtOp, CrdtOperation, DeleteIn, DeleteResult, DirtyHeadDebug,
-    FileMetadata, FileStore, IdMapping, IdMappingContent, MembershipRange, MutationCall,
-    MutationRecord, MutationStatus, Page, PendingUpload, ReadSpec, RemoteMember, RemotePull,
-    RemotePullResult, RemotePushSettlement, RemotePushSettlementOutcome,
-    RemotePushSettlementResult, ResultEntry, RevKey, RevState, RevWriteResult, RowChange,
+    DocWrite, FileMetadata, FileStore, IdMapping, IdMappingContent, MembershipRange, MutationCall,
+    MutationRecord, MutationStatus, Page, PendingUpload, ReadSpec, RemoteMember, RemotePageWrite,
+    RemotePageWriteResult, RemotePending, RemoteSettlementOutcome, RemoteSettlementWrite,
+    RemoteSettlementWriteResult, ResultEntry, RevKey, RevState, RevWriteResult, RowChange,
     RowChangeOp, RowHead, RowKey, ScheduledJob, ScheduledState, StoreSchema, TableDef, UploadLease,
-    UploadLeaseWrite, UpsertIn, WriteBatch,
+    UploadLeaseWrite, WriteBatch,
 };
 
 static PATH_LOCKS: LazyLock<Mutex<FxHashMap<String, Weak<Mutex<()>>>>> =
@@ -36,12 +36,12 @@ const STORE_META_IDENTITY: &str = "";
 const REMOTE_PUSH_ENVELOPE_PREFIX: &str = "push_envelope:";
 const REMOTE_PUSH_ENVELOPE_PREFIX_END: &str = "push_envelope;";
 const IDENTITY_STATE_META: &str = "identity_state";
-const REMOTE_SETTLEMENT_ACK_PREFIX: &str = "settlement_ack:";
-const REMOTE_SETTLEMENT_ACK_PREFIX_END: &str = "settlement_ack;";
-const REMOTE_PULL_CURSOR_PREFIX: &str = "pull:";
+const REMOTE_RECEIPT_PREFIX: &str = "settlement_ack:";
+const REMOTE_RECEIPT_PREFIX_END: &str = "settlement_ack;";
+const REMOTE_CURSOR_PREFIX: &str = "pull:";
 
-fn remote_pull_cursor_key(subscription: &str) -> String {
-    format!("{REMOTE_PULL_CURSOR_PREFIX}{subscription}")
+fn remote_cursor_key_encode(subscription: &str) -> String {
+    format!("{REMOTE_CURSOR_PREFIX}{subscription}")
 }
 
 /// How long a claimed scheduled job holds its lease before another worker may reclaim it. A worker
@@ -101,7 +101,7 @@ struct TableRuntime {
     delete_sql: String,
     read_sql: String,
     update_data_sql: String,
-    upsert_sql: String,
+    doc_write_sql: String,
 }
 
 impl TableRuntime {
@@ -114,7 +114,7 @@ impl TableRuntime {
             .collect();
         let read_sql = sql::read_doc(&def.name);
         let update_data_sql = sql::update_doc_data(&def.name);
-        let upsert_sql = sql::write_doc(&def);
+        let doc_write_sql = sql::write_doc(&def);
         let delete_sql = sql::delete_doc(&def.name);
         Self {
             column_positions,
@@ -122,7 +122,7 @@ impl TableRuntime {
             delete_sql,
             read_sql,
             update_data_sql,
-            upsert_sql,
+            doc_write_sql,
         }
     }
 }
@@ -296,21 +296,27 @@ impl EmbeddedStore {
             })?;
         let stored_schema = self.stored_schema_manifest_unlocked()?;
         if stored_signature == current_signature {
-            if !self.doc_tables_match_schema(schema)? {
-                return Err(StorageError::IncompatibleStore(
-                    "the physical schema does not match its signature; the existing store was preserved"
-                        .to_owned(),
-                ));
-            }
-            match stored_schema {
+            let previous = match stored_schema {
                 Some(stored) if schema_signature(&stored) != stored_signature => {
                     return Err(StorageError::IncompatibleStore(
                         "the stored schema manifest does not match its signature; the existing store was preserved"
                             .to_owned(),
                     ));
                 }
-                Some(_) => {}
-                None => self.write_meta_unlocked(SCHEMA_MANIFEST_KEY, &schema_manifest)?,
+                Some(stored) => stored,
+                None => {
+                    self.write_meta_unlocked(SCHEMA_MANIFEST_KEY, &schema_manifest)?;
+                    schema.clone()
+                }
+            };
+            if !self.doc_tables_match_schema(schema)? {
+                self.reconcile_schema_unlocked(
+                    &previous,
+                    schema,
+                    &current_signature,
+                    &schema_manifest,
+                    &existing_tables,
+                )?;
             }
         } else {
             let stored_schema = stored_schema.ok_or_else(|| {
@@ -520,6 +526,7 @@ impl EmbeddedStore {
             .iter()
             .map(String::as_str)
             .collect::<FxHashSet<_>>();
+
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
         let written = (|| {
             for previous_table in &previous.tables {
@@ -546,6 +553,21 @@ impl EmbeddedStore {
                     })?;
                     let columns = self.read_doc_columns_unlocked(&table.name)?;
                     require_doc_base_columns(&table.name, &columns)?;
+                    self.delete_doc_indexes_unlocked(previous_table, Some(table))?;
+                    let current_columns = table
+                        .columns
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .collect::<FxHashSet<_>>();
+                    for column in columns.iter().filter(|column| {
+                        !matches!(
+                            column.as_str(),
+                            "id" | "identity_key" | "creation_time_ms" | "data"
+                        ) && !current_columns.contains(column.as_str())
+                    }) {
+                        self.driver
+                            .execute(&sql::delete_doc_column(&table.name, column)?, Vec::new())?;
+                    }
                     let added = table
                         .columns
                         .iter()
@@ -553,19 +575,16 @@ impl EmbeddedStore {
                         .map(|column| column.name.clone())
                         .collect::<FxHashSet<_>>();
                     for column in &added {
-                        self.driver
-                            .execute(&sql::write_doc_column(&table.name, column)?, Vec::new())?;
+                        if !columns.contains(column.as_str()) {
+                            self.driver.execute(
+                                &sql::write_doc_column(&table.name, column)?,
+                                Vec::new(),
+                            )?;
+                        }
                     }
                     self.write_doc_column_values_unlocked(table, &added)?;
-                    self.delete_doc_indexes_unlocked(previous_table, Some(table))?;
                     self.write_doc_indexes_unlocked(table)?;
                 } else {
-                    if previous_table.is_some() {
-                        return Err(StorageError::IncompatibleStore(format!(
-                            "the physical table for {} is missing",
-                            table.name
-                        )));
-                    }
                     self.create_doc_table_unlocked(table)?;
                 }
             }
@@ -637,7 +656,7 @@ impl EmbeddedStore {
         Ok(lock(&self.clock).now(wall))
     }
 
-    pub fn mutation_begin(&self, call: &MutationCall) -> Result<MutationRecord, StorageError> {
+    pub fn mutation_write(&self, call: &MutationCall) -> Result<MutationRecord, StorageError> {
         let _guard = lock(&self.operation_lock);
         if let Some(record) = self.mutation_record_unlocked(&call.mutation_id)? {
             self.clear_absent_mutation(&call.mutation_id);
@@ -664,7 +683,7 @@ impl EmbeddedStore {
         })
     }
 
-    pub fn mutation_read(&self, call: &MutationCall) -> Result<MutationRecord, StorageError> {
+    pub fn mutation_cache_read(&self, call: &MutationCall) -> Result<MutationRecord, StorageError> {
         let _guard = lock(&self.operation_lock);
         if let Some(record) = self.mutation_record_unlocked(&call.mutation_id)? {
             self.clear_absent_mutation(&call.mutation_id);
@@ -681,7 +700,10 @@ impl EmbeddedStore {
         })
     }
 
-    pub fn mutation_fresh(&self, call: &MutationCall) -> Result<MutationRecord, StorageError> {
+    pub fn mutation_cache_write(
+        &self,
+        call: &MutationCall,
+    ) -> Result<MutationRecord, StorageError> {
         let _guard = lock(&self.operation_lock);
         self.remember_absent_mutation(call)?;
         Ok(MutationRecord {
@@ -747,10 +769,12 @@ impl EmbeddedStore {
             if require_doc_base_columns(&table.name, &columns).is_err() {
                 return Ok(false);
             }
-            for column in &table.columns {
-                if !columns.contains(column.name.as_str()) {
-                    return Ok(false);
-                }
+            let mut expected = ["id", "identity_key", "creation_time_ms", "data"]
+                .into_iter()
+                .collect::<FxHashSet<_>>();
+            expected.extend(table.columns.iter().map(|column| column.name.as_str()));
+            if columns.iter().map(String::as_str).collect::<FxHashSet<_>>() != expected {
+                return Ok(false);
             }
             if self.read_doc_indexes_unlocked(table)? != expected_doc_indexes(table) {
                 return Ok(false);
@@ -981,7 +1005,7 @@ impl EmbeddedStore {
     pub fn doc_version_read(&self, table: &str, id: &str) -> Result<Option<i64>, StorageError> {
         validate_ident(table)?;
         let _guard = lock(&self.operation_lock);
-        Ok(self.read_projection_unlocked(table, id)?.and_then(|state| {
+        Ok(self.remote_doc_read_unlocked(table, id)?.and_then(|state| {
             state
                 .logical_clock
                 .is_finite()
@@ -1132,7 +1156,7 @@ impl EmbeddedStore {
     ) -> Result<std::collections::BTreeMap<String, i64>, StorageError> {
         let mut versions = std::collections::BTreeMap::new();
         for local_id in local_ids {
-            if let Some(state) = self.projection_read(table, local_id)? {
+            if let Some(state) = self.remote_doc_read(table, local_id)? {
                 if state.logical_clock.is_finite() {
                     versions.insert(local_id.clone(), state.logical_clock as i64);
                 }
@@ -1177,16 +1201,16 @@ impl EmbeddedStore {
         clippy::needless_pass_by_value,
         reason = "FFI callers transfer the decoded write into this transaction boundary"
     )]
-    pub fn commit_one_upsert(
+    pub fn commit_one_doc_write(
         &self,
-        upsert: UpsertIn,
+        doc_write: DocWrite,
         options: &CommitOptions,
         fresh: bool,
         data_only: bool,
     ) -> Result<CommitResult, StorageError> {
         let _guard = lock(&self.operation_lock);
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let written = self.commit_one_upsert_unlocked(&upsert, options, fresh, data_only);
+        let written = self.commit_one_doc_write_unlocked(&doc_write, options, fresh, data_only);
 
         match written {
             Ok(result) => match self.driver.execute(sql::COMMIT, Vec::new()) {
@@ -1212,7 +1236,7 @@ impl EmbeddedStore {
         clippy::needless_pass_by_value,
         reason = "the zero-copy FFI entry mirrors the fixed encoded write wire shape"
     )]
-    pub fn commit_one_upsert_encoded(
+    pub fn commit_one_doc_write_encoded(
         &self,
         table: String,
         id: String,
@@ -1225,7 +1249,7 @@ impl EmbeddedStore {
     ) -> Result<CommitResult, StorageError> {
         let _guard = lock(&self.operation_lock);
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let written = self.commit_one_upsert_encoded_unlocked(
+        let written = self.commit_one_doc_write_encoded_unlocked(
             &table,
             &id,
             &data,
@@ -1255,35 +1279,35 @@ impl EmbeddedStore {
         }
     }
 
-    fn commit_one_upsert_unlocked(
+    fn commit_one_doc_write_unlocked(
         &self,
-        upsert: &UpsertIn,
+        doc_write: &DocWrite,
         options: &CommitOptions,
         fresh: bool,
         data_only: bool,
     ) -> Result<CommitResult, StorageError> {
-        let table = self.runtime(&upsert.table)?;
-        self.write_upsert_unlocked(upsert, &table, data_only)?;
+        let table = self.runtime(&doc_write.table)?;
+        self.doc_write_unlocked(doc_write, &table, data_only)?;
         let changes = if options.includes_changes() {
             vec![RowChange {
-                op: RowChangeOp::Upsert,
-                table: upsert.table.clone(),
-                id: upsert.id.clone(),
-                row: Some(materialized_upsert(upsert)?),
+                op: RowChangeOp::Write,
+                table: doc_write.table.clone(),
+                id: doc_write.id.clone(),
+                row: Some(doc_write_row(doc_write)?),
             }]
         } else {
             Vec::new()
         };
-        let changed_tables = vec![upsert.table.clone()];
+        let changed_tables = vec![doc_write.table.clone()];
         let result = self.write_commit_unlocked(changed_tables, changes, options)?;
         if options.is_local() {
             let logical_clock = lock(&self.clock).now(wall_ms()?);
             self.write_dirty_head_unlocked(
                 &RowKey {
-                    document_id: upsert.id.clone(),
-                    table: upsert.table.clone(),
+                    document_id: doc_write.id.clone(),
+                    table: doc_write.table.clone(),
                 },
-                RowChangeOp::Upsert,
+                RowChangeOp::Write,
                 result.commit_seq,
                 logical_clock as i64,
                 logical_clock,
@@ -1294,7 +1318,7 @@ impl EmbeddedStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn commit_one_upsert_encoded_unlocked(
+    fn commit_one_doc_write_encoded_unlocked(
         &self,
         table_name: &str,
         id: &str,
@@ -1306,7 +1330,7 @@ impl EmbeddedStore {
         data_only: bool,
     ) -> Result<CommitResult, StorageError> {
         let table = self.runtime(table_name)?;
-        self.write_upsert_encoded_unlocked(
+        self.doc_write_encoded_unlocked(
             table_name,
             id,
             data,
@@ -1317,7 +1341,7 @@ impl EmbeddedStore {
         )?;
         let changes = if options.includes_changes() {
             vec![RowChange {
-                op: RowChangeOp::Upsert,
+                op: RowChangeOp::Write,
                 table: table_name.to_owned(),
                 id: id.to_owned(),
                 row: Some(materialized_row(id, creation_time, data)?),
@@ -1333,7 +1357,7 @@ impl EmbeddedStore {
                     document_id: id.to_owned(),
                     table: table_name.to_owned(),
                 },
-                RowChangeOp::Upsert,
+                RowChangeOp::Write,
                 result.commit_seq,
                 logical_clock as i64,
                 logical_clock,
@@ -1368,21 +1392,21 @@ impl EmbeddedStore {
             FxHashMap::default()
         };
 
-        if batch.deletes.is_empty() && batch.upserts.len() == 1 {
-            let upsert = &batch.upserts[0];
-            let table = self.runtime(&upsert.table)?;
-            let data_only = is_data_only_id(&batch.data_only_ids, &upsert.table, &upsert.id);
-            self.write_upsert_unlocked(upsert, &table, data_only)?;
-        } else if batch.upserts.is_empty() && batch.deletes.len() == 1 {
+        if batch.deletes.is_empty() && batch.doc_writes.len() == 1 {
+            let doc_write = &batch.doc_writes[0];
+            let table = self.runtime(&doc_write.table)?;
+            let data_only = is_data_only_id(&batch.data_only_ids, &doc_write.table, &doc_write.id);
+            self.doc_write_unlocked(doc_write, &table, data_only)?;
+        } else if batch.doc_writes.is_empty() && batch.deletes.len() == 1 {
             let delete = &batch.deletes[0];
             let table = self.runtime(&delete.table)?;
             self.write_delete_unlocked(delete, &table)?;
         } else {
-            let mut upsert_tables: FxHashMap<String, Arc<TableRuntime>> = FxHashMap::default();
-            for up in &batch.upserts {
-                if !upsert_tables.contains_key(&up.table) {
+            let mut doc_write_tables: FxHashMap<String, Arc<TableRuntime>> = FxHashMap::default();
+            for up in &batch.doc_writes {
+                if !doc_write_tables.contains_key(&up.table) {
                     let table = self.runtime(&up.table)?;
-                    upsert_tables.insert(up.table.clone(), table);
+                    doc_write_tables.insert(up.table.clone(), table);
                 }
             }
             let mut delete_tables: FxHashMap<String, Arc<TableRuntime>> = FxHashMap::default();
@@ -1393,10 +1417,11 @@ impl EmbeddedStore {
                 }
             }
 
-            for upsert in &batch.upserts {
-                let table = &upsert_tables[&upsert.table];
-                let data_only = is_data_only_id(&batch.data_only_ids, &upsert.table, &upsert.id);
-                self.write_upsert_unlocked(upsert, table, data_only)?;
+            for doc_write in &batch.doc_writes {
+                let table = &doc_write_tables[&doc_write.table];
+                let data_only =
+                    is_data_only_id(&batch.data_only_ids, &doc_write.table, &doc_write.id);
+                self.doc_write_unlocked(doc_write, table, data_only)?;
             }
             for delete in &batch.deletes {
                 let table = &delete_tables[&delete.table];
@@ -1579,9 +1604,9 @@ impl EmbeddedStore {
         )
     }
 
-    fn write_upsert_unlocked(
+    fn doc_write_unlocked(
         &self,
-        upsert: &UpsertIn,
+        doc_write: &DocWrite,
         table: &TableRuntime,
         data_only: bool,
     ) -> Result<(), StorageError> {
@@ -1589,31 +1614,31 @@ impl EmbeddedStore {
             self.driver.execute(
                 &table.update_data_sql,
                 [
-                    text_value(upsert.data.clone()),
+                    text_value(doc_write.data.clone()),
                     text_value(self.identity_key.clone()),
-                    text_value(upsert.id.clone()),
+                    text_value(doc_write.id.clone()),
                 ],
             )?;
             if self.driver.changes() == 0 {
                 return Err(StorageError::Unsatisfiable(format!(
                     "data-only update target was missing: {} {}",
-                    upsert.table, upsert.id
+                    doc_write.table, doc_write.id
                 )));
             }
             return Ok(());
         }
         let mut params = Vec::with_capacity(4 + table.def.columns.len());
-        params.push(text_value(upsert.id.clone()));
+        params.push(text_value(doc_write.id.clone()));
         params.push(text_value(self.identity_key.clone()));
-        params.push(Value::from_f64(upsert.creation_time));
-        params.push(text_value(upsert.data.clone()));
-        if cols_are_in_table_order(upsert, table) {
-            for (_, value) in &upsert.cols {
+        params.push(Value::from_f64(doc_write.creation_time));
+        params.push(text_value(doc_write.data.clone()));
+        if cols_are_in_table_order(doc_write, table) {
+            for (_, value) in &doc_write.cols {
                 params.push(Value::Blob(value.encode_key()));
             }
         } else {
             let mut cols = vec![ColValue::Undefined; table.def.columns.len()];
-            for (name, value) in &upsert.cols {
+            for (name, value) in &doc_write.cols {
                 if let Some(&index) = table.column_positions.get(name) {
                     cols[index] = value.clone();
                 }
@@ -1622,11 +1647,11 @@ impl EmbeddedStore {
                 params.push(Value::Blob(value.encode_key()));
             }
         }
-        self.driver.execute(&table.upsert_sql, params)
+        self.driver.execute(&table.doc_write_sql, params)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn write_upsert_encoded_unlocked(
+    fn doc_write_encoded_unlocked(
         &self,
         table_name: &str,
         id: &str,
@@ -1667,7 +1692,7 @@ impl EmbeddedStore {
         for value in encoded_cols {
             params.push(Value::Blob(value.clone()));
         }
-        self.driver.execute(&table.upsert_sql, params)
+        self.driver.execute(&table.doc_write_sql, params)
     }
 
     fn write_delete_unlocked(
@@ -1741,9 +1766,9 @@ impl EmbeddedStore {
     }
 
     /// Delete ledger rows at or below `up_to_seq`, a consumer watermark. The newest commit row
-    /// is always retained so `commit_seq` stays monotonic across the prune; mutations that never
+    /// is always retained so `commit_seq` stays monotonic across deletion; mutations that never
     /// committed (accepted/failed) are never touched. Remote delivery can pass its delivered
-    /// watermark as `up_to_seq`; this method remains a generic consumer-watermark prune.
+    /// watermark as `up_to_seq`; this method remains a generic consumer-watermark deletion.
     pub fn ledger_delete(&self, up_to_seq: i64) -> Result<DeleteResult, StorageError> {
         let _guard = lock(&self.operation_lock);
         let max_seq = self
@@ -1784,14 +1809,14 @@ impl EmbeddedStore {
         })
     }
 
-    pub fn remote_read_cursor(&self, subscription: &str) -> Result<Option<String>, StorageError> {
+    pub fn remote_cursor_read(&self, subscription: &str) -> Result<Option<String>, StorageError> {
         let _guard = lock(&self.operation_lock);
         self.driver
             .run_row(
                 sql::read_remote_cursor(),
                 vec![
                     text_value(self.identity_key.clone()),
-                    text_value(remote_pull_cursor_key(subscription)),
+                    text_value(remote_cursor_key_encode(subscription)),
                 ],
                 |row| optional_text_at(row, 0),
             )
@@ -1806,7 +1831,7 @@ impl EmbeddedStore {
                 sql::remote_progress_has(),
                 vec![
                     text_value(self.identity_key.clone()),
-                    text_value(format!("{REMOTE_PULL_CURSOR_PREFIX}%")),
+                    text_value(format!("{REMOTE_CURSOR_PREFIX}%")),
                 ],
                 |_row| Ok(()),
             )?
@@ -1912,22 +1937,56 @@ impl EmbeddedStore {
         Ok(envelopes)
     }
 
+    /// Exact durable work counts used by the remote actor's convergence snapshot.
+    pub fn remote_pending_read(&self) -> Result<RemotePending, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let range = |start: &str, end: &str| {
+            self.driver
+                .run_row(
+                    sql::read_remote_pending(),
+                    vec![
+                        text_value(self.identity_key.clone()),
+                        text_value(start.to_owned()),
+                        text_value(end.to_owned()),
+                    ],
+                    |row| int_at(row, 0),
+                )
+                .map(|value| value.unwrap_or(0).max(0) as usize)
+        };
+        let mutations = range(REMOTE_PUSH_ENVELOPE_PREFIX, REMOTE_PUSH_ENVELOPE_PREFIX_END)?;
+        let settlements = range(REMOTE_RECEIPT_PREFIX, REMOTE_RECEIPT_PREFIX_END)?;
+        let uploads = self
+            .driver
+            .run_row(
+                sql::read_upload_pending(),
+                vec![text_value(self.identity_key.clone())],
+                |row| int_at(row, 0),
+            )?
+            .unwrap_or(0)
+            .max(0) as usize;
+        Ok(RemotePending {
+            mutations,
+            settlements,
+            uploads,
+        })
+    }
+
     /// Apply every local consequence of one terminal hosted push verdict in one transaction.
-    pub fn remote_push_settle(
+    pub fn remote_settlement_write(
         &self,
-        settlement: &RemotePushSettlement,
-    ) -> Result<RemotePushSettlementResult, StorageError> {
+        settlement: &RemoteSettlementWrite,
+    ) -> Result<RemoteSettlementWriteResult, StorageError> {
         self.validate_remote_push_settlement(settlement)?;
         let _guard = lock(&self.operation_lock);
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let written = self.remote_push_settle_unlocked(settlement);
+        let written = self.remote_settlement_write_unlocked(settlement);
         match written {
             Ok(result) => match self.driver.execute(sql::COMMIT, Vec::new()) {
                 Ok(()) => {
                     self.observe_commit_results(&result.projection.committed);
                     let projections = match &settlement.outcome {
-                        RemotePushSettlementOutcome::Applied { projections, .. }
-                        | RemotePushSettlementOutcome::Rejected { projections, .. } => projections,
+                        RemoteSettlementOutcome::Applied { projections, .. }
+                        | RemoteSettlementOutcome::Rejected { projections, .. } => projections,
                     };
                     self.observe_authoritative_clocks(projections);
                     Ok(result)
@@ -1944,13 +2003,13 @@ impl EmbeddedStore {
         }
     }
 
-    fn remote_push_settle_unlocked(
+    fn remote_settlement_write_unlocked(
         &self,
-        settlement: &RemotePushSettlement,
-    ) -> Result<RemotePushSettlementResult, StorageError> {
+        settlement: &RemoteSettlementWrite,
+    ) -> Result<RemoteSettlementWriteResult, StorageError> {
         let commit_seq = self.remote_push_commit_seq_unlocked(settlement)?;
         let projection = match &settlement.outcome {
-            RemotePushSettlementOutcome::Applied {
+            RemoteSettlementOutcome::Applied {
                 ids,
                 schedules,
                 projections,
@@ -1963,7 +2022,7 @@ impl EmbeddedStore {
                 projections,
                 crdt,
             )?,
-            RemotePushSettlementOutcome::Rejected {
+            RemoteSettlementOutcome::Rejected {
                 schedules,
                 targets,
                 projections,
@@ -1975,12 +2034,12 @@ impl EmbeddedStore {
                 projections,
             )?,
         };
-        Ok(RemotePushSettlementResult { projection })
+        Ok(RemoteSettlementWriteResult { projection })
     }
 
     fn remote_push_commit_seq_unlocked(
         &self,
-        settlement: &RemotePushSettlement,
+        settlement: &RemoteSettlementWrite,
     ) -> Result<i64, StorageError> {
         let watermark = format!("{REMOTE_PUSH_ENVELOPE_PREFIX}{}", settlement.mutation_id);
         let commit_seq = self
@@ -2007,7 +2066,7 @@ impl EmbeddedStore {
 
     fn remote_push_apply_unlocked(
         &self,
-        settlement: &RemotePushSettlement,
+        settlement: &RemoteSettlementWrite,
         commit_seq: i64,
         ids: &[crate::types::RemoteIdMapping],
         schedules: &[crate::types::RemoteScheduleMapping],
@@ -2036,7 +2095,7 @@ impl EmbeddedStore {
 
     fn remote_push_reject_unlocked(
         &self,
-        settlement: &RemotePushSettlement,
+        settlement: &RemoteSettlementWrite,
         commit_seq: i64,
         schedules: &[String],
         targets: &[crate::types::RemoteRowTarget],
@@ -2052,6 +2111,7 @@ impl EmbeddedStore {
                 &target.table,
                 &target.local_document_id,
                 target.server_rev_id.as_deref(),
+                target.retain,
                 settlement.expected_commit_seq,
                 settlement.now_ms,
             )?;
@@ -2132,7 +2192,7 @@ impl EmbeddedStore {
             sql::write_remote_cursor(),
             vec![
                 text_value(self.identity_key.clone()),
-                text_value(format!("{REMOTE_SETTLEMENT_ACK_PREFIX}{op_id}")),
+                text_value(format!("{REMOTE_RECEIPT_PREFIX}{op_id}")),
                 Value::from_i64(commit_seq),
                 text_value(op_id.to_owned()),
                 Value::from_i64(0),
@@ -2148,10 +2208,7 @@ impl EmbeddedStore {
         Ok(())
     }
 
-    pub fn remote_settlement_ack_read(
-        &self,
-        num_items: usize,
-    ) -> Result<Vec<String>, StorageError> {
+    pub fn remote_receipt_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         if num_items == 0 {
             return Ok(Vec::new());
         }
@@ -2161,8 +2218,8 @@ impl EmbeddedStore {
             sql::read_remote_push_envelopes(),
             vec![
                 text_value(self.identity_key.clone()),
-                text_value(REMOTE_SETTLEMENT_ACK_PREFIX.to_owned()),
-                text_value(REMOTE_SETTLEMENT_ACK_PREFIX_END.to_owned()),
+                text_value(REMOTE_RECEIPT_PREFIX.to_owned()),
+                text_value(REMOTE_RECEIPT_PREFIX_END.to_owned()),
             ],
             |row| {
                 mutation_ids.push(text_at(row, 1)?);
@@ -2176,17 +2233,14 @@ impl EmbeddedStore {
         Ok(mutation_ids)
     }
 
-    pub fn remote_settlement_ack_complete(
-        &self,
-        mutation_ids: &[String],
-    ) -> Result<(), StorageError> {
+    pub fn remote_receipt_delete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
         for mutation_id in mutation_ids {
             self.driver.execute(
                 sql::delete_remote_cursor(),
                 vec![
                     text_value(self.identity_key.clone()),
-                    text_value(format!("{REMOTE_SETTLEMENT_ACK_PREFIX}{mutation_id}")),
+                    text_value(format!("{REMOTE_RECEIPT_PREFIX}{mutation_id}")),
                 ],
             )?;
         }
@@ -2194,7 +2248,7 @@ impl EmbeddedStore {
     }
 
     #[cfg(any(test, feature = "testkit"))]
-    pub fn remote_write_cursor(
+    pub fn remote_cursor_write(
         &self,
         subscription: &str,
         cursor: Option<String>,
@@ -2205,7 +2259,7 @@ impl EmbeddedStore {
             sql::write_remote_cursor(),
             vec![
                 text_value(self.identity_key.clone()),
-                text_value(remote_pull_cursor_key(subscription)),
+                text_value(remote_cursor_key_encode(subscription)),
                 Value::from_i64(0),
                 cursor.map_or(Value::Null, text_value),
                 Value::from_i64(now_ms),
@@ -2278,7 +2332,7 @@ impl EmbeddedStore {
         )
     }
 
-    /// Write (upsert) one retained authored-result entry, returning `true` iff a durable write
+    /// Write (doc_write) one retained authored-result entry, returning `true` iff a durable write
     /// occurred (§3/§5): the zero-write fast path skips when the stored `skeleton_hash` already
     /// equals the incoming one. The unlocked variant lets S3 call it inside the pull-page transaction.
     pub fn result_write(&self, entry: &ResultEntry) -> Result<bool, StorageError> {
@@ -2324,10 +2378,10 @@ impl EmbeddedStore {
             .execute(sql::delete_result(), vec![text_value(key.to_owned())])
     }
 
-    /// Sweep the identity's retained-result entries (§6), returning the count deleted: an entry goes
+    /// Delete the identity's retained-result entries (§6), returning the count deleted: an entry goes
     /// if its key is absent from the live-watch `keep` set (edge-orphan) OR its runtime identity no
     /// longer matches the current `schema_hash`/`module_hash` (release rotation).
-    pub fn result_delete_stale(
+    pub fn result_stale_delete(
         &self,
         keep: &FxHashSet<String>,
         schema_hash: &str,
@@ -2336,7 +2390,7 @@ impl EmbeddedStore {
         let _guard = lock(&self.operation_lock);
         let mut stale = Vec::new();
         self.driver.run_rows(
-            sql::read_result_delete_stale(),
+            sql::result_stale_read(),
             vec![text_value(self.identity_key.clone())],
             |row| {
                 let key = text_at(row, 0)?;
@@ -2401,10 +2455,10 @@ impl EmbeddedStore {
         self.read_rev_unlocked(key)
     }
 
-    /// Apply a local CRDT intent to one collaborative field (§8-A). Reads the field's persisted
+    /// Apply a local CRDT intent to one collaborative field (§8-A). Reads the field's stored
     /// checkpoint+log, applies the intent, re-persists, and returns the Loro update delta the driver
     /// carries verbatim on the one push (`PushCall.crdt_ops`).
-    pub fn crdt_field_apply(
+    pub fn crdt_field_intent_write(
         &self,
         table: &str,
         id: &str,
@@ -2416,15 +2470,24 @@ impl EmbeddedStore {
         let _guard = lock(&self.operation_lock);
         let peer_id = self.ensure_peer_id_unlocked(now_ms)?;
         let seed = self.read_plain_field_value_unlocked(table, id, field)?;
-        self.crdt_field_apply_unlocked(table, id, field, kind, op, peer_id, now_ms, seed.as_ref())
-            .map(|(update, _)| update)
+        self.crdt_field_intent_write_unlocked(
+            table,
+            id,
+            field,
+            kind,
+            op,
+            peer_id,
+            now_ms,
+            seed.as_ref(),
+        )
+        .map(|(update, _)| update)
     }
 
     #[allow(
         clippy::too_many_arguments,
         reason = "the parameters are the complete identity and causal state of one CRDT field write"
     )]
-    fn crdt_field_apply_unlocked(
+    fn crdt_field_intent_write_unlocked(
         &self,
         table: &str,
         id: &str,
@@ -2439,7 +2502,7 @@ impl EmbeddedStore {
         let first_touch = prev.is_none();
         let seed = if first_touch { seed } else { None };
         let (state, update) =
-            crate::crdt::crdt_field_apply(prev.as_ref(), kind, op, peer_id, seed)?;
+            crate::crdt::crdt_field_intent_write(prev.as_ref(), kind, op, peer_id, seed)?;
         self.write_crdt_field_state_unlocked(table, id, field, kind, &state, now_ms)?;
         let checkpoint = if first_touch {
             let bytes = crate::crdt::crdt_field_snapshot(&state)?;
@@ -2457,7 +2520,7 @@ impl EmbeddedStore {
     }
 
     /// Snapshot each first-touch CRDT field's PRE-batch plain value so a seed reflects the value
-    /// before this commit's own upsert materialized the edit into the row (§8-A). A field that
+    /// before this commit's own doc_write materialized the edit into the row (§8-A). A field that
     /// already has Loro state is not first-touch and needs no seed; the seed for it stays absent.
     fn pre_capture_crdt_seeds_unlocked(
         &self,
@@ -2505,7 +2568,7 @@ impl EmbeddedStore {
 
     /// Merge a remote CRDT update (a pulled `crdt` `RowChange`, §3) into one field, re-persist, and
     /// return the merged materialized value so the caller writes it into the local replica column.
-    pub fn crdt_field_merge(
+    pub fn crdt_field_update_write(
         &self,
         table: &str,
         id: &str,
@@ -2515,10 +2578,10 @@ impl EmbeddedStore {
         now_ms: i64,
     ) -> Result<serde_json::Value, StorageError> {
         let _guard = lock(&self.operation_lock);
-        self.crdt_field_merge_unlocked(table, id, field, kind, update, now_ms)
+        self.crdt_field_update_write_unlocked(table, id, field, kind, update, now_ms)
     }
 
-    fn crdt_field_merge_unlocked(
+    fn crdt_field_update_write_unlocked(
         &self,
         table: &str,
         id: &str,
@@ -2528,7 +2591,7 @@ impl EmbeddedStore {
         now_ms: i64,
     ) -> Result<serde_json::Value, StorageError> {
         let prev = self.read_crdt_field_state_unlocked(table, id, field)?;
-        let state = crate::crdt::crdt_field_merge(prev.as_ref(), update)?;
+        let state = crate::crdt::crdt_field_update_write(prev.as_ref(), update)?;
         self.write_crdt_field_state_unlocked(table, id, field, kind, &state, now_ms)?;
         crate::crdt::crdt_field_value(&state, kind)
     }
@@ -2569,7 +2632,7 @@ impl EmbeddedStore {
                 )));
             };
             let seed = seeds.get(&(table.clone(), id.clone(), op.field.clone()));
-            let (update, checkpoint) = self.crdt_field_apply_unlocked(
+            let (update, checkpoint) = self.crdt_field_intent_write_unlocked(
                 table,
                 id,
                 &op.field,
@@ -2689,7 +2752,7 @@ impl EmbeddedStore {
 
     /// Read opaque CRDT snapshots after applying an in-memory prefix of local operations.
     ///
-    /// The prefix is never persisted here. This lets a revision captured inside a mutation refer
+    /// The prefix is never stored here. This lets a revision captured inside a mutation refer
     /// to the exact logical state at that point in the transaction without splitting its commit.
     pub fn crdt_snapshot_read_with_ops(
         &self,
@@ -2715,7 +2778,7 @@ impl EmbeddedStore {
                 } else {
                     None
                 };
-                let (next, _) = crate::crdt::crdt_field_apply(
+                let (next, _) = crate::crdt::crdt_field_intent_write(
                     state.as_ref(),
                     field.kind,
                     &op.operation,
@@ -2817,21 +2880,21 @@ impl EmbeddedStore {
         Ok(())
     }
 
-    pub fn projection_read(
+    pub fn remote_doc_read(
         &self,
         table: &str,
         local_document_id: &str,
     ) -> Result<Option<RowHead>, StorageError> {
         validate_ident(table)?;
         let _guard = lock(&self.operation_lock);
-        self.read_projection_unlocked(table, local_document_id)
+        self.remote_doc_read_unlocked(table, local_document_id)
     }
 
     #[cfg(any(test, feature = "testkit"))]
-    pub fn projection_write(&self, state: &RowHead) -> Result<(), StorageError> {
+    pub fn remote_doc_write(&self, state: &RowHead) -> Result<(), StorageError> {
         validate_ident(&state.table)?;
         let _guard = lock(&self.operation_lock);
-        self.projection_write_unlocked(state)
+        self.remote_doc_write_unlocked(state)
     }
 
     fn remote_settle_rejected_dirty_unlocked(
@@ -2839,6 +2902,7 @@ impl EmbeddedStore {
         table: &str,
         local_id: &str,
         server_rev_id: Option<&str>,
+        retain: bool,
         expected_commit_seq: i64,
         now_ms: i64,
     ) -> Result<(Option<crate::types::RetainedRevision>, Option<CommitResult>), StorageError> {
@@ -2852,7 +2916,7 @@ impl EmbeddedStore {
         let Some(dirty) = self.read_pending_local_edit_unlocked(table, local_id)? else {
             return Ok((None, None));
         };
-        let projection = self.read_projection_unlocked(table, local_id)?;
+        let projection = self.remote_doc_read_unlocked(table, local_id)?;
         let accepted_row = projection
             .as_ref()
             .and_then(|state| state.server_row.clone());
@@ -2862,11 +2926,11 @@ impl EmbeddedStore {
         let server_document_id = projection
             .as_ref()
             .map(|state| state.server_document_id.clone());
-        self.materialize_dirty_head_for_row_unlocked(table, local_id)?;
         let base_root_id = dirty.base_root_id.or_else(|| current_root_id.clone());
         let base_node_id = dirty.base_node_id;
-        let reroot = self
-            .archive_current_rev_unlocked(
+        let reroot = if retain {
+            self.materialize_dirty_head_for_row_unlocked(table, local_id)?;
+            self.archive_current_rev_unlocked(
                 table,
                 local_id,
                 ArchiveServerIds {
@@ -2888,10 +2952,13 @@ impl EmbeddedStore {
                 base_node_id,
                 attached_node_id: None,
                 current_root_id,
-            });
+            })
+        } else {
+            None
+        };
         let batch = match accepted_row.as_ref() {
             Some(row) => WriteBatch {
-                upserts: vec![remote_projection_upsert(
+                doc_writes: vec![remote_doc_encode(
                     self.def(table)?.as_ref(),
                     local_id,
                     row,
@@ -2931,7 +2998,7 @@ impl EmbeddedStore {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_remote_projection_records_unlocked(
+    fn remote_doc_page_write_unlocked(
         &self,
         records: &[AuthoritativeRow],
     ) -> Result<AuthoritativeApplyResult, StorageError> {
@@ -2956,7 +3023,7 @@ impl EmbeddedStore {
                     &mut reroots,
                 )?;
             }
-            let existing_projection = self.read_projection_unlocked(&record.table, &local_id)?;
+            let existing_projection = self.remote_doc_read_unlocked(&record.table, &local_id)?;
             let dirty_current = self.read_pending_local_edit_unlocked(&record.table, &local_id)?;
             let remote_matches_dirty_base = dirty_current.as_ref().is_some_and(|dirty| {
                 dirty.base_projection_hash.as_deref() == Some(record.plain_hash.as_str())
@@ -2976,7 +3043,7 @@ impl EmbeddedStore {
                     continue;
                 }
                 RecordOrder::Known => {
-                    self.projection_write_unlocked(&RowHead {
+                    self.remote_doc_write_unlocked(&RowHead {
                         current_rev_id: existing_projection.as_ref().map_or_else(
                             || "main".to_owned(),
                             |state| state.current_rev_id.clone(),
@@ -3007,7 +3074,7 @@ impl EmbeddedStore {
             }
             let batch = match &record.row {
                 Some(row) => WriteBatch {
-                    upserts: vec![remote_projection_upsert(
+                    doc_writes: vec![remote_doc_encode(
                         &table,
                         &local_id,
                         row,
@@ -3036,7 +3103,7 @@ impl EmbeddedStore {
                         .collect(),
                 },
                 None => WriteBatch {
-                    upserts: Vec::new(),
+                    doc_writes: Vec::new(),
                     crdt_ops: vec![],
                     crdt_restores: vec![],
                     fresh_ids: vec![],
@@ -3104,7 +3171,7 @@ impl EmbeddedStore {
                 },
             )?;
             if record.row.is_some() {
-                self.projection_write_unlocked(&RowHead {
+                self.remote_doc_write_unlocked(&RowHead {
                     current_rev_id: "main".to_owned(),
                     server_base: Some(record.plain_hash.clone()),
                     server_row: record.row.clone(),
@@ -3159,7 +3226,7 @@ impl EmbeddedStore {
         for member in &current {
             self.def(&member.table)?;
             if self
-                .projection_local_id_by_server_unlocked(&member.table, &member.server_document_id)?
+                .remote_doc_id_read_unlocked(&member.table, &member.server_document_id)?
                 .is_none()
             {
                 return Err(StorageError::Unsatisfiable(format!(
@@ -3195,16 +3262,16 @@ impl EmbeddedStore {
             )?;
         }
 
-        let mut swept = 0;
+        let mut projection_deleted = 0;
         for exited in previous.difference(&current) {
             if retained.contains(exited) || self.membership_row_has_edge_unlocked(exited)? {
                 continue;
             }
             if self.membership_projection_delete_unlocked(exited, now_ms, projection)? {
-                swept += 1;
+                projection_deleted += 1;
             }
         }
-        Ok(swept)
+        Ok(projection_deleted)
     }
 
     fn membership_row_has_edge_unlocked(
@@ -3225,7 +3292,7 @@ impl EmbeddedStore {
             .is_some())
     }
 
-    fn projection_local_id_by_server_unlocked(
+    fn remote_doc_id_read_unlocked(
         &self,
         table: &str,
         server_document_id: &str,
@@ -3248,7 +3315,7 @@ impl EmbeddedStore {
         projection: &mut AuthoritativeApplyResult,
     ) -> Result<bool, StorageError> {
         let Some(local_id) =
-            self.projection_local_id_by_server_unlocked(&member.table, &member.server_document_id)?
+            self.remote_doc_id_read_unlocked(&member.table, &member.server_document_id)?
         else {
             return Ok(false);
         };
@@ -3296,7 +3363,7 @@ impl EmbeddedStore {
         Ok(true)
     }
 
-    fn validate_remote_pull_unlocked(&self, pull: &RemotePull) -> Result<(), StorageError> {
+    fn validate_remote_pull_unlocked(&self, pull: &RemotePageWrite) -> Result<(), StorageError> {
         let mut members = FxHashSet::default();
         for member in &pull.members {
             self.def(&member.table)?;
@@ -3385,7 +3452,7 @@ impl EmbeddedStore {
 
     fn validate_remote_push_settlement(
         &self,
-        settlement: &RemotePushSettlement,
+        settlement: &RemoteSettlementWrite,
     ) -> Result<(), StorageError> {
         if settlement.mutation_id.is_empty() || settlement.expected_commit_seq < 0 {
             return Err(StorageError::Unsatisfiable(
@@ -3393,13 +3460,13 @@ impl EmbeddedStore {
             ));
         }
         match &settlement.outcome {
-            RemotePushSettlementOutcome::Applied {
+            RemoteSettlementOutcome::Applied {
                 ids,
                 schedules,
                 projections,
                 crdt,
             } => self.validate_remote_push_applied(ids, schedules, projections, crdt)?,
-            RemotePushSettlementOutcome::Rejected {
+            RemoteSettlementOutcome::Rejected {
                 schedules,
                 targets,
                 projections,
@@ -3515,7 +3582,10 @@ impl EmbeddedStore {
         }
     }
 
-    pub fn remote_pull_page(&self, pull: &RemotePull) -> Result<RemotePullResult, StorageError> {
+    pub fn remote_page_write(
+        &self,
+        pull: &RemotePageWrite,
+    ) -> Result<RemotePageWriteResult, StorageError> {
         if pull.subscription.is_empty() {
             return Err(StorageError::Unsatisfiable(
                 "remote pull subscription must not be empty".to_owned(),
@@ -3524,13 +3594,12 @@ impl EmbeddedStore {
         let _guard = lock(&self.operation_lock);
         self.validate_remote_pull_unlocked(pull)?;
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let applied: Result<RemotePullResult, StorageError> = (|| {
+        let applied: Result<RemotePageWriteResult, StorageError> = (|| {
             self.materialize_dirty_heads_in_tx_unlocked()?;
-            let mut projection =
-                self.apply_remote_projection_records_unlocked(&pull.projections)?;
+            let mut projection = self.remote_doc_page_write_unlocked(&pull.projections)?;
 
             let retained = result_disclosed_rows(pull.result.as_deref());
-            let swept = self.membership_snapshot_write_unlocked(
+            let projection_deleted = self.membership_snapshot_write_unlocked(
                 &pull.subscription,
                 &pull.members,
                 &retained,
@@ -3554,7 +3623,7 @@ impl EmbeddedStore {
                 sql::write_remote_cursor(),
                 vec![
                     text_value(self.identity_key.clone()),
-                    text_value(remote_pull_cursor_key(&pull.subscription)),
+                    text_value(remote_cursor_key_encode(&pull.subscription)),
                     Value::from_i64(0),
                     pull.cursor.clone().map_or(Value::Null, text_value),
                     Value::from_i64(pull.received_time),
@@ -3566,13 +3635,13 @@ impl EmbeddedStore {
                 _ => None,
             };
 
-            Ok(RemotePullResult {
+            Ok(RemotePageWriteResult {
                 rev_write: RevWriteResult {
                     duplicates: 0,
                     written: 0,
                 },
                 projection,
-                swept,
+                projection_deleted,
                 crdt,
                 result_changed,
             })
@@ -3602,16 +3671,16 @@ impl EmbeddedStore {
         &self,
         subscription: &str,
         now_ms: i64,
-    ) -> Result<RemotePullResult, StorageError> {
+    ) -> Result<RemotePageWriteResult, StorageError> {
         let _guard = lock(&self.operation_lock);
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let removed: Result<RemotePullResult, StorageError> = (|| {
+        let removed: Result<RemotePageWriteResult, StorageError> = (|| {
             self.materialize_dirty_heads_in_tx_unlocked()?;
             let mut projection = AuthoritativeApplyResult {
                 committed: Vec::new(),
                 reroots: Vec::new(),
             };
-            let swept = self.membership_snapshot_write_unlocked(
+            let projection_deleted = self.membership_snapshot_write_unlocked(
                 subscription,
                 &[],
                 &FxHashSet::default(),
@@ -3622,16 +3691,16 @@ impl EmbeddedStore {
                 sql::delete_remote_cursor(),
                 vec![
                     text_value(self.identity_key.clone()),
-                    text_value(remote_pull_cursor_key(subscription)),
+                    text_value(remote_cursor_key_encode(subscription)),
                 ],
             )?;
-            Ok(RemotePullResult {
+            Ok(RemotePageWriteResult {
                 rev_write: RevWriteResult {
                     duplicates: 0,
                     written: 0,
                 },
                 projection,
-                swept,
+                projection_deleted,
                 crdt: Vec::new(),
                 result_changed: None,
             })
@@ -3674,7 +3743,7 @@ impl EmbeddedStore {
                 .read_dirty_head_unlocked(&projection.table, &local_id)?
                 .is_some_and(|head| head.updated_commit_seq != expected_commit_seq)
             {
-                self.projection_server_base_write_unlocked(projection, &local_id)?;
+                self.remote_doc_base_write_unlocked(projection, &local_id)?;
                 continue;
             }
             if self
@@ -3685,17 +3754,17 @@ impl EmbeddedStore {
             }
             applicable.push(projection.clone());
         }
-        self.apply_remote_projection_records_unlocked(&applicable)
+        self.remote_doc_page_write_unlocked(&applicable)
     }
 
-    fn projection_server_base_write_unlocked(
+    fn remote_doc_base_write_unlocked(
         &self,
         record: &AuthoritativeRow,
         local_id: &str,
     ) -> Result<(), StorageError> {
-        let existing = self.read_projection_unlocked(&record.table, local_id)?;
+        let existing = self.remote_doc_read_unlocked(&record.table, local_id)?;
         let logical_clock = projection_logical_clock(record, existing.as_ref());
-        self.projection_write_unlocked(&RowHead {
+        self.remote_doc_write_unlocked(&RowHead {
             table: record.table.clone(),
             local_document_id: local_id.to_owned(),
             current_rev_id: existing
@@ -3783,7 +3852,7 @@ impl EmbeddedStore {
         })?;
         let accepted_value = crate::crdt::crdt_field_value(&accepted, change.kind)?;
         let mut projection = self
-            .read_projection_unlocked(&change.table, &local_id)?
+            .remote_doc_read_unlocked(&change.table, &local_id)?
             .ok_or_else(|| {
                 StorageError::Unsatisfiable(
                     "accepted remote CRDT state has no projection metadata".to_owned(),
@@ -3791,22 +3860,21 @@ impl EmbeddedStore {
             })?;
         let base_row = projection.server_row.as_deref().unwrap_or(&row_json);
         projection.server_row = Some(patch_row_field(base_row, &change.field, accepted_value)?);
-        self.projection_write_unlocked(&projection)?;
+        self.remote_doc_write_unlocked(&projection)?;
         let value = crate::crdt::crdt_field_value(&state, change.kind)?;
         let patched = patch_row_field(&row_json, &change.field, value)?;
         if patched == row_json {
             return Ok(None);
         }
         let table = self.runtime(&change.table)?;
-        let upsert = crate::store::helpers::remote_projection_upsert(
-            &table.def, &local_id, &patched, now_ms,
-        )?;
-        self.write_upsert_unlocked(&upsert, &table, false)?;
+        let doc_write =
+            crate::store::helpers::remote_doc_encode(&table.def, &local_id, &patched, now_ms)?;
+        self.doc_write_unlocked(&doc_write, &table, false)?;
         Ok(Some(RowChange {
-            op: RowChangeOp::Upsert,
+            op: RowChangeOp::Write,
             table: change.table.clone(),
             id: local_id,
-            row: Some(crate::store::helpers::materialized_upsert(&upsert)?),
+            row: Some(crate::store::helpers::doc_write_row(&doc_write)?),
         }))
     }
 
@@ -3870,9 +3938,9 @@ impl EmbeddedStore {
     }
 
     /// Fold the WAL into the main database file and truncate it, so the next open replays nothing.
-    pub fn checkpoint(&self) -> Result<(), StorageError> {
+    pub fn wal_write(&self) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
-        self.driver.checkpoint()
+        self.driver.wal_write()
     }
 
     /// Run a `PRAGMA` and return its first integer column, for the memory harness to read back the
@@ -3896,10 +3964,10 @@ impl EmbeddedStore {
         if state.log.is_empty() {
             return self.rev_checkpoint_write_unlocked(state, now_ms);
         }
-        let persisted = self.count_rev_log_unlocked(&state.key)?;
-        if state.log.len() > persisted && self.rev_has_unlocked(&state.key)? {
+        let stored = self.rev_log_count_read_unlocked(&state.key)?;
+        if state.log.len() > stored && self.rev_has_unlocked(&state.key)? {
             self.update_rev_meta_unlocked(&state.key, &state.frontier, now_ms)?;
-            for (seq, delta) in state.log.iter().enumerate().skip(persisted) {
+            for (seq, delta) in state.log.iter().enumerate().skip(stored) {
                 self.rev_log_write_unlocked(&state.key, seq, delta, now_ms)?;
             }
             Ok(())
@@ -3963,11 +4031,11 @@ impl EmbeddedStore {
             .is_some())
     }
 
-    fn count_rev_log_unlocked(&self, key: &RevKey) -> Result<usize, StorageError> {
+    fn rev_log_count_read_unlocked(&self, key: &RevKey) -> Result<usize, StorageError> {
         let count = self
             .driver
             .run_row(
-                sql::count_rev_log(),
+                sql::rev_log_count_read(),
                 vec![
                     text_value(self.identity_key.clone()),
                     text_value(key.row.table.clone()),
@@ -4109,7 +4177,7 @@ impl EmbeddedStore {
         Ok(Some(archive_id))
     }
 
-    fn projection_write_unlocked(&self, state: &RowHead) -> Result<(), StorageError> {
+    fn remote_doc_write_unlocked(&self, state: &RowHead) -> Result<(), StorageError> {
         self.driver.execute(
             sql::write_projection(),
             vec![
@@ -4168,7 +4236,7 @@ impl EmbeddedStore {
         self.rev_delete_current_unlocked(&record.table, stale_id)
     }
 
-    /// Remap cleanup for records that do not adopt: rows left under ids the mapping just detached
+    /// Delete remap records that do not adopt: rows left under ids the mapping just detached
     /// are deleted (the same stale deletes an adopting record's batch carries).
     fn delete_stale_projection_rows_unlocked(
         &self,
@@ -4216,7 +4284,7 @@ impl EmbeddedStore {
         Ok(Some(commit))
     }
 
-    /// True if the row has an un-pushed local edit. Such rows are dirty and must never be swept.
+    /// True if the row has an un-pushed local edit. Such rows are dirty and must never be projection_deleted.
     fn row_has_pending_edit_unlocked(
         &self,
         table: &str,
@@ -4354,7 +4422,7 @@ impl EmbeddedStore {
             return Ok(None);
         }
         let Some(projection) =
-            self.read_projection_unlocked(&key.row.table, &key.row.document_id)?
+            self.remote_doc_read_unlocked(&key.row.table, &key.row.document_id)?
         else {
             return Ok(None);
         };
@@ -4371,7 +4439,7 @@ impl EmbeddedStore {
         )?))
     }
 
-    fn read_projection_unlocked(
+    fn remote_doc_read_unlocked(
         &self,
         table: &str,
         local_document_id: &str,
@@ -4453,7 +4521,7 @@ impl EmbeddedStore {
         let proposed_local_id = proposed_local_document_id
             .filter(|id| is_local_document_id_for_table(table, id))
             .filter(|id| *id != server_document_id);
-        let generated_local_id = projection_local_id(table, server_document_id);
+        let generated_local_id = remote_doc_id_encode(table, server_document_id);
         let local_id = match (mapped_local_id.as_deref(), proposed_local_id) {
             (Some(mapped), Some(proposed)) if mapped == generated_local_id => proposed.to_owned(),
             (Some(mapped), _) => mapped.to_owned(),
@@ -4574,17 +4642,17 @@ impl EmbeddedStore {
     ) -> Result<(), StorageError> {
         let logical_clock = lock(&self.clock).now(wall_ms()?);
         let now_ms = logical_clock as i64;
-        for upsert in &batch.upserts {
+        for doc_write in &batch.doc_writes {
             self.write_dirty_head_unlocked(
                 &RowKey {
-                    document_id: upsert.id.clone(),
-                    table: upsert.table.clone(),
+                    document_id: doc_write.id.clone(),
+                    table: doc_write.table.clone(),
                 },
-                RowChangeOp::Upsert,
+                RowChangeOp::Write,
                 commit_seq,
                 now_ms,
                 logical_clock,
-                is_fresh_id(&batch.fresh_ids, &upsert.table, &upsert.id),
+                is_fresh_id(&batch.fresh_ids, &doc_write.table, &doc_write.id),
             )?;
         }
         for delete in &batch.deletes {
@@ -4830,7 +4898,7 @@ impl EmbeddedStore {
             row: head.row.clone(),
         };
         let projection = match head.change.op {
-            RowChangeOp::Upsert => {
+            RowChangeOp::Write => {
                 let Some(row) = self.materialized_doc_row_unlocked(&head.row)? else {
                     return Ok(());
                 };
@@ -5394,20 +5462,21 @@ impl EmbeddedStore {
             .is_some())
     }
 
-    /// Apply one exact upload-lease lifecycle command.
+    /// Write one exact upload-lease lifecycle target state.
     pub fn upload_lease_write(
         &self,
         args: UploadLeaseWrite,
     ) -> Result<Option<PendingUpload>, StorageError> {
         let _guard = lock(&self.operation_lock);
         match args {
-            UploadLeaseWrite::Claim {
+            UploadLeaseWrite::Claimed {
+                local_storage_id: None,
                 owner,
                 now_ms,
                 lease_until,
             } => {
                 let candidate = self.driver.run_row(
-                    sql::read_claimable_upload(),
+                    sql::upload_lease_pending_read(),
                     vec![
                         text_value(self.identity_key.clone()),
                         text_value(UploadLease::PENDING.to_owned()),
@@ -5420,7 +5489,7 @@ impl EmbeddedStore {
                     return Ok(None);
                 };
                 self.driver.execute(
-                    sql::write_upload_claim(),
+                    sql::upload_lease_next_claimed_write(),
                     vec![
                         text_value(UploadLease::CLAIMED.to_owned()),
                         text_value(owner.clone()),
@@ -5441,13 +5510,13 @@ impl EmbeddedStore {
                     ..candidate
                 }))
             }
-            UploadLeaseWrite::Release {
+            UploadLeaseWrite::Pending {
                 local_storage_id,
                 owner,
                 now_ms,
             } => {
                 self.driver.execute(
-                    sql::write_upload_release(),
+                    sql::upload_lease_pending_write(),
                     vec![
                         text_value(UploadLease::PENDING.to_owned()),
                         Value::from_i64(now_ms),
@@ -5458,8 +5527,8 @@ impl EmbeddedStore {
                 )?;
                 Ok(None)
             }
-            UploadLeaseWrite::Renew {
-                local_storage_id,
+            UploadLeaseWrite::Claimed {
+                local_storage_id: Some(local_storage_id),
                 owner,
                 now_ms,
                 lease_until,
@@ -5473,7 +5542,7 @@ impl EmbeddedStore {
                     row_to_pending_upload,
                 )?;
                 self.driver.execute(
-                    sql::write_upload_renew(),
+                    sql::upload_lease_claimed_write(),
                     vec![
                         Value::from_i64(lease_until),
                         Value::from_i64(now_ms),
@@ -5596,12 +5665,12 @@ impl EmbeddedStore {
     }
 
     #[cfg(any(test, feature = "testkit"))]
-    pub fn schedule_due_read(&self, now_ms: i64) -> Result<Vec<ScheduledJob>, StorageError> {
+    pub fn schedule_lease_read(&self, now_ms: i64) -> Result<Vec<ScheduledJob>, StorageError> {
         let mut out = Vec::new();
         let _guard = lock(&self.operation_lock);
         self.driver.run_rows(
-            sql::read_due_schedules(),
-            schedule_claimable_params(&self.identity_key.clone(), now_ms),
+            sql::schedule_lease_read(),
+            schedule_lease_params(&self.identity_key.clone(), now_ms),
             |row| {
                 out.push(row_to_scheduled_job(row)?);
                 Ok(())
@@ -5628,8 +5697,8 @@ impl EmbeddedStore {
         let mut candidates = Vec::new();
         let _guard = lock(&self.operation_lock);
         self.driver.run_rows(
-            sql::read_due_schedules(),
-            schedule_claimable_params(&self.identity_key.clone(), now_ms),
+            sql::schedule_lease_read(),
+            schedule_lease_params(&self.identity_key.clone(), now_ms),
             |row| {
                 candidates.push(row_to_scheduled_job(row)?);
                 Ok(())
@@ -5940,7 +6009,7 @@ impl EmbeddedStore {
         if let Some(mutation_id) = options.mutation_id() {
             if let Some(call) = self.take_absent_mutation_call(mutation_id, options) {
                 terminal_mutation_call = Some(call);
-            } else if options.mutation_fresh() {
+            } else if options.mutation_is_fresh() {
                 terminal_mutation_call =
                     Some(require_terminal_mutation_call(options, mutation_id)?);
             } else {
@@ -5999,7 +6068,7 @@ impl EmbeddedStore {
             } else {
                 let (name, args) = terminal_mutation_call.take().ok_or_else(|| {
                     StorageError::Unsatisfiable(format!(
-                        "mutation id {mutation_id} was committed before mutation_begin"
+                        "mutation id {mutation_id} was committed before mutation_write"
                     ))
                 })?;
                 self.driver.execute(
@@ -6375,13 +6444,13 @@ mod helpers;
 use helpers::row_to_rev_frontier;
 use helpers::{
     append_doc, append_f64, append_json_string, blob_at, changed_tables, cols_are_in_table_order,
-    combine_rollback, commit_seq_key, create_peer_id, hex, int_at, is_built_in_index,
-    is_data_only_id, is_fresh_id, is_local_document_id_for_table, is_valid_ident, key_positions,
-    lock, lock_key, materialized_row, materialized_upsert, max_commit_seq_params, optional_text_at,
-    order_col_value_at, path_lock, peer_id_from_bytes, physical_index_columns, projection_local_id,
-    projection_logical_clock, real_at, record_order, remote_projection_upsert,
+    combine_rollback, commit_seq_key, create_peer_id, doc_write_row, hex, int_at,
+    is_built_in_index, is_data_only_id, is_fresh_id, is_local_document_id_for_table,
+    is_valid_ident, key_positions, lock, lock_key, materialized_row, max_commit_seq_params,
+    optional_text_at, order_col_value_at, path_lock, peer_id_from_bytes, physical_index_columns,
+    projection_logical_clock, real_at, record_order, remote_doc_encode, remote_doc_id_encode,
     require_terminal_mutation_call, rev_lifecycle_at, row_changes, row_to_dirty_head,
     row_to_file_metadata, row_to_id_mapping, row_to_mutation_record, row_to_pending_upload,
-    row_to_rev_state, row_to_scheduled_job, schedule_claimable_params, schema_signature, text_at,
+    row_to_rev_state, row_to_scheduled_job, schedule_lease_params, schema_signature, text_at,
     text_ref_at, text_value, validate_ident, RecordOrder,
 };

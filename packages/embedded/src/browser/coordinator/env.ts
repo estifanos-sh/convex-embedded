@@ -41,12 +41,6 @@ export async function assertRuntimeCapabilities(): Promise<void> {
       "ConvexEmbeddedClient browser storage requires cross-origin isolation and SharedArrayBuffer support.",
     );
   }
-  const navigatorLike = navigatorLikeGlobal();
-  if (typeof navigatorLike.storage?.getDirectory !== "function") {
-    throw new Error(
-      "ConvexEmbeddedClient browser storage requires navigator.storage.getDirectory support.",
-    );
-  }
 }
 
 export function workerGlobal(): WorkerGlobalLike {
@@ -70,14 +64,12 @@ function assertDedicatedWorkerGlobal(): void {
 
 function navigatorLikeGlobal(): {
   locks?: LockManagerLike;
-  storage?: { getDirectory?: () => Promise<unknown> };
 } {
   return (
     (
       globalThis as {
         navigator?: {
           locks?: LockManagerLike;
-          storage?: { getDirectory?: () => Promise<unknown> };
         };
       }
     ).navigator ?? {}

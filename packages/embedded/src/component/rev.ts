@@ -15,9 +15,10 @@ import {
 import { ConvexError, v } from "convex/values";
 import { paginator } from "convex-helpers/server/pagination";
 
-import { crdtKindValidator, deleteProgress, deleteProgressValidator } from "./model";
+import { crdtKindValidator, deleteResult, deleteResultValidator } from "./model";
 import schema from "./schema";
 import { read as readTime } from "./time";
+import { write as retentionWrite } from "./crdt/retention";
 import { hashValue } from "../hash";
 
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
@@ -47,11 +48,7 @@ const revisionOriginValidator = v.union(
   v.literal("displaced"),
   v.literal("delete"),
 );
-const revisionStatusValidator = v.union(
-  v.literal("active"),
-  v.literal("retained"),
-  v.literal("acknowledged"),
-);
+const revisionStatusValidator = v.union(v.literal("active"), v.literal("retained"));
 
 const revisionValidator = v.object({
   revId: v.string(),
@@ -248,10 +245,14 @@ async function revisionCheckpointWrite(ctx: MutationCtx, args: RevisionCheckpoin
       )
       .unique();
     const blobId = await inlineBlobWrite(ctx, snapshot.bytes, snapshot.hash);
+    const now = readTime();
+    if (checkpoint?.state !== "ready") {
+      await retentionWrite(ctx, field._id, field.epoch, snapshot.headSeq, now);
+    }
     const ready = {
       state: "ready" as const,
       blobId,
-      updatedAt: readTime(),
+      updatedAt: now,
     };
     if (checkpoint) {
       await ctx.db.patch("crdtCheckpoints", checkpoint._id, ready);
@@ -263,7 +264,7 @@ async function revisionCheckpointWrite(ctx: MutationCtx, args: RevisionCheckpoin
         projectionHash: snapshot.projectionHash,
         responseToken: crypto.randomUUID(),
         ...ready,
-        createdAt: readTime(),
+        createdAt: now,
       });
     }
   }
@@ -386,7 +387,7 @@ export const list = query({
   },
 });
 
-export const set = mutation({
+export const restore = mutation({
   args: { table: v.string(), rowId: v.string(), revId: v.string() },
   returns: revisionValidator,
   handler: async (ctx, args) => {
@@ -416,31 +417,17 @@ export const set = mutation({
   },
 });
 
-export const ack = mutation({
-  args: { table: v.string(), rowId: v.string(), revId: v.string() },
-  returns: revisionValidator,
-  handler: async (ctx, args) => {
-    const target = await revisionRow(ctx, args.table, args.rowId, args.revId);
-    if (!target) throw new Error("Revision not found.");
-    if (target.status !== "active") {
-      await ctx.db.patch("revisions", target._id, { status: "acknowledged" });
-      target.status = "acknowledged";
-    }
-    return revisionValue(ctx, target);
-  },
-});
-
-const remove = mutation({
+const deletion = mutation({
   args: {
     table: v.string(),
     rowId: v.string(),
     revId: v.string(),
     numItems: v.number(),
   },
-  returns: deleteProgressValidator,
+  returns: deleteResultValidator,
   handler: async (ctx, args) => {
     const target = await revisionRow(ctx, args.table, args.rowId, args.revId);
-    if (!target) return deleteProgress(0, true);
+    if (!target) return deleteResult(0, true);
     if (target.status === "active") throw new Error("The active revision cannot be deleted.");
     const limit = clamp(args.numItems);
     const crdt = await ctx.db
@@ -449,13 +436,13 @@ const remove = mutation({
       .take(limit + 1);
     const page = crdt.slice(0, limit);
     for (const row of page) await ctx.db.delete("revisionCrdt", row._id);
-    if (page.length === limit) return deleteProgress(page.length, false);
+    if (page.length === limit) return deleteResult(page.length, false);
     await ctx.db.delete("revisions", target._id);
-    return deleteProgress(page.length + 1, true);
+    return deleteResult(page.length + 1, true);
   },
 });
 
-export { remove as delete };
+export { deletion as delete };
 
 async function revisionRead(ctx: QueryCtx, table: string, rowId: string, revId: string) {
   const row = await revisionRow(ctx, table, rowId, revId);

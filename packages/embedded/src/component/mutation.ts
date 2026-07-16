@@ -5,7 +5,7 @@ import { v } from "convex/values";
 import { paginator } from "convex-helpers/server/pagination";
 
 import { identityKey } from "./identity";
-import { deleteProgress, deleteProgressValidator } from "./model";
+import { deleteResult, deleteResultValidator } from "./model";
 import schema from "./schema";
 import { isAcknowledged } from "./settlement";
 
@@ -105,14 +105,14 @@ export const read = query({
   },
 });
 
-const remove = mutation({
+const deletion = mutation({
   args: {
     clientId: v.optional(v.string()),
     identity: v.optional(identitySelectorValidator),
     settledBefore: v.number(),
     numItems: v.number(),
   },
-  returns: deleteProgressValidator,
+  returns: deleteResultValidator,
   handler: async (ctx, args) => {
     const limit = clamp(args.numItems);
     const selectedIdentity = args.identity ? await identityKey(args.identity) : undefined;
@@ -144,11 +144,11 @@ const remove = mutation({
       await ctx.db.delete("mutations", row._id);
       deleted += 1;
     }
-    return deleteProgress(deleted, rows.length <= limit);
+    return deleteResult(deleted, rows.length <= limit);
   },
 });
 
-export { remove as delete };
+export { deletion as delete };
 
 function clamp(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1) {

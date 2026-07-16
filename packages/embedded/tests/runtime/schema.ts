@@ -90,6 +90,19 @@ describe("Convex schema storage conversion", () => {
     expect(() => toRuntimeStoreSchema(schema)).not.toThrow();
   });
 
+  test("keeps hosted component maintenance indexes out of browser storage", () => {
+    const schema = defineSchema({ documents: defineTable({ value: v.string() }) });
+    const checkpoints = toRuntimeStoreSchema(schema).tables.find(
+      (table) => table.name === "__e_crdtCheckpoints",
+    );
+
+    expect(checkpoints).toBeDefined();
+    expect(checkpoints?.indexes.map((index) => index.name)).not.toContain(
+      "by_field_epoch_state_retain_seq",
+    );
+    expect(checkpoints?.columns.map((column) => column.name)).not.toContain("idx_retain_until");
+  });
+
   test("aliases indexed user fields that collide with storage internals", () => {
     const schema = defineSchema({
       docs: defineTable({
@@ -112,6 +125,16 @@ describe("Convex schema storage conversion", () => {
         name: "idx_creation_time_ms",
         field: "creation_time_ms",
       },
+    ]);
+  });
+
+  test("keeps camel-case word boundaries in physical column names", () => {
+    const schema = defineSchema({
+      documents: defineTable({ updatedAt: v.number() }).index("by_updated_at", ["updatedAt"]),
+    });
+
+    expect(toStoreSchema(schema).tables[0]!.columns).toEqual([
+      { field: "updatedAt", name: "idx_updated_at" },
     ]);
   });
 

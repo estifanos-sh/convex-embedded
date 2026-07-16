@@ -20,6 +20,8 @@ pub enum RemoteError {
     NoRuntime,
     #[error("remote client is not started")]
     NotStarted,
+    #[error("remote checkpoint manifest became stale")]
+    StaleCheckpoint,
     #[error("Convex protocol error: {0}")]
     Protocol(String),
     #[error("remote client retired: {0}")]
@@ -33,11 +35,12 @@ pub enum RemoteError {
 }
 
 impl RemoteError {
-    /// Whether retrying the failed operation may succeed. Only network-level failures (transport,
-    /// timeout) are transient; auth, protocol, config, storage, and lifecycle errors are permanent
-    /// and will keep failing until something external changes.
+    /// Whether retrying the failed operation may succeed. Network failures and temporary local
+    /// storage contention/resource failures are transient; invalid protocol data, configuration,
+    /// corruption, and lifecycle errors are permanent.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, RemoteError::Timeout(_) | RemoteError::Transport(_))
+            || matches!(self, RemoteError::Storage(error) if error.is_transient())
     }
 }

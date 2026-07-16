@@ -10,6 +10,7 @@ import schema from "../../../../convex/schema";
 import { ConvexEmbeddedClient } from "../../src/node/client";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
+import { read as readTime } from "../testkit/time";
 import * as documents from "../fixture/convex/documents";
 
 const remoteUrl = fixtureRemoteUrl();
@@ -178,7 +179,7 @@ describe("v5 production pull contract", () => {
       await hosted.mutation(api.documents.update, {
         id: document._id,
         title,
-        updatedAt: Date.now(),
+        updatedAt: readTime(),
       });
 
       while (local?.title !== title && getTimerTime() < deadline) {
@@ -238,7 +239,7 @@ describe("v5 production pull contract", () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         local = await embedded.query(api.documents.getBySlug, { slug: prefix });
       }
-      if (!local) throw new Error("Embedded client did not bootstrap the production document.");
+      if (!local) throw new Error("Embedded client did not pull the production document.");
 
       await embedded.mutation(api.documents.writeBody, {
         id: local._id,
@@ -375,7 +376,7 @@ describe("v5 production pull contract", () => {
     }
   }, 25_000);
 
-  test("bootstraps a checkpoint larger than one Convex value into a fresh client", async () => {
+  test("pulls a checkpoint larger than one Convex value into a fresh client", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const prefix = `production-large-${crypto.randomUUID()}`;
     const body = largeBody(350_000);
@@ -401,7 +402,7 @@ describe("v5 production pull contract", () => {
       const local = await waitUntil(
         () => first.query(api.documents.getBySlug, { slug: prefix }),
         (value) => value !== null,
-        "large checkpoint source bootstrap",
+        "large checkpoint source pull",
       );
       if (!local) throw new Error("Large checkpoint source document disappeared.");
       const expectedBody = `${body.slice(0, 1)}X${body.slice(1)}`;
@@ -434,7 +435,7 @@ describe("v5 production pull contract", () => {
       const fresh = await waitUntil(
         () => second!.query(api.documents.getBySlug, { slug: prefix }),
         (value) => value?.body === expectedBody,
-        "multi-chunk checkpoint bootstrap",
+        "multi-chunk checkpoint pull",
       );
       if (!fresh) throw new Error("Fresh client did not retain the large checkpoint document.");
       expect(fresh.body).toBe(expectedBody);
@@ -521,16 +522,29 @@ describe("v5 production pull contract", () => {
           })}`,
         );
       }
-      const updatedAt = Date.now() + 1_000;
+      const updatedAt = readTime() + 1_000;
       await hosted.mutation(api.documents.update, {
         id: hostedDocuments[1]!._id,
         updatedAt,
       });
-      const transitioned = await waitUntil(
-        () => live!.query(pageDocuments, args),
-        (value) => value.page[0]?.updatedAt === updatedAt,
-        "retained cursor transition",
-      );
+      let transitioned: DocumentPage;
+      try {
+        transitioned = await waitUntil(
+          () => live!.query(pageDocuments, args),
+          (value) => value.page[0]?.updatedAt === updatedAt,
+          "retained cursor transition",
+        );
+      } catch (error) {
+        throw new Error(
+          `Retained cursor did not transition locally: ${JSON.stringify({
+            cause: error instanceof Error ? error.message : String(error),
+            current: await live.query(pageDocuments, args),
+            hosted: await hosted.query(api.documents.list, { prefix }),
+            connection: live.connectionState(),
+            remoteEvents,
+          })}`,
+        );
+      }
       expect(second.page[0]?._id).toBe(transitioned.page[0]?._id);
     } finally {
       stopEvents?.();

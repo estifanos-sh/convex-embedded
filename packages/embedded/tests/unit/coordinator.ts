@@ -9,7 +9,10 @@ import {
 import { WASM_API_VERSION } from "../../src/browser/artifact";
 import { EMBEDDED_STORE_FORMAT_VERSION } from "../../src/abi";
 import { getTimerTime } from "../../src/time";
+import { EmbeddedClient } from "../../src/client";
+import type { EmbeddedEvent } from "../../src/events";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import type { Runner } from "../../src/runtime/runner";
 import {
   WorkerCommand,
   WorkerEvent,
@@ -35,6 +38,97 @@ import {
 } from "../../src/browser/coordinator/protocol";
 
 describe("browser deployment coordination", () => {
+  test("opens storage only after the page grants ownership", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const responses: WorkerResponse[] = [];
+    let opens = 0;
+    const runtime = createCoordinatorRuntime(
+      {
+        clientId: "follower",
+        id: 1,
+        identity: identity(),
+        op: WorkerCommand.Init,
+        storagePath: "documents.db",
+        storageOwner: false,
+      },
+      {
+        assertCapabilities: () => undefined,
+        channels: { open: () => recordingChannel([]) },
+        closeSelf: () => undefined,
+        locks: {
+          request: async (_name, callback) => await callback(),
+        },
+        openRuntime: async () => {
+          opens += 1;
+          return pendingRemoteRuntime();
+        },
+        postLocal: (response) => responses.push(response),
+        randomId: (prefix) => `${prefix}-follower`,
+      },
+    );
+
+    const started = runtime.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(opens).toBe(0);
+    runtime.handle({ id: 2, op: WorkerCommand.StorageOwnerWrite });
+    await started;
+
+    expect(result(responses, 1)).toEqual({ id: 1, op: WorkerEvent.Result });
+    await waitUntil(() => result(responses, 2) !== undefined);
+    expect(result(responses, 2)).toEqual({ id: 2, op: WorkerEvent.Result });
+    expect(opens).toBe(1);
+    await runtime.close();
+  });
+
+  test("acknowledges close only after the storage runtime has closed", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const responses: WorkerResponse[] = [];
+    const closed: string[] = [];
+    const closeReady = deferred<void>();
+    let workerClosed = false;
+    const runtime = createCoordinatorRuntime(
+      {
+        clientId: "owner",
+        id: 1,
+        identity: identity(),
+        op: WorkerCommand.Init,
+        storagePath: "documents.db",
+        storageOwner: true,
+      },
+      {
+        assertCapabilities: () => undefined,
+        channels: { open: () => recordingChannel([]) },
+        closeSelf: () => {
+          workerClosed = true;
+        },
+        locks: {
+          request: async (_name, callback) => await callback(),
+        },
+        openRuntime: async () =>
+          testRuntime(
+            "owner",
+            closed,
+            async () => undefined,
+            async () => undefined,
+            closeReady.promise,
+          ),
+        postLocal: (response) => responses.push(response),
+        randomId: (prefix) => `${prefix}-owner`,
+      },
+    );
+
+    await runtime.start();
+    runtime.handle({ id: 2, op: WorkerCommand.Close });
+    await Promise.resolve();
+    expect(result(responses, 2)).toBeUndefined();
+    expect(workerClosed).toBe(false);
+
+    closeReady.resolve();
+    await waitUntil(() => result(responses, 2) !== undefined);
+    expect(closed).toEqual(["owner"]);
+    expect(workerClosed).toBe(true);
+  });
+
   test("failed identity negotiation resets replication before another remote turn", async () => {
     const responses: WorkerResponse[] = [];
     let resets = 0;
@@ -218,6 +312,102 @@ describe("browser deployment coordination", () => {
     ]);
   });
 
+  test("sends the current remote snapshot after a follower is attached", () => {
+    const messages: PeerMessage[] = [];
+    const runtime = remoteRuntime();
+    runtime.remoteEvent = {
+      at: 1,
+      attempt: 2,
+      generation: 3,
+      sequence: 4,
+      status: "connected",
+      tick: {
+        changedTables: [],
+        pullAttempted: 1,
+        pushAccepted: 0,
+        pushAttempted: 0,
+        pushConflicts: 0,
+        pushFailed: 0,
+        pushRebases: 0,
+        pushed: 0,
+        received: 1,
+        reconnected: false,
+        retainedRevisions: 0,
+        rowsApplied: 0,
+        sent: 1,
+        receiptsPushed: 0,
+        storeJobs: 0,
+        pending: {
+          checkpoints: 0,
+          inflight: 1,
+          mutations: 2,
+          scope: 1,
+          settlements: 0,
+          uploads: 0,
+        },
+      },
+      type: "remote",
+    };
+    const leader = new LeaderRuntime({
+      epoch: "leader-incarnation",
+      identity: identity(),
+      runtime,
+      scope: "scope",
+      storagePath: "documents.db",
+    });
+
+    leader.attachFollower(
+      {
+        clientId: "client",
+        identity: identity(),
+        op: PeerOp.Attach,
+        protocol: CoordinatorProtocol,
+        remote: {
+          authFetchToken: false,
+          clientId: "client",
+          moduleGraphHash: "modules",
+          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+          schemaHash: "schema",
+          url: "https://fixture.convex.cloud",
+        },
+        scope: "scope",
+        storagePath: "documents.db",
+        workerId: "follower",
+      },
+      () => recordingChannel(messages),
+      () => undefined,
+      "owner",
+    );
+
+    expect(messages.map((message) => message.op)).toEqual([PeerOp.Attached, PeerOp.Response]);
+    expect(messages[1]).toEqual(
+      expect.objectContaining({
+        response: expect.objectContaining({
+          event: expect.objectContaining({
+            generation: 3,
+            incarnation: "leader-incarnation",
+            sequence: 4,
+            status: "connected",
+            tick: expect.objectContaining({
+              pending: {
+                checkpoints: 0,
+                inflight: 1,
+                mutations: 2,
+                scope: 1,
+                settlements: 0,
+                uploads: 0,
+              },
+              pullAttempted: 1,
+              received: 1,
+              sent: 1,
+            }),
+            type: "remote",
+          }),
+        }),
+      }),
+    );
+  });
+
   test("promotes one follower and replays an unresolved request after leader death", async () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
     const channels = new ChannelBus();
@@ -275,6 +465,7 @@ describe("browser deployment coordination", () => {
     expect(opened).toEqual(["first"]);
     firstClose.resolve();
     await closeFirst;
+    second.handle({ id: 99, op: WorkerCommand.StorageOwnerWrite });
     await waitUntil(() => opened.length === 2);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(secondResponses).toContainEqual({
@@ -294,6 +485,80 @@ describe("browser deployment coordination", () => {
 
     await second.close();
     expect(closed).toEqual(["first", "second"]);
+  });
+
+  test("accepts sequence one from the new leader incarnation after an owner handoff", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const channels = new ChannelBus();
+    const locks = new LockQueue();
+    const firstResponses: WorkerResponse[] = [];
+    const secondResponses: WorkerResponse[] = [];
+    const firstRuntime = remoteRuntime();
+    const secondRuntime = remoteRuntime();
+    const first = coordinator("first-incarnation", firstResponses, {
+      channels,
+      locks,
+      openRuntime: async () => firstRuntime,
+      remote: true,
+    });
+    const second = coordinator("second-incarnation", secondResponses, {
+      channels,
+      locks,
+      openRuntime: async () => secondRuntime,
+      remote: true,
+    });
+
+    await first.start();
+    await second.start();
+    firstRuntime.emit?.({
+      at: 1,
+      attempt: 1,
+      generation: 1,
+      sequence: 99,
+      status: "connected",
+      type: "remote",
+    });
+    await waitUntil(() => remoteEvents(secondResponses).some((event) => event.sequence === 99));
+    const oldEvent = remoteEvents(secondResponses).find((event) => event.sequence === 99)!;
+
+    await first.close();
+    second.handle({ id: 99, op: WorkerCommand.StorageOwnerWrite });
+    await waitUntil(() => secondRuntime.emit !== undefined);
+    secondRuntime.emit?.({
+      at: 2,
+      attempt: 1,
+      generation: 1,
+      sequence: 1,
+      status: "offline",
+      type: "remote",
+    });
+    await waitUntil(() => remoteEvents(secondResponses).some((event) => event.sequence === 1));
+    const nextEvent = remoteEvents(secondResponses).find(
+      (event) => event.sequence === 1 && event.status === "offline",
+    )!;
+
+    expect(oldEvent.incarnation).toBe("leader-first-incarnation");
+    expect(nextEvent.incarnation).toBe("leader-second-incarnation");
+    let emit: ((event: EmbeddedEvent) => void) | undefined;
+    const runner = {
+      identity: { read: async () => undefined, write: async () => undefined },
+      remote: { identity: { read: async () => undefined } },
+      subscribeEvents: (listener: (event: EmbeddedEvent) => void) => {
+        emit = listener;
+        return () => undefined;
+      },
+    } as unknown as Runner;
+    const client = new EmbeddedClient({ eagerRunner: runner, remoteConfigured: true, runner });
+    try {
+      await Promise.resolve();
+      emit?.(oldEvent);
+      expect(client.connectionState().remote).toBe("connected");
+      emit?.(nextEvent);
+      expect(client.connectionState().remote).toBe("offline");
+    } finally {
+      await client.close();
+      await second.close();
+    }
   });
 
   test("does not repeat a hosted action after leader death loses its result", async () => {
@@ -353,6 +618,7 @@ describe("browser deployment coordination", () => {
     await waitUntil(() => firstActions === 1);
 
     await first.close();
+    second.handle({ id: 99, op: WorkerCommand.StorageOwnerWrite });
     await waitUntil(() => opened.length === 2);
     await waitUntil(() => result(secondResponses, 2)?.error !== undefined);
     expect(result(secondResponses, 2)?.error?.name).toBe(
@@ -374,6 +640,7 @@ function coordinator(
     channels: ChannelBus;
     locks: LockQueue;
     openRuntime: () => Promise<WorkerState>;
+    remote?: boolean;
   },
 ) {
   return createCoordinatorRuntime(
@@ -382,7 +649,18 @@ function coordinator(
       id: 1,
       identity: identity(),
       op: WorkerCommand.Init,
+      remote: options.remote
+        ? {
+            authFetchToken: false,
+            clientId: workerId,
+            moduleGraphHash: "modules",
+            protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+            schemaHash: "schema",
+            url: "https://fixture.convex.cloud",
+          }
+        : undefined,
       storagePath: "documents.db",
+      storageOwner: workerId.startsWith("first"),
     },
     {
       assertCapabilities: () => undefined,
@@ -558,6 +836,35 @@ function pendingRemoteRuntime(): WorkerState {
       remote: { close: async () => undefined },
     },
   } as unknown as WorkerState;
+}
+
+function remoteRuntime(): WorkerState {
+  return {
+    closed: false,
+    opfs: { closeAll: () => undefined },
+    runner: {
+      route: async () => undefined,
+      runQuery: async () => undefined,
+      remote: { scope: { write: async () => undefined } },
+      subscribeEvents: () => () => undefined,
+    },
+    stops: new Map(),
+    store: {
+      close: async () => undefined,
+      remote: {
+        close: async () => undefined,
+        identity: async () => ({ identity: null, identityKey: "unauthenticated" }),
+        pull: async () => new Promise(() => undefined),
+        start: async () => undefined,
+      },
+    },
+  } as unknown as WorkerState;
+}
+
+function remoteEvents(responses: WorkerResponse[]) {
+  return responses.flatMap((response) =>
+    response.op === WorkerEvent.Event && response.event.type === "remote" ? [response.event] : [],
+  );
 }
 
 function identity(overrides: Partial<RuntimeIdentity> = {}): RuntimeIdentity {

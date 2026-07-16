@@ -28,7 +28,15 @@ export interface EmbeddedMutationTiming {
 }
 
 /** Browser/native remote replication lifecycle state. @public */
-export type EmbeddedRemoteStatus = "starting" | "started" | "tick" | "idle" | "error" | "closed";
+export type EmbeddedRemoteStatus =
+  | "starting"
+  | "started"
+  | "connected"
+  | "tick"
+  | "idle"
+  | "offline"
+  | "error"
+  | "closed";
 
 /**
  * Boot-lifecycle transition an embedded runtime moves through while opening its local store.
@@ -40,14 +48,14 @@ export type EmbeddedRuntimePhase =
   | "wasm-load"
   | "store-open"
   | "store-setup"
-  | "store-checkpoint"
+  | "store-wal-write"
   | "remote-attach"
   | "ready";
 
 /**
  * Degradation an app can observe while an embedded runtime boots or runs: a deployment mismatch, an
  * exhausted client rotation, OPFS handle-acquire contention, a store open slow past the notice
- * threshold, or a boot failure.
+ * threshold, a temporary in-memory storage fallback, or a boot failure.
  *
  * @public
  */
@@ -56,12 +64,13 @@ export type EmbeddedRuntimeDegradation =
   | "retired"
   | "opfs-acquire-retry"
   | "opfs-acquire-reclaimed"
+  | "temporary-storage"
   | "slow-open"
   | "corrupt"
   | "failed";
 
 /** Row inserted or replaced by a local storage commit. @public */
-export interface EmbeddedDataUpsert {
+export interface EmbeddedDataWrite {
   id: string;
   row: Record<string, unknown>;
   table: string;
@@ -110,7 +119,7 @@ export interface EmbeddedDataEvent {
   /** `"cache"` marks a value a retained-result cache-serve produced (Cut 7 §7); internal channel only. */
   source?: "local" | "remote" | "cache";
   type: "data";
-  upserts: EmbeddedDataUpsert[];
+  docWrites: EmbeddedDataWrite[];
 }
 
 /** Local file/upload/id-map changes. @public */
@@ -118,13 +127,17 @@ export interface EmbeddedStorageEvent {
   at: number;
   deletes: EmbeddedDataDelete[];
   type: "storage";
-  upserts: EmbeddedDataUpsert[];
+  docWrites: EmbeddedDataWrite[];
 }
 
 /** Remote replication status and error event. @public */
 export interface EmbeddedRemoteEvent {
   at: number;
   attempt: number;
+  /** Browser leader incarnation; a change resets the per-runtime generation and sequence fence. */
+  incarnation?: string;
+  /** Remote actor incarnation; higher generations supersede every earlier event. */
+  generation?: number;
   durationMs?: number;
   error?: string;
   /** Foreground remote-actor contention for a replay push, when this event reports one. */
@@ -134,6 +147,8 @@ export interface EmbeddedRemoteEvent {
   };
   nextRunAt?: number;
   status: EmbeddedRemoteStatus;
+  /** Monotonic event sequence within one generation. */
+  sequence?: number;
   tick?: {
     changedTables: string[];
     rowsApplied: number;
@@ -148,8 +163,16 @@ export interface EmbeddedRemoteEvent {
     pushFailed: number;
     retainedRevisions: number;
     sent: number;
-    settlementsAcknowledged: number;
+    receiptsPushed: number;
     storeJobs: number;
+    pending?: {
+      checkpoints: number;
+      inflight: number;
+      mutations: number;
+      scope: number;
+      settlements: number;
+      uploads: number;
+    };
   };
   type: "remote";
   wasmApiVersion?: number;
@@ -200,7 +223,7 @@ export interface EmbeddedSchedulerEvent {
   at: number;
   deletes: EmbeddedDataDelete[];
   type: "scheduler";
-  upserts: EmbeddedDataUpsert[];
+  docWrites: EmbeddedDataWrite[];
 }
 
 /**
@@ -268,9 +291,12 @@ export type EmbeddedPublicEvent =
   | {
       type: "remote";
       at: number;
-      status: "starting" | "ready" | "idle" | "offline" | "error" | "closed";
+      status: "starting" | "connected" | "ready" | "idle" | "offline" | "error" | "closed";
       attempt: number;
+      generation?: number;
+      incarnation?: string;
       nextRunAt?: number;
+      sequence?: number;
       error?: string;
     }
   | {
@@ -320,7 +346,7 @@ function mapRuntimeEvent(event: EmbeddedRuntimeEvent): EmbeddedPublicEvent {
     : event.phase === "store-open"
       ? "store-open"
       : event.phase === "store-setup" ||
-          event.phase === "store-checkpoint" ||
+          event.phase === "store-wal-write" ||
           event.phase === "remote-attach"
         ? "schema-ready"
         : event.phase === "ready"
@@ -331,20 +357,27 @@ function mapRuntimeEvent(event: EmbeddedRuntimeEvent): EmbeddedPublicEvent {
 
 function mapRemoteEvent(event: EmbeddedRemoteEvent): EmbeddedPublicEvent {
   const status: (EmbeddedPublicEvent & { type: "remote" })["status"] =
-    event.status === "started" || event.status === "tick"
-      ? "ready"
-      : event.status === "starting"
+    event.status === "connected" || event.status === "tick"
+      ? "connected"
+      : event.status === "started"
         ? "starting"
-        : event.status === "idle"
-          ? "idle"
-          : event.status === "closed"
-            ? "closed"
-            : "error";
+        : event.status === "starting"
+          ? "starting"
+          : event.status === "idle"
+            ? "idle"
+            : event.status === "offline"
+              ? "offline"
+              : event.status === "closed"
+                ? "closed"
+                : "error";
   return {
     type: "remote",
     at: event.at,
     status,
     attempt: event.attempt,
+    ...(event.incarnation === undefined ? {} : { incarnation: event.incarnation }),
+    ...(event.generation === undefined ? {} : { generation: event.generation }),
+    ...(event.sequence === undefined ? {} : { sequence: event.sequence }),
     ...(event.nextRunAt === undefined ? {} : { nextRunAt: event.nextRunAt }),
     ...(event.error ? { error: event.error } : {}),
   };

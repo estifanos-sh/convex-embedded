@@ -495,8 +495,8 @@ function matchResult(
     }
   }
   const resultRows: ResultRow[] = [];
-  const prune = (value: unknown, path: string): unknown => {
-    if (Array.isArray(value)) return value.map((child, index) => prune(child, `${path}/${index}`));
+  const encode = (value: unknown, path: string): unknown => {
+    if (Array.isArray(value)) return value.map((child, index) => encode(child, `${path}/${index}`));
     if (typeof value !== "object" || value === null || value instanceof ArrayBuffer) return value;
     const record = value as Record<string, unknown>;
     if (typeof record._id === "string" && typeof record._creationTime === "number") {
@@ -512,11 +512,11 @@ function matchResult(
     return Object.fromEntries(
       Object.entries(record).map(([key, child]) => [
         key,
-        prune(child, `${path}/${pointerPart(key)}`),
+        encode(child, `${path}/${pointerPart(key)}`),
       ]),
     );
   };
-  return { result: prune(authored, ""), resultRows };
+  return { result: encode(authored, ""), resultRows };
 }
 
 async function plainLiveResult(rows: QueryRow[]) {

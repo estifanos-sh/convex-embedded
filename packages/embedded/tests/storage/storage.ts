@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vite-plus/test";
 
 import { NativeStore } from "../../src/node/native";
-import type { StorageBackend, StoreSchema, StoredDoc, UpsertIn } from "../../src/storage/types";
+import type { StorageBackend, StoreSchema, StoredDoc, DocWrite } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { defineConformance } from "../testkit/conformance";
 import { nativeModule } from "../testkit/native";
@@ -70,7 +70,7 @@ async function open(path: string): Promise<NativeStore> {
   return NativeStore.openWith(nativeModule().Store, path);
 }
 
-function issue(id: string, title: string, status: string): UpsertIn {
+function issue(id: string, title: string, status: string): DocWrite {
   return {
     table: "issues",
     id,
@@ -158,7 +158,7 @@ describe("native storage details", () => {
     await store.close();
   });
 
-  test("invalid one-upsert encoding fails loudly instead of falling back to generic commit", async () => {
+  test("invalid one-docWrite encoding fails loudly instead of falling back to generic commit", async () => {
     let genericCommits = 0;
     const store = NativeStore.wrap({
       clear: async () => undefined,
@@ -172,14 +172,14 @@ describe("native storage details", () => {
     });
 
     await expect(
-      store.commitOneUpsert!(
+      store.commitOneDocWrite!(
         {
           fresh: true,
-          upsert: issue("missing-fast-path", "missing", "open"),
+          docWrite: issue("missing-fast-path", "missing", "open"),
         },
         { changes: "omit", mutation: "none", source: "local" },
       ),
-    ).rejects.toThrow("missing commitOneUpsertEncoded");
+    ).rejects.toThrow("missing commitOneDocWriteEncoded");
     expect(genericCommits).toBe(0);
   });
 
@@ -205,7 +205,7 @@ describe("native storage details", () => {
 
     expect(
       await store.upload.lease.write({
-        lease: "claim",
+        lease: "claimed",
         owner: "remote",
         nowMs: 20,
         leaseUntil: 120,
@@ -236,13 +236,11 @@ describe("native storage details", () => {
     });
     await expect(
       store.upload.lease.write({
-        lease: "claim",
-        localStorageId: "_storage|local",
+        lease: "pending",
         owner: "remote",
         nowMs: 40,
-        leaseUntil: 140,
       } as never),
-    ).rejects.toThrow("invalid upload lease claim command payload");
+    ).rejects.toThrow("invalid upload lease pending command payload");
     await store.close();
   });
 
@@ -250,7 +248,7 @@ describe("native storage details", () => {
     const store = await open(tmp("native_cache.db"));
     await store.setup(schema);
     await store.commit({
-      upserts: [issue("a", "A", "open"), issue("b", "B", "closed")],
+      docWrites: [issue("a", "A", "open"), issue("b", "B", "closed")],
       deletes: [],
     });
     const byStatus = (value: string) =>
@@ -287,11 +285,11 @@ describe("native storage details", () => {
     const store = await open(tmp("native_commit_exact_metadata.db"));
     await store.setup(schema);
     await expect(
-      store.commit({ deletes: [], upserts: [] }, {
+      store.commit({ deletes: [], docWrites: [] }, {
         changes: "omit",
         mutation: "terminal",
         mutationArgs: "{}",
-        mutationFresh: false,
+        mutationIsFresh: false,
         mutationId: "mutation:partial",
         mutationName: "issues:send",
         mutationResult: "null",
@@ -307,7 +305,7 @@ describe("native storage details", () => {
     await store.setup(aliasSchema);
     const first = store.clock.read();
     await store.commit({
-      upserts: [
+      docWrites: [
         {
           table: "users",
           id: "users|a",
@@ -363,7 +361,7 @@ describe("native storage details", () => {
     const store = await open(tmp("native_resume_key.db"));
     await store.setup(schema);
     await store.commit({
-      upserts: [issue("a", "A", "open"), issue("b", "B", "open"), issue("c", "C", "open")],
+      docWrites: [issue("a", "A", "open"), issue("b", "B", "open"), issue("c", "C", "open")],
       deletes: [],
     });
     const first = await store.doc.page.read({ table: "issues", order: "asc", pageSize: 2 });
@@ -428,7 +426,7 @@ describe("native storage details", () => {
   test("shares immutable cached docs and invalidates precise cache entries", async () => {
     const store = await open(tmp("native_read_cache_epoch.db"));
     await store.setup(cacheSchema);
-    await store.commit({ upserts: [issue("a", "A", "open")], deletes: [] });
+    await store.commit({ docWrites: [issue("a", "A", "open")], deletes: [] });
 
     const first = await store.doc.read("issues", "a");
     expect(first).toBeDefined();
@@ -440,7 +438,7 @@ describe("native storage details", () => {
     }).toThrow(TypeError);
 
     await store.commit({
-      upserts: [
+      docWrites: [
         {
           table: "notes",
           id: "n",
@@ -453,7 +451,7 @@ describe("native storage details", () => {
     });
     expect(await store.doc.read("issues", "a")).toBe(first);
 
-    await store.commit({ upserts: [issue("a", "A2", "closed")], deletes: [] });
+    await store.commit({ docWrites: [issue("a", "A2", "closed")], deletes: [] });
     const changed = await store.doc.read("issues", "a");
     expect(changed).not.toBe(first);
     expect(changed?.status).toBe("closed");
@@ -476,7 +474,7 @@ describe("native storage details", () => {
     expect(Object.isFrozen(cachedPage.docs[0])).toBe(true);
 
     await store.commit({
-      upserts: [issue("a", "A3", "closed")],
+      docWrites: [issue("a", "A3", "closed")],
       deletes: [],
       dataOnlyIds: [{ table: "issues", id: "a" }],
     });
@@ -498,7 +496,7 @@ describe("native storage details", () => {
     expect(stats.queryTableEpochs.issues).toBeUndefined();
     expect(stats.queryTableEpochs.notes).toBeUndefined();
 
-    await store.commit({ upserts: [issue("b", "B", "closed")], deletes: [] });
+    await store.commit({ docWrites: [issue("b", "B", "closed")], deletes: [] });
     const invalidatedPage = await store.doc.page.read({
       table: "issues",
       index: "by_status",
@@ -515,7 +513,7 @@ describe("native storage details", () => {
     const store = await open(tmp("native_read_cache_bytes.db"));
     await store.setup(schema);
     await store.commit({
-      upserts: [
+      docWrites: [
         {
           table: "issues",
           id: "bytes",

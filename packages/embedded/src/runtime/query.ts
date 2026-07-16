@@ -690,7 +690,7 @@ export class QueryBuilder<
     overlay: QueryOverlay | undefined,
   ): boolean {
     return (
-      this.store.capabilities?.exactScanBounds === true &&
+      this.store.capabilities?.hasExactBounds === true &&
       !overlay &&
       !this.predicates.length &&
       boundsAreExact(bounds)

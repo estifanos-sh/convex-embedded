@@ -20,7 +20,7 @@ export function commitRowChanges(commit: CommitResult, batch: WriteBatch): Stora
   for (const mapping of batch.idMappings ?? []) {
     changes.push({
       id: `${mapping.table}|${mapping.localId}`,
-      op: "upsert",
+      op: "write",
       row: { ...mapping, id: `${mapping.table}|${mapping.localId}` },
       table: "_id_mappings",
     });
@@ -30,12 +30,12 @@ export function commitRowChanges(commit: CommitResult, batch: WriteBatch): Stora
 
 export function batchRowChanges(batch: WriteBatch): StorageRowChange[] {
   return [
-    ...batch.upserts.map(
-      (upsert): StorageRowChange => ({
-        id: upsert.id,
-        op: "upsert",
-        row: { _creationTime: upsert.creationTime, _id: upsert.id, ...upsert.data },
-        table: upsert.table,
+    ...batch.docWrites.map(
+      (docWrite): StorageRowChange => ({
+        id: docWrite.id,
+        op: "write",
+        row: { _creationTime: docWrite.creationTime, _id: docWrite.id, ...docWrite.data },
+        table: docWrite.table,
       }),
     ),
     ...batch.deletes.map(
@@ -62,15 +62,15 @@ export function emitDeletes(
     deletes,
     source,
     type: "data",
-    upserts: [],
+    docWrites: [],
   });
   const storageDeletes = deletes.filter((change) => isStorageTable(change.table));
   if (storageDeletes.length) {
-    emit({ at, deletes: storageDeletes, type: "storage", upserts: [] });
+    emit({ at, deletes: storageDeletes, type: "storage", docWrites: [] });
   }
   const schedulerDeletes = deletes.filter((change) => change.table === "_scheduled_jobs");
   if (schedulerDeletes.length) {
-    emit({ at, deletes: schedulerDeletes, type: "scheduler", upserts: [] });
+    emit({ at, deletes: schedulerDeletes, type: "scheduler", docWrites: [] });
   }
 }
 
@@ -82,8 +82,8 @@ export function emitCommit(
 ): void {
   const changes = commitRowChanges(commit, batch);
   if (!changes.length) return;
-  const upserts = changes.flatMap((change) =>
-    change.op === "upsert" ? [{ id: change.id, row: change.row, table: change.table }] : [],
+  const docWrites = changes.flatMap((change) =>
+    change.op === "write" ? [{ id: change.id, row: change.row, table: change.table }] : [],
   );
   const deletes = changes.flatMap((change) =>
     change.op === "delete" ? [{ id: change.id, table: change.table }] : [],
@@ -96,27 +96,27 @@ export function emitCommit(
     deletes,
     source,
     type: "data",
-    upserts,
+    docWrites,
   };
   emit(event);
-  const storageUpserts = upserts.filter((change) => isStorageTable(change.table));
+  const storageUpserts = docWrites.filter((change) => isStorageTable(change.table));
   const storageDeletes = deletes.filter((change) => isStorageTable(change.table));
   if (storageUpserts.length || storageDeletes.length) {
     emit({
       at: event.at,
       deletes: storageDeletes,
       type: "storage",
-      upserts: storageUpserts,
+      docWrites: storageUpserts,
     } satisfies EmbeddedStorageEvent);
   }
-  const schedulerUpserts = upserts.filter((change) => change.table === "_scheduled_jobs");
+  const schedulerUpserts = docWrites.filter((change) => change.table === "_scheduled_jobs");
   const schedulerDeletes = deletes.filter((change) => change.table === "_scheduled_jobs");
   if (schedulerUpserts.length || schedulerDeletes.length) {
     emit({
       at: event.at,
       deletes: schedulerDeletes,
       type: "scheduler",
-      upserts: schedulerUpserts,
+      docWrites: schedulerUpserts,
     } satisfies EmbeddedSchedulerEvent);
   }
 }
@@ -145,7 +145,7 @@ export function emitFileStore(emit: EmbeddedInternalEventListener, metadata: Fil
     createdTime: metadata.createdTime,
     updatedTime: now,
   };
-  const upserts = [
+  const docWrites = [
     { id: metadata.storageId, row: { ...metadata, _id: metadata.storageId }, table: "_storage" },
     { id: upload.localStorageId, row: { ...upload }, table: "_pending_uploads" },
     { id: mapping.id, row: mapping, table: "_id_mappings" },
@@ -157,14 +157,14 @@ export function emitFileStore(emit: EmbeddedInternalEventListener, metadata: Fil
     deletes: [],
     source: "local",
     type: "data",
-    upserts,
+    docWrites,
   });
-  emit({ at, deletes: [], type: "storage", upserts });
+  emit({ at, deletes: [], type: "storage", docWrites });
 }
 
 export function emitSchedulerUpsert(emit: EmbeddedInternalEventListener, job: ScheduledJob): void {
   const row = normalizeCopy(job) as Record<string, unknown>;
-  const upserts = [{ id: job.jobId, row, table: "_scheduled_jobs" }];
+  const docWrites = [{ id: job.jobId, row, table: "_scheduled_jobs" }];
   const at = getTimerTime();
   emit({
     at,
@@ -172,7 +172,7 @@ export function emitSchedulerUpsert(emit: EmbeddedInternalEventListener, job: Sc
     deletes: [],
     source: "local",
     type: "data",
-    upserts,
+    docWrites,
   });
-  emit({ at, deletes: [], type: "scheduler", upserts });
+  emit({ at, deletes: [], type: "scheduler", docWrites });
 }

@@ -81,12 +81,12 @@ export async function withEntropy<T>(
   const realNow = Date.now;
   const realRandom = Math.random;
   const crypto = (globalThis as { crypto?: Crypto }).crypto;
-  const realUuid = crypto?.randomUUID;
-  const realFill = crypto?.getRandomValues;
+  const realUuid = crypto ? crypto.randomUUID.bind(crypto) : undefined;
+  const realFill = crypto ? crypto.getRandomValues.bind(crypto) : undefined;
   const ownUuid = crypto ? Object.hasOwn(crypto, "randomUUID") : false;
   const ownFill = crypto ? Object.hasOwn(crypto, "getRandomValues") : false;
   Date.now = () => mutationTime;
-  Math.random = stream.random;
+  Math.random = () => stream.random();
   if (crypto) {
     (crypto as { randomUUID: unknown }).randomUUID = () => stream.uuid();
     (crypto as { getRandomValues: unknown }).getRandomValues = (view: ArrayBufferView) =>

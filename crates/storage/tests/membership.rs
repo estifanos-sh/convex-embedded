@@ -49,8 +49,8 @@ fn snapshot(
     projections: Vec<AuthoritativeRow>,
     cursor: &str,
     received_time: i64,
-) -> RemotePull {
-    RemotePull {
+) -> RemotePageWrite {
+    RemotePageWrite {
         subscription: subscription.into(),
         members,
         projections,
@@ -108,7 +108,7 @@ fn text_checkpoint(text: &str) -> CrdtSnapshot {
     source
         .commit(
             WriteBatch {
-                upserts: vec![UpsertIn {
+                doc_writes: vec![DocWrite {
                     table: "issues".into(),
                     id: "source".into(),
                     data: r#"{"body":"","title":"source"}"#.into(),
@@ -143,8 +143,8 @@ fn crdt_pull(
     checkpoint: &CrdtSnapshot,
     projection_hash: String,
     clock: f64,
-) -> RemotePull {
-    RemotePull {
+) -> RemotePageWrite {
+    RemotePageWrite {
         subscription: "issues:crdt:{}".into(),
         members: vec![member(server_id)],
         projections: vec![AuthoritativeRow {
@@ -190,7 +190,7 @@ fn text_increment(checkpoint: &CrdtSnapshot) -> (Vec<u8>, CrdtSnapshot) {
     .unwrap();
     source.setup(&crdt_schema()).unwrap();
     source
-        .remote_pull_page(&crdt_pull(
+        .remote_page_write(&crdt_pull(
             SERVER_ID,
             checkpoint,
             checkpoint.projection_hash.clone(),
@@ -231,7 +231,7 @@ fn a_projection_is_deleted_only_after_its_final_membership_edge_exits() {
     store.setup(&schema()).unwrap();
 
     store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             vec![member(SERVER_ID)],
             vec![projection(SERVER_ID, "shared", 1.0, 1)],
@@ -244,7 +244,7 @@ fn a_projection_is_deleted_only_after_its_final_membership_edge_exits() {
         vec![member(SERVER_ID)]
     );
     store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:open:{}",
             vec![member(SERVER_ID)],
             vec![projection(SERVER_ID, "shared", 1.0, 2)],
@@ -260,7 +260,7 @@ fn a_projection_is_deleted_only_after_its_final_membership_edge_exits() {
     );
 
     let first_exit = store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             Vec::new(),
             Vec::new(),
@@ -268,25 +268,25 @@ fn a_projection_is_deleted_only_after_its_final_membership_edge_exits() {
             3,
         ))
         .unwrap();
-    assert_eq!(first_exit.swept, 0);
+    assert_eq!(first_exit.projection_deleted, 0);
     assert_eq!(rows(&store).len(), 1);
     assert_eq!(
         store
-            .remote_read_cursor("issues:all:{}")
+            .remote_cursor_read("issues:all:{}")
             .unwrap()
             .as_deref(),
         Some("all:2")
     );
     assert_eq!(
         store
-            .remote_read_cursor("issues:open:{}")
+            .remote_cursor_read("issues:open:{}")
             .unwrap()
             .as_deref(),
         Some("open:1")
     );
 
     let final_exit = store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:open:{}",
             Vec::new(),
             Vec::new(),
@@ -294,7 +294,7 @@ fn a_projection_is_deleted_only_after_its_final_membership_edge_exits() {
             4,
         ))
         .unwrap();
-    assert_eq!(final_exit.swept, 1);
+    assert_eq!(final_exit.projection_deleted, 1);
     assert!(rows(&store).is_empty());
 }
 
@@ -305,7 +305,7 @@ fn an_unchanged_membership_accepts_only_changed_projections() {
     let members = vec![member(SERVER_ID), member(STALE_SERVER_ID)];
 
     store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             members.clone(),
             vec![
@@ -318,7 +318,7 @@ fn an_unchanged_membership_accepts_only_changed_projections() {
         .unwrap();
 
     let delta = store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             members.clone(),
             vec![projection(SERVER_ID, "after", 2.0, 2)],
@@ -338,7 +338,7 @@ fn an_unchanged_membership_accepts_only_changed_projections() {
     assert!(current.iter().any(|row| row["title"] == "stable"));
 
     let unchanged = store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             vec![member(SERVER_ID), member(STALE_SERVER_ID)],
             Vec::new(),
@@ -355,7 +355,7 @@ fn an_invalid_snapshot_rolls_back_projection_membership_and_cursor_together() {
     let store = EmbeddedStore::open(tmp_path("membership_atomic.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             vec![member(SERVER_ID)],
             vec![projection(SERVER_ID, "before", 1.0, 1)],
@@ -365,7 +365,7 @@ fn an_invalid_snapshot_rolls_back_projection_membership_and_cursor_together() {
         .unwrap();
 
     let missing_id = "jx77missingauthoritativeprojection";
-    let rejected = store.remote_pull_page(&snapshot(
+    let rejected = store.remote_page_write(&snapshot(
         "issues:all:{}",
         vec![member(missing_id)],
         vec![projection(SERVER_ID, "must roll back", 2.0, 2)],
@@ -376,14 +376,14 @@ fn an_invalid_snapshot_rolls_back_projection_membership_and_cursor_together() {
     assert_eq!(rows(&store)[0]["title"], "before");
     assert_eq!(
         store
-            .remote_read_cursor("issues:all:{}")
+            .remote_cursor_read("issues:all:{}")
             .unwrap()
             .as_deref(),
         Some("cursor:1")
     );
 
     let exit = store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             Vec::new(),
             Vec::new(),
@@ -391,7 +391,10 @@ fn an_invalid_snapshot_rolls_back_projection_membership_and_cursor_together() {
             3,
         ))
         .unwrap();
-    assert_eq!(exit.swept, 1, "the original edge survived the rollback");
+    assert_eq!(
+        exit.projection_deleted, 1,
+        "the original edge survived the rollback"
+    );
 }
 
 #[test]
@@ -399,7 +402,7 @@ fn final_membership_exit_archives_dirty_state_before_removing_the_projection() {
     let store = EmbeddedStore::open(tmp_path("membership_dirty.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             vec![member(SERVER_ID)],
             vec![projection(SERVER_ID, "server", 1.0, 1)],
@@ -410,13 +413,13 @@ fn final_membership_exit_archives_dirty_state_before_removing_the_projection() {
     let local_id = rows(&store)[0]["_id"].as_str().unwrap().to_owned();
     store
         .commit(
-            upserts(vec![issue(&store, &local_id, "local", "dirty")]),
+            doc_writes(vec![issue(&store, &local_id, "local", "dirty")]),
             &CommitOptions::default(),
         )
         .unwrap();
 
     let exit = store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:all:{}",
             Vec::new(),
             Vec::new(),
@@ -424,7 +427,7 @@ fn final_membership_exit_archives_dirty_state_before_removing_the_projection() {
             2,
         ))
         .unwrap();
-    assert_eq!(exit.swept, 1);
+    assert_eq!(exit.projection_deleted, 1);
     assert_eq!(exit.projection.reroots.len(), 1);
     assert!(rows(&store).is_empty());
     let revisions = store
@@ -448,7 +451,7 @@ fn warm_and_fresh_stores_converge_after_the_same_complete_snapshot() {
     warm.setup(&schema()).unwrap();
     fresh.setup(&schema()).unwrap();
 
-    warm.remote_pull_page(&snapshot(
+    warm.remote_page_write(&snapshot(
         "issues:all:{}",
         vec![member(SERVER_ID), member(STALE_SERVER_ID)],
         vec![
@@ -466,8 +469,8 @@ fn warm_and_fresh_stores_converge_after_the_same_complete_snapshot() {
         "cursor:current",
         2,
     );
-    warm.remote_pull_page(&current).unwrap();
-    fresh.remote_pull_page(&current).unwrap();
+    warm.remote_page_write(&current).unwrap();
+    fresh.remote_page_write(&current).unwrap();
 
     assert_eq!(rows(&warm), rows(&fresh));
     assert_eq!(rows(&warm).len(), 1);
@@ -477,8 +480,8 @@ fn warm_and_fresh_stores_converge_after_the_same_complete_snapshot() {
         fresh.subscription_membership_read("issues:all:{}").unwrap()
     );
     assert_eq!(
-        warm.remote_read_cursor("issues:all:{}").unwrap(),
-        fresh.remote_read_cursor("issues:all:{}").unwrap()
+        warm.remote_cursor_read("issues:all:{}").unwrap(),
+        fresh.remote_cursor_read("issues:all:{}").unwrap()
     );
 }
 
@@ -490,7 +493,7 @@ fn mixed_projection_membership_crdt_and_invalidation_commit_together() {
         let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
         store.setup(&crdt_schema()).unwrap();
         let applied = store
-            .remote_pull_page(&crdt_pull(
+            .remote_page_write(&crdt_pull(
                 SERVER_ID,
                 &checkpoint,
                 checkpoint.projection_hash.clone(),
@@ -526,7 +529,7 @@ fn mixed_projection_membership_crdt_and_invalidation_commit_together() {
     );
     assert_eq!(
         reopened
-            .remote_read_cursor("issues:crdt:{}")
+            .remote_cursor_read("issues:crdt:{}")
             .unwrap()
             .as_deref(),
         Some("cursor:crdt")
@@ -542,7 +545,7 @@ fn duplicate_and_stale_crdt_heads_are_idempotent_and_divergence_fails_closed() {
         EmbeddedStore::open(tmp_path("membership_crdt_idempotent.db").to_str().unwrap()).unwrap();
     store.setup(&crdt_schema()).unwrap();
     store
-        .remote_pull_page(&crdt_pull(
+        .remote_page_write(&crdt_pull(
             SERVER_ID,
             &checkpoint,
             checkpoint.projection_hash.clone(),
@@ -567,7 +570,7 @@ fn duplicate_and_stale_crdt_heads_are_idempotent_and_divergence_fails_closed() {
         updates: vec![update],
         checkpoint_request: None,
     }];
-    store.remote_pull_page(&incremental).unwrap();
+    store.remote_page_write(&incremental).unwrap();
     assert_eq!(rows(&store)[0]["body"], "remoteA");
     assert_eq!(
         store
@@ -581,7 +584,7 @@ fn duplicate_and_stale_crdt_heads_are_idempotent_and_divergence_fails_closed() {
     let mut duplicate = incremental.clone();
     duplicate.cursor = Some("cursor:duplicate".into());
     duplicate.received_time = 21;
-    store.remote_pull_page(&duplicate).unwrap();
+    store.remote_page_write(&duplicate).unwrap();
     assert_eq!(rows(&store)[0]["body"], "remoteA");
 
     let mut stale = crdt_pull(
@@ -592,7 +595,7 @@ fn duplicate_and_stale_crdt_heads_are_idempotent_and_divergence_fails_closed() {
     );
     stale.cursor = Some("cursor:stale".into());
     stale.received_time = 22;
-    store.remote_pull_page(&stale).unwrap();
+    store.remote_page_write(&stale).unwrap();
     assert_eq!(rows(&store)[0]["body"], "remoteA");
 
     let mut divergent = duplicate;
@@ -600,13 +603,13 @@ fn duplicate_and_stale_crdt_heads_are_idempotent_and_divergence_fails_closed() {
     divergent.received_time = 23;
     divergent.crdt[0].projection_hash = "different-projection".into();
     assert!(matches!(
-        store.remote_pull_page(&divergent),
+        store.remote_page_write(&divergent),
         Err(StorageError::Unsatisfiable(_))
     ));
     assert_eq!(rows(&store)[0]["body"], "remoteA");
     assert_eq!(
         store
-            .remote_read_cursor("issues:crdt:{}")
+            .remote_cursor_read("issues:crdt:{}")
             .unwrap()
             .as_deref(),
         Some("cursor:stale")
@@ -620,7 +623,7 @@ fn corrupt_crdt_rolls_back_projection_mapping_membership_cursor_and_clock() {
     {
         let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
         store.setup(&crdt_schema()).unwrap();
-        let rejected = store.remote_pull_page(&crdt_pull(
+        let rejected = store.remote_page_write(&crdt_pull(
             SERVER_ID,
             &checkpoint,
             "wrong-projection-hash".into(),
@@ -633,7 +636,7 @@ fn corrupt_crdt_rolls_back_projection_mapping_membership_cursor_and_clock() {
             .subscription_membership_read("issues:crdt:{}")
             .unwrap()
             .is_empty());
-        assert_eq!(store.remote_read_cursor("issues:crdt:{}").unwrap(), None);
+        assert_eq!(store.remote_cursor_read("issues:crdt:{}").unwrap(), None);
         assert!(store.clock_read().unwrap() < DOMINATING_CLOCK);
     }
     let reopened = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
@@ -653,7 +656,7 @@ fn failed_pull_restores_dirty_projection_and_discards_displacement_archive() {
         EmbeddedStore::open(tmp_path("membership_dirty_rollback.db").to_str().unwrap()).unwrap();
     store.setup(&crdt_schema()).unwrap();
     store
-        .remote_pull_page(&crdt_pull(
+        .remote_page_write(&crdt_pull(
             SERVER_ID,
             &checkpoint,
             checkpoint.projection_hash.clone(),
@@ -663,7 +666,7 @@ fn failed_pull_restores_dirty_projection_and_discards_displacement_archive() {
     let local_id = rows(&store)[0]["_id"].as_str().unwrap().to_owned();
     store
         .commit(
-            upserts(vec![UpsertIn {
+            doc_writes(vec![DocWrite {
                 table: "issues".into(),
                 id: local_id.clone(),
                 data: r#"{"body":"remote","title":"local dirty"}"#.into(),
@@ -686,7 +689,7 @@ fn failed_pull_restores_dirty_projection_and_discards_displacement_archive() {
         r#"{{"_id":"{SERVER_ID}","_creationTime":1,"status":"open","title":"server winner","body":""}}"#
     ));
     assert!(matches!(
-        store.remote_pull_page(&rejected),
+        store.remote_page_write(&rejected),
         Err(StorageError::Unsatisfiable(_))
     ));
 
@@ -695,7 +698,7 @@ fn failed_pull_restores_dirty_projection_and_discards_displacement_archive() {
     assert_eq!(store.dirty_heads_debug_read().unwrap().len(), 1);
     assert_eq!(
         store
-            .remote_read_cursor("issues:crdt:{}")
+            .remote_cursor_read("issues:crdt:{}")
             .unwrap()
             .as_deref(),
         Some("cursor:crdt")
@@ -730,7 +733,7 @@ fn commit_fault_rolls_back_the_complete_mixed_pull_page() {
             bytes: checkpoint.bytes.clone(),
         });
         fail_next_commit();
-        let rejected = store.remote_pull_page(&pull);
+        let rejected = store.remote_page_write(&pull);
         assert!(matches!(rejected, Err(StorageError::Turso(_))));
         assert!(rows(&store).is_empty());
         assert!(store.id_page_read("issues").unwrap().is_empty());
@@ -738,7 +741,7 @@ fn commit_fault_rolls_back_the_complete_mixed_pull_page() {
             .subscription_membership_read("issues:crdt:{}")
             .unwrap()
             .is_empty());
-        assert_eq!(store.remote_read_cursor("issues:crdt:{}").unwrap(), None);
+        assert_eq!(store.remote_cursor_read("issues:crdt:{}").unwrap(), None);
         assert_eq!(store.blob_read(&blob_key).unwrap(), None);
         assert!(store.clock_read().unwrap() < DOMINATING_CLOCK);
     }
@@ -774,7 +777,7 @@ fn applied_push_settlement_is_one_crash_atomic_state() {
         committed = store
             .commit(
                 WriteBatch {
-                    upserts: vec![UpsertIn {
+                    doc_writes: vec![DocWrite {
                         table: "issues".into(),
                         id: local_id.into(),
                         data: r#"{"body":"","title":"local"}"#.into(),
@@ -812,7 +815,7 @@ fn applied_push_settlement_is_one_crash_atomic_state() {
             .unwrap();
 
         fail_next_commit();
-        let failed = store.remote_push_settle(&applied_settlement(
+        let failed = store.remote_settlement_write(&applied_settlement(
             mutation_id,
             committed.commit_seq,
             local_id,
@@ -831,7 +834,7 @@ fn applied_push_settlement_is_one_crash_atomic_state() {
         store.setup(&crdt_schema()).unwrap();
         assert_applied_settlement_before(&store, mutation_id, local_id);
         store
-            .remote_push_settle(&applied_settlement(
+            .remote_settlement_write(&applied_settlement(
                 mutation_id,
                 committed.commit_seq,
                 local_id,
@@ -853,12 +856,12 @@ fn applied_settlement(
     local_id: &str,
     snapshot: &CrdtSnapshot,
     payload: &[u8],
-) -> RemotePushSettlement {
-    RemotePushSettlement {
+) -> RemoteSettlementWrite {
+    RemoteSettlementWrite {
         mutation_id: mutation_id.into(),
         expected_commit_seq: commit_seq,
         now_ms: 3,
-        outcome: RemotePushSettlementOutcome::Applied {
+        outcome: RemoteSettlementOutcome::Applied {
             ids: vec![RemoteIdMapping {
                 table: "issues".into(),
                 server_document_id: SERVER_ID.into(),
@@ -911,7 +914,7 @@ fn assert_applied_settlement_before(store: &EmbeddedStore, mutation_id: &str, lo
     );
     assert_eq!(store.dirty_heads_debug_read().unwrap().len(), 1);
     assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 1);
-    assert!(store.remote_settlement_ack_read(10).unwrap().is_empty());
+    assert!(store.remote_receipt_read(10).unwrap().is_empty());
     assert!(store.remote_push_envelope_read(10).unwrap()[0].contains(mutation_id));
 }
 
@@ -945,7 +948,7 @@ fn assert_applied_settlement_after(
     assert!(store.dirty_heads_debug_read().unwrap().is_empty());
     assert!(store.remote_push_envelope_read(10).unwrap().is_empty());
     assert_eq!(
-        store.remote_settlement_ack_read(10).unwrap(),
+        store.remote_receipt_read(10).unwrap(),
         vec![mutation_id.to_owned()]
     );
 }
@@ -960,7 +963,7 @@ fn rejected_push_settlement_is_one_crash_atomic_state() {
         let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
         store.setup(&schema()).unwrap();
         store
-            .remote_pull_page(&snapshot(
+            .remote_page_write(&snapshot(
                 "issues:rejected:{}",
                 vec![member(SERVER_ID)],
                 vec![projection(SERVER_ID, "server base", 1.0, 1)],
@@ -983,7 +986,7 @@ fn rejected_push_settlement_is_one_crash_atomic_state() {
             .unwrap();
         commit_seq = store
             .commit(
-                upserts(vec![UpsertIn {
+                doc_writes(vec![DocWrite {
                     table: "issues".into(),
                     id: local_id.clone(),
                     data: r#"{"title":"local rejected"}"#.into(),
@@ -1005,7 +1008,7 @@ fn rejected_push_settlement_is_one_crash_atomic_state() {
 
         fail_next_commit();
         let failed =
-            store.remote_push_settle(&rejected_settlement(mutation_id, commit_seq, &local_id));
+            store.remote_settlement_write(&rejected_settlement(mutation_id, commit_seq, &local_id));
         assert!(
             matches!(failed, Err(StorageError::Turso(_))),
             "unexpected settlement result: {failed:?}"
@@ -1018,7 +1021,7 @@ fn rejected_push_settlement_is_one_crash_atomic_state() {
         store.setup(&schema()).unwrap();
         assert_rejected_settlement_before(&store, mutation_id, &local_id);
         let result = store
-            .remote_push_settle(&rejected_settlement(mutation_id, commit_seq, &local_id))
+            .remote_settlement_write(&rejected_settlement(mutation_id, commit_seq, &local_id))
             .unwrap();
         assert_eq!(result.projection.reroots.len(), 1);
         assert_rejected_settlement_after(&store, mutation_id, &local_id);
@@ -1029,17 +1032,22 @@ fn rejected_push_settlement_is_one_crash_atomic_state() {
     assert_rejected_settlement_after(&reopened, mutation_id, &local_id);
 }
 
-fn rejected_settlement(mutation_id: &str, commit_seq: i64, local_id: &str) -> RemotePushSettlement {
-    RemotePushSettlement {
+fn rejected_settlement(
+    mutation_id: &str,
+    commit_seq: i64,
+    local_id: &str,
+) -> RemoteSettlementWrite {
+    RemoteSettlementWrite {
         mutation_id: mutation_id.into(),
         expected_commit_seq: commit_seq,
         now_ms: 3,
-        outcome: RemotePushSettlementOutcome::Rejected {
+        outcome: RemoteSettlementOutcome::Rejected {
             schedules: vec!["schedule:rejected".into()],
             targets: vec![RemoteRowTarget {
                 table: "issues".into(),
                 local_document_id: local_id.into(),
                 server_rev_id: Some("rev:rejected".into()),
+                retain: true,
             }],
             projections: Vec::new(),
         },
@@ -1062,7 +1070,7 @@ fn assert_rejected_settlement_before(store: &EmbeddedStore, mutation_id: &str, l
         .iter()
         .all(|revision| !matches!(revision.lifecycle, RevLifecycle::Archived(_))));
     assert!(store.remote_push_envelope_read(10).unwrap()[0].contains(mutation_id));
-    assert!(store.remote_settlement_ack_read(10).unwrap().is_empty());
+    assert!(store.remote_receipt_read(10).unwrap().is_empty());
 }
 
 fn assert_rejected_settlement_after(store: &EmbeddedStore, mutation_id: &str, local_id: &str) {
@@ -1092,7 +1100,7 @@ fn assert_rejected_settlement_after(store: &EmbeddedStore, mutation_id: &str, lo
     )));
     assert!(store.remote_push_envelope_read(10).unwrap().is_empty());
     assert_eq!(
-        store.remote_settlement_ack_read(10).unwrap(),
+        store.remote_receipt_read(10).unwrap(),
         vec![mutation_id.to_owned()]
     );
 }
@@ -1104,7 +1112,7 @@ fn older_rejection_preserves_a_newer_dirty_head_and_updates_its_server_base() {
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .remote_pull_page(&snapshot(
+        .remote_page_write(&snapshot(
             "issues:rejected-older:{}",
             vec![member(SERVER_ID)],
             vec![projection(SERVER_ID, "server base", 1.0, 1)],
@@ -1115,7 +1123,7 @@ fn older_rejection_preserves_a_newer_dirty_head_and_updates_its_server_base() {
     let local_id = rows(&store)[0]["_id"].as_str().unwrap().to_owned();
     let older = store
         .commit(
-            upserts(vec![UpsertIn {
+            doc_writes(vec![DocWrite {
                 table: "issues".into(),
                 id: local_id.clone(),
                 data: r#"{"title":"older local"}"#.into(),
@@ -1130,7 +1138,7 @@ fn older_rejection_preserves_a_newer_dirty_head_and_updates_its_server_base() {
         .unwrap();
     let newer = store
         .commit(
-            upserts(vec![UpsertIn {
+            doc_writes(vec![DocWrite {
                 table: "issues".into(),
                 id: local_id.clone(),
                 data: r#"{"title":"newer local"}"#.into(),
@@ -1144,16 +1152,17 @@ fn older_rejection_preserves_a_newer_dirty_head_and_updates_its_server_base() {
     authoritative.local_document_id = Some(local_id.clone());
 
     let result = store
-        .remote_push_settle(&RemotePushSettlement {
+        .remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: mutation_id.into(),
             expected_commit_seq: older.commit_seq,
             now_ms: 3,
-            outcome: RemotePushSettlementOutcome::Rejected {
+            outcome: RemoteSettlementOutcome::Rejected {
                 schedules: Vec::new(),
                 targets: vec![RemoteRowTarget {
                     table: "issues".into(),
                     local_document_id: local_id.clone(),
                     server_rev_id: None,
+                    retain: false,
                 }],
                 projections: vec![authoritative],
             },
@@ -1165,14 +1174,14 @@ fn older_rejection_preserves_a_newer_dirty_head_and_updates_its_server_base() {
     let dirty = store.dirty_heads_debug_read().unwrap();
     assert_eq!(dirty.len(), 1);
     assert_eq!(dirty[0].updated_commit_seq, newer.commit_seq);
-    let projection = store.projection_read("issues", &local_id).unwrap().unwrap();
+    let projection = store.remote_doc_read("issues", &local_id).unwrap().unwrap();
     assert!(projection
         .server_row
         .as_deref()
         .is_some_and(|row| row.contains("new server base")));
     assert!(store.remote_push_envelope_read(10).unwrap().is_empty());
     assert_eq!(
-        store.remote_settlement_ack_read(10).unwrap(),
+        store.remote_receipt_read(10).unwrap(),
         vec![mutation_id.to_owned()]
     );
 }
@@ -1187,7 +1196,7 @@ fn rejected_crdt_settlement_restores_the_accepted_opaque_state() {
         let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
         store.setup(&crdt_schema()).unwrap();
         store
-            .remote_pull_page(&crdt_pull(
+            .remote_page_write(&crdt_pull(
                 SERVER_ID,
                 &checkpoint,
                 checkpoint.projection_hash.clone(),
@@ -1198,7 +1207,7 @@ fn rejected_crdt_settlement_restores_the_accepted_opaque_state() {
         let commit_seq = store
             .commit(
                 WriteBatch {
-                    upserts: vec![UpsertIn {
+                    doc_writes: vec![DocWrite {
                         table: "issues".into(),
                         id: local_id.clone(),
                         data: r#"{"body":"remote-local","title":"local"}"#.into(),
@@ -1228,16 +1237,17 @@ fn rejected_crdt_settlement_restores_the_accepted_opaque_state() {
             .remote_push_envelope_write(mutation_id, commit_seq, "{}", 2)
             .unwrap();
         let result = store
-            .remote_push_settle(&RemotePushSettlement {
+            .remote_settlement_write(&RemoteSettlementWrite {
                 mutation_id: mutation_id.into(),
                 expected_commit_seq: commit_seq,
                 now_ms: 3,
-                outcome: RemotePushSettlementOutcome::Rejected {
+                outcome: RemoteSettlementOutcome::Rejected {
                     schedules: Vec::new(),
                     targets: vec![RemoteRowTarget {
                         table: "issues".into(),
                         local_document_id: local_id.clone(),
                         server_rev_id: None,
+                        retain: true,
                     }],
                     projections: Vec::new(),
                 },

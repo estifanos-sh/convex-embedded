@@ -10,7 +10,7 @@ import { ConvexError, v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { defineEmbedded } from "../../src/server";
-import { set as revisionSet } from "../../src/component/rev";
+import { restore as revisionRestore } from "../../src/component/rev";
 import { hashDocument, hashValue } from "../../src/hash";
 import { pull as componentPull } from "../../src/component/protocol";
 import { retire as componentRetire } from "../../src/component/remote/client";
@@ -55,7 +55,26 @@ describe("v5 server surface", () => {
       "pull",
       "push",
       "query",
+      "upload",
     ]);
+  });
+
+  test("mints a hosted upload URL for the remote byte drain", async () => {
+    const embedded = defineEmbedded({ component, schema });
+    const handler = (
+      embedded.upload as unknown as {
+        _handler: (
+          ctx: unknown,
+          args: { localStorageId: string; sha256: string; size: number },
+        ) => Promise<unknown>;
+      }
+    )._handler;
+    await expect(
+      handler(
+        { storage: { generateUploadUrl: async () => "https://upload.example/once" } },
+        { localStorageId: "_storage|local", sha256: "a".repeat(64), size: 5 },
+      ),
+    ).resolves.toEqual({ uploadUrl: "https://upload.example/once" });
   });
 
   test("reports the deployment protocol during identity negotiation", async () => {
@@ -469,7 +488,7 @@ describe("v5 server surface", () => {
       authored,
     )) as { result: unknown; resultRows: Array<{ path: string; table: string; rowId: string }> };
 
-  test("prunes a matched complete document and emits its RFC 6901 pointer", async () => {
+  test("encodes a matched complete document and emits its RFC 6901 pointer", async () => {
     const doc = { _id: "documents:1", _creationTime: 1, owner: "o", title: "T" };
     const { result, resultRows } = await skeletonOf({ data: { items: [doc] }, total: 42 }, [
       { table: "documents", rowId: "documents:1", fields: doc },
@@ -543,7 +562,7 @@ describe("v5 server surface", () => {
     ]);
   });
 
-  test("fails an oversized pruned result with the member-page bound", async () => {
+  test("fails an oversized encoded result with the member-page bound", async () => {
     const doc = { _id: "documents:1", _creationTime: 1, title: "T" };
     const items = Array.from({ length: 1_025 }, () => doc);
     await expect(
@@ -1405,7 +1424,9 @@ describe("v5 server surface", () => {
     };
     const restore = (revId: string) =>
       (
-        revisionSet as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+        revisionRestore as unknown as {
+          _handler: (ctx: unknown, args: unknown) => Promise<unknown>;
+        }
       )._handler({ db }, { table: "documents", rowId: "documents:1", revId });
 
     await restore("r1");

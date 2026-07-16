@@ -26,6 +26,7 @@ import {
 } from "./model";
 import schema from "./schema";
 import { read as readTime } from "./time";
+import { write as retentionWrite } from "./crdt/retention";
 import { hashDocument, hashValue } from "../hash";
 import {
   EMBEDDED_CLIENT_RETIRED,
@@ -47,6 +48,12 @@ const BLOB_CHUNK_BYTES = 196_608;
 const MAX_BLOB_CHUNKS = 32;
 const MAX_CRDT_CHECKPOINT_BYTES = BLOB_CHUNK_BYTES * MAX_BLOB_CHUNKS;
 const MAX_PULL_CRDT_PAYLOADS = 512;
+const CRDT_CHECKPOINT_PAYLOAD_INTERVAL = 16;
+// Component queries cannot use Convex pagination. Keep each logical checkpoint page bounded by
+// both the maximum database read and the returned byte envelope, then continue with our own
+// sequence cursor. Eight maximum-sized payloads remain below Convex's query read limit.
+const MAX_CHECKPOINT_PAGE_ITEMS = 8;
+const MAX_CHECKPOINT_PAGE_BYTES = 1_048_576;
 const MAX_CRDT_FIELDS_PER_ROW = 64;
 
 const runtimeValidator = v.object({
@@ -108,12 +115,7 @@ export const commit = mutation({
 
     await clientWrite(ctx, request.clientId, request.runtime, request.identity);
 
-    const prior = await ctx.db
-      .query("mutations")
-      .withIndex("by_clientid_and_mutationid", (q) =>
-        q.eq("clientId", request.clientId).eq("mutationId", request.settlement.mutationId),
-      )
-      .unique();
+    const prior = await mutationCacheRead(ctx, request.identity, request.settlement.mutationId);
     if (prior) {
       if (prior.fingerprint !== request.fingerprint) {
         throw new ConvexError({
@@ -150,7 +152,12 @@ export const commit = mutation({
     }
 
     if (request.acknowledgeMutationId) {
-      await acknowledgeWrite(ctx, request.clientId, request.acknowledgeMutationId);
+      await acknowledgeWrite(
+        ctx,
+        request.clientId,
+        request.acknowledgeMutationId,
+        request.identity,
+      );
     }
 
     if (request.kind === "apply") {
@@ -317,13 +324,25 @@ async function revisionWrite(
   const createdAt = readTime();
   const retained: Array<{ table: string; rowId: string; revId: string }> = [];
   for (const revision of revisions) {
-    const revId = crypto.randomUUID();
     const deleted = revision.content === "deleted";
     const fingerprint = await hashValue({
       deleted,
       value: revision.content === "value" ? revision.value : null,
       crdt: [],
     });
+    const existing = (
+      await ctx.db
+        .query("revisions")
+        .withIndex("by_table_and_rowid_and_fingerprint", (q) =>
+          q.eq("table", revision.table).eq("rowId", revision.rowId).eq("fingerprint", fingerprint),
+        )
+        .take(1)
+    )[0];
+    if (existing) {
+      retained.push({ table: revision.table, rowId: revision.rowId, revId: existing.revId });
+      continue;
+    }
+    const revId = crypto.randomUUID();
     await ctx.db.insert("revisions", {
       key: revisionKey(createdAt, revId),
       revId,
@@ -366,6 +385,7 @@ export const replayWrite = mutation({
     tokenHash: v.string(),
     kind: v.literal("push"),
     clientId: v.string(),
+    identity: v.optional(v.string()),
     requestId: v.string(),
     functionName: v.string(),
     mutationId: v.string(),
@@ -385,14 +405,9 @@ export const replayWrite = mutation({
   },
   returns: v.union(settlementValidator, v.null()),
   handler: async (ctx, args) => {
-    await clientWrite(ctx, args.clientId, args.runtime);
-    await replaySweep(ctx);
-    const settled = await ctx.db
-      .query("mutations")
-      .withIndex("by_clientid_and_mutationid", (q) =>
-        q.eq("clientId", args.clientId).eq("mutationId", args.mutationId),
-      )
-      .unique();
+    await clientWrite(ctx, args.clientId, args.runtime, args.identity);
+    await replayDelete(ctx);
+    const settled = await mutationCacheRead(ctx, args.identity, args.mutationId);
     if (settled) {
       if (settled.fingerprint !== args.fingerprint) {
         throw new ConvexError({
@@ -435,7 +450,7 @@ export const replayWrite = mutation({
   },
 });
 
-async function replaySweep(ctx: MutationCtx): Promise<void> {
+async function replayDelete(ctx: MutationCtx): Promise<void> {
   const now = readTime();
   const expired = await ctx.db
     .query("replays")
@@ -628,7 +643,7 @@ export const blobWrite = mutation({
   },
 });
 
-export const bootstrap = query({
+export const checkpointRead = query({
   args: {
     table: v.string(),
     rowId: v.string(),
@@ -638,30 +653,33 @@ export const bootstrap = query({
     headSeq: v.number(),
     cursor: v.union(v.string(), v.null()),
   },
-  returns: v.object({
-    checkpoint: v.object({ id: v.string(), seq: v.number(), bytes: v.number(), hash: v.string() }),
-    headSeq: v.number(),
-    chunks: v.array(v.object({ ordinal: v.number(), bytes: v.bytes(), hash: v.string() })),
-    payloads: v.array(v.object({ seq: v.number(), bytes: v.bytes(), hash: v.string() })),
-    continueCursor: v.union(v.string(), v.null()),
-    isDone: v.boolean(),
-  }),
+  returns: v.union(
+    v.object({ kind: v.literal("stale") }),
+    v.object({
+      checkpoint: v.object({
+        id: v.string(),
+        seq: v.number(),
+        bytes: v.number(),
+        hash: v.string(),
+      }),
+      headSeq: v.number(),
+      chunks: v.array(v.object({ ordinal: v.number(), bytes: v.bytes(), hash: v.string() })),
+      payloads: v.array(v.object({ seq: v.number(), bytes: v.bytes(), hash: v.string() })),
+      continueCursor: v.union(v.string(), v.null()),
+      isDone: v.boolean(),
+    }),
+  ),
   handler: async (ctx, args) => {
     const checkpoint = await ctx.db.get("crdtCheckpoints", args.checkpointId);
     if (!checkpoint || checkpoint.state !== "ready" || !checkpoint.blobId) {
-      throw new Error("Embedded checkpoint is not ready for bootstrap.");
+      return { kind: "stale" as const };
     }
     const field = await ctx.db.get("crdtFields", checkpoint.fieldId);
-    if (
-      !field ||
-      field.detached ||
-      field.table !== args.table ||
-      field.rowId !== args.rowId ||
-      field.field !== args.field ||
-      field.epoch !== args.epoch ||
-      checkpoint.epoch !== args.epoch
-    ) {
-      throw new Error("Embedded bootstrap checkpoint does not address the authorized field.");
+    if (!field || field.detached || field.epoch !== args.epoch || checkpoint.epoch !== args.epoch) {
+      return { kind: "stale" as const };
+    }
+    if (field.table !== args.table || field.rowId !== args.rowId || field.field !== args.field) {
+      throw new Error("Embedded checkpoint does not address the authorized field.");
     }
     if (
       !Number.isSafeInteger(args.headSeq) ||
@@ -669,35 +687,42 @@ export const bootstrap = query({
       args.headSeq > field.headSeq ||
       args.headSeq - checkpoint.throughSeq > MAX_PULL_CRDT_PAYLOADS
     ) {
-      throw new Error("Embedded bootstrap head is outside the retained field history.");
+      throw new Error("Embedded checkpoint head is outside the readable field history.");
     }
     const blob = await ctx.db.get("blobs", checkpoint.blobId);
-    if (!blob || blob.state !== "ready") throw new Error("Embedded checkpoint blob is not ready.");
-    const cursor = bootstrapCursor(args.cursor, checkpoint.throughSeq, args.headSeq, blob.chunks);
+    if (!blob || blob.state !== "ready") return { kind: "stale" as const };
+    const cursor = checkpointCursor(args.cursor, checkpoint.throughSeq, args.headSeq, blob.chunks);
     const chunks = [] as Array<{ ordinal: number; bytes: ArrayBuffer; hash: string }>;
     const payloads = [] as Array<{ seq: number; bytes: ArrayBuffer; hash: string }>;
     let continueCursor: string | null;
     let isDone: boolean;
     if (cursor.kind === "chunk") {
-      const [chunk] = await ctx.db
+      const page = await ctx.db
         .query("blobChunks")
         .withIndex("by_blobid_and_ordinal", (q) =>
           q.eq("blobId", blob._id).gt("ordinal", cursor.ordinal),
         )
-        .take(1);
-      if (!chunk || chunk.ordinal !== cursor.ordinal + 1) {
-        throw new Error("Embedded bootstrap checkpoint chunks are not contiguous.");
+        .take(MAX_CHECKPOINT_PAGE_ITEMS);
+      let pageBytes = 0;
+      for (const chunk of page) {
+        if (chunks.length > 0 && pageBytes + chunk.bytes.byteLength > MAX_CHECKPOINT_PAGE_BYTES) {
+          break;
+        }
+        if (chunk.ordinal !== cursor.ordinal + chunks.length + 1) return { kind: "stale" as const };
+        chunks.push({ ordinal: chunk.ordinal, bytes: chunk.bytes, hash: chunk.hash });
+        pageBytes += chunk.bytes.byteLength;
       }
-      chunks.push({ ordinal: chunk.ordinal, bytes: chunk.bytes, hash: chunk.hash });
-      const checkpointDone = chunk.ordinal + 1 === blob.chunks;
+      const last = chunks.at(-1);
+      if (!last) return { kind: "stale" as const };
+      const checkpointDone = last.ordinal + 1 === blob.chunks;
       isDone = checkpointDone && checkpoint.throughSeq === args.headSeq;
       continueCursor = isDone
         ? null
         : checkpointDone
           ? `payload:${checkpoint.throughSeq}`
-          : `chunk:${chunk.ordinal}`;
+          : `chunk:${last.ordinal}`;
     } else {
-      const [payload] = await ctx.db
+      const page = await ctx.db
         .query("crdtPayloads")
         .withIndex("by_fieldid_and_epoch_and_seq", (q) =>
           q
@@ -706,13 +731,23 @@ export const bootstrap = query({
             .gt("seq", cursor.seq)
             .lte("seq", args.headSeq),
         )
-        .take(1);
-      if (!payload || payload.seq !== cursor.seq + 1) {
-        throw new Error("Embedded bootstrap payload history is not contiguous.");
+        .take(MAX_CHECKPOINT_PAGE_ITEMS);
+      if (page[0]?.seq !== cursor.seq + 1) return { kind: "stale" as const };
+      let pageBytes = 0;
+      for (const payload of page) {
+        if (
+          payloads.length > 0 &&
+          pageBytes + payload.bytes.byteLength > MAX_CHECKPOINT_PAGE_BYTES
+        ) {
+          break;
+        }
+        if (payload.seq !== cursor.seq + payloads.length + 1) return { kind: "stale" as const };
+        payloads.push({ seq: payload.seq, bytes: payload.bytes, hash: payload.hash });
+        pageBytes += payload.bytes.byteLength;
       }
-      payloads.push({ seq: payload.seq, bytes: payload.bytes, hash: payload.hash });
-      isDone = payload.seq === args.headSeq;
-      continueCursor = isDone ? null : `payload:${payload.seq}`;
+      const last = payloads.at(-1)!;
+      isDone = last.seq === args.headSeq;
+      continueCursor = isDone ? null : `payload:${last.seq}`;
     }
     return {
       checkpoint: {
@@ -739,10 +774,10 @@ export const installation = query({
 });
 
 export const acknowledge = mutation({
-  args: { clientId: v.string(), mutationId: v.string() },
+  args: { clientId: v.string(), mutationId: v.string(), identity: v.optional(v.string()) },
   returns: v.null(),
   handler: async (ctx, args) => {
-    await acknowledgeWrite(ctx, args.clientId, args.mutationId);
+    await acknowledgeWrite(ctx, args.clientId, args.mutationId, args.identity);
     return null;
   },
 });
@@ -751,20 +786,30 @@ async function acknowledgeWrite(
   ctx: MutationCtx,
   clientId: string,
   mutationId: string,
+  identity?: string,
 ): Promise<void> {
-  const row = await ctx.db
-    .query("mutations")
-    .withIndex("by_clientid_and_mutationid", (q) =>
-      q.eq("clientId", clientId).eq("mutationId", mutationId),
-    )
-    .unique();
+  const row = await mutationCacheRead(ctx, identity, mutationId);
   if (!row) return;
-  const client = await clientRead(ctx, clientId);
+  const client = await clientRead(ctx, row.clientId);
   if (client && row._creationTime > (client.acknowledgedThrough ?? 0)) {
     await ctx.db.patch("clients", client._id, {
       acknowledgedThrough: row._creationTime,
     });
   }
+}
+
+/** Mutation identity survives page, worker, and remote-client incarnations. */
+async function mutationCacheRead(
+  ctx: MutationCtx,
+  identity: string | undefined,
+  mutationId: string,
+) {
+  return await ctx.db
+    .query("mutations")
+    .withIndex("by_identity_and_mutationid", (q) =>
+      q.eq("identity", identity).eq("mutationId", mutationId),
+    )
+    .unique();
 }
 
 async function crdtRead(
@@ -874,7 +919,7 @@ async function crdtRead(
   return result;
 }
 
-function bootstrapCursor(
+function checkpointCursor(
   value: string | null,
   checkpointSeq: number,
   headSeq: number,
@@ -883,14 +928,14 @@ function bootstrapCursor(
   if (value === null) return { kind: "chunk", ordinal: -1 };
   const [kind, raw] = value.split(":");
   const coordinate = Number(raw);
-  if (!Number.isSafeInteger(coordinate)) throw new Error("Invalid Embedded bootstrap cursor.");
+  if (!Number.isSafeInteger(coordinate)) throw new Error("Invalid Embedded checkpoint cursor.");
   if (kind === "chunk" && coordinate >= 0 && coordinate < chunks - 1) {
     return { kind, ordinal: coordinate };
   }
   if (kind === "payload" && coordinate >= checkpointSeq && coordinate < headSeq) {
     return { kind, seq: coordinate };
   }
-  throw new Error("Invalid Embedded bootstrap cursor.");
+  throw new Error("Invalid Embedded checkpoint cursor.");
 }
 
 export const witnessRead = query({
@@ -1087,6 +1132,40 @@ async function crdtWrite(
     }
     throw new Error("CRDT checkpoint responses use the checkpoint push request.");
   }
+  await checkpointRequestWrite(ctx, field, seq, effect.projectionHash);
+}
+
+async function checkpointRequestWrite(
+  ctx: MutationCtx,
+  field: DataModel["crdtFields"]["document"],
+  throughSeq: number,
+  projectionHash: string,
+): Promise<void> {
+  const [requested] = await ctx.db
+    .query("crdtCheckpoints")
+    .withIndex("by_field_epoch_state_seq", (q) =>
+      q.eq("fieldId", field._id).eq("epoch", field.epoch).eq("state", "requested"),
+    )
+    .take(1);
+  if (requested) return;
+  const [ready] = await ctx.db
+    .query("crdtCheckpoints")
+    .withIndex("by_field_epoch_state_seq", (q) =>
+      q.eq("fieldId", field._id).eq("epoch", field.epoch).eq("state", "ready"),
+    )
+    .order("desc")
+    .take(1);
+  if (throughSeq - (ready?.throughSeq ?? 0) < CRDT_CHECKPOINT_PAYLOAD_INTERVAL) return;
+  await ctx.db.insert("crdtCheckpoints", {
+    fieldId: field._id,
+    epoch: field.epoch,
+    throughSeq,
+    projectionHash,
+    responseToken: crypto.randomUUID(),
+    state: "requested",
+    createdAt: readTime(),
+    updatedAt: readTime(),
+  });
 }
 
 export const checkpointWrite = mutation({
@@ -1099,7 +1178,6 @@ export const checkpointWrite = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const blob = await blobResolve(ctx, args.content);
     const checkpoint = await ctx.db.get("crdtCheckpoints", args.checkpointId);
     if (!checkpoint) throw new Error("CRDT checkpoint request not found.");
     if (
@@ -1110,19 +1188,22 @@ export const checkpointWrite = mutation({
       throw new Error("CRDT checkpoint response does not match its request.");
     }
     if (checkpoint.state === "ready") {
-      if (checkpoint.blobId !== blob._id) {
-        throw new Error("Ready CRDT checkpoint does not match the carried response.");
-      }
+      // Several live clients can observe and answer the same request before the first response
+      // commits. The first ready checkpoint is authoritative; every later response for that exact
+      // request is settled without resolving or retaining its losing blob.
       return null;
     }
+    const blob = await blobResolve(ctx, args.content);
     const field = await ctx.db.get("crdtFields", checkpoint.fieldId);
     if (!field || field.epoch !== checkpoint.epoch || field.headSeq < checkpoint.throughSeq) {
       throw new Error("CRDT checkpoint request no longer covers an active field.");
     }
+    const now = readTime();
+    await retentionWrite(ctx, checkpoint.fieldId, checkpoint.epoch, checkpoint.throughSeq, now);
     await ctx.db.patch("crdtCheckpoints", checkpoint._id, {
       state: "ready",
       blobId: blob._id,
-      updatedAt: readTime(),
+      updatedAt: now,
     });
     return null;
   },

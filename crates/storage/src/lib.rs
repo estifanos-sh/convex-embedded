@@ -8,7 +8,7 @@
 //!
 //! Reads are total and paged: [`sql`] compiles every scan shape (widening bounds it cannot
 //! represent exactly), rows stream straight off the statement into documents, and pages resume
-//! through keyset cursors. The commit/mutation ledgers are pruned by consumer watermark, and a
+//! through keyset cursors. Commit and mutation ledger rows are deleted by consumer watermark, and a
 //! `__embedded_blobs` table stores binary payloads without any text encoding. Local-first service
 //! metadata lives beside those document tables: id mappings, file metadata, pending upload leases,
 //! and scheduled jobs are all identity-scoped.
@@ -43,18 +43,18 @@ pub use types::{
     CommitPush, CommitResult, CommitSource, CountSpec, CrdtCheckpoint, CrdtCheckpointRequest,
     CrdtEffect, CrdtFieldDef, CrdtFieldKind, CrdtOp, CrdtOperation, CrdtReadState, CrdtReadWitness,
     CrdtRemoteEffect, CrdtRemoteState, CrdtRemoteWrite, CrdtRestore, CrdtSnapshot, CrdtWireOp,
-    DeleteIn, DeleteResult, DirtyHeadDebug, DirtyHeadToken, FileMetadata, FileStore, IdMapping,
-    IdMappingContent, IndexDef, InsertRef, MembershipRange, MutationCall, MutationRecord,
-    MutationStatus, Order, Page, PendingUpload, PushEnvelope, PushOutcome, PushResponse,
-    RangeVersion, ReadBound, ReadEquality, ReadRange, ReadSpec, RemoteBlob, RemoteCrdtChange,
-    RemoteIdMapping, RemoteMember, RemotePull, RemotePullResult, RemotePushSettlement,
-    RemotePushSettlementOutcome, RemotePushSettlementResult, RemoteRowTarget,
-    RemoteScheduleMapping, ResultEntry, RetainedRevision, RevFrontier, RevKey, RevLifecycle,
-    RevState, RevWriteResult, RevisionCandidate, RevisionCheckpoint, RevisionCheckpointOperation,
-    RevisionContent, RowChange, RowChangeOp, RowHead, RowKey, RuntimeWireIdentity, ScheduleRef,
-    ScheduledFunctionKind, ScheduledJob, ScheduledState, SettledCrdt, SettledInsert,
-    SettledRevision, SettledSchedule, SettledUpload, StoreSchema, TableDef, UploadLease,
-    UploadLeaseWrite, UploadRef, UpsertIn, WriteBatch,
+    DeleteIn, DeleteResult, DirtyHeadDebug, DirtyHeadToken, DocWrite, FileMetadata, FileStore,
+    IdMapping, IdMappingContent, IndexDef, InsertRef, MembershipRange, MutationCall,
+    MutationRecord, MutationStatus, Order, Page, PendingUpload, PushEnvelope, PushOutcome,
+    PushResponse, RangeVersion, ReadBound, ReadEquality, ReadRange, ReadSpec, RemoteBlob,
+    RemoteCrdtChange, RemoteIdMapping, RemoteMember, RemotePageWrite, RemotePageWriteResult,
+    RemotePending, RemoteRowTarget, RemoteScheduleMapping, RemoteSettlementOutcome,
+    RemoteSettlementWrite, RemoteSettlementWriteResult, ResultEntry, RetainedRevision, RevFrontier,
+    RevKey, RevLifecycle, RevState, RevWriteResult, RevisionCandidate, RevisionCheckpoint,
+    RevisionCheckpointOperation, RevisionContent, RowChange, RowChangeOp, RowHead, RowKey,
+    RuntimeWireIdentity, ScheduleRef, ScheduledFunctionKind, ScheduledJob, ScheduledState,
+    SettledCrdt, SettledInsert, SettledRevision, SettledSchedule, SettledUpload, StoreSchema,
+    TableDef, UploadLease, UploadLeaseWrite, UploadRef, WriteBatch,
 };
 
 pub use crdt::crdt_checkpoint_response;

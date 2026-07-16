@@ -9,10 +9,9 @@
  * high-water mark; `peakKiB` samples it during the scenario and `settledKiB` reads it once the
  * scenario's async work quiesces. A future `allocatedBytes` export could separate live from reserved.
  *
- * Integration: the browser bench (post wasm rebuild) passes the worker's `WebAssembly.Memory` and a
- * scenario body — boot an existing store, sync N=100 docs, bootstrap a 10k-row pull — plus a settle
- * that drains the tick loop and checkpoints. This module owns only the probe, the sample/baseline
- * shapes, and the threshold compare so all three are typechecked and unit-tested without wasm.
+ * Integration: the browser memory test runs the packaged artifact in a fresh worker, intercepts the
+ * exact shared memory passed to it, and drives boot, 100-row, and 10k-row scenarios. This module owns
+ * the sample/budget shapes, summary, and threshold comparison used by that real browser gate.
  */
 
 export type MemoryScenario = "boot" | "steady100" | "pull10k";
@@ -20,26 +19,49 @@ export type MemoryScenario = "boot" | "steady100" | "pull10k";
 export const MEMORY_SCENARIOS: readonly MemoryScenario[] = ["boot", "steady100", "pull10k"];
 
 export interface MemorySample {
+  initialKiB: number;
+  jsHeapUsedKiB: number | null;
+  maximumKiB: number;
   peakKiB: number;
   scenario: MemoryScenario;
   settledKiB: number;
 }
 
+export interface MemoryBudget {
+  capturedPeakKiB: number;
+  capturedRuns: number;
+  capturedSpreadKiB: number;
+  maximumKiB: number;
+  peakKiB: number;
+  scenario: MemoryScenario;
+}
+
 export interface MemoryBaseline {
   capturedAt: string;
   notes: string[];
-  samples: MemorySample[];
+  budgets: MemoryBudget[];
   source: string;
-  tolerance: number;
-  version: 1;
+  version: 2;
 }
 
 export interface MemoryComparison {
-  baselinePeakKiB: number;
+  budgetPeakKiB: number;
   currentPeakKiB: number;
-  ratio: number;
+  currentMaximumKiB: number;
+  maximumBudgetKiB: number;
   scenario: MemoryScenario;
   status: "fail" | "pass";
+}
+
+export interface MemorySummary {
+  initialKiB: number;
+  jsHeapUsedKiB: number | null;
+  maximumKiB: number;
+  peakKiB: number;
+  runs: number;
+  scenario: MemoryScenario;
+  settledKiB: number;
+  spreadKiB: number;
 }
 
 /** Wasm linear-memory size in KiB. */
@@ -47,58 +69,74 @@ export function probeHeapKiB(memory: WebAssembly.Memory): number {
   return memory.buffer.byteLength / 1024;
 }
 
-/**
- * Peak (sampled every `intervalMs` during `run`) and settled heap for one scenario. Linear memory is
- * monotonic, so the peak is the high-water reached during the scenario and settled is the reading
- * after the caller's async work quiesces.
- */
-export async function measureScenario(
-  scenario: MemoryScenario,
-  memory: WebAssembly.Memory,
-  run: () => Promise<void>,
-  settle: () => Promise<void>,
-  intervalMs = 25,
-): Promise<MemorySample> {
-  let peakKiB = probeHeapKiB(memory);
-  const sampler = setInterval(() => {
-    peakKiB = Math.max(peakKiB, probeHeapKiB(memory));
-  }, intervalMs);
-  try {
-    await run();
-    peakKiB = Math.max(peakKiB, probeHeapKiB(memory));
-  } finally {
-    clearInterval(sampler);
-  }
-  await settle();
-  const settledKiB = probeHeapKiB(memory);
-  return { peakKiB: Math.max(peakKiB, settledKiB), scenario, settledKiB };
-}
-
-/** A scenario passes when its peak heap stays within `tolerance` of the baseline peak. */
+/** A scenario passes only when both committed high-water and reservation limit stay in budget. */
 export function compareMemory(
   samples: readonly MemorySample[],
   baseline: MemoryBaseline,
 ): MemoryComparison[] {
   return samples.map((sample) => {
-    const target = baseline.samples.find((entry) => entry.scenario === sample.scenario);
+    const target = baseline.budgets.find((entry) => entry.scenario === sample.scenario);
     if (!target) {
-      throw new Error(`memory baseline has no scenario ${sample.scenario}`);
+      throw new Error(`memory budget has no scenario ${sample.scenario}`);
     }
-    const ratio = sample.peakKiB / target.peakKiB;
     return {
-      baselinePeakKiB: target.peakKiB,
+      budgetPeakKiB: target.peakKiB,
       currentPeakKiB: sample.peakKiB,
-      ratio,
+      currentMaximumKiB: sample.maximumKiB,
+      maximumBudgetKiB: target.maximumKiB,
       scenario: sample.scenario,
-      status: ratio <= 1 + baseline.tolerance ? "pass" : "fail",
+      status:
+        sample.peakKiB <= target.peakKiB && sample.maximumKiB <= target.maximumKiB
+          ? "pass"
+          : "fail",
+    };
+  });
+}
+
+/** Reduces repeated fresh-worker measurements without hiding the worst run. */
+export function summarizeMemory(samples: readonly MemorySample[]): MemorySummary[] {
+  return MEMORY_SCENARIOS.map((scenario) => {
+    const runs = samples.filter((sample) => sample.scenario === scenario);
+    if (runs.length === 0) throw new Error(`memory samples have no scenario ${scenario}`);
+    const peaks = runs.map((sample) => sample.peakKiB);
+    const jsHeap = runs
+      .map((sample) => sample.jsHeapUsedKiB)
+      .filter((value): value is number => value !== null);
+    return {
+      initialKiB: Math.max(...runs.map((sample) => sample.initialKiB)),
+      jsHeapUsedKiB: jsHeap.length === 0 ? null : Math.max(...jsHeap),
+      maximumKiB: Math.max(...runs.map((sample) => sample.maximumKiB)),
+      peakKiB: Math.max(...peaks),
+      runs: runs.length,
+      scenario,
+      settledKiB: Math.max(...runs.map((sample) => sample.settledKiB)),
+      spreadKiB: Math.max(...peaks) - Math.min(...peaks),
     };
   });
 }
 
 export function readMemoryBaseline(value: unknown): MemoryBaseline {
   const baseline = value as MemoryBaseline;
-  if (baseline.version !== 1 || !Array.isArray(baseline.samples)) {
-    throw new Error("memory baseline is malformed");
+  if (baseline.version !== 2 || !Array.isArray(baseline.budgets)) {
+    throw new Error("memory budget is malformed");
+  }
+  for (const scenario of MEMORY_SCENARIOS) {
+    const budget = baseline.budgets.find((entry) => entry.scenario === scenario);
+    if (
+      budget === undefined ||
+      !Number.isFinite(budget.peakKiB) ||
+      !Number.isFinite(budget.maximumKiB) ||
+      !Number.isFinite(budget.capturedPeakKiB) ||
+      !Number.isInteger(budget.capturedRuns) ||
+      !Number.isFinite(budget.capturedSpreadKiB) ||
+      budget.peakKiB <= 0 ||
+      budget.maximumKiB < budget.peakKiB ||
+      budget.capturedPeakKiB > budget.peakKiB ||
+      budget.capturedRuns < 2 ||
+      budget.capturedSpreadKiB < 0
+    ) {
+      throw new Error(`memory budget is malformed for ${scenario}`);
+    }
   }
   return baseline;
 }

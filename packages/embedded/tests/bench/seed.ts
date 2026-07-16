@@ -48,12 +48,12 @@ export async function seedBrowserVolume(options: {
       await state.store.commit(
         {
           deletes: [],
-          upserts: Array.from({ length: end - start }, (_, offset) => {
+          docWrites: Array.from({ length: end - start }, (_, offset) => {
             const sequence = start + offset;
             return {
               cols: {
                 idx_slug: `${options.prefix}${sequence.toString(36)}`,
-                idx_updatedat: -sequence - 1,
+                idx_updated_at: -sequence - 1,
               },
               creationTime: sequence + 1,
               data: {
@@ -70,7 +70,7 @@ export async function seedBrowserVolume(options: {
         { changes: "include", source: "remote" },
       );
     }
-    await state.store.checkpoint();
+    await state.store.wal.write();
   } finally {
     await state.store.close().catch(() => undefined);
     state.opfs.closeAll();

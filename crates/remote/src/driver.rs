@@ -32,15 +32,15 @@ use crate::{
     transport::{ConnectRequest, RemoteTransport, TransportEvent},
     upload,
     upload::{RemoteUploadRequest, RemoteUploader},
-    ConvexArgs, RemoteError, RemoteResult, RemoteTick,
+    ConvexArgs, RemoteError, RemotePending, RemoteResult, RemoteTick,
 };
 
 const RECEIVE_DRAIN_LIMIT: usize = 4;
 const REPLAY_INFLIGHT_LIMIT: usize = 64;
-const SETTLEMENT_ACK_LIMIT: usize = 64;
+const REMOTE_RECEIPT_LIMIT: usize = 64;
 const UPLOAD_DRAIN_LIMIT: usize = 4;
-const MAX_BOOTSTRAP_CHUNKS: usize = 32;
-const MAX_BOOTSTRAP_PAYLOADS: usize = 512;
+const MAX_CHECKPOINT_CHUNKS: usize = 32;
+const MAX_CHECKPOINT_PAYLOADS: usize = 512;
 #[cfg(not(target_arch = "wasm32"))]
 const RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -58,7 +58,7 @@ pub struct RemoteDocPush {
 }
 
 /// The pull subscription a client publishes (§11 D3): the query `fn(args)` the server re-runs to
-/// authorize, scope, and bootstrap. The server, not the client, computes each read-set, so the
+/// authorize, scope, and pull initial state. The server, not the client, computes each read-set, so the
 /// client publishes exact query descriptors rather than a client-computed range.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteSubscription {
@@ -151,14 +151,14 @@ pub struct RemoteDriver<
     pull_subscriptions: Vec<PullSubscription>,
     scope_tick: RemoteTick,
     table_names: Option<Vec<String>>,
-    ack_queue_empty: bool,
+    receipt_queue_empty: bool,
     push_queue_empty: bool,
     pending_checkpoints: VecDeque<PendingCheckpoint>,
-    projection_active: Option<ActiveProjection>,
-    projection_order: VecDeque<String>,
-    projection_paused: bool,
-    projection_pending: BTreeMap<String, PreparedProjection>,
-    replay_waiting_for_projection: bool,
+    remote_write_active: Option<ActiveRemoteWrite>,
+    remote_write_order: VecDeque<String>,
+    remote_write_paused: bool,
+    remote_write_pending: BTreeMap<String, PendingRemoteWrite>,
+    replay_waiting_for_remote_write: bool,
     scope: RemoteScope,
     scope_pending_removals: BTreeSet<String>,
     inflight_remote_push: VecDeque<InflightRemotePush>,
@@ -202,7 +202,7 @@ struct PendingCheckpoint {
 struct PullSubscription {
     last_result: Option<FunctionResult>,
     /// The most recent retained result whose application failed for a permanent (non-transient)
-    /// reason. A live manifest that keeps re-delivering unchanged — e.g. one whose bootstrap prefix no
+    /// reason. A live manifest that keeps re-delivering unchanged — e.g. one whose checkpoint prefix no
     /// longer exists server-side — is reported once and then skipped until it changes, so the one-shot
     /// pull lane cannot hot-loop. Cleared as soon as any result applies cleanly.
     last_failed_result: Option<FunctionResult>,
@@ -211,13 +211,13 @@ struct PullSubscription {
     cursor: Option<String>,
 }
 
-struct PreparedProjection {
+struct PendingRemoteWrite {
     checkpoint_responses: Vec<PendingCheckpoint>,
     crdt_changes: usize,
     pull_changes: usize,
     result: Option<FunctionResult>,
     subscription: String,
-    write: ProjectionWrite,
+    write: RemoteWrite,
 }
 
 struct PreparedCrdt {
@@ -226,14 +226,14 @@ struct PreparedCrdt {
     blob: Option<storage::RemoteBlob>,
 }
 
-enum ProjectionWrite {
-    Pull(storage::RemotePull),
+enum RemoteWrite {
+    Page(storage::RemotePageWrite),
     SubscriptionDelete { now_ms: i64 },
 }
 
-struct ActiveProjection {
-    future: RemoteStoreFuture<storage::RemotePullResult>,
-    projection: PreparedProjection,
+struct ActiveRemoteWrite {
+    future: RemoteStoreFuture<storage::RemotePageWriteResult>,
+    pending: PendingRemoteWrite,
 }
 
 struct AcceptedIdentity {
@@ -283,7 +283,7 @@ fn parse_identity_response(json: &serde_json::Value) -> RemoteResult<AcceptedIde
 #[cfg(not(target_arch = "wasm32"))]
 enum ActorEvent {
     Command(Option<RemoteCommand>),
-    Projection(Result<storage::RemotePullResult, storage::StorageError>),
+    RemoteWrite(Result<storage::RemotePageWriteResult, storage::StorageError>),
     Reconnect,
     Transport(RemoteResult<TransportEvent>),
 }
@@ -352,14 +352,14 @@ where
             pull_subscriptions: Vec::new(),
             scope_tick: RemoteTick::default(),
             table_names: None,
-            ack_queue_empty: false,
+            receipt_queue_empty: false,
             push_queue_empty: false,
             pending_checkpoints: VecDeque::new(),
-            projection_active: None,
-            projection_order: VecDeque::new(),
-            projection_paused: false,
-            projection_pending: BTreeMap::new(),
-            replay_waiting_for_projection: false,
+            remote_write_active: None,
+            remote_write_order: VecDeque::new(),
+            remote_write_paused: false,
+            remote_write_pending: BTreeMap::new(),
+            replay_waiting_for_remote_write: false,
             scope: RemoteScope::default(),
             scope_pending_removals: BTreeSet::new(),
             inflight_remote_push: VecDeque::new(),
@@ -409,6 +409,7 @@ where
         if should_yield() {
             tick.sent += self.flush_outbound().await?;
             self.record_store_jobs(&mut tick, store_jobs_before);
+            self.pending_write(&mut tick)?;
             return Ok(tick);
         }
 
@@ -418,7 +419,7 @@ where
                 .await?;
             let received_message = remote_tick_should_drain_more(&received);
             tick.merge(received);
-            tick.merge(self.settle_ready_remote_push()?);
+            tick.merge(self.remote_settlement_write()?);
             tick.merge(self.dispatch_ready_remote_pushes().await?);
             if should_yield() || !received_message {
                 break;
@@ -430,7 +431,7 @@ where
             }
         }
 
-        tick.merge(self.drive_projection_with_ingress().await?);
+        tick.merge(self.drive_remote_write_with_ingress().await?);
 
         // A retained pull can expose a checkpoint request without changing the
         // app-query descriptor. Flush that already-authorized response in this
@@ -441,8 +442,18 @@ where
                 .await?,
         );
 
+        // Browser pulls are ingress-driven, so there may be no later foreground command after the
+        // final mutation response. A terminal replay writes a durable settlement receipt; clear it
+        // in this same actor turn once replay and checkpoint work are empty. Otherwise the browser
+        // can project the authoritative row successfully while its exact pending snapshot remains
+        // non-empty forever.
+        if !should_yield() && !self.has_pending_push() {
+            tick.merge(self.acknowledge_settlements().await?);
+        }
+
         tick.sent += self.flush_outbound().await?;
         self.record_store_jobs(&mut tick, store_jobs_before);
+        self.pending_write(&mut tick)?;
         Ok(tick)
     }
 
@@ -462,7 +473,7 @@ where
         }
         if !should_yield() {
             tick.merge(
-                self.push_projection_heads_interruptible(should_yield)
+                self.push_after_remote_write_interruptible(should_yield)
                     .await?,
             );
         }
@@ -471,20 +482,56 @@ where
         }
         if should_yield() {
             self.record_store_jobs(&mut tick, store_jobs_before);
+            self.pending_write(&mut tick)?;
             return Ok(tick);
         }
         tick.merge(self.drain_ready_messages(should_yield).await?);
-        tick.merge(self.drive_projection_with_ingress().await?);
+        tick.merge(self.drive_remote_write_with_ingress().await?);
         tick.merge(
             self.flush_checkpoint_responses_interruptible(should_yield)
                 .await?,
         );
         self.record_store_jobs(&mut tick, store_jobs_before);
+        self.pending_write(&mut tick)?;
         Ok(tick)
     }
 
     fn record_store_jobs(&self, tick: &mut RemoteTick, before: usize) {
         tick.store_jobs += self.store.store_job_count().saturating_sub(before);
+    }
+
+    fn pending_read(&self) -> RemoteResult<RemotePending> {
+        let durable = self.store.remote_pending_read()?;
+        let mut scope = BTreeSet::new();
+        for subscription in &self.scope.subscriptions {
+            let key = remote_subscription_key(subscription)?;
+            let applied = self
+                .pull_subscriptions
+                .iter()
+                .find(|active| active.key == key)
+                .is_some_and(|active| active.last_result.is_some());
+            if !applied {
+                scope.insert(key);
+            }
+        }
+        scope.extend(self.scope_pending_removals.iter().cloned());
+        scope.extend(self.remote_write_pending.keys().cloned());
+        if let Some(active) = &self.remote_write_active {
+            scope.insert(active.pending.subscription.clone());
+        }
+        Ok(RemotePending {
+            checkpoints: self.pending_checkpoints.len(),
+            inflight: self.inflight_remote_push.len(),
+            mutations: durable.mutations,
+            scope: scope.len(),
+            settlements: durable.settlements,
+            uploads: durable.uploads,
+        })
+    }
+
+    fn pending_write(&self, tick: &mut RemoteTick) -> RemoteResult<()> {
+        tick.pending = Some(self.pending_read()?);
+        Ok(())
     }
 
     async fn flush_checkpoint_responses_interruptible<F>(
@@ -497,7 +544,8 @@ where
         if should_yield() || self.pending_checkpoints.is_empty() {
             return Ok(RemoteTick::default());
         }
-        self.push_projection_heads_interruptible(should_yield).await
+        self.push_after_remote_write_interruptible(should_yield)
+            .await
     }
 
     fn schema_table_names(&mut self) -> RemoteResult<Vec<String>> {
@@ -523,7 +571,7 @@ where
                 .await?;
             let should_drain_more = remote_tick_should_drain_more(&received);
             tick.merge(received);
-            tick.merge(self.settle_ready_remote_push()?);
+            tick.merge(self.remote_settlement_write()?);
             tick.merge(self.dispatch_ready_remote_pushes().await?);
             tick.merge(self.queue_changed_subscription_results().await?);
             if !should_drain_more || should_yield() {
@@ -619,15 +667,15 @@ where
         let deadline = self.deadline_after(self.config.timing.operation_timeout);
         let result = self.wait_for_query_result(subscriber_id, deadline).await;
         self.base.unsubscribe(subscriber_id);
-        let cleanup = self.flush_outbound().await;
+        let flushed = self.flush_outbound().await;
         match result {
             Ok(result) => {
-                tick.sent += cleanup?;
+                tick.sent += flushed?;
                 self.record_store_jobs(&mut tick, store_jobs_before);
                 Ok((result, tick))
             }
             Err(e) => {
-                cleanup.ok();
+                flushed.ok();
                 Err(e)
             }
         }
@@ -684,7 +732,7 @@ where
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(
         clippy::too_many_lines,
-        reason = "the actor loop selects socket ingress, commands, deferred foreground work, and projection completion in one place"
+        reason = "the actor loop selects socket ingress, commands, deferred foreground work, and remote-write completion in one place"
     )]
     pub(crate) async fn run_with_observer<F>(
         mut self,
@@ -696,7 +744,7 @@ where
     {
         let mut deferred_commands = VecDeque::new();
         loop {
-            if self.projection_active.is_none() {
+            if self.remote_write_active.is_none() {
                 if let Some(command) = deferred_commands.pop_front() {
                     if self.run_command(command, &commands).await? {
                         return Ok(());
@@ -710,9 +758,9 @@ where
             }
 
             let event = if !self.connected {
-                if let Some(active) = self.projection_active.as_mut() {
+                if let Some(active) = self.remote_write_active.as_mut() {
                     tokio::select! {
-                        applied = active.future.as_mut() => ActorEvent::Projection(applied),
+                        applied = active.future.as_mut() => ActorEvent::RemoteWrite(applied),
                         command = commands.recv() => ActorEvent::Command(command),
                         () = tokio::time::sleep(RECONNECT_RETRY_DELAY) => ActorEvent::Reconnect,
                     }
@@ -722,10 +770,10 @@ where
                         () = tokio::time::sleep(RECONNECT_RETRY_DELAY) => ActorEvent::Reconnect,
                     }
                 }
-            } else if let Some(active) = self.projection_active.as_mut() {
+            } else if let Some(active) = self.remote_write_active.as_mut() {
                 let transport = &mut self.transport;
                 tokio::select! {
-                    applied = active.future.as_mut() => ActorEvent::Projection(applied),
+                    applied = active.future.as_mut() => ActorEvent::RemoteWrite(applied),
                     command = commands.recv() => ActorEvent::Command(command),
                     received = transport.receive_wait() => ActorEvent::Transport(received),
                 }
@@ -737,7 +785,7 @@ where
                 }
             };
             match event {
-                ActorEvent::Command(Some(command)) if self.projection_active.is_some() => {
+                ActorEvent::Command(Some(command)) if self.remote_write_active.is_some() => {
                     match command {
                         command @ (RemoteCommand::Close { .. }
                         | RemoteCommand::ScopeWrite { .. }) => {
@@ -774,12 +822,12 @@ where
                     Ok(false) => {}
                     Err(error) => return Err(error),
                 },
-                ActorEvent::Projection(applied) => {
-                    let projected = self.complete_projection(applied)?;
+                ActorEvent::RemoteWrite(applied) => {
+                    let written = self.complete_remote_write(applied)?;
                     let tick = if deferred_commands.is_empty() {
-                        self.complete_actor_turn(projected).await?
+                        self.complete_actor_turn(written).await?
                     } else {
-                        self.complete_actor_io(projected).await?
+                        self.complete_actor_io(written).await?
                     };
                     if tick.has_observable_progress() {
                         observe(tick);
@@ -800,15 +848,16 @@ where
     async fn complete_actor_turn(&mut self, mut tick: RemoteTick) -> RemoteResult<RemoteTick> {
         tick.merge(self.complete_actor_io(RemoteTick::default()).await?);
         tick.merge(self.queue_changed_subscription_results().await?);
+        self.pending_write(&mut tick)?;
         Ok(tick)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     async fn complete_actor_io(&mut self, mut tick: RemoteTick) -> RemoteResult<RemoteTick> {
         tick.sent += self.flush_outbound().await?;
-        tick.merge(self.settle_ready_remote_push()?);
+        tick.merge(self.remote_settlement_write()?);
         tick.merge(self.dispatch_ready_remote_pushes().await?);
-        if self.projection_active.is_none() {
+        if self.remote_write_active.is_none() {
             tick.merge(
                 self.flush_checkpoint_responses_interruptible(&mut || false)
                     .await?,
@@ -830,11 +879,12 @@ where
                 // the local runner, so durable queue hints computed by an earlier actor turn are
                 // invalid once this command arrives.
                 self.push_queue_empty = false;
-                self.ack_queue_empty = false;
+                self.receipt_queue_empty = false;
                 let result = match self.pull_interruptible(|| !commands.is_empty()).await {
-                    Ok(mut tick) => match self.apply_ready_subscriptions().await {
+                    Ok(mut tick) => match self.subscription_ready_write().await {
                         Ok(ready) => {
                             tick.merge(ready);
+                            self.pending_write(&mut tick)?;
                             Ok(tick)
                         }
                         Err(error) => Err(error),
@@ -941,7 +991,7 @@ where
         let event = self.transport.receive(timeout).await;
         let mut tick = self.receive_event(event).await?;
         tick.sent += self.flush_outbound().await?;
-        tick.merge(self.settle_ready_remote_push()?);
+        tick.merge(self.remote_settlement_write()?);
         Ok(tick)
     }
 
@@ -1001,23 +1051,23 @@ where
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn apply_ready_subscriptions(&mut self) -> RemoteResult<RemoteTick> {
+    async fn subscription_ready_write(&mut self) -> RemoteResult<RemoteTick> {
         let tables = self.schema_table_names()?;
         let mut tick = self.ensure_live_subscription(&tables, false).await?;
-        tick.merge(self.drive_projection_with_ingress().await?);
+        tick.merge(self.drive_remote_write_with_ingress().await?);
         tick.sent += self.flush_outbound().await?;
         Ok(tick)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn drive_projection_with_ingress(&mut self) -> RemoteResult<RemoteTick> {
+    async fn drive_remote_write_with_ingress(&mut self) -> RemoteResult<RemoteTick> {
         let mut tick = RemoteTick::default();
-        while let Some(active) = self.projection_active.as_mut() {
+        while let Some(active) = self.remote_write_active.as_mut() {
             let event = {
                 let transport = &mut self.transport;
                 tokio::select! {
                     biased;
-                    applied = active.future.as_mut() => ActorEvent::Projection(applied),
+                    applied = active.future.as_mut() => ActorEvent::RemoteWrite(applied),
                     received = transport.receive_wait() => ActorEvent::Transport(received),
                 }
             };
@@ -1026,11 +1076,11 @@ where
                     let received = self.receive_event(received).await?;
                     tick.merge(received);
                     tick.sent += self.flush_outbound().await?;
-                    tick.merge(self.settle_ready_remote_push()?);
+                    tick.merge(self.remote_settlement_write()?);
                     tick.merge(self.queue_changed_subscription_results().await?);
                 }
-                ActorEvent::Projection(applied) => {
-                    tick.merge(self.complete_projection(applied)?);
+                ActorEvent::RemoteWrite(applied) => {
+                    tick.merge(self.complete_remote_write(applied)?);
                     tick.merge(self.queue_changed_subscription_results().await?);
                     tick.sent += self.flush_outbound().await?;
                 }
@@ -1041,18 +1091,18 @@ where
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn drive_projection_with_ingress(&mut self) -> RemoteResult<RemoteTick> {
+    async fn drive_remote_write_with_ingress(&mut self) -> RemoteResult<RemoteTick> {
         let mut tick = RemoteTick::default();
-        while let Some(active) = self.projection_active.as_mut() {
+        while let Some(active) = self.remote_write_active.as_mut() {
             let applied = active.future.as_mut().await;
-            tick.merge(self.complete_projection(applied)?);
+            tick.merge(self.complete_remote_write(applied)?);
             tick.merge(self.queue_changed_subscription_results().await?);
             tick.sent += self.flush_outbound().await?;
         }
         Ok(tick)
     }
 
-    fn settle_ready_remote_push(&mut self) -> RemoteResult<RemoteTick> {
+    fn remote_settlement_write(&mut self) -> RemoteResult<RemoteTick> {
         let mut tick = RemoteTick::default();
         while let Some(mut inflight) = self.inflight_remote_push.pop_front() {
             let result = match inflight.result.try_recv() {
@@ -1083,11 +1133,10 @@ where
                         RemoteTick::default(),
                     )?);
                     if !acknowledgements.is_empty() {
-                        self.store
-                            .remote_settlement_ack_complete(&acknowledgements)?;
-                        tick.settlements_acknowledged += acknowledgements.len();
+                        self.store.remote_receipt_delete(&acknowledgements)?;
+                        tick.receipts_pushed += acknowledgements.len();
                     }
-                    if self.replay_waiting_for_projection {
+                    if self.replay_waiting_for_remote_write {
                         self.inflight_remote_push.clear();
                         break;
                     }
@@ -1110,7 +1159,7 @@ where
     }
 
     async fn queue_changed_subscription_results(&mut self) -> RemoteResult<RemoteTick> {
-        if self.projection_active.is_some() {
+        if self.remote_write_active.is_some() {
             return Ok(RemoteTick::default());
         }
         let pending = self.pull_changed_results(&BTreeSet::new());
@@ -1119,7 +1168,7 @@ where
             tick.pull_attempted += 1;
             tick.merge(self.enqueue_pull_result(result, &key).await?);
         }
-        tick.merge(self.start_next_projection());
+        tick.merge(self.start_next_remote_write());
         Ok(tick)
     }
 
@@ -1179,7 +1228,7 @@ where
             tick.pull_attempted += 1;
             tick.merge(self.enqueue_pull_result(result, &key).await?);
         }
-        tick.merge(self.start_next_projection());
+        tick.merge(self.start_next_remote_write());
         tick.sent += self.flush_outbound().await?;
         Ok(tick)
     }
@@ -1218,9 +1267,9 @@ where
         let tick = RemoteTick::default();
         for key in std::mem::take(&mut self.scope_pending_removals) {
             if self
-                .projection_active
+                .remote_write_active
                 .as_ref()
-                .is_some_and(|active| active.projection.subscription == key)
+                .is_some_and(|active| active.pending.subscription == key)
             {
                 self.scope_pending_removals.insert(key);
                 continue;
@@ -1233,15 +1282,15 @@ where
                 let active = self.pull_subscriptions.remove(index);
                 self.base.unsubscribe(active.subscriber_id);
             }
-            self.projection_pending.remove(&key);
-            self.projection_order.retain(|queued| queued != &key);
-            self.stage_projection(PreparedProjection {
+            self.remote_write_pending.remove(&key);
+            self.remote_write_order.retain(|queued| queued != &key);
+            self.stage_remote_write(PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
                 result: None,
                 subscription: key,
-                write: ProjectionWrite::SubscriptionDelete {
+                write: RemoteWrite::SubscriptionDelete {
                     now_ms: self.clock.now_ms()?,
                 },
             });
@@ -1290,7 +1339,7 @@ where
             return Ok((subscription.pull_args.clone(), None, RemoteTick::default()));
         };
         let mut tick = RemoteTick::default();
-        let hosted = if let Some(cursor) = self.store.remote_read_cursor(key)? {
+        let hosted = if let Some(cursor) = self.store.remote_cursor_read(key)? {
             cursor
         } else {
             let mut cursor = None;
@@ -1348,7 +1397,7 @@ where
                     .latest_results()
                     .get(&subscription.subscriber_id)
                     .filter(|result| {
-                        self.projection_observed_result(&subscription.key) != Some(*result)
+                        self.observed_remote_result(&subscription.key) != Some(*result)
                     })
                     .cloned()
                     .map(|result| (subscription.key.clone(), result))
@@ -1370,14 +1419,12 @@ where
 
     async fn acknowledge_settlements(&mut self) -> RemoteResult<RemoteTick> {
         let mut tick = RemoteTick::default();
-        if self.ack_queue_empty {
+        if self.receipt_queue_empty {
             return Ok(tick);
         }
-        let mutation_ids = self
-            .store
-            .remote_settlement_ack_read(SETTLEMENT_ACK_LIMIT)?;
+        let mutation_ids = self.store.remote_receipt_read(REMOTE_RECEIPT_LIMIT)?;
         if mutation_ids.is_empty() {
-            self.ack_queue_empty = true;
+            self.receipt_queue_empty = true;
             return Ok(tick);
         }
         let request = BTreeMap::from([
@@ -1409,9 +1456,9 @@ where
         };
         tick.merge(remote_tick);
         if matches!(result, FunctionResult::Value(Value::Null)) {
-            self.store.remote_settlement_ack_complete(&mutation_ids)?;
-            tick.settlements_acknowledged += mutation_ids.len();
-            self.ack_queue_empty = mutation_ids.len() < SETTLEMENT_ACK_LIMIT;
+            self.store.remote_receipt_delete(&mutation_ids)?;
+            tick.receipts_pushed += mutation_ids.len();
+            self.receipt_queue_empty = mutation_ids.len() < REMOTE_RECEIPT_LIMIT;
         } else if let error @ (RemoteError::Retired(_) | RemoteError::DeploymentMismatch(_)) =
             function_result_error(protocol::EMBEDDED_PUSH, &result)
         {
@@ -1455,7 +1502,8 @@ where
             let now_ms = self.clock.now_ms()?;
             let lease_until_ms =
                 now_ms.saturating_add(duration_millis_i64(self.config.timing.operation_timeout));
-            let Some(upload) = self.store.upload_lease_write(UploadLeaseWrite::Claim {
+            let Some(upload) = self.store.upload_lease_write(UploadLeaseWrite::Claimed {
+                local_storage_id: None,
                 owner: owner.clone(),
                 now_ms,
                 lease_until: lease_until_ms,
@@ -1495,13 +1543,13 @@ where
                     }
                 }
                 Err(error) => {
-                    let released = self.store.upload_lease_write(UploadLeaseWrite::Release {
+                    let pending = self.store.upload_lease_write(UploadLeaseWrite::Pending {
                         local_storage_id: upload.local_storage_id.clone(),
                         owner: owner.clone(),
                         now_ms: self.clock.now_ms()?,
                     });
-                    if let Err(release_error) = released {
-                        return Err(RemoteError::Storage(release_error));
+                    if let Err(pending_error) = pending {
+                        return Err(RemoteError::Storage(pending_error));
                     }
                     return Err(error);
                 }
@@ -1560,7 +1608,7 @@ where
         };
         let upload_url = upload::decode_upload_url(value)?;
         let owner = self.upload_owner();
-        self.write_upload_lease(upload, &owner)?;
+        self.upload_lease_write(upload, &owner)?;
         let receipt = self
             .uploader
             .upload(RemoteUploadRequest {
@@ -1577,21 +1625,21 @@ where
                 "upload response returned empty storageId".to_owned(),
             ));
         }
-        self.write_upload_lease(upload, &owner)?;
+        self.upload_lease_write(upload, &owner)?;
         Ok((receipt.storage_id, result_tick))
     }
 
-    fn write_upload_lease(&self, upload: &PendingUpload, owner: &str) -> RemoteResult<()> {
+    fn upload_lease_write(&self, upload: &PendingUpload, owner: &str) -> RemoteResult<()> {
         let now_ms = self.clock.now_ms()?;
         let lease_until_ms =
             now_ms.saturating_add(duration_millis_i64(self.config.timing.operation_timeout));
-        let renewed = self.store.upload_lease_write(UploadLeaseWrite::Renew {
-            local_storage_id: upload.local_storage_id.clone(),
+        let claimed = self.store.upload_lease_write(UploadLeaseWrite::Claimed {
+            local_storage_id: Some(upload.local_storage_id.clone()),
             owner: owner.to_owned(),
             now_ms,
             lease_until: lease_until_ms,
         })?;
-        if renewed.is_some() {
+        if claimed.is_some() {
             Ok(())
         } else {
             Err(RemoteError::Protocol(format!(
@@ -1614,14 +1662,24 @@ where
     ) -> RemoteResult<RemoteDocPush> {
         let mut tick = RemoteTick::default();
         self.push_queue_empty = false;
-        if self.replay_waiting_for_projection {
+        // A browser pull may yield to this foreground request immediately after consuming the
+        // rebase settlement, before it queues the changed subscription result. Reconcile that
+        // deferred result here. Otherwise every later pull can observe only a transport timeout
+        // while `replay_waiting_for_remote_write` permanently rejects the retained envelope.
+        if self.replay_waiting_for_remote_write {
+            tick.merge(self.queue_changed_subscription_results().await?);
+            tick.merge(self.drive_remote_write_with_ingress().await?);
+        }
+        if self.replay_waiting_for_remote_write {
+            self.pending_write(&mut tick)?;
             return Ok(RemoteDocPush {
                 state: RemoteDocPushState::Blocked,
                 tick,
             });
         }
-        tick.merge(self.finish_active_projection_before_replay().await?);
+        tick.merge(self.finish_active_remote_write_before_replay().await?);
         tick.merge(self.dispatch_ready_remote_pushes().await?);
+        self.pending_write(&mut tick)?;
         Ok(RemoteDocPush {
             state: self.push_queue_state()?,
             tick,
@@ -1630,7 +1688,7 @@ where
 
     async fn dispatch_ready_remote_pushes(&mut self) -> RemoteResult<RemoteTick> {
         let mut tick = RemoteTick::default();
-        if self.replay_waiting_for_projection || self.push_queue_empty {
+        if self.replay_waiting_for_remote_write || self.push_queue_empty {
             return Ok(tick);
         }
         let queued = self
@@ -1665,9 +1723,7 @@ where
         }
 
         let mut prefixes = self.speculative_crdt_prefixes()?;
-        let mut acknowledgements = self
-            .store
-            .remote_settlement_ack_read(SETTLEMENT_ACK_LIMIT)?;
+        let mut acknowledgements = self.store.remote_receipt_read(REMOTE_RECEIPT_LIMIT)?;
         tick.sent += self.ensure_connected().await?;
         let capacity = REPLAY_INFLIGHT_LIMIT - inflight_envelopes.len();
         for mut envelope in queued
@@ -1783,7 +1839,7 @@ where
                     crdt,
                 } => {
                     let local_id = self.local_id_of(table, id)?;
-                    if let Some(projection) = self.store.projection_read(table, &local_id)? {
+                    if let Some(projection) = self.store.remote_doc_read(table, &local_id)? {
                         if projection.server_base.as_deref() == Some(content_hash.as_str())
                             && projection.logical_clock.is_finite()
                             && projection.logical_clock > *version
@@ -1970,7 +2026,7 @@ where
         })
     }
 
-    async fn push_projection_heads_interruptible<F>(
+    async fn push_after_remote_write_interruptible<F>(
         &mut self,
         should_yield: &mut F,
     ) -> RemoteResult<RemoteTick>
@@ -1978,11 +2034,11 @@ where
         F: FnMut() -> bool,
     {
         let mut tick = RemoteTick::default();
-        if self.replay_waiting_for_projection {
+        if self.replay_waiting_for_remote_write {
             return Ok(tick);
         }
-        tick.merge(self.finish_active_projection_before_replay().await?);
-        tick.merge(self.settle_ready_remote_push()?);
+        tick.merge(self.finish_active_remote_write_before_replay().await?);
+        tick.merge(self.remote_settlement_write()?);
         tick.merge(self.dispatch_ready_remote_pushes().await?);
         if self.store.remote_push_envelope_read(1)?.is_empty()
             && self.inflight_remote_push.is_empty()
@@ -2095,7 +2151,7 @@ where
         let now = self.clock.now_ms()?;
         if response.outcome == PushOutcome::Rebase {
             tick.push_rebases += 1;
-            self.wait_for_rebase_projection();
+            self.wait_for_rebase_remote_write();
             tick.merge(result_tick);
             return Ok(tick);
         }
@@ -2149,23 +2205,31 @@ where
             Vec::new()
         };
         let outcome = match response.outcome {
-            PushOutcome::Applied => storage::RemotePushSettlementOutcome::Applied {
+            PushOutcome::Applied => storage::RemoteSettlementOutcome::Applied {
                 ids,
                 schedules,
                 projections,
                 crdt,
             },
             PushOutcome::Conflict | PushOutcome::Rejected => {
-                storage::RemotePushSettlementOutcome::Rejected {
+                storage::RemoteSettlementOutcome::Rejected {
                     schedules: queued.local_schedule_ids.clone(),
                     targets: rejected_write_targets(&queued)
                         .into_iter()
-                        .map(|(table, local_document_id)| storage::RemoteRowTarget {
-                            server_rev_id: revisions
-                                .get(&(table.clone(), local_document_id.clone()))
-                                .cloned(),
-                            table,
-                            local_document_id,
+                        .map(|(table, local_document_id)| {
+                            let key = (table.clone(), local_document_id.clone());
+                            let server_rev_id = revisions.get(&key).cloned();
+                            storage::RemoteRowTarget {
+                                retain: rejected_target_should_retain(
+                                    &queued,
+                                    &revisions,
+                                    &key,
+                                    matches!(&response.outcome, PushOutcome::Rejected),
+                                ),
+                                server_rev_id,
+                                table,
+                                local_document_id,
+                            }
                         })
                         .collect(),
                     projections,
@@ -2177,7 +2241,7 @@ where
         };
         let settled = self
             .store
-            .remote_push_settle(&storage::RemotePushSettlement {
+            .remote_settlement_write(&storage::RemoteSettlementWrite {
                 mutation_id: envelope.mutation_id.clone(),
                 expected_commit_seq: envelope.commit_seq,
                 now_ms: now,
@@ -2201,13 +2265,13 @@ where
             PushOutcome::Rebase => unreachable!("rebase returned before settlement"),
         }
         tick.retained_revisions.extend(settled.projection.reroots);
-        self.ack_queue_empty = false;
+        self.receipt_queue_empty = false;
         tick.merge(result_tick);
         Ok(tick)
     }
 
-    fn wait_for_rebase_projection(&mut self) {
-        self.replay_waiting_for_projection = true;
+    fn wait_for_rebase_remote_write(&mut self) {
+        self.replay_waiting_for_remote_write = true;
     }
 
     fn complete_checkpoint_push(
@@ -2332,7 +2396,7 @@ where
         subscription: &str,
     ) -> RemoteResult<RemoteTick> {
         if self
-            .projection_observed_result(subscription)
+            .observed_remote_result(subscription)
             .is_some_and(|observed| observed == &result)
         {
             return Ok(RemoteTick::default());
@@ -2360,10 +2424,11 @@ where
                 Ok(RemoteTick::default())
             }
             Err(error) if error.is_transient() => Err(error),
-            Err(_) => {
+            Err(error) => {
                 self.record_pull_failure(subscription, result);
                 Ok(RemoteTick {
                     pull_diagnostics: 1,
+                    pull_error: Some(error.to_string()),
                     ..RemoteTick::default()
                 })
             }
@@ -2379,13 +2444,13 @@ where
         let (page, crdt, result) = self
             .prepare_pull_result(result, subscription, descriptor)
             .await?;
-        let prepared = self.prepare_projection(&page, crdt, result, subscription)?;
-        self.stage_projection(prepared);
+        let prepared = self.prepare_remote_write(&page, crdt, result, subscription)?;
+        self.stage_remote_write(prepared);
         Ok(())
     }
 
     /// A retained result whose application already failed permanently is not re-attempted until the
-    /// live manifest changes. Without this gate a bootstrap prefix the server can no longer supply
+    /// live manifest changes. Without this gate a checkpoint prefix the server can no longer supply
     /// (e.g. after a component wipe) re-issues a fresh one-shot pull on every tick — an unbounded hot
     /// loop with no convergence.
     fn pull_result_already_failed(&self, subscription: &str, result: &FunctionResult) -> bool {
@@ -2416,16 +2481,16 @@ where
         }
     }
 
-    fn stage_projection(&mut self, projection: PreparedProjection) {
+    fn stage_remote_write(&mut self, pending: PendingRemoteWrite) {
         if !self
-            .projection_pending
-            .contains_key(&projection.subscription)
+            .remote_write_pending
+            .contains_key(&pending.subscription)
         {
-            self.projection_order
-                .push_back(projection.subscription.clone());
+            self.remote_write_order
+                .push_back(pending.subscription.clone());
         }
-        self.projection_pending
-            .insert(projection.subscription.clone(), projection);
+        self.remote_write_pending
+            .insert(pending.subscription.clone(), pending);
     }
 
     async fn prepare_pull_result(
@@ -2435,7 +2500,8 @@ where
         descriptor: &RemoteSubscription,
     ) -> RemoteResult<(pull::PullPage, Vec<PreparedCrdt>, FunctionResult)> {
         let accepted_crdt = self.accepted_crdt(subscription)?;
-        loop {
+        let mut stale_restarts = 0usize;
+        'manifest: loop {
             let FunctionResult::Value(value) = result.clone() else {
                 return Err(function_result_error(protocol::EMBEDDED_PULL, &result));
             };
@@ -2449,7 +2515,30 @@ where
                         blob: None,
                     });
                 } else {
-                    prepared_crdt.push(self.prepare_crdt(descriptor, crdt).await?);
+                    match self.prepare_crdt(descriptor, crdt).await {
+                        Ok(prepared) => prepared_crdt.push(prepared),
+                        Err(RemoteError::StaleCheckpoint) => {
+                            stale_restarts += 1;
+                            if stale_restarts > 4 {
+                                return Err(RemoteError::Protocol(
+                                    "checkpoint manifest kept changing during bounded restart"
+                                        .to_owned(),
+                                ));
+                            }
+                            let refreshed = self
+                                .refresh_stale_pull_result(subscription, descriptor, &result)
+                                .await?;
+                            if refreshed == result {
+                                return Err(RemoteError::Protocol(
+                                    "live pull returned the same stale checkpoint manifest"
+                                        .to_owned(),
+                                ));
+                            }
+                            result = refreshed;
+                            continue 'manifest;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             let latest = self
@@ -2464,6 +2553,29 @@ where
             }
             return Ok((page, prepared_crdt, result));
         }
+    }
+
+    async fn refresh_stale_pull_result(
+        &mut self,
+        subscription: &str,
+        descriptor: &RemoteSubscription,
+        current: &FunctionResult,
+    ) -> RemoteResult<FunctionResult> {
+        let latest = self
+            .pull_subscriptions
+            .iter()
+            .find(|active| active.key == subscription)
+            .and_then(|active| self.base.latest_results().get(&active.subscriber_id))
+            .cloned();
+        if let Some(latest) = latest.filter(|latest| latest != current) {
+            return Ok(latest);
+        }
+        let args = pull::live_args(
+            &self.config.runtime,
+            &descriptor.pull_fn,
+            &descriptor.pull_args,
+        )?;
+        self.query(protocol::pull_function()?, args).await
     }
 
     fn accepted_crdt(&self, subscription: &str) -> RemoteResult<Vec<pull::PullCrdt>> {
@@ -2481,13 +2593,13 @@ where
         Ok(pull::decode(value.clone())?.crdt)
     }
 
-    fn prepare_projection(
+    fn prepare_remote_write(
         &mut self,
         page: &pull::PullPage,
         crdt: Vec<PreparedCrdt>,
         result: FunctionResult,
         subscription: &str,
-    ) -> RemoteResult<PreparedProjection> {
+    ) -> RemoteResult<PendingRemoteWrite> {
         let accepted_changes = self.accepted_changes(subscription)?;
         let checkpoint_responses = crdt
             .iter()
@@ -2546,13 +2658,13 @@ where
             .map(|payload| self.result_entry(subscription, payload, &projections, pulled_at))
             .transpose()?;
         let pull_changes = projections.len();
-        Ok(PreparedProjection {
+        Ok(PendingRemoteWrite {
             checkpoint_responses,
             crdt_changes: crdt_changes.len(),
             pull_changes,
             result: Some(result),
             subscription: subscription.to_owned(),
-            write: ProjectionWrite::Pull(storage::RemotePull {
+            write: RemoteWrite::Page(storage::RemotePageWrite {
                 subscription: subscription.to_owned(),
                 members: page_members,
                 projections,
@@ -2566,7 +2678,7 @@ where
     }
 
     /// Assemble the retained authored-result cache entry (Cut 7 §2/§3) for the writing pull page. The
-    /// skeleton is the Convex-value codec of the pruned `result`, `paths` the codec of `resultRows`,
+    /// skeleton is the Convex-value codec with matched subtrees encoded as `null`; `paths` is the codec of `resultRows`,
     /// and `skeleton_hash` covers BOTH so a paths-only change still leaves the zero-write fast path.
     fn result_entry(
         &self,
@@ -2667,15 +2779,15 @@ where
             .collect())
     }
 
-    fn projection_observed_result(&self, subscription: &str) -> Option<&FunctionResult> {
-        self.projection_pending
+    fn observed_remote_result(&self, subscription: &str) -> Option<&FunctionResult> {
+        self.remote_write_pending
             .get(subscription)
             .and_then(|pending| pending.result.as_ref())
             .or_else(|| {
-                self.projection_active
+                self.remote_write_active
                     .as_ref()
-                    .filter(|active| active.projection.subscription == subscription)
-                    .and_then(|active| active.projection.result.as_ref())
+                    .filter(|active| active.pending.subscription == subscription)
+                    .and_then(|active| active.pending.result.as_ref())
             })
             .or_else(|| {
                 self.pull_subscriptions
@@ -2685,63 +2797,60 @@ where
             })
     }
 
-    fn start_next_projection(&mut self) -> RemoteTick {
+    fn start_next_remote_write(&mut self) -> RemoteTick {
         let tick = RemoteTick::default();
-        if self.projection_paused || !self.inflight_remote_push.is_empty() {
+        if self.remote_write_paused || !self.inflight_remote_push.is_empty() {
             return tick;
         }
-        while self.projection_active.is_none() {
-            let Some(subscription) = self.projection_order.pop_front() else {
+        while self.remote_write_active.is_none() {
+            let Some(subscription) = self.remote_write_order.pop_front() else {
                 break;
             };
-            let Some(projection) = self.projection_pending.remove(&subscription) else {
+            let Some(pending) = self.remote_write_pending.remove(&subscription) else {
                 continue;
             };
-            let future = match &projection.write {
-                ProjectionWrite::Pull(pull) => self.store.remote_pull_page_queue(pull.clone()),
-                ProjectionWrite::SubscriptionDelete { now_ms } => self
+            let future = match &pending.write {
+                RemoteWrite::Page(pull) => self.store.remote_page_write(pull.clone()),
+                RemoteWrite::SubscriptionDelete { now_ms } => self
                     .store
                     .remote_subscription_delete_queue(subscription, *now_ms),
             };
-            self.projection_active = Some(ActiveProjection { future, projection });
-        }
-        if self.projection_active.is_none() && self.projection_order.is_empty() {
-            self.replay_waiting_for_projection = false;
+            self.remote_write_active = Some(ActiveRemoteWrite { future, pending });
         }
         tick
     }
 
-    async fn finish_active_projection_before_replay(&mut self) -> RemoteResult<RemoteTick> {
-        if self.projection_active.is_none() {
+    async fn finish_active_remote_write_before_replay(&mut self) -> RemoteResult<RemoteTick> {
+        if self.remote_write_active.is_none() {
             return Ok(RemoteTick::default());
         }
-        self.projection_paused = true;
-        let completed = self.drive_projection_with_ingress().await;
-        self.projection_paused = false;
+        self.remote_write_paused = true;
+        let completed = self.drive_remote_write_with_ingress().await;
+        self.remote_write_paused = false;
         completed
     }
 
-    fn complete_projection(
+    fn complete_remote_write(
         &mut self,
-        apply: Result<storage::RemotePullResult, storage::StorageError>,
+        apply: Result<storage::RemotePageWriteResult, storage::StorageError>,
     ) -> RemoteResult<RemoteTick> {
         #[cfg(test)]
         self.actor_trace
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push("projection");
-        let active = self.projection_active.take().ok_or_else(|| {
-            RemoteError::Protocol("projection completed without active work".to_owned())
+            .push("remote_write");
+        let active = self.remote_write_active.take().ok_or_else(|| {
+            RemoteError::Protocol("remote write completed without active work".to_owned())
         })?;
         let apply = apply?;
         let mut tick = RemoteTick::default();
         tick.pull_snapshots += 1;
         let crdt_rows = apply.crdt.clone();
-        tick.pull_changes_applied += active.projection.pull_changes;
-        tick.received += active.projection.crdt_changes;
+        tick.pull_changes_applied += active.pending.pull_changes;
+        tick.received += active.pending.crdt_changes;
         tick.rows_applied += apply.projection.committed.len();
         tick.retained_revisions.extend(apply.projection.reroots);
-        for response in &active.projection.checkpoint_responses {
+        for response in &active.pending.checkpoint_responses {
             self.checkpoint_enqueue(response.clone());
         }
         for commit in &apply.projection.committed {
@@ -2761,20 +2870,23 @@ where
                 tick.changed_results.push(key);
             }
         }
-        tick.pushed += apply.swept;
-        self.commit_projection_result(&active.projection);
+        tick.pushed += apply.projection_deleted;
+        self.commit_remote_result(&active.pending);
         tick.merge(self.remove_retired_subscriptions()?);
+        if active.pending.result.is_some() {
+            self.replay_waiting_for_remote_write = false;
+        }
         Ok(tick)
     }
 
-    fn commit_projection_result(&mut self, projection: &PreparedProjection) {
-        let Some(result) = &projection.result else {
+    fn commit_remote_result(&mut self, pending: &PendingRemoteWrite) {
+        let Some(result) = &pending.result else {
             return;
         };
         if let Some(active) = self
             .pull_subscriptions
             .iter_mut()
-            .find(|active| active.key == projection.subscription)
+            .find(|active| active.key == pending.subscription)
         {
             active.last_result = Some(result.clone());
         }
@@ -2898,7 +3010,7 @@ where
         let mut chunk_pages = 0usize;
         let mut payload_pages = 0usize;
         loop {
-            let args = pull::bootstrap_args(
+            let args = pull::checkpoint_args(
                 &self.config.runtime,
                 &descriptor.pull_fn,
                 &descriptor.pull_args,
@@ -2914,27 +3026,29 @@ where
             let FunctionResult::Value(value) = result else {
                 return Err(function_result_error(protocol::EMBEDDED_PULL, &result));
             };
-            let page = pull::decode_bootstrap(value)?;
+            let pull::CheckpointResult::Page(page) = pull::decode_checkpoint_page(value)? else {
+                return Err(RemoteError::StaleCheckpoint);
+            };
             if page.checkpoint != crdt.checkpoint {
                 return Err(RemoteError::Protocol(
-                    "bootstrap checkpoint changed during immutable transfer".to_owned(),
+                    "checkpoint changed during immutable transfer".to_owned(),
                 ));
             }
             if page.head_seq != crdt.head_seq
                 || (!page.chunks.is_empty() && !page.payloads.is_empty())
             {
                 return Err(RemoteError::Protocol(
-                    "bootstrap page changed head or mixed checkpoint and payload data".to_owned(),
+                    "checkpoint page changed head or mixed checkpoint and payload data".to_owned(),
                 ));
             }
-            append_bootstrap_chunks(
+            append_checkpoint_chunks(
                 page.chunks,
                 cached.is_some(),
                 &mut bytes,
                 &mut ordinal,
                 &mut chunk_pages,
             )?;
-            append_bootstrap_payloads(
+            append_checkpoint_payloads(
                 page.payloads,
                 &mut updates,
                 &mut next_seq,
@@ -2943,7 +3057,7 @@ where
             if page.is_done {
                 if page.continue_cursor.is_some() {
                     return Err(RemoteError::Protocol(
-                        "completed bootstrap returned a continuation cursor".to_owned(),
+                        "completed checkpoint pull returned a continuation cursor".to_owned(),
                     ));
                 }
                 break;
@@ -2951,19 +3065,20 @@ where
             let next_cursor = page.continue_cursor;
             if next_cursor.is_none() || next_cursor == cursor {
                 return Err(RemoteError::Protocol(
-                    "incomplete bootstrap omitted or repeated its continuation cursor".to_owned(),
+                    "incomplete checkpoint pull omitted or repeated its continuation cursor"
+                        .to_owned(),
                 ));
             }
             cursor = next_cursor;
         }
         if bytes.len() != crdt.checkpoint.bytes || sha256_hex(&bytes) != crdt.checkpoint.hash {
             return Err(RemoteError::Protocol(
-                "assembled bootstrap does not match its checkpoint manifest".to_owned(),
+                "assembled checkpoint does not match its manifest".to_owned(),
             ));
         }
         if next_seq != crdt.head_seq + 1 {
             return Err(RemoteError::Protocol(
-                "assembled bootstrap payloads do not reach the retained head".to_owned(),
+                "assembled checkpoint payloads do not reach the readable head".to_owned(),
             ));
         }
         let blob = cached.is_none().then(|| storage::RemoteBlob {
@@ -3367,8 +3482,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     codec::hex(&hash.finalize())
 }
 
-fn append_bootstrap_chunks(
-    chunks: Vec<pull::BootstrapChunk>,
+fn append_checkpoint_chunks(
+    chunks: Vec<pull::CheckpointChunk>,
     checkpoint_cached: bool,
     bytes: &mut Vec<u8>,
     ordinal: &mut usize,
@@ -3376,14 +3491,14 @@ fn append_bootstrap_chunks(
 ) -> RemoteResult<()> {
     for chunk in chunks {
         *pages = pages.saturating_add(1);
-        if checkpoint_cached || *pages > MAX_BOOTSTRAP_CHUNKS {
+        if checkpoint_cached || *pages > MAX_CHECKPOINT_CHUNKS {
             return Err(RemoteError::Protocol(
-                "bootstrap returned unexpected or excessive checkpoint chunks".to_owned(),
+                "checkpoint pull returned unexpected or excessive chunks".to_owned(),
             ));
         }
         if chunk.ordinal != *ordinal || sha256_hex(&chunk.bytes) != chunk.hash {
             return Err(RemoteError::Protocol(
-                "bootstrap chunk failed sequence or hash verification".to_owned(),
+                "checkpoint chunk failed sequence or hash verification".to_owned(),
             ));
         }
         bytes.extend_from_slice(&chunk.bytes);
@@ -3392,7 +3507,7 @@ fn append_bootstrap_chunks(
     Ok(())
 }
 
-fn append_bootstrap_payloads(
+fn append_checkpoint_payloads(
     payloads: Vec<pull::PullPayload>,
     updates: &mut Vec<Vec<u8>>,
     next_seq: &mut i64,
@@ -3400,12 +3515,12 @@ fn append_bootstrap_payloads(
 ) -> RemoteResult<()> {
     for payload in payloads {
         *pages = pages.saturating_add(1);
-        if *pages > MAX_BOOTSTRAP_PAYLOADS
+        if *pages > MAX_CHECKPOINT_PAYLOADS
             || payload.seq != *next_seq
             || sha256_hex(&payload.bytes) != payload.hash
         {
             return Err(RemoteError::Protocol(
-                "bootstrap payload failed sequence, bound, or hash verification".to_owned(),
+                "checkpoint payload failed sequence, bound, or hash verification".to_owned(),
             ));
         }
         updates.push(payload.bytes);
@@ -3587,6 +3702,20 @@ fn rejected_write_targets(envelope: &PushEnvelope) -> BTreeSet<(String, String)>
         .collect()
 }
 
+fn rejected_target_should_retain(
+    envelope: &PushEnvelope,
+    revisions: &BTreeMap<(String, String), String>,
+    key: &(String, String),
+    retain_rejected: bool,
+) -> bool {
+    retain_rejected
+        || revisions.contains_key(key)
+        || envelope
+            .crdt
+            .iter()
+            .any(|effect| (&effect.table, &effect.row_id) == (&key.0, &key.1))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3597,21 +3726,23 @@ mod tests {
     };
 
     use convex_sync_types::{
-        ClientMessage, LogLinesMessage, QuerySetModification, ServerMessage, StateVersion,
+        ClientMessage, LogLinesMessage, QuerySetModification, ServerMessage, StateModification,
+        StateVersion,
     };
     use futures_util::{future::BoxFuture, FutureExt};
     use tokio::sync::{mpsc, oneshot, Notify};
 
     use super::{
         function_result_error, parse_identity_response, pull_change_has_changed,
-        rejected_write_targets, ActiveProjection, InflightRemotePush, InflightRemotePushKind,
-        PendingCheckpoint, PreparedProjection, ProjectionWrite, PullSubscription, RemoteCommand,
-        RemoteDriver, RemoteScope, RemoteSubscription,
+        rejected_target_should_retain, rejected_write_targets, ActiveRemoteWrite,
+        InflightRemotePush, InflightRemotePushKind, PendingCheckpoint, PendingRemoteWrite,
+        PullSubscription, RemoteCommand, RemoteDriver, RemoteScope, RemoteSubscription,
+        RemoteWrite,
     };
     use crate::{
-        config::RemoteConfig,
+        config::{RemoteConfig, RemoteFunction},
         transport::{ConnectRequest, RemoteTransport, TransportEvent},
-        RemoteError, SystemRemoteClock,
+        RemoteError, RemotePending, SystemRemoteClock,
     };
     use convex::{base_client::FunctionResult, ConvexError, Value};
 
@@ -3659,7 +3790,7 @@ mod tests {
     fn accepted_pull_rows_filter_unchanged_projections() {
         let change = crate::pull::PullChange {
             body: crate::pull::PullChangeBody::Row(storage::RowChange {
-                op: storage::RowChangeOp::Upsert,
+                op: storage::RowChangeOp::Write,
                 table: "documents".into(),
                 id: "document:1".into(),
                 row: Some(r#"{"title":"before"}"#.into()),
@@ -3690,7 +3821,9 @@ mod tests {
         connects: usize,
         events: VecDeque<TransportEvent>,
         mutation_settlements: VecDeque<FunctionResult>,
+        query_results: VecDeque<Value>,
         sent: Vec<ClientMessage>,
+        state_version: Option<StateVersion>,
     }
 
     struct TraceTransport {
@@ -3730,15 +3863,68 @@ mod tests {
                 }
                 _ => None,
             };
+            let query_set = match &message {
+                ClientMessage::ModifyQuerySet {
+                    base_version,
+                    modifications,
+                    new_version,
+                } => Some((
+                    *base_version,
+                    *new_version,
+                    modifications
+                        .iter()
+                        .filter_map(|modification| match modification {
+                            QuerySetModification::Add(query) => Some(query.query_id),
+                            QuerySetModification::Remove { .. } => None,
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                _ => None,
+            };
             trace.sent.push(message);
             if let Some(request_id) = request_id {
                 let settlement = trace
                     .mutation_settlements
                     .pop_front()
                     .unwrap_or(FunctionResult::Value(Value::Null));
+                let start = trace.state_version.unwrap_or_else(StateVersion::initial);
+                let (events, end) = covering_mutation_events_after(start, request_id, settlement);
+                trace.state_version = Some(end);
+                trace.events.extend(events);
+            }
+            if let Some((base_version, new_version, query_ids)) = query_set
+                .filter(|_| trace.state_version.is_some() || !trace.query_results.is_empty())
+            {
+                let start = trace.state_version.unwrap_or_else(StateVersion::initial);
+                debug_assert_eq!(start.query_set, base_version);
+                let end = StateVersion {
+                    query_set: new_version,
+                    ts: start.ts.succ().expect("test timestamp should advance"),
+                    ..start
+                };
+                let modifications = query_ids
+                    .into_iter()
+                    .filter_map(|query_id| {
+                        trace.query_results.pop_front().map(|result| {
+                            StateModification::QueryUpdated {
+                                query_id,
+                                value: result,
+                                log_lines: LogLinesMessage(Vec::new()),
+                                journal: None,
+                            }
+                        })
+                    })
+                    .collect();
+                trace.state_version = Some(end);
                 trace
                     .events
-                    .extend(covering_mutation_events(request_id, settlement));
+                    .push_back(TransportEvent::ServerMessage(ServerMessage::Transition {
+                        start_version: start,
+                        end_version: end,
+                        modifications,
+                        client_clock_skew: None,
+                        server_ts: None,
+                    }));
             }
             future::ready(Ok(())).boxed()
         }
@@ -3779,8 +3965,8 @@ mod tests {
         store
     }
 
-    fn empty_pull_result() -> storage::RemotePullResult {
-        storage::RemotePullResult {
+    fn empty_pull_result() -> storage::RemotePageWriteResult {
+        storage::RemotePageWriteResult {
             rev_write: storage::RevWriteResult {
                 duplicates: 0,
                 written: 0,
@@ -3789,7 +3975,7 @@ mod tests {
                 committed: Vec::new(),
                 reroots: Vec::new(),
             },
-            swept: 0,
+            projection_deleted: 0,
             crdt: Vec::new(),
             result_changed: None,
         }
@@ -3824,8 +4010,8 @@ mod tests {
         .to_string()
     }
 
-    fn empty_projection_write(subscription: &str) -> ProjectionWrite {
-        ProjectionWrite::Pull(storage::RemotePull {
+    fn empty_remote_write(subscription: &str) -> RemoteWrite {
+        RemoteWrite::Page(storage::RemotePageWrite {
             subscription: subscription.to_owned(),
             members: Vec::new(),
             projections: Vec::new(),
@@ -3841,26 +4027,36 @@ mod tests {
         request_id: convex_sync_types::SessionRequestSeqNumber,
         result: FunctionResult,
     ) -> [TransportEvent; 2] {
-        let start = StateVersion::initial();
+        covering_mutation_events_after(StateVersion::initial(), request_id, result).0
+    }
+
+    fn covering_mutation_events_after(
+        start: StateVersion,
+        request_id: convex_sync_types::SessionRequestSeqNumber,
+        result: FunctionResult,
+    ) -> ([TransportEvent; 2], StateVersion) {
         let end = StateVersion {
             ts: start.ts.succ().expect("test timestamp should advance"),
             ..start
         };
-        [
-            TransportEvent::ServerMessage(ServerMessage::MutationResponse {
-                request_id,
-                result: result.into(),
-                ts: Some(end.ts),
-                log_lines: LogLinesMessage(Vec::new()),
-            }),
-            TransportEvent::ServerMessage(ServerMessage::Transition {
-                start_version: start,
-                end_version: end,
-                modifications: Vec::new(),
-                client_clock_skew: None,
-                server_ts: None,
-            }),
-        ]
+        (
+            [
+                TransportEvent::ServerMessage(ServerMessage::MutationResponse {
+                    request_id,
+                    result: result.into(),
+                    ts: Some(end.ts),
+                    log_lines: LogLinesMessage(Vec::new()),
+                }),
+                TransportEvent::ServerMessage(ServerMessage::Transition {
+                    start_version: start,
+                    end_version: end,
+                    modifications: Vec::new(),
+                    client_clock_skew: None,
+                    server_ts: None,
+                }),
+            ],
+            end,
+        )
     }
 
     fn applied_push_result(mutation_id: &str) -> FunctionResult {
@@ -4076,6 +4272,11 @@ mod tests {
             row_id: "documents|mixed".to_owned(),
             content: storage::RevisionContent::Value(serde_json::json!({ "title": "mixed" })),
         });
+        envelope.after_images.push(storage::RevisionCandidate {
+            table: "documents".to_owned(),
+            row_id: "documents|plain".to_owned(),
+            content: storage::RevisionContent::Value(serde_json::json!({ "title": "plain" })),
+        });
         envelope.crdt.extend([
             storage::CrdtEffect {
                 table: "documents".to_owned(),
@@ -4106,8 +4307,35 @@ mod tests {
             BTreeSet::from([
                 ("documents".to_owned(), "documents|crdt".to_owned()),
                 ("documents".to_owned(), "documents|mixed".to_owned()),
+                ("documents".to_owned(), "documents|plain".to_owned()),
             ]),
         );
+        let plain = ("documents".to_owned(), "documents|plain".to_owned());
+        let crdt = ("documents".to_owned(), "documents|crdt".to_owned());
+        assert!(!rejected_target_should_retain(
+            &envelope,
+            &BTreeMap::new(),
+            &plain,
+            false,
+        ));
+        assert!(rejected_target_should_retain(
+            &envelope,
+            &BTreeMap::new(),
+            &crdt,
+            false,
+        ));
+        assert!(rejected_target_should_retain(
+            &envelope,
+            &BTreeMap::from([(plain.clone(), "rev:plain".to_owned())]),
+            &plain,
+            false,
+        ));
+        assert!(rejected_target_should_retain(
+            &envelope,
+            &BTreeMap::new(),
+            &plain,
+            true,
+        ));
     }
 
     #[tokio::test]
@@ -4170,15 +4398,15 @@ mod tests {
         assert_eq!(added.len(), 1);
         assert_eq!(added[0].0, new_key);
         driver.remove_retired_subscriptions().unwrap();
-        driver.start_next_projection();
+        driver.start_next_remote_write();
         driver.flush_outbound().await.unwrap();
 
         assert!(matches!(
             driver
-                .projection_active
+                .remote_write_active
                 .as_ref()
-                .map(|active| &active.projection.write),
-            Some(ProjectionWrite::SubscriptionDelete { .. })
+                .map(|active| &active.pending.write),
+            Some(RemoteWrite::SubscriptionDelete { .. })
         ));
 
         let operations = trace
@@ -4199,7 +4427,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(operations, vec!["add", "remove"]);
 
-        driver.drive_projection_with_ingress().await.unwrap();
+        driver.drive_remote_write_with_ingress().await.unwrap();
 
         trace
             .lock()
@@ -4207,7 +4435,7 @@ mod tests {
             .sent
             .clear();
         let retained = driver.pull_subscriptions[0].subscriber_id;
-        driver.wait_for_rebase_projection();
+        driver.wait_for_rebase_remote_write();
         driver.flush_outbound().await.unwrap();
         assert_eq!(driver.pull_subscriptions[0].subscriber_id, retained);
         assert!(trace
@@ -4218,7 +4446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn covering_transition_settles_before_queued_projection_and_ingress_keeps_running() {
+    async fn covering_transition_settles_before_queued_remote_write_and_ingress_keeps_running() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport {
             trace: Arc::clone(&trace),
@@ -4231,20 +4459,20 @@ mod tests {
         );
         driver.connected = true;
         let actor_trace = Arc::clone(&driver.actor_trace);
-        let projection_release = Arc::new(Notify::new());
-        let release = Arc::clone(&projection_release);
-        driver.projection_active = Some(ActiveProjection {
+        let remote_write_release = Arc::new(Notify::new());
+        let release = Arc::clone(&remote_write_release);
+        driver.remote_write_active = Some(ActiveRemoteWrite {
             future: Box::pin(async move {
                 release.notified().await;
                 Ok(empty_pull_result())
             }),
-            projection: PreparedProjection {
+            pending: PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
                 result: Some(FunctionResult::Value(Value::Null)),
                 subscription: "watch".to_owned(),
-                write: empty_projection_write("watch"),
+                write: empty_remote_write("watch"),
             },
         });
         let checkpoint_id = "checkpoint".to_owned();
@@ -4293,19 +4521,19 @@ mod tests {
         wait_for_actor_trace(
             &actor_trace,
             &["mutation_response", "transition", "settlement"],
-            "socket ingress and settlement were blocked by projection work",
+            "socket ingress and settlement were blocked by remote-write work",
         )
         .await;
-        projection_release.notify_one();
+        remote_write_release.notify_one();
         wait_for_actor_trace(
             &actor_trace,
             &[
                 "mutation_response",
                 "transition",
                 "settlement",
-                "projection",
+                "remote_write",
             ],
-            "queued projection did not complete",
+            "queued remote write did not complete",
         )
         .await;
 
@@ -4319,7 +4547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_completion_flushes_checkpoint_without_pull_command() {
+    async fn remote_write_completion_flushes_checkpoint_without_pull_command() {
         let trace = Arc::new(Mutex::new(TransportTrace {
             auto_respond_to_mutations: true,
             ..TransportTrace::default()
@@ -4334,9 +4562,9 @@ mod tests {
             SystemRemoteClock::default(),
         );
         driver.connected = true;
-        driver.projection_active = Some(ActiveProjection {
+        driver.remote_write_active = Some(ActiveRemoteWrite {
             future: future::ready(Ok(empty_pull_result())).boxed(),
-            projection: PreparedProjection {
+            pending: PendingRemoteWrite {
                 checkpoint_responses: vec![PendingCheckpoint {
                     request: storage::CrdtCheckpointRequest {
                         checkpoint_id: "checkpoint".to_owned(),
@@ -4354,7 +4582,7 @@ mod tests {
                 pull_changes: 0,
                 result: Some(FunctionResult::Value(Value::Null)),
                 subscription: "watch".to_owned(),
-                write: empty_projection_write("watch"),
+                write: empty_remote_write("watch"),
             },
         });
 
@@ -4375,7 +4603,7 @@ mod tests {
             }
         })
         .await
-        .expect("projection completion did not flush its checkpoint mutation");
+        .expect("remote-write completion did not flush its checkpoint mutation");
 
         let (response, completed) = oneshot::channel();
         commands
@@ -4567,17 +4795,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settlement_ack_propagates_a_terminal_push_result() {
+    async fn remote_receipt_propagates_a_terminal_push_result() {
         let store = test_store("remote-ack-terminal.db");
         store
             .remote_push_envelope_write("ack-me", 1, &replay_envelope_json("ack-me", 1), 1)
             .unwrap();
         store
-            .remote_push_settle(&storage::RemotePushSettlement {
+            .remote_settlement_write(&storage::RemoteSettlementWrite {
                 mutation_id: "ack-me".to_owned(),
                 expected_commit_seq: 1,
                 now_ms: 0,
-                outcome: storage::RemotePushSettlementOutcome::Applied {
+                outcome: storage::RemoteSettlementOutcome::Applied {
                     ids: Vec::new(),
                     schedules: Vec::new(),
                     projections: Vec::new(),
@@ -4586,7 +4814,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            store.remote_settlement_ack_read(8).unwrap(),
+            store.remote_receipt_read(8).unwrap(),
             vec!["ack-me".to_owned()]
         );
 
@@ -4611,24 +4839,24 @@ mod tests {
             SystemRemoteClock::default(),
         );
         driver.connected = true;
-        driver.ack_queue_empty = false;
+        driver.receipt_queue_empty = false;
 
         let error = driver.acknowledge_settlements().await.unwrap_err();
         assert!(matches!(error, RemoteError::Retired(_)), "{error:?}");
     }
 
     #[tokio::test]
-    async fn settlement_ack_swallows_a_transient_mutation_failure() {
+    async fn remote_receipt_swallows_a_transient_mutation_failure() {
         let store = test_store("remote-ack-transient.db");
         store
             .remote_push_envelope_write("ack-me", 1, &replay_envelope_json("ack-me", 1), 1)
             .unwrap();
         store
-            .remote_push_settle(&storage::RemotePushSettlement {
+            .remote_settlement_write(&storage::RemoteSettlementWrite {
                 mutation_id: "ack-me".to_owned(),
                 expected_commit_seq: 1,
                 now_ms: 0,
-                outcome: storage::RemotePushSettlementOutcome::Applied {
+                outcome: storage::RemoteSettlementOutcome::Applied {
                     ids: Vec::new(),
                     schedules: Vec::new(),
                     projections: Vec::new(),
@@ -4651,10 +4879,104 @@ mod tests {
             SystemRemoteClock::default(),
         );
         driver.connected = false;
-        driver.ack_queue_empty = false;
+        driver.receipt_queue_empty = false;
 
         let tick = driver.acknowledge_settlements().await.unwrap();
-        assert_eq!(tick.settlements_acknowledged, 0);
+        assert_eq!(tick.receipts_pushed, 0);
+    }
+
+    #[tokio::test]
+    async fn browser_pull_ready_reports_no_scope_after_the_initial_page_write() {
+        let trace = Arc::new(Mutex::new(TransportTrace {
+            query_results: VecDeque::from([Value::try_from(serde_json::json!({
+                "members": [],
+                "changes": [],
+                "crdt": [],
+            }))
+            .unwrap()]),
+            state_version: Some(StateVersion::initial()),
+            ..TransportTrace::default()
+        }));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            test_store("remote-browser-initial-pending.db"),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+        driver
+            .scope_write(RemoteScope {
+                subscriptions: vec![RemoteSubscription {
+                    pull_fn: "documents:list".to_owned(),
+                    pull_args: serde_json::json!({}),
+                    result_cache_key: None,
+                    cursor: None,
+                }],
+            })
+            .unwrap();
+
+        let tick = driver
+            .pull_ready_interruptible(false, || false)
+            .await
+            .unwrap();
+
+        assert_eq!(tick.pull_snapshots, 1);
+        assert_eq!(tick.pending, Some(RemotePending::default()));
+    }
+
+    #[tokio::test]
+    async fn browser_pull_ready_settles_and_acknowledges_the_final_replay() {
+        let store = test_store("remote-browser-settlement-pending.db");
+        store
+            .remote_push_envelope_write("settled", 1, &replay_envelope_json("settled", 1), 1)
+            .unwrap();
+
+        let trace = Arc::new(Mutex::new(TransportTrace {
+            auto_respond_to_mutations: true,
+            mutation_settlements: VecDeque::from([applied_push_result("settled")]),
+            ..TransportTrace::default()
+        }));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            store,
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+        let pushed = driver
+            .doc_push(
+                "documents",
+                "documents|row",
+                storage::DirtyHeadToken {
+                    first_commit_seq: 1,
+                    updated_commit_seq: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pushed.tick.pending,
+            Some(RemotePending {
+                inflight: 1,
+                mutations: 1,
+                ..RemotePending::default()
+            })
+        );
+
+        let tick = driver
+            .pull_ready_interruptible(false, || false)
+            .await
+            .unwrap();
+
+        assert_eq!(tick.push_accepted, 1);
+        assert_eq!(tick.receipts_pushed, 1);
+        assert_eq!(tick.pending, Some(RemotePending::default()));
     }
 
     #[tokio::test]
@@ -4691,6 +5013,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(pushed.tick.push_attempted, 2);
+        assert_eq!(
+            pushed.tick.pending,
+            Some(RemotePending {
+                inflight: 2,
+                mutations: 2,
+                ..RemotePending::default()
+            })
+        );
         assert_eq!(driver.inflight_remote_push.len(), 2);
         let request_ids = trace
             .lock()
@@ -4703,6 +5033,208 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(request_ids, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn foreground_replay_applies_a_changed_subscription_before_retrying_a_rebase() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = documents_crdt_store("remote-rebase-yield.db");
+        let first = Value::try_from(serde_json::json!({
+            "members": [{ "table": "documents", "rowId": "srv1" }],
+            "changes": [{
+                "op": "put",
+                "table": "documents",
+                "rowId": "srv1",
+                "plainHash": "plain:first",
+                "fields": { "title": "first" },
+            }],
+            "crdt": [],
+        }))
+        .unwrap();
+        {
+            let mut state = trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.query_results.push_back(first);
+            state.state_version = Some(StateVersion::initial());
+        }
+        store
+            .remote_push_envelope_write("edit", 1, &replay_envelope_json("edit", 1), 1)
+            .unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+        driver
+            .scope_write(RemoteScope {
+                subscriptions: vec![RemoteSubscription {
+                    pull_fn: "documents:list".to_owned(),
+                    pull_args: serde_json::json!({}),
+                    result_cache_key: None,
+                    cursor: None,
+                }],
+            })
+            .unwrap();
+        let tables = driver.schema_table_names().unwrap();
+        driver
+            .ensure_live_subscription(&tables, false)
+            .await
+            .unwrap();
+        driver.drive_remote_write_with_ingress().await.unwrap();
+
+        let initial = driver
+            .doc_push(
+                "documents",
+                "documents|row",
+                storage::DirtyHeadToken {
+                    first_commit_seq: 1,
+                    updated_commit_seq: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.tick.push_attempted, 1);
+
+        let second = Value::try_from(serde_json::json!({
+            "members": [{ "table": "documents", "rowId": "srv1" }],
+            "changes": [{
+                "op": "put",
+                "table": "documents",
+                "rowId": "srv1",
+                "plainHash": "plain:second",
+                "fields": { "title": "authoritative" },
+            }],
+            "crdt": [],
+        }))
+        .unwrap();
+        let (request_id, query_id, start_version) = {
+            let state = trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let request_id = state
+                .sent
+                .iter()
+                .find_map(|message| match message {
+                    ClientMessage::Mutation { request_id, .. } => Some(*request_id),
+                    _ => None,
+                })
+                .expect("the first replay emitted a mutation");
+            let query_id = state
+                .sent
+                .iter()
+                .find_map(|message| match message {
+                    ClientMessage::ModifyQuerySet { modifications, .. } => modifications
+                        .iter()
+                        .find_map(|modification| match modification {
+                            QuerySetModification::Add(query) => Some(query.query_id),
+                            QuerySetModification::Remove { .. } => None,
+                        }),
+                    _ => None,
+                })
+                .expect("the scope emitted a live query");
+            (
+                request_id,
+                query_id,
+                state
+                    .state_version
+                    .expect("the initial query transition has a version"),
+            )
+        };
+        let end_version = StateVersion {
+            ts: start_version
+                .ts
+                .succ()
+                .expect("the test timestamp should advance"),
+            ..start_version
+        };
+        {
+            let mut state = trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.events.extend([
+                TransportEvent::ServerMessage(ServerMessage::MutationResponse {
+                    request_id,
+                    result: rebase_push_result("edit").into(),
+                    ts: Some(end_version.ts),
+                    log_lines: LogLinesMessage(Vec::new()),
+                }),
+                TransportEvent::ServerMessage(ServerMessage::Transition {
+                    start_version,
+                    end_version,
+                    modifications: vec![StateModification::QueryUpdated {
+                        query_id,
+                        value: second,
+                        log_lines: LogLinesMessage(Vec::new()),
+                        journal: None,
+                    }],
+                    client_clock_skew: None,
+                    server_ts: None,
+                }),
+            ]);
+            state.state_version = Some(end_version);
+        }
+
+        driver
+            .receive_once_with_timeout(Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            !driver.replay_waiting_for_remote_write,
+            "Convex settles the mutation only after the covering transition"
+        );
+        driver
+            .receive_once_with_timeout(Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(driver.replay_waiting_for_remote_write);
+        assert!(
+            driver.remote_write_pending.is_empty(),
+            "the actor yield happens after ingress but before the changed result is queued"
+        );
+
+        let pushed = driver
+            .doc_push(
+                "documents",
+                "documents|row",
+                storage::DirtyHeadToken {
+                    first_commit_seq: 1,
+                    updated_commit_seq: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pushed.tick.push_attempted, 1);
+        assert!(!driver.replay_waiting_for_remote_write);
+        assert_eq!(driver.inflight_remote_push.len(), 1);
+        let page = store
+            .doc_page_read(&storage::ReadSpec {
+                table: "documents".to_owned(),
+                ..storage::ReadSpec::default()
+            })
+            .unwrap();
+        assert_eq!(
+            storage::testkit::parse_docs(&page)[0]["title"],
+            "authoritative",
+            "the changed subscription is durably projected before replay resumes"
+        );
+        assert_eq!(
+            trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sent
+                .iter()
+                .filter(|message| matches!(message, ClientMessage::Mutation { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -4744,7 +5276,7 @@ mod tests {
         ]);
 
         second_send.send(applied_push_result("second")).unwrap();
-        let tick = driver.settle_ready_remote_push().unwrap();
+        let tick = driver.remote_settlement_write().unwrap();
 
         assert!(!tick.has_observable_progress());
         assert_eq!(driver.inflight_remote_push.len(), 2);
@@ -4825,62 +5357,62 @@ mod tests {
     }
 
     #[test]
-    fn queued_projection_coalesces_to_the_newest_subscription_result() {
+    fn queued_remote_write_coalesces_to_the_newest_subscription_result() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport { trace };
         let mut driver = RemoteDriver::open_with_store(
             RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
-            test_store("remote-projection-coalesce.db"),
+            test_store("remote-write-coalesce.db"),
             transport,
             SystemRemoteClock::default(),
         );
-        driver.projection_active = Some(ActiveProjection {
+        driver.remote_write_active = Some(ActiveRemoteWrite {
             future: Box::pin(future::pending()),
-            projection: PreparedProjection {
+            pending: PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
                 result: Some(FunctionResult::Value(Value::String("active".to_owned()))),
                 subscription: "watch".to_owned(),
-                write: empty_projection_write("watch"),
+                write: empty_remote_write("watch"),
             },
         });
         for value in ["older", "newest"] {
-            driver.stage_projection(PreparedProjection {
+            driver.stage_remote_write(PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
                 result: Some(FunctionResult::Value(Value::String(value.to_owned()))),
                 subscription: "watch".to_owned(),
-                write: empty_projection_write("watch"),
+                write: empty_remote_write("watch"),
             });
         }
 
         assert_eq!(
-            driver.projection_order,
+            driver.remote_write_order,
             VecDeque::from(["watch".to_owned()])
         );
         assert_eq!(
             driver
-                .projection_pending
+                .remote_write_pending
                 .get("watch")
-                .and_then(|projection| projection.result.as_ref()),
+                .and_then(|pending| pending.result.as_ref()),
             Some(&FunctionResult::Value(Value::String("newest".to_owned())))
         );
     }
 
     #[test]
-    fn changed_projection_batch_is_staged_before_work_starts() {
+    fn changed_page_batch_is_staged_before_remote_write_starts() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport { trace };
         let mut driver = RemoteDriver::open_with_store(
             RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
-            test_store("remote-projection-batch.db"),
+            test_store("remote-write-batch.db"),
             transport,
             SystemRemoteClock::default(),
         );
         for subscription in ["first", "second"] {
-            driver.stage_projection(PreparedProjection {
+            driver.stage_remote_write(PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
@@ -4888,34 +5420,69 @@ mod tests {
                     subscription.to_owned(),
                 ))),
                 subscription: subscription.to_owned(),
-                write: empty_projection_write(subscription),
+                write: empty_remote_write(subscription),
             });
         }
 
-        assert!(driver.projection_active.is_none());
+        assert!(driver.remote_write_active.is_none());
         assert_eq!(
-            driver.projection_order,
+            driver.remote_write_order,
             VecDeque::from(["first".to_owned(), "second".to_owned()])
         );
 
-        driver.start_next_projection();
+        driver.start_next_remote_write();
         assert_eq!(
             driver
-                .projection_active
+                .remote_write_active
                 .as_ref()
-                .map(|active| active.projection.subscription.as_str()),
+                .map(|active| active.pending.subscription.as_str()),
             Some("first")
         );
-        assert!(driver.projection_pending.contains_key("second"));
+        assert!(driver.remote_write_pending.contains_key("second"));
     }
 
-    #[test]
-    fn retained_replay_pauses_the_projection_lane() {
+    #[tokio::test]
+    async fn rebase_barrier_clears_only_after_a_page_write_completes() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport { trace };
         let mut driver = RemoteDriver::open_with_store(
             RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
-            test_store("remote-projection-replay.db"),
+            test_store("remote-rebase-write-barrier.db"),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.replay_waiting_for_remote_write = true;
+        driver.stage_remote_write(PendingRemoteWrite {
+            checkpoint_responses: Vec::new(),
+            crdt_changes: 0,
+            pull_changes: 0,
+            result: Some(FunctionResult::Value(Value::Null)),
+            subscription: "watch".to_owned(),
+            write: empty_remote_write("watch"),
+        });
+
+        driver.start_next_remote_write();
+        assert!(driver.remote_write_active.is_some());
+        assert!(
+            driver.replay_waiting_for_remote_write,
+            "starting storage work is not proof that the authoritative page committed"
+        );
+
+        driver.drive_remote_write_with_ingress().await.unwrap();
+        assert!(driver.remote_write_active.is_none());
+        assert!(
+            !driver.replay_waiting_for_remote_write,
+            "a successfully committed page write releases the retained replay"
+        );
+    }
+
+    #[test]
+    fn retained_replay_pauses_the_remote_write_lane() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport { trace };
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            test_store("remote-write-replay.db"),
             transport,
             SystemRemoteClock::default(),
         );
@@ -4926,85 +5493,85 @@ mod tests {
             },
             result,
         });
-        driver.stage_projection(PreparedProjection {
+        driver.stage_remote_write(PendingRemoteWrite {
             checkpoint_responses: Vec::new(),
             crdt_changes: 0,
             pull_changes: 0,
             result: Some(FunctionResult::Value(Value::Null)),
             subscription: "watch".to_owned(),
-            write: empty_projection_write("watch"),
+            write: empty_remote_write("watch"),
         });
-        driver.start_next_projection();
+        driver.start_next_remote_write();
 
-        assert!(driver.projection_active.is_none());
-        assert!(driver.projection_pending.contains_key("watch"));
+        assert!(driver.remote_write_active.is_none());
+        assert!(driver.remote_write_pending.contains_key("watch"));
     }
 
     #[tokio::test]
-    async fn foreground_replay_finishes_only_the_active_projection() {
+    async fn foreground_replay_finishes_only_the_active_remote_write() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport { trace };
         let mut driver = RemoteDriver::open_with_store(
             RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
-            test_store("remote-projection-priority.db"),
+            test_store("remote-write-priority.db"),
             transport,
             SystemRemoteClock::default(),
         );
-        driver.projection_active = Some(ActiveProjection {
+        driver.remote_write_active = Some(ActiveRemoteWrite {
             future: Box::pin(future::ready(Ok(empty_pull_result()))),
-            projection: PreparedProjection {
+            pending: PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
                 result: Some(FunctionResult::Value(Value::Null)),
                 subscription: "active".to_owned(),
-                write: empty_projection_write("active"),
+                write: empty_remote_write("active"),
             },
         });
-        driver.stage_projection(PreparedProjection {
+        driver.stage_remote_write(PendingRemoteWrite {
             checkpoint_responses: Vec::new(),
             crdt_changes: 0,
             pull_changes: 0,
             result: Some(FunctionResult::Value(Value::Null)),
             subscription: "queued".to_owned(),
-            write: empty_projection_write("queued"),
+            write: empty_remote_write("queued"),
         });
 
         driver
-            .finish_active_projection_before_replay()
+            .finish_active_remote_write_before_replay()
             .await
             .unwrap();
 
-        assert!(driver.projection_active.is_none());
-        assert!(driver.projection_pending.contains_key("queued"));
-        assert!(!driver.projection_paused);
+        assert!(driver.remote_write_active.is_none());
+        assert!(driver.remote_write_pending.contains_key("queued"));
+        assert!(!driver.remote_write_paused);
     }
 
     #[tokio::test]
-    async fn native_actor_accepts_scope_and_close_while_a_projection_is_active() {
+    async fn native_actor_accepts_scope_and_close_while_a_remote_write_is_active() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport { trace };
         let mut driver = RemoteDriver::open_with_store(
             RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
-            test_store("remote-projection-command.db"),
+            test_store("remote-write-command.db"),
             transport,
             SystemRemoteClock::default(),
         );
         driver.connected = true;
-        let projection_release = Arc::new(Notify::new());
-        let release = Arc::clone(&projection_release);
-        driver.projection_active = Some(ActiveProjection {
+        let remote_write_release = Arc::new(Notify::new());
+        let release = Arc::clone(&remote_write_release);
+        driver.remote_write_active = Some(ActiveRemoteWrite {
             future: Box::pin(async move {
                 release.notified().await;
                 Ok(empty_pull_result())
             }),
-            projection: PreparedProjection {
+            pending: PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
                 result: Some(FunctionResult::Value(Value::Null)),
                 subscription: "active".to_owned(),
-                write: empty_projection_write("active"),
+                write: empty_remote_write("active"),
             },
         });
 
@@ -5020,7 +5587,7 @@ mod tests {
             .unwrap();
         tokio::time::timeout(Duration::from_millis(100), completed)
             .await
-            .expect("scope update was hidden by active projection work")
+            .expect("scope update was hidden by active remote-write work")
             .unwrap()
             .unwrap();
         let (response, closed) = oneshot::channel();
@@ -5030,11 +5597,11 @@ mod tests {
             .unwrap();
         tokio::time::timeout(Duration::from_millis(100), closed)
             .await
-            .expect("close was hidden by active projection work")
+            .expect("close was hidden by active remote-write work")
             .unwrap()
             .unwrap();
         task.await.unwrap().unwrap();
-        projection_release.notify_one();
+        remote_write_release.notify_one();
     }
 
     #[tokio::test]
@@ -5140,7 +5707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_foreground_doc_push_runs_before_the_next_queued_projection() {
+    async fn deferred_foreground_doc_push_runs_before_the_next_queued_remote_write() {
         let trace = Arc::new(Mutex::new(TransportTrace {
             auto_respond_to_mutations: true,
             mutation_settlements: VecDeque::from([applied_push_result("foreground")]),
@@ -5163,29 +5730,29 @@ mod tests {
         driver.push_queue_empty = true;
         let actor_trace = Arc::clone(&driver.actor_trace);
 
-        let projection_release = Arc::new(Notify::new());
-        let release = Arc::clone(&projection_release);
-        driver.projection_active = Some(ActiveProjection {
+        let remote_write_release = Arc::new(Notify::new());
+        let release = Arc::clone(&remote_write_release);
+        driver.remote_write_active = Some(ActiveRemoteWrite {
             future: Box::pin(async move {
                 release.notified().await;
                 Ok(empty_pull_result())
             }),
-            projection: PreparedProjection {
+            pending: PendingRemoteWrite {
                 checkpoint_responses: Vec::new(),
                 crdt_changes: 0,
                 pull_changes: 0,
                 result: Some(FunctionResult::Value(Value::Null)),
                 subscription: "active".to_owned(),
-                write: empty_projection_write("active"),
+                write: empty_remote_write("active"),
             },
         });
-        driver.stage_projection(PreparedProjection {
+        driver.stage_remote_write(PendingRemoteWrite {
             checkpoint_responses: Vec::new(),
             crdt_changes: 0,
             pull_changes: 0,
             result: Some(FunctionResult::Value(Value::Null)),
             subscription: "queued".to_owned(),
-            write: empty_projection_write("queued"),
+            write: empty_remote_write("queued"),
         });
 
         let (commands, receiver) = mpsc::channel(2);
@@ -5214,18 +5781,18 @@ mod tests {
             .unwrap();
         scope_acked.await.unwrap().unwrap();
 
-        projection_release.notify_one();
+        remote_write_release.notify_one();
 
         wait_for_actor_trace(
             &actor_trace,
             &[
-                "projection",
+                "remote_write",
                 "mutation_response",
                 "transition",
                 "settlement",
-                "projection",
+                "remote_write",
             ],
-            "the deferred foreground DocPush did not settle before the next queued projection",
+            "the deferred foreground DocPush did not settle before the next queued remote write",
         )
         .await;
 
@@ -5281,14 +5848,14 @@ mod tests {
         ]);
 
         edit_send.send(rebase_push_result("edit")).unwrap();
-        let tick = driver.settle_ready_remote_push().unwrap();
+        let tick = driver.remote_settlement_write().unwrap();
 
         assert_eq!(tick.push_rebases, 1);
         assert_eq!(tick.push_accepted, 0);
         assert_eq!(tick.pushed, 0);
 
         assert!(driver.inflight_remote_push.is_empty());
-        assert!(driver.replay_waiting_for_projection);
+        assert!(driver.replay_waiting_for_remote_write);
 
         let durable = store.remote_push_envelope_read(10).unwrap();
         assert_eq!(durable.len(), 2);
@@ -5318,8 +5885,8 @@ mod tests {
         store
     }
 
-    fn documents_projection_pull(server_id: &str) -> storage::RemotePull {
-        storage::RemotePull {
+    fn documents_page_write(server_id: &str) -> storage::RemotePageWrite {
+        storage::RemotePageWrite {
             subscription: "documents:list:{}".to_owned(),
             members: vec![storage::RemoteMember {
                 table: "documents".to_owned(),
@@ -5349,8 +5916,8 @@ mod tests {
         server_id: &str,
         checkpoint: Vec<u8>,
         projection_hash: String,
-    ) -> storage::RemotePull {
-        storage::RemotePull {
+    ) -> storage::RemotePageWrite {
+        storage::RemotePageWrite {
             subscription: "documents:list:{}".to_owned(),
             members: vec![storage::RemoteMember {
                 table: "documents".to_owned(),
@@ -5477,7 +6044,7 @@ mod tests {
         let store = documents_crdt_store("remote-crdt-rebase-retry.db");
 
         store
-            .remote_pull_page(&documents_projection_pull("srv1"))
+            .remote_page_write(&documents_page_write("srv1"))
             .unwrap();
         let page = store
             .doc_page_read(&storage::ReadSpec {
@@ -5491,7 +6058,7 @@ mod tests {
             .to_owned();
 
         let mint = documents_crdt_store("remote-crdt-rebase-mint.db");
-        mint.crdt_field_apply(
+        mint.crdt_field_intent_write(
             "documents",
             "seed",
             "body",
@@ -5511,7 +6078,7 @@ mod tests {
             .find(|snapshot| snapshot.field == "body")
             .expect("the minted field carries a body snapshot");
         let payload = mint
-            .crdt_field_apply(
+            .crdt_field_intent_write(
                 "documents",
                 "seed",
                 "body",
@@ -5553,19 +6120,27 @@ mod tests {
             result: edit_result,
         });
         edit_send.send(rebase_push_result("edit")).unwrap();
-        let rebase = driver.settle_ready_remote_push().unwrap();
+        let rebase = driver.remote_settlement_write().unwrap();
         assert_eq!(rebase.push_rebases, 1);
         assert!(driver.inflight_remote_push.is_empty());
-        assert!(driver.replay_waiting_for_projection);
+        assert!(driver.replay_waiting_for_remote_write);
         assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 1);
 
-        store
-            .remote_pull_page(&documents_crdt_advance_pull(
+        driver.stage_remote_write(PendingRemoteWrite {
+            checkpoint_responses: Vec::new(),
+            crdt_changes: 1,
+            pull_changes: 0,
+            result: Some(FunctionResult::Value(Value::Null)),
+            subscription: "documents:list:{}".to_owned(),
+            write: RemoteWrite::Page(documents_crdt_advance_pull(
                 "srv1",
                 snapshot.bytes.clone(),
                 snapshot.projection_hash.clone(),
-            ))
-            .unwrap();
+            )),
+        });
+        driver.start_next_remote_write();
+        assert!(driver.replay_waiting_for_remote_write);
+        driver.drive_remote_write_with_ingress().await.unwrap();
         assert_eq!(
             store
                 .crdt_head_read("documents", &local_id, "body")
@@ -5573,9 +6148,7 @@ mod tests {
             Some(1),
             "the authoritative pull advances the accepted CRDT head past the stale base"
         );
-
-        driver.start_next_projection();
-        assert!(!driver.replay_waiting_for_projection);
+        assert!(!driver.replay_waiting_for_remote_write);
         driver.connected = true;
         driver.push_queue_empty = false;
 
@@ -5678,11 +6251,167 @@ mod tests {
         .unwrap()
     }
 
+    fn documents_checkpoint_result(
+        server_id: &str,
+        checkpoint_id: &str,
+        seq: i64,
+        checkpoint: &[u8],
+        projection_hash: &str,
+    ) -> Value {
+        Value::try_from(serde_json::json!({
+                "members": [{ "table": "documents", "rowId": server_id }],
+                "changes": [],
+                "crdt": [{
+                    "table": "documents",
+                    "rowId": server_id,
+                    "field": "body",
+                    "kind": "text",
+                    "epoch": 0,
+                    "checkpoint": {
+                        "id": checkpoint_id,
+                        "seq": seq,
+                        "bytes": checkpoint.len(),
+                        "hash": super::sha256_hex(checkpoint),
+                    },
+                    "headSeq": seq,
+                    "projectionHash": projection_hash,
+                }],
+        }))
+        .unwrap()
+    }
+
+    fn checkpoint_page(
+        checkpoint_id: &str,
+        seq: i64,
+        checkpoint: &[u8],
+        chunks: &serde_json::Value,
+        continue_cursor: Option<&str>,
+        is_done: bool,
+    ) -> Value {
+        Value::try_from(serde_json::json!({
+                "checkpoint": {
+                    "id": checkpoint_id,
+                    "seq": seq,
+                    "bytes": checkpoint.len(),
+                    "hash": super::sha256_hex(checkpoint),
+                },
+                "headSeq": seq,
+                "chunks": chunks,
+                "payloads": [],
+                "continueCursor": continue_cursor,
+                "isDone": is_done,
+        }))
+        .unwrap()
+    }
+
+    /// Once payload deletion has advanced A through B to C, resuming A may observe that its immutable tail
+    /// is gone. The stale outcome must discard only A's partial bytes, refresh the live query, and
+    /// stage C; it must not enter `last_failed_result` or repeatedly request A.
+    #[tokio::test]
+    async fn a_stale_checkpoint_restarts_from_the_live_checkpoint() {
+        let a = [1u8, 2, 3, 4];
+        let c = [5u8, 6, 7];
+        let result_a = documents_checkpoint_result("srv1", "checkpoint-a", 1, &a, "projection-a");
+        let result_c = documents_checkpoint_result("srv1", "checkpoint-c", 3, &c, "projection-c");
+        let trace = Arc::new(Mutex::new(TransportTrace {
+            query_results: VecDeque::from([
+                result_c.clone(),
+                checkpoint_page(
+                    "checkpoint-a",
+                    1,
+                    &a,
+                    &serde_json::json!([{
+                        "ordinal": 0,
+                        "bytes": { "$bytes": "AQI=" },
+                        "hash": super::sha256_hex(&a[..2]),
+                    }]),
+                    Some("chunk:0"),
+                    false,
+                ),
+                Value::try_from(serde_json::json!({ "kind": "stale" })).unwrap(),
+                checkpoint_page(
+                    "checkpoint-c",
+                    3,
+                    &c,
+                    &serde_json::json!([{
+                        "ordinal": 0,
+                        "bytes": { "$bytes": "BQYH" },
+                        "hash": super::sha256_hex(&c),
+                    }]),
+                    None,
+                    true,
+                ),
+            ]),
+            state_version: Some(StateVersion::initial()),
+            ..TransportTrace::default()
+        }));
+        let transport = TraceTransport { trace };
+        let store = documents_crdt_store("remote-stale-checkpoint-restart.db");
+        store
+            .remote_page_write(&documents_page_write("srv1"))
+            .unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            store,
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+        let descriptor = RemoteSubscription {
+            pull_fn: "documents:list".to_owned(),
+            pull_args: serde_json::json!({}),
+            result_cache_key: None,
+            cursor: None,
+        };
+        let key = super::remote_subscription_key(&descriptor).unwrap();
+        let subscriber_id = driver.base.subscribe(
+            RemoteFunction::parse(&descriptor.pull_fn)
+                .unwrap()
+                .into_udf_path(),
+            crate::pull::args(
+                &driver.config.runtime,
+                &descriptor.pull_fn,
+                &descriptor.pull_args,
+            )
+            .unwrap(),
+        );
+        driver.scope.subscriptions.push(descriptor.clone());
+        driver.pull_subscriptions.push(PullSubscription {
+            last_result: None,
+            last_failed_result: None,
+            key: key.clone(),
+            subscriber_id,
+            cursor: None,
+        });
+
+        let tick = driver
+            .enqueue_pull_result(FunctionResult::Value(result_a), &key)
+            .await
+            .unwrap();
+        assert_eq!(tick.pull_diagnostics, 0);
+        assert!(
+            driver.pull_subscriptions[0].last_failed_result.is_none(),
+            "a stale retained prefix is a restart signal, not a quarantined manifest"
+        );
+        let staged = driver
+            .remote_write_pending
+            .get(&key)
+            .expect("the refreshed C manifest should be staged");
+        assert_eq!(
+            staged.result.as_ref(),
+            Some(&FunctionResult::Value(result_c))
+        );
+        let RemoteWrite::Page(write) = &staged.write else {
+            panic!("expected a staged page write");
+        };
+        assert_eq!(write.crdt[0].checkpoint_seq, 3);
+    }
+
     /// A retained live manifest whose CRDT prefix the client can never reconcile — the production
-    /// shape after the component tables were wiped, where the field head advances but the bootstrap
+    /// shape after the component tables were wiped, where the field head advances but the checkpoint
     /// history no longer exists — must be reported once and then held, not re-attempted on every pull
     /// tick. The pre-fix driver returned this permanent failure straight out of `pull()`, so each
-    /// tick re-issued a fresh one-shot bootstrap (~9 `embedded:pull`/second in prod) that never
+    /// tick re-issued a fresh one-shot checkpoint pull (~9 `embedded:pull`/second in prod) that never
     /// converged. This pins the terminal-diagnostic gate.
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -5693,7 +6422,7 @@ mod tests {
         };
         let store = documents_crdt_store("remote-unsatisfiable-manifest.db");
         store
-            .remote_pull_page(&documents_projection_pull("srv1"))
+            .remote_page_write(&documents_page_write("srv1"))
             .unwrap();
         let page = store
             .doc_page_read(&storage::ReadSpec {
@@ -5707,7 +6436,7 @@ mod tests {
             .to_owned();
 
         let mint = documents_crdt_store("remote-unsatisfiable-mint.db");
-        mint.crdt_field_apply(
+        mint.crdt_field_intent_write(
             "documents",
             "seed",
             "body",
@@ -5727,7 +6456,7 @@ mod tests {
             .find(|snapshot| snapshot.field == "body")
             .expect("the minted field carries a body snapshot");
         store
-            .remote_pull_page(&documents_crdt_advance_pull(
+            .remote_page_write(&documents_crdt_advance_pull(
                 "srv1",
                 snapshot.bytes.clone(),
                 snapshot.projection_hash.clone(),
@@ -5788,7 +6517,7 @@ mod tests {
             "the first unsatisfiable manifest is reported exactly once",
         );
         assert!(
-            driver.projection_pending.is_empty(),
+            driver.remote_write_pending.is_empty(),
             "a failed manifest stages no projection and retains prior accepted state",
         );
 
@@ -5851,13 +6580,13 @@ mod tests {
     fn assemble_result_pull(
         driver: &mut RemoteDriver<TraceTransport, Arc<storage::EmbeddedStore>, SystemRemoteClock>,
         value: Value,
-    ) -> storage::RemotePull {
+    ) -> storage::RemotePageWrite {
         let key = super::remote_subscription_key(&driver.scope.subscriptions[0]).unwrap();
         let page = crate::pull::decode(value.clone()).unwrap();
         let prepared = driver
-            .prepare_projection(&page, Vec::new(), FunctionResult::Value(value), &key)
+            .prepare_remote_write(&page, Vec::new(), FunctionResult::Value(value), &key)
             .unwrap();
-        let ProjectionWrite::Pull(pull) = prepared.write else {
+        let RemoteWrite::Page(pull) = prepared.write else {
             panic!("a live pull prepares a page write");
         };
         pull
@@ -5877,7 +6606,7 @@ mod tests {
             .result
             .clone()
             .expect("the page carries a result entry");
-        driver.store().remote_pull_page(&pull).unwrap();
+        driver.store().remote_page_write(&pull).unwrap();
 
         let stored = driver.store().result_read(&entry.key).unwrap().unwrap();
         assert_eq!(stored, entry);
@@ -5907,13 +6636,13 @@ mod tests {
         );
         let pull = assemble_result_pull(&mut driver, value.clone());
         let entry = *pull.result.clone().unwrap();
-        driver.store().remote_pull_page(&pull).unwrap();
+        driver.store().remote_page_write(&pull).unwrap();
 
         let mut replay = pull.clone();
         let mut later = entry.clone();
         later.clock = 999.0;
         replay.result = Some(Box::new(later));
-        driver.store().remote_pull_page(&replay).unwrap();
+        driver.store().remote_page_write(&replay).unwrap();
 
         let stored = driver.store().result_read(&entry.key).unwrap().unwrap();
         assert_eq!(
@@ -5933,7 +6662,7 @@ mod tests {
             ),
         );
         let first_entry = *first.result.clone().unwrap();
-        driver.store().remote_pull_page(&first).unwrap();
+        driver.store().remote_page_write(&first).unwrap();
 
         let second = assemble_result_pull(
             &mut driver,
@@ -5955,7 +6684,7 @@ mod tests {
             first_entry.skeleton_hash, second_entry.skeleton_hash,
             "a paths-only change moves the skeleton hash",
         );
-        driver.store().remote_pull_page(&second).unwrap();
+        driver.store().remote_page_write(&second).unwrap();
 
         let stored = driver
             .store()
@@ -5989,7 +6718,7 @@ mod tests {
             .result_cache_key
             .clone()
             .unwrap();
-        driver.store().remote_pull_page(&pull).unwrap();
+        driver.store().remote_page_write(&pull).unwrap();
         assert_eq!(driver.store().result_read(&key).unwrap(), None);
     }
 
@@ -6006,7 +6735,7 @@ mod tests {
         let entry = *pull.result.clone().unwrap();
 
         storage::testkit::fail_next_commit();
-        assert!(driver.store().remote_pull_page(&pull).is_err());
+        assert!(driver.store().remote_page_write(&pull).is_err());
         assert_eq!(
             driver.store().result_read(&entry.key).unwrap(),
             None,
@@ -6081,7 +6810,7 @@ mod tests {
             "resultRows": [{ "path": "", "table": "documents", "rowId": "srv1" }],
         })).unwrap();
         let pull1 = assemble_result_pull(&mut driver, v1.clone());
-        driver.store().remote_pull_page(&pull1).unwrap();
+        driver.store().remote_page_write(&pull1).unwrap();
         let local_id = driver
             .store()
             .id_local_read("documents", "srv1")
@@ -6107,7 +6836,7 @@ mod tests {
             pull2.members.is_empty(),
             "the re-pull discloses the row only through the result channel",
         );
-        driver.store().remote_pull_page(&pull2).unwrap();
+        driver.store().remote_page_write(&pull2).unwrap();
 
         let page = driver
             .store()
@@ -6120,7 +6849,7 @@ mod tests {
         assert!(
             docs.iter()
                 .any(|doc| doc["_id"].as_str() == Some(&local_id)),
-            "a result-channel-only re-pull must retain the disclosed row instead of sweeping it",
+            "a result-channel-only re-pull must retain the disclosed row instead of deleting it",
         );
     }
 
@@ -6169,7 +6898,7 @@ mod tests {
             1,
             "first pull discloses the member row"
         );
-        driver.store().remote_pull_page(&pull).unwrap();
+        driver.store().remote_page_write(&pull).unwrap();
         assert!(
             driver
                 .store()
@@ -6229,7 +6958,7 @@ mod tests {
             "a member edge keeps its projection even when the change repeats the accepted plain hash",
         );
 
-        driver.store().remote_pull_page(&pull).unwrap();
+        driver.store().remote_page_write(&pull).unwrap();
         assert!(
             driver
                 .store()

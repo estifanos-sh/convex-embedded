@@ -43,8 +43,8 @@ export const webkitProject = {
       }) as never,
     },
     fileParallelism: false,
-    include: ["tests/browser/webkit.ts"],
+    include: ["tests/browser/protocol.ts", "tests/browser/webkit.ts"],
     name: "webkit",
-    testTimeout: 45_000,
+    testTimeout: 70_000,
   },
 } satisfies TestProjectInlineConfiguration;

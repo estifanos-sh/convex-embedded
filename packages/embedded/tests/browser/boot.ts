@@ -60,7 +60,7 @@ interface WoundRequest {
 
 interface WoundStageRequest {
   op: "woundStage";
-  stage: "open" | "commit" | "checkpoint" | "close";
+  stage: "open" | "commit" | "wal" | "close";
   storageId: string;
 }
 
@@ -305,7 +305,7 @@ async function seed(request: SeedRequest): Promise<SeedResult> {
       await writeSeedRow(state, index);
     }
     rows = (await state.store.doc.count.read({ table: "documents" })) ?? 0;
-    await state.store.checkpoint();
+    await state.store.wal.write();
     dbBytes = fileBytes(state.opfs, path);
     walBytes = fileBytes(state.opfs, `${path}-wal`);
   } finally {
@@ -406,11 +406,11 @@ async function woundStage(request: WoundStageRequest): Promise<never> {
     const commit = writeSeedRow(state, 900_000);
     announce();
     await commit;
-  } else if (request.stage === "checkpoint") {
+  } else if (request.stage === "wal") {
     await writeSeedRow(state, 900_001);
-    const checkpoint = state.store.checkpoint();
+    const walWrite = state.store.wal.write();
     announce();
-    await checkpoint;
+    await walWrite;
   } else if (request.stage === "close") {
     const close = state.store.close();
     announce();

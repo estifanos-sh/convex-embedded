@@ -311,7 +311,7 @@ describe("v5 real Convex vertical slice", () => {
         settledBefore: readTime() + 1_000,
         numItems: 100,
       }),
-    ).toMatchObject({ deleted: expect.any(Number), progress: "complete" });
+    ).toMatchObject({ deleted: expect.any(Number), isDone: true });
 
     await expect(
       client.mutation(api.client.retire, {
@@ -556,9 +556,9 @@ describe("v5 real Convex vertical slice", () => {
       for (const storageId of storageIds) {
         await client.mutation(api.file.remove, { storageId, expectedVersion: 2 });
       }
-      let progress = { progress: "continue" as "continue" | "complete", deleted: 0 };
-      while (progress.progress === "continue") {
-        progress = await client.mutation(api.mutation.remove, {
+      let deletion = { deleted: 0, isDone: false };
+      while (!deletion.isDone) {
+        deletion = await client.mutation(api.mutation.remove, {
           identityKey,
           settledBefore: readTime() + 60_000,
           numItems: 100,
@@ -656,6 +656,62 @@ describe("v5 real Convex vertical slice", () => {
     }
   }, 20_000);
 
+  test("watches a server-only query through the hosted Convex subscription", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "embedded-v5-hosted-watch-"));
+    const slug = `v5-hosted-watch-${crypto.randomUUID()}`;
+    const hosted = new ConvexHttpClient(remoteUrl);
+    const created = await hosted.mutation(api.documents.create, {
+      body: "hosted watch",
+      slug,
+      title: slug,
+      updatedAt: readTime(),
+    });
+    const client = new ConvexEmbeddedClient({
+      modules: { documents },
+      path: join(directory, "embedded.sqlite3"),
+      schema,
+      url: remoteUrl,
+    });
+    const listWatch = client.watchQuery(api.documents.list, { prefix: slug });
+    const stopList = listWatch.onUpdate(() => undefined);
+    let stopHistory: (() => void) | undefined;
+    try {
+      const pullDeadline = getTimerTime() + 15_000;
+      let local = await client.query(api.documents.getBySlug, { slug });
+      while (!local && getTimerTime() < pullDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        local = await client.query(api.documents.getBySlug, { slug });
+      }
+      if (!local) throw new Error("Hosted-watch client did not pull the document.");
+
+      const history = client.watchQuery(api.documents.history, {
+        id: local._id,
+        cursor: null,
+        numItems: 10,
+      });
+      let latest: { page: Array<{ revId: string }> } | undefined;
+      stopHistory = history.onUpdate(() => {
+        latest = history.localQueryResult();
+      });
+
+      const revision = await hosted.mutation(api.documents.savepoint, { id: created._id });
+      const updateDeadline = getTimerTime() + 15_000;
+      while (
+        !latest?.page.some((row) => row.revId === revision.revId) &&
+        getTimerTime() < updateDeadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(latest?.page).toContainEqual(expect.objectContaining({ revId: revision.revId }));
+    } finally {
+      stopHistory?.();
+      stopList();
+      await client.close();
+      await hosted.mutation(api.documents.remove, { id: created._id });
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 25_000);
+
   test("rebases concurrent CRDT edits by pulling opaque payloads and retrying", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-crdt-rebase-${crypto.randomUUID()}`;
@@ -701,7 +757,7 @@ describe("v5 real Convex vertical slice", () => {
           }
           if (!row) {
             throw new Error(
-              `CRDT test client did not bootstrap the hosted document: ${JSON.stringify(events)}`,
+              `CRDT test client did not pull the hosted document: ${JSON.stringify(events)}`,
             );
           }
           return row;
@@ -798,14 +854,14 @@ describe("v5 real Convex vertical slice", () => {
       if (event.error) remoteErrors.push(event.error);
     });
     try {
-      const bootstrapDeadline = getTimerTime() + 15_000;
+      const pullDeadline = getTimerTime() + 15_000;
       let local = await client.query(api.documents.getBySlug, { slug });
-      while (!local && getTimerTime() < bootstrapDeadline) {
+      while (!local && getTimerTime() < pullDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
         local = await client.query(api.documents.getBySlug, { slug });
       }
-      if (!local) throw new Error("CRDT revision client did not bootstrap the document.");
-      const bootstrapReceived = received;
+      if (!local) throw new Error("CRDT revision client did not pull the document.");
+      const receivedAfterInitialPull = received;
 
       await client.mutation(api.documents.writeBody, {
         id: local._id,
@@ -813,13 +869,13 @@ describe("v5 real Convex vertical slice", () => {
       });
       const editDeadline = getTimerTime() + 15_000;
       while (
-        (acceptedPushes < 1 || received <= bootstrapReceived) &&
+        (acceptedPushes < 1 || received <= receivedAfterInitialPull) &&
         getTimerTime() < editDeadline
       ) {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
       expect(acceptedPushes).toBeGreaterThanOrEqual(1);
-      expect(received).toBeGreaterThan(bootstrapReceived);
+      expect(received).toBeGreaterThan(receivedAfterInitialPull);
       expect(remoteErrors).toEqual([]);
       await new Promise((resolve) => setTimeout(resolve, 100));
       await (client as unknown as { __pullRemoteOnce(): Promise<unknown> }).__pullRemoteOnce();
@@ -869,7 +925,7 @@ describe("v5 real Convex vertical slice", () => {
     }
   }, 40_000);
 
-  test("answers a checkpoint request and bootstraps after covered payload deletion", async () => {
+  test("answers a checkpoint request and pulls after covered payload deletion", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-crdt-checkpoint-${crypto.randomUUID()}`;
     const created = await hosted.mutation(api.documents.create, {
@@ -933,7 +989,7 @@ describe("v5 real Convex vertical slice", () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         local = await first.query(api.documents.getBySlug, { slug });
       }
-      if (!local) throw new Error("Checkpoint client did not bootstrap the hosted document.");
+      if (!local) throw new Error("Checkpoint client did not pull the hosted document.");
 
       await first.mutation(api.documents.writeBody, {
         id: local._id,
@@ -957,6 +1013,49 @@ describe("v5 real Convex vertical slice", () => {
         remote = await hosted.query(api.documents.get, { id: created._id });
       }
       expect(remote?.body).toBe("aXYbc");
+
+      await first.mutation(api.documents.writeBody, {
+        id: local._id,
+        splices: [{ index: 3, delete: 0, insert: "Z" }],
+      });
+      deadline = getTimerTime() + 15_000;
+      while (remote?.body !== "aXYZbc" && getTimerTime() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        remote = await hosted.query(api.documents.get, { id: created._id });
+      }
+      expect(remote?.body).toBe("aXYZbc");
+
+      const checkpointField = await hosted.query(api.crdt.field, {
+        rowId: created._id,
+        field: "body",
+      });
+      if (!checkpointField?.checkpoint) throw new Error("CRDT field has no checkpoint.");
+      const firstCheckpointPage = (await hosted.query(api.embedded.pull, {
+        request: {
+          kind: "checkpoint",
+          functionName: "documents:getBySlug",
+          args: { slug },
+          runtime: testRuntime,
+          table: "documents",
+          rowId: created._id,
+          field: "body",
+          checkpointId: checkpointField.checkpoint.id,
+          epoch: checkpointField.epoch,
+          headSeq: checkpointField.headSeq,
+          cursor: null,
+        },
+      })) as {
+        chunks: Array<{ ordinal: number }>;
+        continueCursor: string | null;
+        isDone: boolean;
+        payloads: Array<{ seq: number }>;
+      };
+      expect(firstCheckpointPage.chunks.map((chunk) => chunk.ordinal)).toEqual([0]);
+      expect(firstCheckpointPage.payloads).toEqual([]);
+      expect(firstCheckpointPage.continueCursor).toBe(
+        `payload:${checkpointField.checkpoint.throughSeq}`,
+      );
+      expect(firstCheckpointPage.isDone).toBe(false);
 
       const requested = await hosted.mutation(api.crdt.checkpoint, {
         rowId: created._id,
@@ -991,19 +1090,42 @@ describe("v5 real Convex vertical slice", () => {
       ).toMatchObject({
         id: requested.checkpointId,
         state: "ready",
-        throughSeq: 2,
+        throughSeq: 3,
       });
+
+      const deleted = await hosted.mutation(api.crdt.payloadDelete, {
+        checkpointId: requested.checkpointId,
+        numItems: 100,
+      });
+      expect(deleted).toEqual({ deleted: 1, isDone: true });
+      const finalCheckpointPage = (await hosted.query(api.embedded.pull, {
+        request: {
+          kind: "checkpoint",
+          functionName: "documents:getBySlug",
+          args: { slug },
+          runtime: testRuntime,
+          table: "documents",
+          rowId: created._id,
+          field: "body",
+          checkpointId: checkpointField.checkpoint.id,
+          epoch: checkpointField.epoch,
+          headSeq: checkpointField.headSeq,
+          cursor: firstCheckpointPage.continueCursor,
+        },
+      })) as { isDone: boolean; payloads: Array<{ seq: number }> };
+      expect(finalCheckpointPage.payloads.map((payload) => payload.seq)).toEqual([2, 3]);
+      expect(finalCheckpointPage.isDone).toBe(true);
 
       await first.mutation(api.documents.writeBody, {
         id: local._id,
-        splices: [{ index: 3, delete: 0, insert: "Z" }],
+        splices: [{ index: 4, delete: 0, insert: "W" }],
       });
       deadline = getTimerTime() + 15_000;
-      while (remote?.body !== "aXYZbc" && getTimerTime() < deadline) {
+      while (remote?.body !== "aXYZWbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
         remote = await hosted.query(api.documents.get, { id: created._id });
       }
-      expect(remote?.body).toBe("aXYZbc");
+      expect(remote?.body).toBe("aXYZWbc");
       field = await hosted.query(api.crdt.field, {
         rowId: created._id,
         field: "body",
@@ -1016,12 +1138,6 @@ describe("v5 real Convex vertical slice", () => {
           numItems: 100,
         }),
       ).rejects.toThrow(/detached CRDT epoch/i);
-      const deleted = await hosted.mutation(api.crdt.payloadDelete, {
-        checkpointId: requested.checkpointId,
-        numItems: 100,
-      });
-      expect(deleted).toEqual({ deleted: 2, progress: "complete" });
-
       second = new ConvexEmbeddedClient({
         modules: { documents },
         path: join(directories[1]!, "embedded.sqlite3"),
@@ -1031,13 +1147,13 @@ describe("v5 real Convex vertical slice", () => {
       const secondWatch = second.watchQuery(api.documents.list, { prefix: slug });
       stopSecond = secondWatch.onUpdate(() => undefined);
       deadline = getTimerTime() + 15_000;
-      let bootstrapped = await second.query(api.documents.getBySlug, { slug });
-      while (bootstrapped?.body !== "aXYZbc" && getTimerTime() < deadline) {
+      let pulled = await second.query(api.documents.getBySlug, { slug });
+      while (pulled?.body !== "aXYZWbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        bootstrapped = await second.query(api.documents.getBySlug, { slug });
+        pulled = await second.query(api.documents.getBySlug, { slug });
       }
-      expect(bootstrapped?.body).toBe("aXYZbc");
-      expect((await hosted.query(api.documents.get, { id: created._id }))?.body).toBe("aXYZbc");
+      expect(pulled?.body).toBe("aXYZWbc");
+      expect((await hosted.query(api.documents.get, { id: created._id }))?.body).toBe("aXYZWbc");
       const revision = await first.mutation(api.documents.savepoint, { id: local._id });
       deadline = getTimerTime() + 15_000;
       let hostedRevision = await hosted.query(api.revision.get, {
@@ -1074,14 +1190,14 @@ describe("v5 real Convex vertical slice", () => {
           revId: revision.revId,
           numItems: 100,
         }),
-      ).toMatchObject({ progress: "complete" });
+      ).toMatchObject({ isDone: true });
       expect(
         await hosted.mutation(api.crdt.clear, {
           fieldId: field.id,
           expectedEpoch: field.epoch,
           numItems: 100,
         }),
-      ).toMatchObject({ progress: "complete" });
+      ).toMatchObject({ isDone: true });
     } finally {
       stopFirst();
       stopEvents();
@@ -1093,6 +1209,75 @@ describe("v5 real Convex vertical slice", () => {
       );
     }
   }, 30_000);
+
+  test("requests and answers a checkpoint before a CRDT tail grows unbounded", async () => {
+    const hosted = new ConvexHttpClient(remoteUrl);
+    const slug = `v5-crdt-auto-checkpoint-${crypto.randomUUID()}`;
+    const created = await hosted.mutation(api.documents.create, {
+      body: "a",
+      slug,
+      title: slug,
+      updatedAt: readTime(),
+    });
+    const directory = await mkdtemp(join(tmpdir(), "embedded-v5-auto-checkpoint-"));
+    const client = new ConvexEmbeddedClient({
+      modules: { documents },
+      path: join(directory, "embedded.sqlite3"),
+      schema,
+      url: remoteUrl,
+    });
+    const watch = client.watchQuery(api.documents.list, { prefix: slug });
+    const stop = watch.onUpdate(() => undefined);
+    try {
+      let deadline = getTimerTime() + 15_000;
+      let local = await client.query(api.documents.getBySlug, { slug });
+      while (!local && getTimerTime() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        local = await client.query(api.documents.getBySlug, { slug });
+      }
+      if (!local) throw new Error("Automatic checkpoint client did not pull the document.");
+
+      let body = "a";
+      for (let edit = 0; edit < 17; edit += 1) {
+        const insert = String.fromCharCode(98 + edit);
+        await client.mutation(api.documents.writeBody, {
+          id: local._id,
+          splices: [{ index: body.length, delete: 0, insert }],
+        });
+        body += insert;
+        deadline = getTimerTime() + 15_000;
+        let remote = await hosted.query(api.documents.get, { id: created._id });
+        while (remote?.body !== body && getTimerTime() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          remote = await hosted.query(api.documents.get, { id: created._id });
+        }
+        expect(remote?.body).toBe(body);
+      }
+
+      deadline = getTimerTime() + 15_000;
+      let field = await hosted.query(api.crdt.field, {
+        rowId: created._id,
+        field: "body",
+      });
+      while (
+        (field?.checkpoint?.state !== "ready" || field.checkpoint.throughSeq !== field.headSeq) &&
+        getTimerTime() < deadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        field = await hosted.query(api.crdt.field, {
+          rowId: created._id,
+          field: "body",
+        });
+      }
+      expect(field?.headSeq).toBe(17);
+      expect(field?.checkpoint).toMatchObject({ state: "ready", throughSeq: 17 });
+    } finally {
+      stop();
+      await client.close();
+      await hosted.mutation(api.documents.remove, { id: created._id });
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("executes a scheduled mutation once on the authoritative server", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
@@ -1119,7 +1304,7 @@ describe("v5 real Convex vertical slice", () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         local = await client.query(api.documents.getBySlug, { slug });
       }
-      if (!local) throw new Error("Schedule client did not bootstrap the hosted document.");
+      if (!local) throw new Error("Schedule client did not pull the hosted document.");
 
       await client.mutation(api.documents.scheduleAppend, { id: local._id });
       expect((await client.query(api.documents.getBySlug, { slug }))?.title).toBe(slug);
@@ -1183,7 +1368,7 @@ describe("v5 real Convex vertical slice", () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
         local = await client.query(api.documents.getBySlug, { slug });
       }
-      if (!local) throw new Error("Schedule cancellation client did not bootstrap the document.");
+      if (!local) throw new Error("Schedule cancellation client did not pull the document.");
 
       const scheduleId = await client.mutation(api.documents.scheduleAppendAfter, {
         id: local._id,
@@ -1309,7 +1494,7 @@ describe("v5 real Convex vertical slice", () => {
       }
       if (!local) {
         throw new Error(
-          `CRDT delta client did not bootstrap the hosted document: ${JSON.stringify(events)}`,
+          `CRDT delta client did not pull the hosted document: ${JSON.stringify(events)}`,
         );
       }
 
@@ -1387,6 +1572,42 @@ describe("v5 real Convex vertical slice", () => {
         args: { ...requestArgs, updatedAt: Number(requestArgs.updatedAt) + 1 },
       }),
     ).rejects.toThrow(/different replay fingerprint/i);
+    for (const insert of first.inserts) {
+      if (insert.table === "documents") {
+        await client.mutation(api.documents.remove, { id: insert.id as never });
+      }
+    }
+  });
+
+  test("deduplicates a durable mutation after the worker client id changes", async () => {
+    const client = new ConvexHttpClient(remoteUrl);
+    const mutationId = crypto.randomUUID();
+    const firstClientId = `before-reload-${crypto.randomUUID()}`;
+    const nextClientId = `after-reload-${crypto.randomUUID()}`;
+    const firstRequest = await pushArgs({
+      clientId: firstClientId,
+      mutationId,
+      functionName: "replay:insertNull",
+      args: { title: mutationId, slug: mutationId, updatedAt: readTime() },
+      inserts: [{ mutationId, ordinal: 0, table: "documents" }],
+    });
+    const first = await runPush(client, firstRequest);
+    const replayed = await runPush(client, {
+      ...firstRequest,
+      clientId: nextClientId,
+    });
+
+    expect(replayed).toEqual(first);
+    expect(replayed.inserts).toEqual(first.inserts);
+    expect((await remoteClientMetadata(client, firstClientId)).metadata?.acknowledgedThrough).toBe(
+      undefined,
+    );
+    await client.mutation(api.embedded.push, {
+      request: { kind: "acknowledge", clientId: nextClientId, mutationId },
+    });
+    expect(
+      (await remoteClientMetadata(client, firstClientId)).metadata?.acknowledgedThrough,
+    ).toBeTypeOf("number");
     for (const insert of first.inserts) {
       if (insert.table === "documents") {
         await client.mutation(api.documents.remove, { id: insert.id as never });
@@ -1633,6 +1854,50 @@ describe("v5 real Convex vertical slice", () => {
     await client.mutation(api.documents.remove, { id: document._id });
   });
 
+  test("does not retain an equal after-image merely because its witness moved", async () => {
+    const client = new ConvexHttpClient(remoteUrl);
+    const prefix = `v5-equal-conflict-${crypto.randomUUID()}`;
+    const document = await client.mutation(api.documents.create, { title: prefix, slug: prefix });
+    const title = `${prefix}-same`;
+    const updatedAt = readTime();
+    try {
+      await client.mutation(api.documents.update, { id: document._id, title, updatedAt });
+      const settlement = await runPush(
+        client,
+        await pushArgs({
+          mutationId: crypto.randomUUID(),
+          functionName: "documents:update",
+          args: { id: document._id, title, updatedAt },
+          reads: [
+            {
+              kind: "point",
+              table: "documents",
+              rowId: document._id,
+              plainHash: await hashDocument(document),
+              crdt: [],
+            },
+          ],
+          afterImages: [
+            {
+              content: "value",
+              table: "documents",
+              rowId: document._id,
+              value: { body: document.body, slug: document.slug, title, updatedAt },
+            },
+          ],
+        }),
+      );
+
+      expect(settlement.outcome).toBe("conflict");
+      expect(settlement.revisions).toEqual([]);
+      expect(
+        (await client.query(api.revision.list, { rowId: document._id, cursor: null })).page,
+      ).toEqual([]);
+    } finally {
+      await client.mutation(api.documents.remove, { id: document._id });
+    }
+  });
+
   test("shares only verified conflicting after-images from a failed grouped write", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-group-${crypto.randomUUID()}`;
@@ -1865,7 +2130,7 @@ describe("v5 real Convex vertical slice", () => {
           revId: first.revId,
           numItems: 1,
         }),
-      ).toEqual({ deleted: 1, progress: "complete" });
+      ).toEqual({ deleted: 1, isDone: true });
       expect(
         (
           await client.query(api.documents.history, {

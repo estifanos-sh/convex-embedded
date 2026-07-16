@@ -11,31 +11,31 @@ use storage::testkit::*;
 use storage::*;
 
 #[test]
-fn prune_ledger_keeps_local_dirty_commit_sequence() {
+fn ledger_delete_keeps_local_dirty_commit_sequence() {
     let store = EmbeddedStore::open(tmp_path("rs_prune.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     for i in 0..3 {
         commit(
             &store,
-            upserts(vec![issue(&store, &format!("i{i}"), "t", "open")]),
+            doc_writes(vec![issue(&store, &format!("i{i}"), "t", "open")]),
         );
     }
 
-    let pruned = store.ledger_delete(i64::MAX).unwrap();
-    assert_eq!(pruned.commits_deleted, 0);
+    let deleted = store.ledger_delete(i64::MAX).unwrap();
+    assert_eq!(deleted.commits_deleted, 0);
 
-    let next = commit(&store, upserts(vec![issue(&store, "i3", "t", "open")]));
+    let next = commit(&store, doc_writes(vec![issue(&store, "i3", "t", "open")]));
     assert_eq!(next.commit_seq, 4);
 
     assert_eq!(store.ledger_delete(0).unwrap().commits_deleted, 0);
 }
 
 #[test]
-fn prune_ledger_removes_committed_mutations_only() {
+fn ledger_delete_removes_committed_mutations_only() {
     let store = EmbeddedStore::open(tmp_path("rs_prune_mut.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .mutation_begin(&MutationCall {
+        .mutation_write(&MutationCall {
             args: "{}".into(),
             mutation_id: "committed".into(),
             name: "issues:send".into(),
@@ -43,28 +43,28 @@ fn prune_ledger_removes_committed_mutations_only() {
         .unwrap();
     store
         .commit(
-            upserts(vec![issue(&store, "i0", "t", "open")]),
+            doc_writes(vec![issue(&store, "i0", "t", "open")]),
             &CommitOptions::existing("committed", None),
         )
         .unwrap();
     store
-        .mutation_begin(&MutationCall {
+        .mutation_write(&MutationCall {
             args: "{}".into(),
             mutation_id: "accepted".into(),
             name: "issues:send".into(),
         })
         .unwrap();
-    commit(&store, upserts(vec![issue(&store, "i1", "t", "open")]));
+    commit(&store, doc_writes(vec![issue(&store, "i1", "t", "open")]));
 
-    let pruned = store.ledger_delete(i64::MAX).unwrap();
-    assert_eq!(pruned.commits_deleted, 0);
-    assert_eq!(pruned.mutations_deleted, 1);
+    let deleted = store.ledger_delete(i64::MAX).unwrap();
+    assert_eq!(deleted.commits_deleted, 0);
+    assert_eq!(deleted.mutations_deleted, 1);
 
-    let pruned = store.ledger_delete(i64::MAX).unwrap();
-    assert_eq!(pruned.commits_deleted, 0);
-    assert_eq!(pruned.mutations_deleted, 0);
+    let deleted = store.ledger_delete(i64::MAX).unwrap();
+    assert_eq!(deleted.commits_deleted, 0);
+    assert_eq!(deleted.mutations_deleted, 0);
     let record = store
-        .mutation_begin(&MutationCall {
+        .mutation_write(&MutationCall {
             args: "{}".into(),
             mutation_id: "accepted".into(),
             name: "issues:send".into(),
@@ -74,18 +74,18 @@ fn prune_ledger_removes_committed_mutations_only() {
 }
 
 #[test]
-fn prune_ledger_uses_the_public_consumer_watermark() {
+fn ledger_delete_uses_the_public_consumer_watermark() {
     let store = EmbeddedStore::open(tmp_path("rs_prune_watermark.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     for i in 0..3 {
         commit(
             &store,
-            upserts(vec![issue(&store, &format!("i{i}"), "t", "open")]),
+            doc_writes(vec![issue(&store, &format!("i{i}"), "t", "open")]),
         );
     }
 
-    let pruned = store.ledger_delete(1).unwrap();
-    assert_eq!(pruned.commits_deleted, 0);
+    let deleted = store.ledger_delete(1).unwrap();
+    assert_eq!(deleted.commits_deleted, 0);
 }
 
 #[test]
@@ -96,21 +96,21 @@ fn remote_cursor_round_trips_and_clears_by_identity() {
     let store_b = EmbeddedStore::open_with_identity_key(path.to_str().unwrap(), "b").unwrap();
     store_b.setup(&schema()).unwrap();
 
-    assert_eq!(store_a.remote_read_cursor("issues:list").unwrap(), None);
+    assert_eq!(store_a.remote_cursor_read("issues:list").unwrap(), None);
     assert!(!store_a.remote_progress_has().unwrap());
     store_a
-        .remote_write_cursor("issues:list", Some("c:1:1".into()), 100)
+        .remote_cursor_write("issues:list", Some("c:1:1".into()), 100)
         .unwrap();
     assert_eq!(
-        store_a.remote_read_cursor("issues:list").unwrap(),
+        store_a.remote_cursor_read("issues:list").unwrap(),
         Some("c:1:1".into())
     );
     assert!(store_a.remote_progress_has().unwrap());
-    assert_eq!(store_b.remote_read_cursor("issues:list").unwrap(), None);
+    assert_eq!(store_b.remote_cursor_read("issues:list").unwrap(), None);
     assert!(!store_b.remote_progress_has().unwrap());
 
     store_a.clear().unwrap();
-    assert_eq!(store_a.remote_read_cursor("issues:list").unwrap(), None);
+    assert_eq!(store_a.remote_cursor_read("issues:list").unwrap(), None);
     assert!(!store_a.remote_progress_has().unwrap());
 }
 
@@ -119,7 +119,7 @@ fn clear_removes_docs_ledger_and_blobs_for_the_identity() {
     let store = EmbeddedStore::open(tmp_path("rs_clear_all.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .mutation_begin(&MutationCall {
+        .mutation_write(&MutationCall {
             args: "{}".into(),
             mutation_id: "m1".into(),
             name: "issues:send".into(),
@@ -128,7 +128,7 @@ fn clear_removes_docs_ledger_and_blobs_for_the_identity() {
     store.blob_write("frame", vec![1, 2, 3]).unwrap();
     store
         .commit(
-            upserts(vec![issue(&store, "i1", "t", "open")]),
+            doc_writes(vec![issue(&store, "i1", "t", "open")]),
             &CommitOptions::existing("m1", Some("\"ok\"".into())),
         )
         .unwrap();
@@ -138,14 +138,14 @@ fn clear_removes_docs_ledger_and_blobs_for_the_identity() {
     assert!(read_doc(&store, "issues", "i1").is_none());
     assert!(store.blob_read("frame").unwrap().is_none());
     let replay = store
-        .mutation_begin(&MutationCall {
+        .mutation_write(&MutationCall {
             args: "{}".into(),
             mutation_id: "m1".into(),
             name: "issues:send".into(),
         })
         .unwrap();
     assert_eq!(replay.status, MutationStatus::Accepted);
-    let next = commit(&store, upserts(vec![issue(&store, "i2", "t", "open")]));
+    let next = commit(&store, doc_writes(vec![issue(&store, "i2", "t", "open")]));
     assert_eq!(next.commit_seq, 1);
 }
 
@@ -215,7 +215,8 @@ fn service_metadata_tables_round_trip_and_clear_by_identity() {
         .unwrap();
     assert!(store.upload_has_pending().unwrap());
     let claimed = store
-        .upload_lease_write(UploadLeaseWrite::Claim {
+        .upload_lease_write(UploadLeaseWrite::Claimed {
+            local_storage_id: None,
             owner: "worker".into(),
             now_ms: 50,
             lease_until: 150,
@@ -230,8 +231,8 @@ fn service_metadata_tables_round_trip_and_clear_by_identity() {
         }
     );
     assert!(store
-        .upload_lease_write(UploadLeaseWrite::Renew {
-            local_storage_id: "_storage|local".into(),
+        .upload_lease_write(UploadLeaseWrite::Claimed {
+            local_storage_id: Some("_storage|local".into()),
             owner: "worker".into(),
             now_ms: 60,
             lease_until: 160,
@@ -239,7 +240,7 @@ fn service_metadata_tables_round_trip_and_clear_by_identity() {
         .unwrap()
         .is_some());
     assert!(store
-        .upload_lease_write(UploadLeaseWrite::Release {
+        .upload_lease_write(UploadLeaseWrite::Pending {
             local_storage_id: "_storage|local".into(),
             owner: "worker".into(),
             now_ms: 70,
@@ -261,18 +262,18 @@ fn service_metadata_tables_round_trip_and_clear_by_identity() {
             updated_time: 80,
         })
         .unwrap();
-    assert_eq!(store.schedule_due_read(99).unwrap(), Vec::new());
-    assert_eq!(store.schedule_due_read(100).unwrap().len(), 1);
+    assert_eq!(store.schedule_lease_read(99).unwrap(), Vec::new());
+    assert_eq!(store.schedule_lease_read(100).unwrap().len(), 1);
     assert_eq!(
         store.schedule_cancel("job:1", 101).unwrap().unwrap().state,
         ScheduledState::Canceled
     );
-    assert_eq!(store.schedule_due_read(200).unwrap(), Vec::new());
+    assert_eq!(store.schedule_lease_read(200).unwrap(), Vec::new());
 
     store.clear().unwrap();
     assert!(store.id_read("issues", "issues|local").unwrap().is_none());
     assert!(store.file_read("_storage|local").unwrap().is_none());
     assert!(store.upload_read().unwrap().is_empty());
-    assert!(store.schedule_due_read(1_000).unwrap().is_empty());
+    assert!(store.schedule_lease_read(1_000).unwrap().is_empty());
     assert!(store.blob_read("_storage|local").unwrap().is_none());
 }

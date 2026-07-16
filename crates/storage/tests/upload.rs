@@ -26,6 +26,7 @@ fn upload_complete_sets_storage_mapping_and_removes_upload() {
             updated_time: 40,
         })
         .unwrap();
+    assert_eq!(store.remote_pending_read().unwrap().uploads, 1);
     store
         .id_write(&IdMapping {
             table: "_storage".into(),
@@ -36,7 +37,8 @@ fn upload_complete_sets_storage_mapping_and_removes_upload() {
         })
         .unwrap();
     store
-        .upload_lease_write(UploadLeaseWrite::Claim {
+        .upload_lease_write(UploadLeaseWrite::Claimed {
+            local_storage_id: None,
             owner: "worker".into(),
             now_ms: 50,
             lease_until: 150,
@@ -58,6 +60,7 @@ fn upload_complete_sets_storage_mapping_and_removes_upload() {
         .upload_complete("_storage|local", "worker", "_storage|server", 70)
         .unwrap());
     assert!(store.upload_read().unwrap().is_empty());
+    assert_eq!(store.remote_pending_read().unwrap().uploads, 0);
     let uploaded = store
         .id_read("_storage", "_storage|local")
         .unwrap()
@@ -92,7 +95,8 @@ fn upload_lease_write_reclaims_expired_claimed_upload() {
         .unwrap();
 
     let claimed = store
-        .upload_lease_write(UploadLeaseWrite::Claim {
+        .upload_lease_write(UploadLeaseWrite::Claimed {
+            local_storage_id: None,
             owner: "worker".into(),
             now_ms: 50,
             lease_until: 150,

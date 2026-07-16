@@ -32,7 +32,7 @@ fn identity_switch_preserves_and_isolates_each_partition() {
     let id = "issues|00000000000000000000000000000001";
     store
         .commit(
-            upserts(vec![issue(&store, id, "from a", "open")]),
+            doc_writes(vec![issue(&store, id, "from a", "open")]),
             &envelope_options("mutation:a", "a", 1),
         )
         .unwrap();
@@ -42,7 +42,7 @@ fn identity_switch_preserves_and_isolates_each_partition() {
     assert!(store.remote_push_envelope_read(1).unwrap().is_empty());
     store
         .commit(
-            upserts(vec![issue(&store, id, "from b", "open")]),
+            doc_writes(vec![issue(&store, id, "from b", "open")]),
             &envelope_options("mutation:b", "b", 2),
         )
         .unwrap();
@@ -107,7 +107,7 @@ fn cached_identity_reopens_the_last_server_accepted_partition() {
         store.setup(&schema()).unwrap();
         commit(
             &store,
-            upserts(vec![issue(&store, pending_id, "offline", "pending")]),
+            doc_writes(vec![issue(&store, pending_id, "offline", "pending")]),
         );
         store.identity_write("unauthenticated", None).unwrap();
         assert!(store.doc_read("issues", pending_id).unwrap().is_some());
@@ -122,8 +122,11 @@ fn cached_identity_reopens_the_last_server_accepted_partition() {
                 Some(accepted.to_owned())
             )
         );
-        commit(&store, upserts(vec![issue(&store, id, "offline", "open")]));
-        store.checkpoint().unwrap();
+        commit(
+            &store,
+            doc_writes(vec![issue(&store, id, "offline", "open")]),
+        );
+        store.wal_write().unwrap();
     }
 
     let reopened = EmbeddedStore::open_with_cached_identity_key(
@@ -168,7 +171,7 @@ fn corrupt_cached_identity_fails_closed() {
         store.execute_sql_for_test(
             "UPDATE __embedded_meta SET value = 'not-json' WHERE identity_key = 'browser-storage' AND key = 'identity_state'",
         );
-        store.checkpoint().unwrap();
+        store.wal_write().unwrap();
     }
 
     let Err(error) = EmbeddedStore::open_with_cached_identity_key(

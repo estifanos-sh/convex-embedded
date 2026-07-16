@@ -484,8 +484,8 @@ fn clear_fields(fields: &LoroMap) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Materialize the visible row JSON (`{_id, _creationTime, ...fields}`) from a ref's Loro state,
-/// or `None` if the ref is a tombstone. Total + deterministic for any ref (including bare
+/// Materialize the visible row JSON (`{_id, _creationTime, ...fields}`) from a rev's Loro state,
+/// or `None` if the rev is a tombstone. Total + deterministic for any rev (including bare
 /// fork/import revs) because `_creationTime` lives in a Loro register, not a separate row.
 pub(crate) fn rev_doc_read(
     state: &RevState,
@@ -577,14 +577,14 @@ fn json_to_col(value: Option<&JsonValue>) -> Result<ColValue, StorageError> {
     }
 }
 
-/// A stable, content-addressed ref id (`<prefix>:<hash>`). Re-deriving from the same state yields
+/// A stable, content-addressed rev id (`<prefix>:<hash>`). Re-deriving from the same state yields
 /// the same id (idempotent); distinct states get distinct ids.
 fn content_rev_id(prefix: &str, frontier: &[u8]) -> String {
     let digest = sha256_prefixed([frontier]);
     format!("{prefix}:{}", &digest[7..23])
 }
 
-/// Rev id for an archived copy of a ref's state (a reset loser).
+/// Rev id for an archived copy of a rev's state (a reset loser).
 pub(crate) fn archive_rev_id(frontier: &[u8]) -> String {
     content_rev_id("archive", frontier)
 }
@@ -602,8 +602,8 @@ mod field;
 
 pub use field::crdt_checkpoint_response;
 pub(crate) use field::{
-    crdt_field_accept, crdt_field_accept_incremental, crdt_field_apply, crdt_field_merge,
+    crdt_field_accept, crdt_field_accept_incremental, crdt_field_intent_write,
     crdt_field_projection_hash, crdt_field_reject, crdt_field_remote_effect, crdt_field_restore,
-    crdt_field_settle, crdt_field_snapshot, crdt_field_value, CrdtAcceptedState, CrdtFieldState,
-    SEED_PEER,
+    crdt_field_settle, crdt_field_snapshot, crdt_field_update_write, crdt_field_value,
+    CrdtAcceptedState, CrdtFieldState, SEED_PEER,
 };

@@ -93,9 +93,9 @@ export function namespaceBatch(instancePath: ComponentInstancePath, batch: Write
       ...mapping,
       table: physicalTable(instancePath, mapping.table),
     })),
-    upserts: batch.upserts.map((upsert) => ({
-      ...upsert,
-      table: physicalTable(instancePath, upsert.table),
+    docWrites: batch.docWrites.map((docWrite) => ({
+      ...docWrite,
+      table: physicalTable(instancePath, docWrite.table),
     })),
     schedules: batch.schedules,
   };
@@ -108,7 +108,7 @@ export function batchInvalidationKeys(
 ): string[] {
   return [
     ...new Set([
-      ...batch.upserts.map((upsert) => invalidationKey(instancePath, upsert.table)),
+      ...batch.docWrites.map((docWrite) => invalidationKey(instancePath, docWrite.table)),
       ...batch.deletes.map((deleted) => invalidationKey(instancePath, deleted.table)),
     ]),
   ];

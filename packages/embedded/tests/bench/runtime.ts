@@ -6,12 +6,12 @@ import { makeFunctionReference } from "convex/server";
 import { expect, test } from "vite-plus/test";
 
 import {
-  adapterUpsert,
+  adapterWrite,
   benchModules,
   benchSchema,
   benchId,
   bindingEq,
-  bindingUpsert,
+  bindingWrite,
   createAdapterBenchHarness,
   createBindingBenchHarness,
   createNativeRuntimeBenchHarness,
@@ -38,7 +38,7 @@ import type {
   ReadCacheStats,
   StoreBinding,
 } from "../../src/storage/binding";
-import type { OneUpsertCommit, WriteBatch } from "../../src/storage/types";
+import type { OneDocWriteCommit, WriteBatch } from "../../src/storage/types";
 import type { RunMutationOptions, RunMutationTiming } from "../../src/runtime/runner";
 import { freezeNormalizedTreeWithEstimate, reviveDoc } from "../../src/runtime/codec";
 
@@ -352,22 +352,22 @@ async function runRuntimeInsertScenarios(
 
     const storageInsertHarness = await createHarness({ seedRows: 0 });
     harnesses.push(storageInsertHarness);
-    const storageInserts: OneUpsertCommit[] = Array.from(
+    const storageInserts: OneDocWriteCommit[] = Array.from(
       { length: options.iterations + options.warmups },
       (_, index) => ({
         fresh: true,
-        upsert: adapterUpsert(benchId(index), storageInsertHarness.channel, index),
+        docWrite: adapterWrite(benchId(index), storageInsertHarness.channel, index),
       }),
     );
     let storageInsertSequence = 0;
     results.push(
       await measure(
         layer,
-        "storage.one_upsert.no_handler",
+        "storage.one_doc_write.no_handler",
         options.iterations,
         () => {
           const commit = storageInserts[storageInsertSequence++ % storageInserts.length]!;
-          return storageInsertHarness.store.commitOneUpsert!(commit, {
+          return storageInsertHarness.store.commitOneDocWrite!(commit, {
             changes: "omit",
             mutation: "none",
             source: "local",
@@ -387,13 +387,13 @@ async function runRuntimeInsertScenarios(
           args: `{"body":"inserted-with-id-${index}","channel":"${storageWithIdHarness.channel}","sequence":${index}}`,
           commit: {
             fresh: true,
-            upsert: adapterUpsert(
+            docWrite: adapterWrite(
               id,
               storageWithIdHarness.channel,
               index,
               `inserted-with-id-${index}`,
             ),
-          } satisfies OneUpsertCommit,
+          } satisfies OneDocWriteCommit,
           mutationId: `bench:${index}`,
           result: `"${id}"`,
         };
@@ -403,14 +403,14 @@ async function runRuntimeInsertScenarios(
     results.push(
       await measure(
         layer,
-        "storage.one_upsert.no_handler.with_id",
+        "storage.one_doc_write.no_handler.with_id",
         options.iterations,
         () => {
           const item = storageWithIdInserts[storageWithIdSequence++ % storageWithIdInserts.length]!;
-          return storageWithIdHarness.store.commitOneUpsert!(item.commit, {
+          return storageWithIdHarness.store.commitOneDocWrite!(item.commit, {
             changes: "omit",
             mutationArgs: item.args,
-            mutationFresh: true,
+            mutationIsFresh: true,
             mutationId: item.mutationId,
             mutation: "terminal",
             mutationName: "messages:insert",
@@ -434,20 +434,20 @@ async function runRuntimeInsertScenarios(
             args: `{"body":"inserted-with-lookup-${index}","channel":"${storageWithLookupHarness.channel}","sequence":${index}}`,
             commit: {
               fresh: true,
-              upsert: adapterUpsert(
+              docWrite: adapterWrite(
                 id,
                 storageWithLookupHarness.channel,
                 index,
                 `inserted-with-lookup-${index}`,
               ),
-            } satisfies OneUpsertCommit,
+            } satisfies OneDocWriteCommit,
             mutationId: `bench-lookup:${index}`,
             result: `"${id}"`,
           };
         },
       );
       for (const item of storageWithLookupInserts) {
-        await mutation.begin({
+        await mutation.write({
           args: item.args,
           mutationId: item.mutationId,
           name: "messages:insert",
@@ -457,17 +457,17 @@ async function runRuntimeInsertScenarios(
       results.push(
         await measure(
           layer,
-          "storage.one_upsert.no_handler.with_id.lookup",
+          "storage.one_doc_write.no_handler.with_id.lookup",
           options.iterations,
           () => {
             const item =
               storageWithLookupInserts[
                 storageWithLookupSequence++ % storageWithLookupInserts.length
               ]!;
-            return storageWithLookupHarness.store.commitOneUpsert!(item.commit, {
+            return storageWithLookupHarness.store.commitOneDocWrite!(item.commit, {
               changes: "omit",
               mutationArgs: item.args,
-              mutationFresh: false,
+              mutationIsFresh: false,
               mutationId: item.mutationId,
               mutation: "terminal",
               mutationName: "messages:insert",
@@ -1057,8 +1057,8 @@ async function runAdapterScenarios(
       (_, batchIndex) => {
         const index = batchIndex % writeHarness.ids.length;
         return {
-          upserts: [
-            adapterUpsert(
+          docWrites: [
+            adapterWrite(
               writeHarness.ids[index]!,
               writeHarness.channel,
               index,
@@ -1092,8 +1092,8 @@ async function runAdapterScenarios(
       (_, batchIndex) => {
         const index = batchIndex % writeHarness.ids.length;
         return {
-          upserts: [
-            adapterUpsert(
+          docWrites: [
+            adapterWrite(
               writeHarness.ids[index]!,
               writeHarness.channel,
               index,
@@ -1127,8 +1127,8 @@ async function runAdapterScenarios(
     const rewriteBatches: WriteBatch[] = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
-        upserts: [
-          adapterUpsert(rewriteHarness.ids[0]!, rewriteHarness.channel, 0, `rewrite-${index + 1}`),
+        docWrites: [
+          adapterWrite(rewriteHarness.ids[0]!, rewriteHarness.channel, 0, `rewrite-${index + 1}`),
         ],
         dataOnlyIds: [{ table: "messages", id: rewriteHarness.ids[0]! }],
         deletes: [],
@@ -1157,7 +1157,7 @@ async function runAdapterScenarios(
     const insertBatches: WriteBatch[] = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
-        upserts: [adapterUpsert(benchId(index), insertHarness.channel, index)],
+        docWrites: [adapterWrite(benchId(index), insertHarness.channel, index)],
         freshIds: [{ table: "messages", id: benchId(index) }],
         deletes: [],
       }),
@@ -1180,24 +1180,25 @@ async function runAdapterScenarios(
       ),
     );
 
-    const oneUpsertInsertHarness = await createAdapterBenchHarness({ seedRows: 0 });
-    harnesses.push(oneUpsertInsertHarness);
-    const oneUpsertInserts: OneUpsertCommit[] = Array.from(
+    const oneDocWriteInsertHarness = await createAdapterBenchHarness({ seedRows: 0 });
+    harnesses.push(oneDocWriteInsertHarness);
+    const oneDocWriteInserts: OneDocWriteCommit[] = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
         fresh: true,
-        upsert: adapterUpsert(benchId(index), oneUpsertInsertHarness.channel, index),
+        docWrite: adapterWrite(benchId(index), oneDocWriteInsertHarness.channel, index),
       }),
     );
-    let oneUpsertInsertSequence = 0;
+    let oneDocWriteInsertSequence = 0;
     results.push(
       await measure(
         layer,
-        "adapter.commit.insert.one_upsert",
+        "adapter.commit.insert.one_doc_write",
         options.iterations,
         () => {
-          const commit = oneUpsertInserts[oneUpsertInsertSequence++ % oneUpsertInserts.length]!;
-          return oneUpsertInsertHarness.store.commitOneUpsert(commit, {
+          const commit =
+            oneDocWriteInserts[oneDocWriteInsertSequence++ % oneDocWriteInserts.length]!;
+          return oneDocWriteInsertHarness.store.commitOneDocWrite(commit, {
             changes: "include",
             mutation: "none",
             source: "local",
@@ -1205,36 +1206,36 @@ async function runAdapterScenarios(
         },
         {
           baseline: oldBaselines.mutationInsert,
-          readStats: oneUpsertInsertHarness.readCacheStats,
+          readStats: oneDocWriteInsertHarness.readCacheStats,
         },
       ),
     );
 
-    const oneUpsertNoChangesHarness = await createAdapterBenchHarness({ seedRows: 0 });
-    harnesses.push(oneUpsertNoChangesHarness);
-    const oneUpsertNoChanges: OneUpsertCommit[] = Array.from(
+    const oneDocWriteNoChangesHarness = await createAdapterBenchHarness({ seedRows: 0 });
+    harnesses.push(oneDocWriteNoChangesHarness);
+    const oneDocWriteNoChanges: OneDocWriteCommit[] = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
         fresh: true,
-        upsert: adapterUpsert(benchId(index), oneUpsertNoChangesHarness.channel, index),
+        docWrite: adapterWrite(benchId(index), oneDocWriteNoChangesHarness.channel, index),
       }),
     );
-    let oneUpsertNoChangesSequence = 0;
+    let oneDocWriteNoChangesSequence = 0;
     results.push(
       await measure(
         layer,
-        "adapter.commit.insert.one_upsert.no_changes",
+        "adapter.commit.insert.one_doc_write.no_changes",
         options.iterations,
         () => {
           const commit =
-            oneUpsertNoChanges[oneUpsertNoChangesSequence++ % oneUpsertNoChanges.length]!;
-          return oneUpsertNoChangesHarness.store.commitOneUpsert(commit, {
+            oneDocWriteNoChanges[oneDocWriteNoChangesSequence++ % oneDocWriteNoChanges.length]!;
+          return oneDocWriteNoChangesHarness.store.commitOneDocWrite(commit, {
             changes: "omit",
             mutation: "none",
             source: "local",
           });
         },
-        { readStats: oneUpsertNoChangesHarness.readCacheStats },
+        { readStats: oneDocWriteNoChangesHarness.readCacheStats },
       ),
     );
 
@@ -1243,7 +1244,7 @@ async function runAdapterScenarios(
     const insertNoChangesBatches: WriteBatch[] = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
-        upserts: [adapterUpsert(benchId(index), insertNoChangesHarness.channel, index)],
+        docWrites: [adapterWrite(benchId(index), insertNoChangesHarness.channel, index)],
         freshIds: [{ table: "messages", id: benchId(index) }],
         deletes: [],
       }),
@@ -1272,7 +1273,7 @@ async function runAdapterScenarios(
     const remoteInsertBatches: WriteBatch[] = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
-        upserts: [adapterUpsert(benchId(index), remoteInsertHarness.channel, index)],
+        docWrites: [adapterWrite(benchId(index), remoteInsertHarness.channel, index)],
         freshIds: [{ table: "messages", id: benchId(index) }],
         deletes: [],
       }),
@@ -1503,8 +1504,8 @@ async function runBindingScenarios(
     const patchBatches = Array.from({ length: options.iterations + warmups }, (_, batchIndex) => {
       const index = batchIndex % writeHarness.ids.length;
       return {
-        upserts: [
-          bindingUpsert(
+        docWrites: [
+          bindingWrite(
             writeHarness.ids[index]!,
             writeHarness.channel,
             index,
@@ -1529,8 +1530,8 @@ async function runBindingScenarios(
       (_, batchIndex) => {
         const index = batchIndex % writeHarness.ids.length;
         return {
-          upserts: [
-            bindingUpsert(
+          docWrites: [
+            bindingWrite(
               writeHarness.ids[index]!,
               writeHarness.channel,
               index,
@@ -1554,8 +1555,8 @@ async function runBindingScenarios(
     const rewriteHarness = await createBindingBenchHarness({ seedRows: 1 });
     harnesses.push(rewriteHarness);
     const rewriteBatches = Array.from({ length: options.iterations + warmups }, (_, index) => ({
-      upserts: [
-        bindingUpsert(rewriteHarness.ids[0]!, rewriteHarness.channel, 0, `rewrite-${index + 1}`),
+      docWrites: [
+        bindingWrite(rewriteHarness.ids[0]!, rewriteHarness.channel, 0, `rewrite-${index + 1}`),
       ],
       dataOnlyIds: [{ table: "messages", id: rewriteHarness.ids[0]! }],
       deletes: [],
@@ -1573,7 +1574,7 @@ async function runBindingScenarios(
     const insertHarness = await createBindingBenchHarness({ seedRows: 0 });
     harnesses.push(insertHarness);
     const insertBatches = Array.from({ length: options.iterations + warmups }, (_, index) => ({
-      upserts: [bindingUpsert(benchId(index), insertHarness.channel, index)],
+      docWrites: [bindingWrite(benchId(index), insertHarness.channel, index)],
       deletes: [],
       freshIds: [{ table: "messages", id: benchId(index) }],
       idMappings: [],
@@ -1592,46 +1593,49 @@ async function runBindingScenarios(
       ),
     );
 
-    const mutationFreshHarness = await createBindingBenchHarness({ seedRows: 0 });
-    harnesses.push(mutationFreshHarness);
-    let mutationFreshSequence = 0;
+    const mutationCacheWriteHarness = await createBindingBenchHarness({ seedRows: 0 });
+    harnesses.push(mutationCacheWriteHarness);
+    let mutationCacheWriteSequence = 0;
     results.push(
       await measure(layer, "binding.mutation.fresh", options.iterations, () => {
-        const index = mutationFreshSequence++;
+        const index = mutationCacheWriteSequence++;
         const mutationId = `bench-mutation:${index}`;
-        return mutationFreshHarness.binding.mutationFresh!({
-          args: `{"body":"message ${index}","channel":"${mutationFreshHarness.channel}","sequence":${index}}`,
+        return mutationCacheWriteHarness.binding.mutationCacheWrite!({
+          args: `{"body":"message ${index}","channel":"${mutationCacheWriteHarness.channel}","sequence":${index}}`,
           mutationId,
           name: "messages:send",
         });
       }),
     );
 
-    if (insertHarness.binding.commitOneUpsert) {
-      const oneUpsertHarness = await createBindingBenchHarness({ seedRows: 0 });
-      harnesses.push(oneUpsertHarness);
-      const oneUpsertBatches = Array.from({ length: options.iterations + warmups }, (_, index) => ({
-        upserts: [bindingUpsert(benchId(index), oneUpsertHarness.channel, index)],
-        deletes: [],
-        freshIds: [{ table: "messages", id: benchId(index) }],
-        idMappings: [],
-      }));
-      let oneUpsertSequence = 0;
+    if (insertHarness.binding.commitOneDocWrite) {
+      const oneDocWriteHarness = await createBindingBenchHarness({ seedRows: 0 });
+      harnesses.push(oneDocWriteHarness);
+      const oneDocWriteBatches = Array.from(
+        { length: options.iterations + warmups },
+        (_, index) => ({
+          docWrites: [bindingWrite(benchId(index), oneDocWriteHarness.channel, index)],
+          deletes: [],
+          freshIds: [{ table: "messages", id: benchId(index) }],
+          idMappings: [],
+        }),
+      );
+      let oneDocWriteSequence = 0;
       results.push(
-        await measure(layer, "binding.commit.insert.one_upsert_sync", options.iterations, () => {
-          const batch = oneUpsertBatches[oneUpsertSequence++ % oneUpsertBatches.length]!;
-          return bindingCommitOneUpsert(oneUpsertHarness, batch, { source: "local" });
+        await measure(layer, "binding.commit.insert.one_doc_write_sync", options.iterations, () => {
+          const batch = oneDocWriteBatches[oneDocWriteSequence++ % oneDocWriteBatches.length]!;
+          return bindingCommitOneDocWrite(oneDocWriteHarness, batch, { source: "local" });
         }),
       );
     }
 
-    if (insertHarness.binding.commitOneUpsert) {
+    if (insertHarness.binding.commitOneDocWrite) {
       const inlineWithMutationHarness = await createBindingBenchHarness({ seedRows: 0 });
       harnesses.push(inlineWithMutationHarness);
       const inlineWithMutationBatches = Array.from(
         { length: options.iterations + warmups },
         (_, index) => ({
-          upserts: [bindingUpsert(benchId(index), inlineWithMutationHarness.channel, index)],
+          docWrites: [bindingWrite(benchId(index), inlineWithMutationHarness.channel, index)],
           deletes: [],
           freshIds: [{ table: "messages", id: benchId(index) }],
           idMappings: [],
@@ -1651,13 +1655,13 @@ async function runBindingScenarios(
           const index = inlineWithMutationSequence++;
           const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
           const mutationId = `bench-commit:${index}`;
-          return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+          return bindingCommitOneDocWrite(inlineWithMutationHarness, batch, {
             includeChanges: false,
             mutationArgs: `{"body":"message ${index}","channel":"${inlineWithMutationHarness.channel}","sequence":${index}}`,
             mutationId,
             mutationName: "messages:send",
             mutationResult: `"${benchId(index)}"`,
-            mutationFresh: true,
+            mutationIsFresh: true,
             source: "local",
           });
         }),
@@ -1672,13 +1676,13 @@ async function runBindingScenarios(
             const index = inlineWithMutationPrecomputedSequence++;
             const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
             const metadata = inlineWithMutationMetadata[index % inlineWithMutationMetadata.length]!;
-            return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+            return bindingCommitOneDocWrite(inlineWithMutationHarness, batch, {
               includeChanges: false,
               mutationArgs: metadata.args,
               mutationId: metadata.id,
               mutationName: "messages:send",
               mutationResult: metadata.result,
-              mutationFresh: true,
+              mutationIsFresh: true,
               source: "local",
             });
           },
@@ -1694,13 +1698,13 @@ async function runBindingScenarios(
             const index = inlineWithMutationPrecomputedArgsSequence++;
             const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
             const metadata = inlineWithMutationMetadata[index % inlineWithMutationMetadata.length]!;
-            return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+            return bindingCommitOneDocWrite(inlineWithMutationHarness, batch, {
               includeChanges: false,
               mutationArgs: metadata.args,
               mutationId: `bench-commit-precomputed-args:${index}`,
               mutationName: "messages:send",
               mutationResult: `"${benchId(index)}"`,
-              mutationFresh: true,
+              mutationIsFresh: true,
               source: "local",
             });
           },
@@ -1716,13 +1720,13 @@ async function runBindingScenarios(
             const index = inlineWithMutationPrecomputedResultSequence++;
             const batch = inlineWithMutationBatches[index % inlineWithMutationBatches.length]!;
             const metadata = inlineWithMutationMetadata[index % inlineWithMutationMetadata.length]!;
-            return bindingCommitOneUpsert(inlineWithMutationHarness, batch, {
+            return bindingCommitOneDocWrite(inlineWithMutationHarness, batch, {
               includeChanges: false,
               mutationArgs: `{"body":"message ${index}","channel":"${inlineWithMutationHarness.channel}","sequence":${index}}`,
               mutationId: `bench-commit-precomputed-result:${index}`,
               mutationName: "messages:send",
               mutationResult: metadata.result,
-              mutationFresh: true,
+              mutationIsFresh: true,
               source: "local",
             });
           },
@@ -1734,7 +1738,7 @@ async function runBindingScenarios(
       const inlineWithMutationLookupBatches = Array.from(
         { length: options.iterations + warmups },
         (_, index) => ({
-          upserts: [bindingUpsert(benchId(index), inlineWithMutationLookupHarness.channel, index)],
+          docWrites: [bindingWrite(benchId(index), inlineWithMutationLookupHarness.channel, index)],
           deletes: [],
           freshIds: [{ table: "messages", id: benchId(index) }],
           idMappings: [],
@@ -1751,7 +1755,7 @@ async function runBindingScenarios(
             const batch =
               inlineWithMutationLookupBatches[index % inlineWithMutationLookupBatches.length]!;
             const mutationId = `bench-commit-lookup:${index}`;
-            return bindingCommitOneUpsert(inlineWithMutationLookupHarness, batch, {
+            return bindingCommitOneDocWrite(inlineWithMutationLookupHarness, batch, {
               includeChanges: false,
               mutationArgs: `{"body":"message ${index}","channel":"${inlineWithMutationLookupHarness.channel}","sequence":${index}}`,
               mutationId,
@@ -1769,7 +1773,7 @@ async function runBindingScenarios(
     const insertNoChangesBatches = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
-        upserts: [bindingUpsert(benchId(index), insertNoChangesHarness.channel, index)],
+        docWrites: [bindingWrite(benchId(index), insertNoChangesHarness.channel, index)],
         deletes: [],
         freshIds: [{ table: "messages", id: benchId(index) }],
         idMappings: [],
@@ -1786,13 +1790,13 @@ async function runBindingScenarios(
       }),
     );
 
-    if (insertHarness.binding.commitOneUpsert) {
+    if (insertHarness.binding.commitOneDocWrite) {
       const inlineInsertHarness = await createBindingBenchHarness({ seedRows: 0 });
       harnesses.push(inlineInsertHarness);
       const inlineInsertBatches = Array.from(
         { length: options.iterations + warmups },
         (_, index) => ({
-          upserts: [bindingUpsert(benchId(index), inlineInsertHarness.channel, index)],
+          docWrites: [bindingWrite(benchId(index), inlineInsertHarness.channel, index)],
           deletes: [],
           freshIds: [{ table: "messages", id: benchId(index) }],
           idMappings: [],
@@ -1802,18 +1806,18 @@ async function runBindingScenarios(
       results.push(
         await measure(layer, "binding.commit.insert.inline", options.iterations, () => {
           const batch = inlineInsertBatches[inlineSequence++ % inlineInsertBatches.length]!;
-          return bindingCommitOneUpsert(inlineInsertHarness, batch, { source: "local" });
+          return bindingCommitOneDocWrite(inlineInsertHarness, batch, { source: "local" });
         }),
       );
     }
 
-    if (insertHarness.binding.commitOneUpsert) {
+    if (insertHarness.binding.commitOneDocWrite) {
       const inlineNoChangesHarness = await createBindingBenchHarness({ seedRows: 0 });
       harnesses.push(inlineNoChangesHarness);
       const inlineNoChangesBatches = Array.from(
         { length: options.iterations + warmups },
         (_, index) => ({
-          upserts: [bindingUpsert(benchId(index), inlineNoChangesHarness.channel, index)],
+          docWrites: [bindingWrite(benchId(index), inlineNoChangesHarness.channel, index)],
           deletes: [],
           freshIds: [{ table: "messages", id: benchId(index) }],
           idMappings: [],
@@ -1824,7 +1828,7 @@ async function runBindingScenarios(
         await measure(layer, "binding.commit.insert.inline.no_changes", options.iterations, () => {
           const batch =
             inlineNoChangesBatches[inlineNoChangesSequence++ % inlineNoChangesBatches.length]!;
-          return bindingCommitOneUpsert(inlineNoChangesHarness, batch, {
+          return bindingCommitOneDocWrite(inlineNoChangesHarness, batch, {
             includeChanges: false,
             source: "local",
           });
@@ -1837,7 +1841,7 @@ async function runBindingScenarios(
     const remoteInsertBatches = Array.from(
       { length: options.iterations + warmups },
       (_, index) => ({
-        upserts: [bindingUpsert(benchId(index), remoteInsertHarness.channel, index)],
+        docWrites: [bindingWrite(benchId(index), remoteInsertHarness.channel, index)],
         deletes: [],
         freshIds: [{ table: "messages", id: benchId(index) }],
         idMappings: [],
@@ -1853,7 +1857,7 @@ async function runBindingScenarios(
     const emptyHarness = await createBindingBenchHarness({ seedRows: 0 });
     harnesses.push(emptyHarness);
     const emptyBatch: BindingWriteBatch = {
-      upserts: [],
+      docWrites: [],
       deletes: [],
       freshIds: [],
       idMappings: [],
@@ -1881,7 +1885,7 @@ async function runBindingScenarios(
           mutationId: `bench-empty-commit:${index}`,
           mutationName: "messages:noop",
           mutationResult: "null",
-          mutationFresh: true,
+          mutationIsFresh: true,
           source: "local",
         });
       }),
@@ -1985,19 +1989,19 @@ function bindingCommit(
   return harness.binding.commit(batch, options);
 }
 
-function bindingCommitOneUpsert(
+function bindingCommitOneDocWrite(
   harness: BindingBenchHarness,
   batch: BindingWriteBatch,
   options: BindingCommitOptions,
 ) {
-  const upsert = batch.upserts[0]!;
-  return harness.binding.commitOneUpsert
-    ? harness.binding.commitOneUpsert(
-        upsert.table,
-        upsert.id,
-        upsert.data,
-        upsert.cols,
-        upsert.creationTime,
+  const docWrite = batch.docWrites[0]!;
+  return harness.binding.commitOneDocWrite
+    ? harness.binding.commitOneDocWrite(
+        docWrite.table,
+        docWrite.id,
+        docWrite.data,
+        docWrite.cols,
+        docWrite.creationTime,
         options.source,
         options.mutationId,
         options.mutationName,
@@ -2006,7 +2010,7 @@ function bindingCommitOneUpsert(
         options.includeChanges,
         batch.freshIds.length === 1,
         batch.dataOnlyIds?.length === 1,
-        options.mutationFresh,
+        options.mutationIsFresh,
       )
     : bindingCommit(harness, batch, options);
 }
@@ -2264,8 +2268,8 @@ function mutationIdTimingOption(
   recorder: MutationTimingRecorder,
 ): RunMutationOptions {
   return recorder.callback
-    ? { mutationFresh: true, mutationId, onTiming: recorder.callback }
-    : { mutationFresh: true, mutationId };
+    ? { mutationIsFresh: true, mutationId, onTiming: recorder.callback }
+    : { mutationIsFresh: true, mutationId };
 }
 
 function coldBeforeEach(

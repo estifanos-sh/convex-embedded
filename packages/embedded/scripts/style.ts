@@ -36,6 +36,7 @@ const rawTimeAllowedFiles = new Set([
   "packages/embedded/tests/fixture/convex/time.ts",
   "packages/embedded/tests/testkit/time.ts",
 ]);
+const nativePlatformSymbols = new Set(["sync_url"]);
 const testFiles = new Set([
   "tests/runtime/client.ts",
   "tests/runtime/runtime.ts",
@@ -46,33 +47,33 @@ const testFiles = new Set([
 ]);
 const bannedTsNames: BannedName[] = [
   { pattern: /^collect[A-Z]/, replacement: "reserve collect for Convex query terminals" },
-  { pattern: /^find[A-Z]/, replacement: "use gather, read, or get" },
-  { pattern: /^lookup[A-Z]/, replacement: "use read or get" },
-  { pattern: /^put[A-Z]/, replacement: "use insert, store, or write" },
-  { pattern: /^upsert[A-Z]/, replacement: "use insert, patch, store, or write" },
-  { pattern: /^update[A-Z]/, replacement: "use patch or write" },
-  { pattern: /^modify[A-Z]/, replacement: "use patch or write" },
-  { pattern: /^persist[A-Z]/, replacement: "use store or write" },
-  { pattern: /^make[A-Z]/, replacement: "use create or build" },
-  { pattern: /^fmt[A-Z]/, replacement: "use format" },
-  { pattern: /^unsub[A-Z]/, replacement: "use unsubscribe" },
-  { pattern: /^sync[A-Z]/, replacement: "use replicate or pull for replication" },
-  { pattern: /^resolve[A-Z]/, replacement: "use read, load, or to" },
+  { pattern: /^find[A-Z]/, replacement: "use read" },
+  { pattern: /^lookup[A-Z]/, replacement: "use read" },
+  { pattern: /^put[A-Z]/, replacement: "use write" },
+  { pattern: /^upsert[A-Z]/, replacement: "use write" },
+  { pattern: /^update[A-Z]/, replacement: "use write" },
+  { pattern: /^modify[A-Z]/, replacement: "use write" },
+  { pattern: /^persist[A-Z]/, replacement: "use write" },
+  { pattern: /^make[A-Z]/, replacement: "use the domain noun and an approved verb" },
+  { pattern: /^fmt[A-Z]/, replacement: "use encode for a codec" },
+  { pattern: /^unsub[A-Z]/, replacement: "use the owning noun and write or delete" },
+  { pattern: /^sync[A-Z]/, replacement: "use push or pull for replication" },
+  { pattern: /^resolve[A-Z]/, replacement: "use read or decode" },
 ];
 const bannedRustNames: BannedName[] = [
   { pattern: /^collect_/, replacement: "reserve collect for Convex query terminals" },
-  { pattern: /^find_/, replacement: "use gather, read, or get" },
-  { pattern: /^lookup_/, replacement: "use read or get" },
-  { pattern: /^put_/, replacement: "use insert, store, or write" },
-  { pattern: /^upsert_/, replacement: "use insert, patch, store, or write" },
-  { pattern: /^update_/, replacement: "use patch or write" },
-  { pattern: /^modify_/, replacement: "use patch or write" },
-  { pattern: /^persist_/, replacement: "use store or write" },
-  { pattern: /^make_/, replacement: "use create or build" },
-  { pattern: /^fmt_/, replacement: "use format" },
-  { pattern: /^unsub_/, replacement: "use unsubscribe" },
-  { pattern: /^sync_/, replacement: "use replicate or pull for replication" },
-  { pattern: /^resolve_/, replacement: "use read, load, or to" },
+  { pattern: /^find_/, replacement: "use read" },
+  { pattern: /^lookup_/, replacement: "use read" },
+  { pattern: /^put_/, replacement: "use write" },
+  { pattern: /^upsert_/, replacement: "use write" },
+  { pattern: /^update_/, replacement: "use write" },
+  { pattern: /^modify_/, replacement: "use write" },
+  { pattern: /^persist_/, replacement: "use write" },
+  { pattern: /^make_/, replacement: "use the domain noun and an approved verb" },
+  { pattern: /^fmt_/, replacement: "use encode for a codec" },
+  { pattern: /^unsub_/, replacement: "use the owning noun and write or delete" },
+  { pattern: /^sync_/, replacement: "use push or pull for replication" },
+  { pattern: /^resolve_/, replacement: "use read or decode" },
 ];
 
 const violations: Violation[] = [];
@@ -84,7 +85,7 @@ for (const file of walk(resolve(packageDir, "src"), (path) => path.endsWith(".ts
   if (statSync(file).isDirectory()) continue;
   auditTsExports(file);
 }
-for (const crateRoot of ["crates/storage/src", "crates/node/src"]) {
+for (const crateRoot of ["crates/storage/src", "crates/remote/src", "crates/node/src"]) {
   for (const file of walk(resolve(repoDir, crateRoot), (path) => path.endsWith(".rs"))) {
     if (statSync(file).isDirectory()) continue;
     auditRustPublicSymbols(file);
@@ -92,6 +93,7 @@ for (const crateRoot of ["crates/storage/src", "crates/node/src"]) {
 }
 auditRawTimeCalls();
 auditVersionedNames();
+auditDeprecatedTerms();
 
 if (violations.length > 0) {
   console.error("Style audit failed:");
@@ -209,7 +211,60 @@ function auditVersionedNames(): void {
   }
 }
 
+function auditDeprecatedTerms(): void {
+  const roots = [
+    resolve(packageDir, "src"),
+    resolve(packageDir, "tests"),
+    resolve(packageDir, "scripts"),
+    resolve(repoDir, "convex"),
+    resolve(repoDir, "demos/browser/vite/src"),
+    resolve(repoDir, "crates/storage/src"),
+    resolve(repoDir, "crates/remote/src"),
+    resolve(repoDir, "crates/node/src"),
+  ];
+  const terms = [
+    {
+      pattern: new RegExp(`\\b${"boot"}${"strap"}\\w*\\b`, "gi"),
+      replacement:
+        "use checkpoint for the state object, pull for transfer, or lease for readability",
+    },
+    deprecated("remote_" + "push_settle", "use remote_settlement_write"),
+    deprecated("remote_" + "pull_page", "use remote_page_write"),
+    deprecated("remote_" + "settlement_ack", "use remote_receipt"),
+    deprecated("remote_" + "read_cursor", "use remote_cursor_read"),
+    deprecated("remote_" + "write_cursor", "use remote_cursor_write"),
+    deprecated("commitOne" + "Upsert", "use commitOneDocWrite"),
+    deprecated("exact" + "ScanBounds", "use hasExactBounds"),
+    deprecated("schedule_" + "due_read", "use schedule_lease_read"),
+    deprecated("cleanup" + "Follower", "use followerDelete"),
+    deprecated("pruneArtifact" + "Copies", "use artifactCopyDelete"),
+    deprecated("replay" + "Sweep", "use replayDelete"),
+    deprecated("EmbeddedData" + "Upsert", "use EmbeddedDataWrite"),
+  ];
+  for (const root of roots) {
+    for (const file of walk(root, isAuditedSource)) {
+      if (statSync(file).isDirectory()) continue;
+      const rel = relative(repoDir, file);
+      if (isGeneratedPath(rel)) continue;
+      const source = readFileSync(file, "utf8");
+      for (const term of terms) {
+        for (const match of source.matchAll(term.pattern)) {
+          violations.push({
+            file: rel,
+            message: `deprecated term "${match[0]}"; ${term.replacement}`,
+          });
+        }
+      }
+    }
+  }
+}
+
+function deprecated(name: string, replacement: string): { pattern: RegExp; replacement: string } {
+  return { pattern: new RegExp(`\\b${name}\\b`, "g"), replacement };
+}
+
 function auditSymbol(file: string, name: string, banned: BannedName[]): void {
+  if (nativePlatformSymbols.has(name)) return;
   for (const rule of banned) {
     if (rule.pattern.test(name)) {
       violations.push({

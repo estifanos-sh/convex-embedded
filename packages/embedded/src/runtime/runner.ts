@@ -12,7 +12,7 @@ import type {
   CommitOptions,
   CrdtSnapshot,
   DirtyHeadDebug,
-  OneUpsertCommit,
+  OneDocWriteCommit,
   RemoteIdentity,
   RemoteScope,
   RemoteSubscription,
@@ -140,7 +140,7 @@ export type StopOnUpdate = () => void;
 export interface RunMutationOptions {
   allowInternal?: boolean;
   auth?: UserIdentity | null;
-  mutationFresh?: boolean;
+  mutationIsFresh?: boolean;
   mutationId?: string;
   onAccepted?(this: void, mutationId: string): void;
   onTiming?(this: void, timing: RunMutationTiming): void;
@@ -367,7 +367,7 @@ interface RuntimeScope {
 }
 
 interface ScopedMutationTransaction {
-  oneUpsert(): OneUpsertCommit | undefined;
+  oneDocWrite(): OneDocWriteCommit | undefined;
   revisionRestore(expectation: RevisionRestoreExpectation): void;
   restore(snapshot: ScopedMutationSnapshot): void;
   snapshot(): ScopedMutationSnapshot;
@@ -503,11 +503,11 @@ function pointerRead(value: unknown, reference: ValidatorIdReference): string | 
 async function crdtEffects(batch: WriteBatch): Promise<Record<string, unknown>[]> {
   return await Promise.all(
     (batch.crdtOps ?? []).map(async (op) => {
-      const upsert = batch.upserts.find(
+      const docWrite = batch.docWrites.find(
         (candidate) => candidate.table === op.table && candidate.id === op.id,
       );
-      if (!upsert) throw new Error(`CRDT effect target is missing: ${op.table}/${op.id}`);
-      const projection = fieldValue(upsert.data, op.field);
+      if (!docWrite) throw new Error(`CRDT effect target is missing: ${op.table}/${op.id}`);
+      const projection = fieldValue(docWrite.data, op.field);
       const kind = op.kind === "count.add" ? "count" : op.kind.startsWith("text.") ? "text" : "set";
       return {
         table: op.table,
@@ -535,13 +535,13 @@ function afterImages(
     | { content: "deleted"; table: string; rowId: string }
   >();
   const crdtOnly = new Set((batch.crdtOnlyIds ?? []).map((row) => `${row.table}\u0000${row.id}`));
-  for (const upsert of batch.upserts) {
-    if (crdtOnly.has(`${upsert.table}\u0000${upsert.id}`)) continue;
-    candidates.set(`${upsert.table}\u0000${upsert.id}`, {
+  for (const docWrite of batch.docWrites) {
+    if (crdtOnly.has(`${docWrite.table}\u0000${docWrite.id}`)) continue;
+    candidates.set(`${docWrite.table}\u0000${docWrite.id}`, {
       content: "value",
-      table: upsert.table,
-      rowId: upsert.id,
-      value: upsert.data,
+      table: docWrite.table,
+      rowId: docWrite.id,
+      value: docWrite.data,
     });
   }
   for (const deleted of batch.deletes) {
@@ -726,9 +726,9 @@ export function createRunner(
       return existing;
     };
     return {
-      oneUpsert() {
+      oneDocWrite() {
         if (writers.size !== 1) return undefined;
-        return writers.get(ROOT_INSTANCE)?.oneUpsert();
+        return writers.get(ROOT_INSTANCE)?.oneDocWrite();
       },
       revisionRestore(expectation) {
         revisionRestores.push(expectation);
@@ -765,12 +765,12 @@ export function createRunner(
         const crdtOps: NonNullable<WriteBatch["crdtOps"]> = [];
         const crdtOnlyIds: NonNullable<WriteBatch["crdtOnlyIds"]> = [];
         const crdtRestores: NonNullable<WriteBatch["crdtRestores"]> = [];
-        const upserts: WriteBatch["upserts"] = [];
+        const docWrites: WriteBatch["docWrites"] = [];
         const deletes: WriteBatch["deletes"] = [];
         const freshIds: NonNullable<WriteBatch["freshIds"]> = [];
         const dataOnlyIds: NonNullable<WriteBatch["dataOnlyIds"]> = [];
         const idMappings: NonNullable<WriteBatch["idMappings"]> = [];
-        let rootBatch: WriteBatch = { deletes: [], upserts: [] };
+        let rootBatch: WriteBatch = { deletes: [], docWrites: [] };
         for (const [instancePath, w] of writers) {
           const batch = w.toBatch();
           if (instancePath === ROOT_INSTANCE) rootBatch = batch;
@@ -778,7 +778,7 @@ export function createRunner(
             for (const key of batchInvalidationKeys(instancePath, batch)) touchedKeys.add(key);
           }
           const namespaced = namespaceBatch(instancePath, batch);
-          upserts.push(...namespaced.upserts);
+          docWrites.push(...namespaced.docWrites);
           deletes.push(...namespaced.deletes);
           crdtOps.push(...(namespaced.crdtOps ?? []));
           crdtOnlyIds.push(...(namespaced.crdtOnlyIds ?? []));
@@ -796,7 +796,7 @@ export function createRunner(
             deletes,
             freshIds,
             idMappings,
-            upserts,
+            docWrites,
           },
           rootBatch,
           touchedKeys: watching ? [...touchedKeys] : [],
@@ -812,12 +812,12 @@ export function createRunner(
           )) as Record<string, unknown> | null;
           if (expectation.deleted) {
             if (current !== null) {
-              throw new Error("rev.set must be followed by the matching document delete.");
+              throw new Error("rev.restore must be followed by the matching document delete.");
             }
             continue;
           }
           if (current === null || !equals(documentValue(current), expectation.value)) {
-            throw new Error("rev.set must be followed by the matching document replace.");
+            throw new Error("rev.restore must be followed by the matching document replace.");
           }
         }
       },
@@ -964,10 +964,10 @@ export function createRunner(
       );
     }
     const displaced =
-      componentRevision === "set"
+      componentRevision === "restore"
         ? await revisionCurrent(root.writer(rootScope).db, checked)
         : undefined;
-    if (componentRevision === "set" && displaced !== undefined) {
+    if (componentRevision === "restore" && displaced !== undefined) {
       const target = (await runQuery(
         embeddedComponentReference("rev/get"),
         checked,
@@ -994,14 +994,14 @@ export function createRunner(
     timingPhaseStartedAt = timing ? getTimerTime() : 0;
     const recordsMutation =
       options.mutationId !== undefined &&
-      !(options.mutationFresh && options.pushCall !== undefined);
+      !(options.mutationIsFresh && options.pushCall !== undefined);
     const encodedMutationArgs = recordsMutation ? encode(checked) : undefined;
     if (timing) {
       timing.argsEncodeMs = getTimerTime() - timingPhaseStartedAt;
       timingPhaseStartedAt = getTimerTime();
     }
-    if (!tx && options.mutationId && store.mutation && !options.mutationFresh) {
-      const existing = await store.mutation.begin({
+    if (!tx && options.mutationId && store.mutation && !options.mutationIsFresh) {
+      const existing = await store.mutation.write({
         args: encodedMutationArgs!,
         mutationId: options.mutationId,
         name: resolved.name,
@@ -1125,7 +1125,7 @@ export function createRunner(
         ? withEntropySpan(pushEnvelopeTimeHlc, options.pushCall.rngSeed, runHandler)
         : runHandler());
       validated = validateReturn(fn, result);
-      if (componentRevision === "set") {
+      if (componentRevision === "restore") {
         const revision = validated as RevisionRestoreExpectation;
         const snapshots = (await runQuery(
           embeddedComponentReference("rev/restoreRead"),
@@ -1177,9 +1177,9 @@ export function createRunner(
       // replay, so record it as the mutation's terminal `failed` outcome (preserving ConvexError).
       if (snapshot) root.restore(snapshot);
       if (!tx && options.mutationId && store.mutation && recordsMutation) {
-        if (options.mutationFresh) {
+        if (options.mutationIsFresh) {
           await store.mutation
-            .begin(
+            .write(
               {
                 args: encodedMutationArgs!,
                 mutationId: options.mutationId,
@@ -1198,14 +1198,14 @@ export function createRunner(
       await root.validateRevisionRestores();
       const watching = watchers.size > 0;
       const localSchedules = !remoteEnabled && pendingScheduleRows.length > 0;
-      const canCommitOneUpsert =
+      const canCommitOneDocWrite =
         !watching &&
         !hasEventListeners() &&
-        !!store.commitOneUpsert &&
+        !!store.commitOneDocWrite &&
         !options.pushCall &&
         !localSchedules;
-      const oneUpsert = canCommitOneUpsert ? root.oneUpsert() : undefined;
-      const batchInfo = oneUpsert ? undefined : root.toBatch(watching);
+      const oneDocWrite = canCommitOneDocWrite ? root.oneDocWrite() : undefined;
+      const batchInfo = oneDocWrite ? undefined : root.toBatch(watching);
       if (timing) {
         timing.batchMs = getTimerTime() - timingPhaseStartedAt;
         timingPhaseStartedAt = getTimerTime();
@@ -1277,7 +1277,7 @@ export function createRunner(
       const commitOptions: CommitOptions =
         options.mutationId === undefined
           ? { changes: "omit", mutation: "none", source: "local" }
-          : options.mutationFresh &&
+          : options.mutationIsFresh &&
               pushEnvelopeJson !== undefined &&
               pushEnvelopeNowMs !== undefined
             ? {
@@ -1291,7 +1291,7 @@ export function createRunner(
                 changes: "omit",
                 mutation: "terminal",
                 mutationArgs: encodedMutationArgs!,
-                mutationFresh: options.mutationFresh === true,
+                mutationIsFresh: options.mutationIsFresh === true,
                 mutationId: options.mutationId,
                 mutationName: resolved.name,
                 mutationResult: encodedMutationResult!,
@@ -1301,8 +1301,8 @@ export function createRunner(
                 source: "local",
               };
       if (localSchedules) batchInfo!.batch.schedules = pendingScheduleRows;
-      const commit = oneUpsert
-        ? await store.commitOneUpsert!(oneUpsert, commitOptions)
+      const commit = oneDocWrite
+        ? await store.commitOneDocWrite!(oneDocWrite, commitOptions)
         : await runSpan("storage.commit", () => store.commit(batchInfo!.batch, commitOptions));
       if (timing) {
         timing.commitMs = getTimerTime() - timingPhaseStartedAt;
@@ -1621,7 +1621,7 @@ export function createRunner(
       deletes: [],
       source: "cache",
       type: "data",
-      upserts: [],
+      docWrites: [],
     });
   };
 
@@ -1678,7 +1678,7 @@ export function createRunner(
       deletes: [],
       source,
       type: "data",
-      upserts: [],
+      docWrites: [],
     });
     scheduleNotify({ dataOnlyDocIds: new Map(), tables });
   };
@@ -1847,7 +1847,7 @@ export function createRunner(
   }
 
   // Cut 7 §6: stopping a watch drops its retained-result entry so no entry outlives its watch. The
-  // restart orphan sweep (`result_delete_stale`) is the durable backstop for crashes and rotation.
+  // restart orphan deletion (`result_stale_delete`) is the durable backstop for crashes and rotation.
   // Item-7 guard: a rapid resubscribe can mint a fresh same-key entry while this fire-and-forget
   // delete is still in flight; skip the delete unless the watcher is truly gone (`!watchers.has`).
   async function deleteWatchResult(watcher: Watcher): Promise<void> {
@@ -1858,7 +1858,7 @@ export function createRunner(
       const key = (await subscriptionDescriptor(watcher))?.resultCacheKey;
       if (key !== undefined && !watchers.has(watcher.key)) await store.result.delete(key);
     } catch {
-      /* best-effort: the orphan sweep reclaims a stranded entry on restart. */
+      /* best-effort: restart deletion reclaims a stranded entry. */
     }
   }
 
@@ -2114,10 +2114,10 @@ export function createRunner(
       }
     }
     const projections: Record<string, unknown>[] = [];
-    if (service.projectionDebugRead) {
+    if (service.remoteDocDebugRead) {
       for (const mapping of idMappings) {
         if (typeof mapping.table !== "string" || typeof mapping.localId !== "string") continue;
-        const projection = await service.projectionDebugRead(mapping.table, mapping.localId);
+        const projection = await service.remoteDocDebugRead(mapping.table, mapping.localId);
         if (projection) projections.push(normalizeCopy(projection) as Record<string, unknown>);
       }
     }
@@ -2380,10 +2380,10 @@ async function clearDeletes(
 function rootBatchInvalidationKeys(batch: WriteBatch): string[] {
   const keys: string[] = [];
   const seen = new Set<string>();
-  for (const upsert of batch.upserts) {
-    if (seen.has(upsert.table)) continue;
-    seen.add(upsert.table);
-    keys.push(upsert.table);
+  for (const docWrite of batch.docWrites) {
+    if (seen.has(docWrite.table)) continue;
+    seen.add(docWrite.table);
+    keys.push(docWrite.table);
   }
   for (const deleted of batch.deletes) {
     if (seen.has(deleted.table)) continue;
@@ -2394,21 +2394,21 @@ function rootBatchInvalidationKeys(batch: WriteBatch): string[] {
 }
 
 function rootBatchDataOnlyDocIds(batch: WriteBatch): Map<InvalidationKey, Set<string>> | undefined {
-  if (batch.upserts.length === 0 || batch.deletes.length > 0) return undefined;
+  if (batch.docWrites.length === 0 || batch.deletes.length > 0) return undefined;
   if ((batch.crdtOps?.length ?? 0) > 0) return undefined;
   if ((batch.freshIds?.length ?? 0) > 0) return undefined;
   const dataOnlyIds = batch.dataOnlyIds ?? [];
-  if (dataOnlyIds.length !== batch.upserts.length) return undefined;
+  if (dataOnlyIds.length !== batch.docWrites.length) return undefined;
   const marked = new Set(dataOnlyIds.map((row) => `${row.table}\0${row.id}`));
   const byTable = new Map<InvalidationKey, Set<string>>();
-  for (const upsert of batch.upserts) {
-    if (!marked.has(`${upsert.table}\0${upsert.id}`)) return undefined;
-    let ids = byTable.get(upsert.table);
+  for (const docWrite of batch.docWrites) {
+    if (!marked.has(`${docWrite.table}\0${docWrite.id}`)) return undefined;
+    let ids = byTable.get(docWrite.table);
     if (!ids) {
       ids = new Set<string>();
-      byTable.set(upsert.table, ids);
+      byTable.set(docWrite.table, ids);
     }
-    ids.add(upsert.id);
+    ids.add(docWrite.id);
   }
   return byTable;
 }

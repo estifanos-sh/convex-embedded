@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use proptest::prelude::*;
 use storage::testkit::{decode_cursor, doc_ids, encode_cursor, paged_ids, tmp_path, vals_schema};
 use storage::{
-    Bound, ColValue, CommitOptions, CountSpec, EmbeddedStore, Order, ReadSpec, UpsertIn, WriteBatch,
+    Bound, ColValue, CommitOptions, CountSpec, DocWrite, EmbeddedStore, Order, ReadSpec, WriteBatch,
 };
 
 /// The Convex total order, written independently from the engine so it can serve as an oracle for
@@ -40,8 +40,8 @@ fn convex_cmp(a: &ColValue, b: &ColValue) -> Ordering {
 
 static DB: AtomicUsize = AtomicUsize::new(0);
 
-/// A fresh, uniquely-named store per generated case — fully isolated (turso has no `:memory:`, so each
-/// case needs its own file so proptest shrinking can't leak state across runs).
+/// A fresh, uniquely-named store per generated case so proptest shrinking cannot leak state across
+/// runs. The generated-input suite intentionally exercises the same filesystem backend as native.
 fn fresh() -> EmbeddedStore {
     let n = DB.fetch_add(1, AtomicOrdering::Relaxed);
     let store = EmbeddedStore::open(tmp_path(&format!("prop_paging_{n}.db")).to_str().unwrap())
@@ -94,9 +94,9 @@ proptest! {
 /// Build + seed a `vals` store with `(id, v)` rows via a non-`local` source.
 fn seed(rows: &[(&str, ColValue)]) -> EmbeddedStore {
     let store = fresh();
-    let upserts: Vec<UpsertIn> = rows
+    let doc_writes: Vec<DocWrite> = rows
         .iter()
-        .map(|(id, v)| UpsertIn {
+        .map(|(id, v)| DocWrite {
             table: "vals".into(),
             id: (*id).into(),
             data: r#"{"v":0}"#.into(),
@@ -109,7 +109,7 @@ fn seed(rows: &[(&str, ColValue)]) -> EmbeddedStore {
             WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
-                upserts,
+                doc_writes,
                 deletes: vec![],
                 fresh_ids: vec![],
                 data_only_ids: vec![],
@@ -173,10 +173,10 @@ proptest! {
     ) {
         let store = fresh();
 
-        let upserts: Vec<UpsertIn> = values
+        let doc_writes: Vec<DocWrite> = values
             .iter()
             .enumerate()
-            .map(|(i, v)| UpsertIn {
+            .map(|(i, v)| DocWrite {
                 table: "vals".into(),
                 id: format!("r{i}"),
                 data: r#"{"v":0}"#.into(),
@@ -189,7 +189,7 @@ proptest! {
                 WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
-                    upserts,
+                    doc_writes,
                     deletes: vec![],
                     fresh_ids: vec![],
                     data_only_ids: vec![],
@@ -235,10 +235,10 @@ proptest! {
         eq_pick in any::<prop::sample::Index>(),
     ) {
         let store = fresh();
-        let rows: Vec<UpsertIn> = values
+        let rows: Vec<DocWrite> = values
             .iter()
             .enumerate()
-            .map(|(i, v)| UpsertIn {
+            .map(|(i, v)| DocWrite {
                 table: "vals".into(),
                 id: format!("r{i}"),
                 data: r#"{"v":0}"#.into(),
@@ -251,7 +251,7 @@ proptest! {
                 WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
-                    upserts: rows,
+                    doc_writes: rows,
                     deletes: vec![],
                     fresh_ids: vec![],
                     data_only_ids: vec![],

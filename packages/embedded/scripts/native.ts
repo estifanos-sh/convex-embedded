@@ -1,4 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -61,7 +62,10 @@ function nativeSourceCandidates(): string[] {
 }
 
 function loadNativeArtifact(path: string): void {
-  const probe = resolve(tmpdir(), `convex-embedded-native-probe-${process.pid}-${Date.now()}.node`);
+  const probe = resolve(
+    tmpdir(),
+    `convex-embedded-native-probe-${process.pid}-${randomUUID()}.node`,
+  );
   copyFileSync(path, probe);
   try {
     const module = require(probe) as {

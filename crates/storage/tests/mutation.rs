@@ -67,7 +67,7 @@ fn duplicate_mutation_id_rolls_back_second_batch() {
     let store = EmbeddedStore::open(tmp_path("rs_mutation_id.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .mutation_begin(&MutationCall {
+        .mutation_write(&MutationCall {
             args: "{}".into(),
             mutation_id: "mutation-1".into(),
             name: "issues:send".into(),
@@ -77,12 +77,12 @@ fn duplicate_mutation_id_rolls_back_second_batch() {
 
     store
         .commit(
-            upserts(vec![issue(&store, "first", "first", "open")]),
+            doc_writes(vec![issue(&store, "first", "first", "open")]),
             &options,
         )
         .unwrap();
     let duplicate = store.commit(
-        upserts(vec![issue(&store, "second", "second", "open")]),
+        doc_writes(vec![issue(&store, "second", "second", "open")]),
         &options,
     );
 
@@ -96,7 +96,7 @@ fn mutation_id_commit_requires_accepted_record() {
     let store = EmbeddedStore::open(tmp_path("rs_unbegun_mutation.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     let err = store.commit(
-        upserts(vec![issue(&store, "missing", "missing", "open")]),
+        doc_writes(vec![issue(&store, "missing", "missing", "open")]),
         &CommitOptions::existing("mutation-missing", None),
     );
 
@@ -111,7 +111,7 @@ fn first_seen_mutation_id_commits_terminal_record() {
     store.setup(&schema()).unwrap();
     let result = store
         .commit(
-            upserts(vec![issue(&store, "first-seen", "first", "open")]),
+            doc_writes(vec![issue(&store, "first-seen", "first", "open")]),
             &CommitOptions::terminal(
                 MutationCall {
                     args: r#"{"body":"first"}"#.into(),
@@ -126,7 +126,7 @@ fn first_seen_mutation_id_commits_terminal_record() {
         .unwrap();
 
     let record = store
-        .mutation_read(&MutationCall {
+        .mutation_cache_read(&MutationCall {
             args: r#"{"body":"first"}"#.into(),
             mutation_id: "mutation-first-seen".into(),
             name: "issues:send".into(),
@@ -148,15 +148,15 @@ fn mutation_id_replay_returns_committed_result() {
         mutation_id: "mutation-replay".into(),
         name: "issues:send".into(),
     };
-    store.mutation_begin(&call).unwrap();
+    store.mutation_write(&call).unwrap();
     let commit = store
         .commit(
-            upserts(vec![issue(&store, "replayed", "first", "open")]),
+            doc_writes(vec![issue(&store, "replayed", "first", "open")]),
             &CommitOptions::terminal(call.clone(), r#"{"ok":true,"id":"replayed"}"#, false, None),
         )
         .unwrap();
 
-    let replay = store.mutation_begin(&call).unwrap();
+    let replay = store.mutation_write(&call).unwrap();
     assert_eq!(replay.status, MutationStatus::Committed);
     assert_eq!(replay.commit_seq, Some(commit.commit_seq));
     assert_eq!(
@@ -181,18 +181,18 @@ fn lookup_absent_mutation_id_commits_terminal_record() {
         name: "issues:send".into(),
     };
     assert_eq!(
-        store.mutation_read(&call).unwrap().status,
+        store.mutation_cache_read(&call).unwrap().status,
         MutationStatus::Accepted
     );
 
     let result = store
         .commit(
-            upserts(vec![issue(&store, "lookup-first-seen", "first", "open")]),
+            doc_writes(vec![issue(&store, "lookup-first-seen", "first", "open")]),
             &CommitOptions::terminal(call.clone(), r#""lookup-first-seen""#, false, None),
         )
         .unwrap();
 
-    let record = store.mutation_read(&call).unwrap();
+    let record = store.mutation_cache_read(&call).unwrap();
     assert_eq!(record.status, MutationStatus::Committed);
     assert_eq!(record.commit_seq, Some(result.commit_seq));
     assert_eq!(record.result.as_deref(), Some(r#""lookup-first-seen""#));
@@ -217,7 +217,7 @@ fn lookup_absent_mutation_id_fails_terminal_record() {
         name: "issues:send".into(),
     };
     assert_eq!(
-        store.mutation_read(&call).unwrap().status,
+        store.mutation_cache_read(&call).unwrap().status,
         MutationStatus::Accepted
     );
 
@@ -225,14 +225,14 @@ fn lookup_absent_mutation_id_fails_terminal_record() {
         .mutation_fail(&call.mutation_id, "handler failed")
         .unwrap();
 
-    let record = store.mutation_read(&call).unwrap();
+    let record = store.mutation_cache_read(&call).unwrap();
     assert_eq!(record.status, MutationStatus::Failed);
     assert_eq!(record.error.as_deref(), Some("handler failed"));
     assert_eq!(record.result, None);
     assert_eq!(record.commit_seq, None);
 
     let err = store.commit(
-        upserts(vec![issue(&store, "failed-lookup", "failed", "open")]),
+        doc_writes(vec![issue(&store, "failed-lookup", "failed", "open")]),
         &CommitOptions::terminal(call, "null", false, None),
     );
 
@@ -246,7 +246,7 @@ fn failed_mutation_cannot_be_committed() {
         EmbeddedStore::open(tmp_path("rs_failed_mutation_commit.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .mutation_begin(&MutationCall {
+        .mutation_write(&MutationCall {
             args: "{}".into(),
             mutation_id: "m1".into(),
             name: "issues:send".into(),
@@ -255,7 +255,7 @@ fn failed_mutation_cannot_be_committed() {
     store.mutation_fail("m1", "local failed").unwrap();
 
     let err = store.commit(
-        upserts(vec![issue(&store, "failed", "failed", "open")]),
+        doc_writes(vec![issue(&store, "failed", "failed", "open")]),
         &CommitOptions::existing("m1", None),
     );
 

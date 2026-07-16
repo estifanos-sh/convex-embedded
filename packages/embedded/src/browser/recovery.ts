@@ -4,9 +4,9 @@
  * @remarks
  * The unit of failure is the WASM store instance (shared linear memory plus the emnapi pthread
  * pool) owned by the coordinator-leader under its Web Locks storage lease. These primitives detect
- * a wedged instance (progress-based watchdog), contain a crash loop (breaker), and pace WAL
- * checkpoints. The graft that swaps a fresh instance into the retained {@link WorkerState} lives in
- * the leader; this module owns only the timing and policy that drive it.
+ * a wedged instance (progress-based watchdog), fail that instance closed, and pace WAL writes.
+ * A hung WASM promise can retain its linear memory indefinitely, so recovery never opens another
+ * store inside the same worker.
  *
  * @internal
  */
@@ -19,16 +19,16 @@ export const WATCHDOG_POLL_MS = 1_000;
 export const REBUILD_MAX = 3;
 /** Sliding window the breaker counts rebuilds over. */
 export const REBUILD_WINDOW_MS = 300_000;
-/** Idle time after the last drain before a WAL checkpoint is paced. */
-export const CHECKPOINT_IDLE_MS = 30_000;
+/** Idle time after the last drain before a WAL write is paced. */
+export const WAL_WRITE_IDLE_MS = 30_000;
 
-/** Progress-guarded lanes the watchdog covers. `checkpoint` classifies as an instance-lane fault. */
-export type WatchdogLane = "push" | "pull" | "remote-start" | "checkpoint";
+/** Progress-guarded lanes the watchdog covers. `wal-write` is an instance-lane fault. */
+export type WatchdogLane = "push" | "pull" | "remote-start" | "wal-write";
 
 /** A rebuild triggered by a remote-only lane may keep the last good instance; anything else is fatal. */
 export type RebuildLaneClass = "remote" | "instance";
 
-/** Clock and timer seam so the watchdog and checkpoint pacing are deterministic under test. */
+/** Clock and timer seam so the watchdog and WAL-write pacing are deterministic under test. */
 export interface RecoveryTimer {
   now(): number;
   setInterval(callback: () => void, ms: number): unknown;
@@ -36,7 +36,7 @@ export interface RecoveryTimer {
 }
 
 const defaultTimer: RecoveryTimer = {
-  now: () => (typeof performance !== "undefined" ? performance.now() : Date.now()),
+  now: () => performance.now(),
   setInterval: (callback, ms) => setInterval(callback, ms),
   clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
 };
@@ -44,33 +44,37 @@ const defaultTimer: RecoveryTimer = {
 /**
  * Progress-based watchdog over the store instance's lanes. A lane armed with {@link arm} becomes
  * SUSPECT once {@link WATCHDOG_IDLE_MS} elapses with no {@link progress} signal; the first suspect
- * latches until {@link reset} so a rebuild is entered exactly once.
+ * latches until {@link reset} so terminal handling is entered exactly once.
  */
 export class Watchdog {
-  private lastProgressAt: number;
   private nextToken = 1;
   private ticker: unknown;
   private suspected = false;
-  private readonly active = new Map<number, { armedAt: number; lane: WatchdogLane }>();
+  private readonly active = new Map<
+    number,
+    { armedAt: number; lane: WatchdogLane; lastProgressAt: number }
+  >();
 
   constructor(
     private readonly onSuspect: (lane: WatchdogLane) => void,
     private readonly idleMs: number = WATCHDOG_IDLE_MS,
     private readonly timer: RecoveryTimer = defaultTimer,
     private readonly pollMs: number = WATCHDOG_POLL_MS,
-  ) {
-    this.lastProgressAt = timer.now();
-  }
+  ) {}
 
-  /** Records liveness. Any transport send/receive, upload byte, or pull decode calls this. */
-  progress(): void {
-    this.lastProgressAt = this.timer.now();
+  /** Records liveness for one lane, or all lanes when called without a lane by direct users. */
+  progress(lane?: WatchdogLane): void {
+    const at = this.timer.now();
+    for (const entry of this.active.values()) {
+      if (lane === undefined || entry.lane === lane) entry.lastProgressAt = at;
+    }
   }
 
   /** Arms a lane; the returned disarm is idempotent and safe to call after a {@link reset}. */
   arm(lane: WatchdogLane): () => void {
     const token = this.nextToken++;
-    this.active.set(token, { armedAt: this.timer.now(), lane });
+    const armedAt = this.timer.now();
+    this.active.set(token, { armedAt, lane, lastProgressAt: armedAt });
     if (this.ticker === undefined) {
       this.ticker = this.timer.setInterval(() => this.check(), this.pollMs);
     }
@@ -89,8 +93,18 @@ export class Watchdog {
   reset(): void {
     this.suspected = false;
     this.active.clear();
-    this.lastProgressAt = this.timer.now();
     this.stopTickingIfIdle();
+  }
+
+  /** Re-arms a suspected lane without forgetting that its operation is still running. */
+  retry(lane: WatchdogLane): void {
+    const at = this.timer.now();
+    for (const entry of this.active.values()) {
+      if (entry.lane !== lane) continue;
+      entry.armedAt = at;
+      entry.lastProgressAt = at;
+    }
+    this.suspected = false;
   }
 
   dispose(): void {
@@ -108,7 +122,7 @@ export class Watchdog {
     if (this.suspected) return;
     const cutoff = this.timer.now() - this.idleMs;
     for (const entry of this.active.values()) {
-      if (Math.max(entry.armedAt, this.lastProgressAt) <= cutoff) {
+      if (Math.max(entry.armedAt, entry.lastProgressAt) <= cutoff) {
         this.suspected = true;
         this.onSuspect(entry.lane);
         return;
@@ -131,7 +145,7 @@ export class CrashBreaker {
   ) {}
 
   record(now: number, laneClass: RebuildLaneClass): boolean {
-    this.prune(now);
+    this.expiredDelete(now);
     this.events.push({ at: now, laneClass });
     return this.events.length > this.max;
   }
@@ -140,7 +154,7 @@ export class CrashBreaker {
     return this.events.map((event) => event.laneClass);
   }
 
-  private prune(now: number): void {
+  private expiredDelete(now: number): void {
     const cutoff = now - this.windowMs;
     while (this.events.length > 0 && this.events[0]!.at <= cutoff) this.events.shift();
   }
@@ -164,24 +178,24 @@ export function laneClassOf(lane: WatchdogLane): RebuildLaneClass {
   return lane === "push" || lane === "pull" ? "remote" : "instance";
 }
 
-/** Inputs to the WAL checkpoint pacing decision. */
-export interface CheckpointDecision {
+/** Inputs to the WAL-write pacing decision. */
+export interface WalWriteDecision {
   now: number;
   lastActivityAt: number;
-  lastCheckpointAt: number;
+  lastWalWriteAt: number;
   remoteBusy: boolean;
   idleMs?: number;
 }
 
 /**
  * True when the push queue has drained (no remote work in flight) and the store has been idle for
- * {@link CHECKPOINT_IDLE_MS} since both the last activity and the last checkpoint.
+ * {@link WAL_WRITE_IDLE_MS} since both the last activity and the last WAL write.
  */
-export function checkpointDue(decision: CheckpointDecision): boolean {
+export function walWriteDue(decision: WalWriteDecision): boolean {
   if (decision.remoteBusy) return false;
-  const idleMs = decision.idleMs ?? CHECKPOINT_IDLE_MS;
+  const idleMs = decision.idleMs ?? WAL_WRITE_IDLE_MS;
   if (decision.now - decision.lastActivityAt < idleMs) return false;
-  if (decision.now - decision.lastCheckpointAt < idleMs) return false;
+  if (decision.now - decision.lastWalWriteAt < idleMs) return false;
   return true;
 }
 
@@ -215,9 +229,9 @@ export function rejectMutationsForRebuild(
 }
 
 /**
- * Actions the recovery controller drives on the leader-owned store instance. The graft
- * (`rebuild`), lease release (`deadInstance`), and event emission are all leader/coordinator
- * concerns; this module owns only when they fire.
+ * Actions the recovery controller drives on the leader-owned store instance. Lease release
+ * (`deadInstance`) and event emission are leader/coordinator concerns; this module owns only when
+ * they fire.
  */
 export interface RecoveryHost {
   now(): number;
@@ -228,7 +242,7 @@ export interface RecoveryHost {
   stopRemote(): void;
   closeRemoteSocket?(): void;
   deadInstance(error: Error): void;
-  runCheckpoint(): Promise<void>;
+  walWrite(): Promise<void>;
 }
 
 export interface StoreRecoveryOptions {
@@ -236,72 +250,72 @@ export interface StoreRecoveryOptions {
   pollMs?: number;
   rebuildMax?: number;
   rebuildWindowMs?: number;
-  checkpointIdleMs?: number;
-  checkpointPollMs?: number;
+  walWriteIdleMs?: number;
+  walWritePollMs?: number;
   timer?: RecoveryTimer;
 }
 
 /**
- * Drives detection, containment, and checkpoint pacing for one store instance. The graft itself is
- * a {@link RecoveryHost} concern; this controller decides when to rebuild, when to trip, and when
- * to checkpoint.
+ * Drives detection, containment, and WAL-write pacing for one store instance.
  */
 export class StoreRecovery {
   readonly watchdog: Watchdog;
-  private readonly breaker: CrashBreaker;
   private readonly timer: RecoveryTimer;
-  private readonly checkpointIdleMs: number;
+  private readonly walWriteIdleMs: number;
   private readonly idleMs: number;
-  private readonly checkpointTicker: unknown;
+  private readonly walWriteTicker: unknown;
   private rebuilding = false;
-  private lastRebuildSucceeded = true;
   private remoteBusy = false;
   private disposed = false;
   private generation = 0;
   private lastActivityAt: number;
-  private lastCheckpointAt: number;
+  private lastWalWriteAt: number;
   private lastTransportActivityAt: number;
+  private readonly silentRetries = new Map<WatchdogLane, number>();
 
   constructor(
     private readonly host: RecoveryHost,
     options: StoreRecoveryOptions = {},
   ) {
     this.timer = options.timer ?? defaultTimer;
-    this.checkpointIdleMs = options.checkpointIdleMs ?? CHECKPOINT_IDLE_MS;
+    this.walWriteIdleMs = options.walWriteIdleMs ?? WAL_WRITE_IDLE_MS;
     this.idleMs = options.idleMs ?? WATCHDOG_IDLE_MS;
     this.lastTransportActivityAt = this.timer.now();
     this.watchdog = new Watchdog(
-      (lane) => void this.onSuspect(lane),
+      (lane) => this.onSuspect(lane),
       options.idleMs ?? WATCHDOG_IDLE_MS,
       this.timer,
       options.pollMs ?? WATCHDOG_POLL_MS,
     );
-    this.breaker = new CrashBreaker(
-      options.rebuildMax ?? REBUILD_MAX,
-      options.rebuildWindowMs ?? REBUILD_WINDOW_MS,
-    );
     this.lastActivityAt = this.timer.now();
-    this.lastCheckpointAt = this.timer.now();
-    this.checkpointTicker = this.timer.setInterval(
-      () => void this.pollCheckpoint(),
-      options.checkpointPollMs ?? this.checkpointIdleMs,
+    this.lastWalWriteAt = this.timer.now();
+    this.walWriteTicker = this.timer.setInterval(
+      () => void this.walWrite(),
+      options.walWritePollMs ?? this.walWriteIdleMs,
     );
   }
 
   /** Arms a lane for the duration of a store op; returns the disarm to call in `finally`. */
   arm(lane: WatchdogLane): () => void {
-    return this.watchdog.arm(lane);
+    const disarm = this.watchdog.arm(lane);
+    let armed = true;
+    return () => {
+      if (!armed) return;
+      armed = false;
+      disarm();
+      this.silentRetries.delete(lane);
+    };
   }
 
-  /** The token a transport/loop captures at creation so a rebuild ages out its stale signals. */
+  /** The token a transport/loop captures at creation so a restart ages out its stale signals. */
   get remoteGeneration(): number {
     return this.generation;
   }
 
   /** Records lane progress that resets the idle deadline; a stale-generation signal is ignored. */
-  progress(generation?: number): void {
+  progress(generation?: number, lane?: WatchdogLane): void {
     if (generation !== undefined && generation !== this.generation) return;
-    this.watchdog.progress();
+    if (lane !== undefined) this.watchdog.progress(lane);
     this.lastTransportActivityAt = this.timer.now();
   }
 
@@ -314,12 +328,17 @@ export class StoreRecovery {
   /** A surfaced pthread error while lanes are idle marks the pool dead and rebuilds early. */
   reportThreadError(generation?: number): void {
     if (generation !== undefined && generation !== this.generation) return;
-    void this.onSuspect("checkpoint");
+    this.onSuspect("wal-write");
   }
 
   onRemoteActive(): void {
     this.remoteBusy = true;
     this.lastActivityAt = this.timer.now();
+  }
+
+  /** Clears the in-flight turn fence even when the turn failed or scheduled more work. */
+  onRemoteSettled(): void {
+    this.remoteBusy = false;
   }
 
   onRemoteIdle(): void {
@@ -335,76 +354,54 @@ export class StoreRecovery {
     if (this.disposed) return;
     this.disposed = true;
     this.watchdog.dispose();
-    this.timer.clearInterval(this.checkpointTicker);
+    this.timer.clearInterval(this.walWriteTicker);
   }
 
-  private async onSuspect(lane: WatchdogLane): Promise<void> {
+  private onSuspect(lane: WatchdogLane): void {
     if (this.rebuilding || this.disposed) return;
     if ((lane === "push" || lane === "pull" || lane === "remote-start") && this.transportSilent()) {
-      this.remoteBusy = false;
-      this.host.emitRemoteError("embedded remote replication offline; reconnecting");
-      this.host.closeRemoteSocket?.();
-      this.watchdog.reset();
-      return;
-    }
-    this.rebuilding = true;
-    const laneClass = laneClassOf(lane);
-    this.host.emitDegraded(`embedded store instance wedged on ${lane} lane`);
-    if (this.breaker.record(this.timer.now(), laneClass)) {
-      const trip = classifyTrip(this.breaker.windowLaneClasses(), this.lastRebuildSucceeded);
-      if (trip === "dead") {
-        this.host.deadInstance(
-          new Error("embedded store instance failed repeatedly and cannot be recovered"),
-        );
-        this.dispose();
+      const retries = (this.silentRetries.get(lane) ?? 0) + 1;
+      this.silentRetries.set(lane, retries);
+      if (retries === 1) {
+        this.host.emitRemoteError("embedded remote replication offline; reconnecting");
+        this.host.closeRemoteSocket?.();
+        // Keep supervising the same promise. If closing the socket fails to settle it before the
+        // next deadline, the second suspect is a terminal instance wedge.
+        this.watchdog.retry(lane);
         return;
       }
-      this.host.stopRemote();
-      this.host.emitRemoteError("embedded remote replication stopped after repeated failures");
-      this.rebuilding = false;
-      return;
     }
+    this.rebuilding = true;
+    this.host.emitDegraded(`embedded store instance wedged on ${lane} lane`);
     this.generation += 1;
-    this.watchdog.reset();
-    try {
-      await this.host.rebuild();
-      this.remoteBusy = false;
-      this.lastRebuildSucceeded = true;
-      this.lastActivityAt = this.timer.now();
-      this.lastCheckpointAt = this.timer.now();
-      this.host.emitReady();
-    } catch (error) {
-      this.lastRebuildSucceeded = false;
-      this.host.deadInstance(error instanceof Error ? error : new Error(String(error)));
-      this.dispose();
-    } finally {
-      this.rebuilding = false;
-    }
+    this.silentRetries.clear();
+    this.host.deadInstance(new Error(`embedded store instance wedged on ${lane} lane`));
+    this.dispose();
   }
 
   private transportSilent(): boolean {
     return this.timer.now() - this.lastTransportActivityAt >= this.idleMs;
   }
 
-  private async pollCheckpoint(): Promise<void> {
+  private async walWrite(): Promise<void> {
     if (this.rebuilding || this.disposed) return;
     if (
-      !checkpointDue({
-        idleMs: this.checkpointIdleMs,
+      !walWriteDue({
+        idleMs: this.walWriteIdleMs,
         lastActivityAt: this.lastActivityAt,
-        lastCheckpointAt: this.lastCheckpointAt,
+        lastWalWriteAt: this.lastWalWriteAt,
         now: this.timer.now(),
         remoteBusy: this.remoteBusy,
       })
     ) {
       return;
     }
-    this.lastCheckpointAt = this.timer.now();
-    const disarm = this.watchdog.arm("checkpoint");
+    this.lastWalWriteAt = this.timer.now();
+    const disarm = this.watchdog.arm("wal-write");
     try {
-      await this.host.runCheckpoint();
+      await this.host.walWrite();
     } catch {
-      // Swallowed exactly like the boot checkpoint; a hang is covered by the armed watchdog.
+      // Best-effort like the boot WAL write; a hang is covered by the armed watchdog.
     } finally {
       disarm();
     }

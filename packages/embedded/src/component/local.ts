@@ -5,7 +5,7 @@ import { write as checkpointWrite } from "./crdt/checkpoint";
 import { get as fieldGet, read as fieldRead } from "./crdt/field";
 import { delete as payloadDelete } from "./crdt/payload";
 import { delete as fileDelete, read as fileRead } from "./file";
-import { delete as mutationDelete, read as mutationRead } from "./mutation";
+import { delete as mutationDelete, read as mutationCacheRead } from "./mutation";
 import {
   acknowledge,
   commit,
@@ -17,7 +17,6 @@ import {
 } from "./protocol";
 import { read as clientRead, retire as clientRetire } from "./remote/client";
 import {
-  ack,
   checkpointWrite as revisionCheckpointWrite,
   create,
   createLocal,
@@ -28,7 +27,7 @@ import {
   restoreRead,
   retain,
   retainLocal,
-  set,
+  restore,
 } from "./rev";
 
 /** Package-owned component modules recognized by the local runtime. @internal */
@@ -38,7 +37,7 @@ export const embeddedComponentModules: ModuleMap = {
   "crdt/field": { get: fieldGet, read: fieldRead },
   "crdt/payload": { delete: payloadDelete },
   file: { delete: fileDelete, read: fileRead },
-  mutation: { delete: mutationDelete, read: mutationRead },
+  mutation: { delete: mutationDelete, read: mutationCacheRead },
   protocol: {
     acknowledge,
     commit,
@@ -50,7 +49,6 @@ export const embeddedComponentModules: ModuleMap = {
   },
   "remote/client": { read: clientRead, retire: clientRetire },
   rev: {
-    ack,
     checkpointWrite: revisionCheckpointWrite,
     create,
     createLocal,
@@ -61,6 +59,6 @@ export const embeddedComponentModules: ModuleMap = {
     restoreRead,
     retain,
     retainLocal,
-    set,
+    restore,
   },
 };

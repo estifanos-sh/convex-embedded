@@ -1,8 +1,8 @@
 use std::{future::Future, pin::Pin};
 
 use storage::{
-    IdMapping, PendingUpload, RemotePull, RemotePullResult, RemotePushSettlement,
-    RemotePushSettlementResult, RowHead, StorageError, UploadLeaseWrite,
+    IdMapping, PendingUpload, RemotePageWrite, RemotePageWriteResult, RemoteSettlementWrite,
+    RemoteSettlementWriteResult, RowHead, StorageError, UploadLeaseWrite,
 };
 
 use crate::RemoteResult;
@@ -43,21 +43,22 @@ pub trait RemoteStore {
         table: &str,
         server_document_id: &str,
     ) -> Result<Option<String>, StorageError>;
-    fn projection_read(&self, table: &str, local_id: &str)
+    fn remote_doc_read(&self, table: &str, local_id: &str)
         -> Result<Option<RowHead>, StorageError>;
 
-    fn remote_read_cursor(&self, subscription: &str) -> Result<Option<String>, StorageError>;
+    fn remote_cursor_read(&self, subscription: &str) -> Result<Option<String>, StorageError>;
     fn remote_progress_has(&self) -> Result<bool, StorageError>;
     fn remote_subscription_read(&self) -> Result<Vec<String>, StorageError>;
+    fn remote_pending_read(&self) -> Result<storage::RemotePending, StorageError>;
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError>;
-    fn remote_push_settle(
+    fn remote_settlement_write(
         &self,
-        settlement: &RemotePushSettlement,
-    ) -> Result<RemotePushSettlementResult, StorageError>;
-    fn remote_settlement_ack_read(&self, _num_items: usize) -> Result<Vec<String>, StorageError> {
+        settlement: &RemoteSettlementWrite,
+    ) -> Result<RemoteSettlementWriteResult, StorageError>;
+    fn remote_receipt_read(&self, _num_items: usize) -> Result<Vec<String>, StorageError> {
         Ok(Vec::new())
     }
-    fn remote_settlement_ack_complete(&self, _mutation_ids: &[String]) -> Result<(), StorageError> {
+    fn remote_receipt_delete(&self, _mutation_ids: &[String]) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -95,12 +96,12 @@ pub trait RemoteStore {
         table: &str,
         id: &str,
     ) -> Result<Vec<storage::CrdtSnapshot>, StorageError>;
-    fn remote_pull_page_queue(&self, pull: RemotePull) -> RemoteStoreFuture<RemotePullResult>;
+    fn remote_page_write(&self, pull: RemotePageWrite) -> RemoteStoreFuture<RemotePageWriteResult>;
     fn remote_subscription_delete_queue(
         &self,
         subscription: String,
         now_ms: i64,
-    ) -> RemoteStoreFuture<RemotePullResult>;
+    ) -> RemoteStoreFuture<RemotePageWriteResult>;
 }
 
 pub trait RemoteClock {
@@ -202,15 +203,15 @@ impl RemoteStore for std::sync::Arc<storage::EmbeddedStore> {
     ) -> Result<Option<String>, StorageError> {
         storage::EmbeddedStore::id_local_read(self, table, server_document_id)
     }
-    fn projection_read(
+    fn remote_doc_read(
         &self,
         table: &str,
         local_id: &str,
     ) -> Result<Option<RowHead>, StorageError> {
-        storage::EmbeddedStore::projection_read(self, table, local_id)
+        storage::EmbeddedStore::remote_doc_read(self, table, local_id)
     }
-    fn remote_read_cursor(&self, subscription: &str) -> Result<Option<String>, StorageError> {
-        storage::EmbeddedStore::remote_read_cursor(self, subscription)
+    fn remote_cursor_read(&self, subscription: &str) -> Result<Option<String>, StorageError> {
+        storage::EmbeddedStore::remote_cursor_read(self, subscription)
     }
     fn remote_progress_has(&self) -> Result<bool, StorageError> {
         storage::EmbeddedStore::remote_progress_has(self)
@@ -218,20 +219,23 @@ impl RemoteStore for std::sync::Arc<storage::EmbeddedStore> {
     fn remote_subscription_read(&self) -> Result<Vec<String>, StorageError> {
         storage::EmbeddedStore::remote_subscription_read(self)
     }
+    fn remote_pending_read(&self) -> Result<storage::RemotePending, StorageError> {
+        storage::EmbeddedStore::remote_pending_read(self)
+    }
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         storage::EmbeddedStore::remote_push_envelope_read(self, num_items)
     }
-    fn remote_push_settle(
+    fn remote_settlement_write(
         &self,
-        settlement: &RemotePushSettlement,
-    ) -> Result<RemotePushSettlementResult, StorageError> {
-        storage::EmbeddedStore::remote_push_settle(self, settlement)
+        settlement: &RemoteSettlementWrite,
+    ) -> Result<RemoteSettlementWriteResult, StorageError> {
+        storage::EmbeddedStore::remote_settlement_write(self, settlement)
     }
-    fn remote_settlement_ack_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
-        storage::EmbeddedStore::remote_settlement_ack_read(self, num_items)
+    fn remote_receipt_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
+        storage::EmbeddedStore::remote_receipt_read(self, num_items)
     }
-    fn remote_settlement_ack_complete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
-        storage::EmbeddedStore::remote_settlement_ack_complete(self, mutation_ids)
+    fn remote_receipt_delete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
+        storage::EmbeddedStore::remote_receipt_delete(self, mutation_ids)
     }
     fn crdt_remote_state(
         &self,
@@ -276,23 +280,23 @@ impl RemoteStore for std::sync::Arc<storage::EmbeddedStore> {
         storage::EmbeddedStore::crdt_snapshot_read(self, table, id)
     }
     #[cfg(not(target_arch = "wasm32"))]
-    fn remote_pull_page_queue(&self, pull: RemotePull) -> RemoteStoreFuture<RemotePullResult> {
+    fn remote_page_write(&self, pull: RemotePageWrite) -> RemoteStoreFuture<RemotePageWriteResult> {
         let store = std::sync::Arc::clone(self);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || store.remote_pull_page(&pull))
-                .await
-                .map_err(|error| {
-                    StorageError::Unsatisfiable(format!(
-                        "projection storage task terminated: {error}"
-                    ))
-                })?
+            tokio::task::spawn_blocking(move || {
+                storage::EmbeddedStore::remote_page_write(&store, &pull)
+            })
+            .await
+            .map_err(|error| {
+                StorageError::Unsatisfiable(format!("projection storage task terminated: {error}"))
+            })?
         })
     }
     fn remote_subscription_delete_queue(
         &self,
         subscription: String,
         now_ms: i64,
-    ) -> RemoteStoreFuture<RemotePullResult> {
+    ) -> RemoteStoreFuture<RemotePageWriteResult> {
         let store = std::sync::Arc::clone(self);
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
@@ -355,15 +359,15 @@ impl<S: RemoteStore + ?Sized> RemoteStore for Box<S> {
     ) -> Result<Option<String>, StorageError> {
         self.as_ref().id_local_read(table, server_document_id)
     }
-    fn projection_read(
+    fn remote_doc_read(
         &self,
         table: &str,
         local_id: &str,
     ) -> Result<Option<RowHead>, StorageError> {
-        self.as_ref().projection_read(table, local_id)
+        self.as_ref().remote_doc_read(table, local_id)
     }
-    fn remote_read_cursor(&self, subscription: &str) -> Result<Option<String>, StorageError> {
-        self.as_ref().remote_read_cursor(subscription)
+    fn remote_cursor_read(&self, subscription: &str) -> Result<Option<String>, StorageError> {
+        self.as_ref().remote_cursor_read(subscription)
     }
     fn remote_progress_has(&self) -> Result<bool, StorageError> {
         self.as_ref().remote_progress_has()
@@ -371,20 +375,23 @@ impl<S: RemoteStore + ?Sized> RemoteStore for Box<S> {
     fn remote_subscription_read(&self) -> Result<Vec<String>, StorageError> {
         self.as_ref().remote_subscription_read()
     }
+    fn remote_pending_read(&self) -> Result<storage::RemotePending, StorageError> {
+        self.as_ref().remote_pending_read()
+    }
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         self.as_ref().remote_push_envelope_read(num_items)
     }
-    fn remote_push_settle(
+    fn remote_settlement_write(
         &self,
-        settlement: &RemotePushSettlement,
-    ) -> Result<RemotePushSettlementResult, StorageError> {
-        self.as_ref().remote_push_settle(settlement)
+        settlement: &RemoteSettlementWrite,
+    ) -> Result<RemoteSettlementWriteResult, StorageError> {
+        self.as_ref().remote_settlement_write(settlement)
     }
-    fn remote_settlement_ack_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
-        self.as_ref().remote_settlement_ack_read(num_items)
+    fn remote_receipt_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
+        self.as_ref().remote_receipt_read(num_items)
     }
-    fn remote_settlement_ack_complete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
-        self.as_ref().remote_settlement_ack_complete(mutation_ids)
+    fn remote_receipt_delete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
+        self.as_ref().remote_receipt_delete(mutation_ids)
     }
     fn crdt_remote_state(
         &self,
@@ -421,14 +428,14 @@ impl<S: RemoteStore + ?Sized> RemoteStore for Box<S> {
     ) -> Result<Vec<storage::CrdtSnapshot>, StorageError> {
         self.as_ref().crdt_snapshot_read(table, id)
     }
-    fn remote_pull_page_queue(&self, pull: RemotePull) -> RemoteStoreFuture<RemotePullResult> {
-        self.as_ref().remote_pull_page_queue(pull)
+    fn remote_page_write(&self, pull: RemotePageWrite) -> RemoteStoreFuture<RemotePageWriteResult> {
+        self.as_ref().remote_page_write(pull)
     }
     fn remote_subscription_delete_queue(
         &self,
         subscription: String,
         now_ms: i64,
-    ) -> RemoteStoreFuture<RemotePullResult> {
+    ) -> RemoteStoreFuture<RemotePageWriteResult> {
         self.as_ref()
             .remote_subscription_delete_queue(subscription, now_ms)
     }
@@ -522,16 +529,16 @@ mod tests {
             self.record("id_local_read");
             Ok(None)
         }
-        fn projection_read(
+        fn remote_doc_read(
             &self,
             _table: &str,
             _local_id: &str,
         ) -> Result<Option<RowHead>, StorageError> {
-            self.record("projection_read");
+            self.record("remote_doc_read");
             Ok(None)
         }
-        fn remote_read_cursor(&self, _subscription: &str) -> Result<Option<String>, StorageError> {
-            self.record("remote_read_cursor");
+        fn remote_cursor_read(&self, _subscription: &str) -> Result<Option<String>, StorageError> {
+            self.record("remote_cursor_read");
             Ok(None)
         }
         fn remote_progress_has(&self) -> Result<bool, StorageError> {
@@ -542,6 +549,10 @@ mod tests {
             self.record("remote_subscription_read");
             Ok(Vec::new())
         }
+        fn remote_pending_read(&self) -> Result<storage::RemotePending, StorageError> {
+            self.record("remote_pending_read");
+            Ok(storage::RemotePending::default())
+        }
         fn remote_push_envelope_read(
             &self,
             _num_items: usize,
@@ -549,25 +560,19 @@ mod tests {
             self.record("remote_push_envelope_read");
             Ok(Vec::new())
         }
-        fn remote_push_settle(
+        fn remote_settlement_write(
             &self,
-            _settlement: &RemotePushSettlement,
-        ) -> Result<RemotePushSettlementResult, StorageError> {
-            self.record("remote_push_settle");
+            _settlement: &RemoteSettlementWrite,
+        ) -> Result<RemoteSettlementWriteResult, StorageError> {
+            self.record("remote_settlement_write");
             Err(Self::unsatisfiable())
         }
-        fn remote_settlement_ack_read(
-            &self,
-            _num_items: usize,
-        ) -> Result<Vec<String>, StorageError> {
-            self.record("remote_settlement_ack_read");
+        fn remote_receipt_read(&self, _num_items: usize) -> Result<Vec<String>, StorageError> {
+            self.record("remote_receipt_read");
             Ok(Vec::new())
         }
-        fn remote_settlement_ack_complete(
-            &self,
-            _mutation_ids: &[String],
-        ) -> Result<(), StorageError> {
-            self.record("remote_settlement_ack_complete");
+        fn remote_receipt_delete(&self, _mutation_ids: &[String]) -> Result<(), StorageError> {
+            self.record("remote_receipt_delete");
             Ok(())
         }
         fn crdt_remote_state(
@@ -608,21 +613,24 @@ mod tests {
             self.record("crdt_snapshot_read");
             Ok(Vec::new())
         }
-        fn remote_pull_page_queue(&self, _pull: RemotePull) -> RemoteStoreFuture<RemotePullResult> {
-            self.record("remote_pull_page_queue");
+        fn remote_page_write(
+            &self,
+            _pull: RemotePageWrite,
+        ) -> RemoteStoreFuture<RemotePageWriteResult> {
+            self.record("remote_page_write");
             Box::pin(async { Err(Self::unsatisfiable()) })
         }
         fn remote_subscription_delete_queue(
             &self,
             _subscription: String,
             _now_ms: i64,
-        ) -> RemoteStoreFuture<RemotePullResult> {
+        ) -> RemoteStoreFuture<RemotePageWriteResult> {
             self.record("remote_subscription_delete_queue");
             Box::pin(async { Err(Self::unsatisfiable()) })
         }
     }
 
-    const EVERY_METHOD: [&str; 24] = [
+    const EVERY_METHOD: [&str; 25] = [
         "store_job_count",
         "schema_table_names",
         "identity_write",
@@ -633,19 +641,20 @@ mod tests {
         "blob_write",
         "id_read",
         "id_local_read",
-        "projection_read",
-        "remote_read_cursor",
+        "remote_doc_read",
+        "remote_cursor_read",
         "remote_progress_has",
         "remote_subscription_read",
+        "remote_pending_read",
         "remote_push_envelope_read",
-        "remote_push_settle",
-        "remote_settlement_ack_read",
-        "remote_settlement_ack_complete",
+        "remote_settlement_write",
+        "remote_receipt_read",
+        "remote_receipt_delete",
         "crdt_remote_state",
         "crdt_remote_effect",
         "crdt_read_states",
         "crdt_snapshot_read",
-        "remote_pull_page_queue",
+        "remote_page_write",
         "remote_subscription_delete_queue",
     ];
 
@@ -664,7 +673,8 @@ mod tests {
         let _ = boxed.schema_table_names();
         let _ = boxed.identity_write("k", None);
         let _ = boxed.upload_has_pending();
-        let _ = boxed.upload_lease_write(UploadLeaseWrite::Claim {
+        let _ = boxed.upload_lease_write(UploadLeaseWrite::Claimed {
+            local_storage_id: None,
             owner: String::new(),
             now_ms: 0,
             lease_until: 0,
@@ -674,29 +684,30 @@ mod tests {
         let _ = boxed.blob_write("k", Vec::new());
         let _ = boxed.id_read("t", "l");
         let _ = boxed.id_local_read("t", "s");
-        let _ = boxed.projection_read("t", "l");
-        let _ = boxed.remote_read_cursor("s");
+        let _ = boxed.remote_doc_read("t", "l");
+        let _ = boxed.remote_cursor_read("s");
         let _ = boxed.remote_progress_has();
         let _ = boxed.remote_subscription_read();
+        let _ = boxed.remote_pending_read();
         let _ = boxed.remote_push_envelope_read(1);
-        let _ = boxed.remote_push_settle(&RemotePushSettlement {
+        let _ = boxed.remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: String::new(),
             expected_commit_seq: 0,
             now_ms: 0,
-            outcome: storage::RemotePushSettlementOutcome::Rejected {
+            outcome: storage::RemoteSettlementOutcome::Rejected {
                 schedules: Vec::new(),
                 targets: Vec::new(),
                 projections: Vec::new(),
             },
         });
-        let _ = boxed.remote_settlement_ack_read(1);
-        let _ = boxed.remote_settlement_ack_complete(&[]);
+        let _ = boxed.remote_receipt_read(1);
+        let _ = boxed.remote_receipt_delete(&[]);
         let _ = boxed.crdt_remote_state("t", "i", "f", CrdtFieldKind::Text);
         let _ = boxed.crdt_remote_effect("t", "i", "f", CrdtFieldKind::Text, &[], &[]);
         let _ = boxed.crdt_read_states("t", "i");
         let _ = boxed.crdt_snapshot_read("t", "i");
         let _ = boxed
-            .remote_pull_page_queue(RemotePull {
+            .remote_page_write(RemotePageWrite {
                 subscription: String::new(),
                 members: Vec::new(),
                 projections: Vec::new(),

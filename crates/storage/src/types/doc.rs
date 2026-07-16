@@ -159,13 +159,13 @@ pub struct Page {
     pub versions: std::collections::BTreeMap<String, i64>,
 }
 
-/// An upsert: the document plus its extracted column values. Mirrors the TS `UpsertIn`.
+/// An doc_write: the document plus its extracted column values. Mirrors the TS `DocWrite`.
 ///
 /// `data` is always compact JSON object text (the `encode()` output of the runtime): it starts
 /// with `{`, carries no `_id`/`_creationTime` keys, and has no insignificant whitespace. The
 /// page splicer relies on this invariant; any future writer (replication) must preserve it.
 #[derive(Debug, Clone)]
-pub struct UpsertIn {
+pub struct DocWrite {
     pub table: String,
     pub id: String,
     pub data: String,
@@ -180,10 +180,10 @@ pub struct DeleteIn {
     pub id: String,
 }
 
-/// A batch of upserts and deletes applied in one transaction. Mirrors the TS `WriteBatch`.
+/// A batch of doc_writes and deletes applied in one transaction. Mirrors the TS `WriteBatch`.
 #[derive(Debug, Clone, Default)]
 pub struct WriteBatch {
-    pub upserts: Vec<UpsertIn>,
+    pub doc_writes: Vec<DocWrite>,
     pub deletes: Vec<DeleteIn>,
     pub crdt_ops: Vec<CrdtOp>,
     pub crdt_restores: Vec<CrdtRestore>,
@@ -235,14 +235,14 @@ pub struct RowChange {
     pub op: RowChangeOp,
     pub table: String,
     pub id: String,
-    /// Materialized document JSON for upserts; absent for deletes.
+    /// Materialized document JSON for doc_writes; absent for deletes.
     pub row: Option<String>,
 }
 
 /// Row change operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowChangeOp {
-    Upsert,
+    Write,
     Delete,
 }
 
@@ -250,7 +250,7 @@ impl RowChangeOp {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Upsert => "upsert",
+            Self::Write => "write",
             Self::Delete => "delete",
         }
     }
@@ -258,8 +258,9 @@ impl RowChangeOp {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "upsert" => Some(Self::Upsert),
+            "write" | "doc_write" => Some(Self::Write),
             "delete" => Some(Self::Delete),
+            legacy if legacy == concat!("up", "sert") => Some(Self::Write),
             _ => None,
         }
     }

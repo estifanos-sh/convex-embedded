@@ -127,7 +127,7 @@ export function createStorageService(
         { id: storageId, table: "_pending_uploads" },
       ];
       const mapping = service.id ? await service.id.read("_storage", storageId) : undefined;
-      const upserts = mapping
+      const docWrites = mapping
         ? [
             {
               id: `_storage|${storageId}`,
@@ -144,9 +144,9 @@ export function createStorageService(
         changedTables: ["_storage", "_pending_uploads", "_id_mappings"],
         deletes,
         type: "data",
-        upserts,
+        docWrites,
       });
-      emit({ at, deletes, type: "storage", upserts });
+      emit({ at, deletes, type: "storage", docWrites });
     },
     async generateUploadUrl() {
       const token = randomId("upload");

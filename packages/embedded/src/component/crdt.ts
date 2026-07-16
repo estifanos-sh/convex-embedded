@@ -2,7 +2,7 @@ import type { DataModelFromSchemaDefinition, MutationBuilder } from "convex/serv
 import { mutationGeneric } from "convex/server";
 import { v } from "convex/values";
 
-import { deleteProgress, deleteProgressValidator } from "./model";
+import { deleteResult, deleteResultValidator } from "./model";
 import schema from "./schema";
 
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
@@ -15,10 +15,10 @@ export const clear = mutation({
     expectedEpoch: v.number(),
     numItems: v.number(),
   },
-  returns: deleteProgressValidator,
+  returns: deleteResultValidator,
   handler: async (ctx, args) => {
     const field = await ctx.db.get("crdtFields", args.fieldId);
-    if (!field) return deleteProgress(0, true);
+    if (!field) return deleteResult(0, true);
     if (!field.detached || field.epoch !== args.expectedEpoch) {
       throw new Error("Only the expected detached CRDT epoch can be cleared.");
     }
@@ -31,7 +31,7 @@ export const clear = mutation({
       .take(limit + 1);
     const payloadPage = payloads.slice(0, limit);
     for (const payload of payloadPage) await ctx.db.delete("crdtPayloads", payload._id);
-    if (payloadPage.length === limit) return deleteProgress(payloadPage.length, false);
+    if (payloadPage.length === limit) return deleteResult(payloadPage.length, false);
 
     const remaining = limit - payloadPage.length;
     const checkpoints = await ctx.db
@@ -52,9 +52,9 @@ export const clear = mutation({
       await ctx.db.delete("crdtCheckpoints", checkpoint._id);
     }
     const deleted = payloadPage.length + checkpointPage.length;
-    if (checkpointPage.length === remaining) return deleteProgress(deleted, false);
+    if (checkpointPage.length === remaining) return deleteResult(deleted, false);
     await ctx.db.delete("crdtFields", field._id);
-    return deleteProgress(deleted + 1, true);
+    return deleteResult(deleted + 1, true);
   },
 });
 

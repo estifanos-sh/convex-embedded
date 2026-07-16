@@ -211,6 +211,7 @@ function isOwnershipReplaySafe(request: WorkerRequest): boolean {
     case WorkerCommand.IdentityRead:
     case WorkerCommand.IdentityWrite:
     case WorkerCommand.RemoteIdentityRead:
+    case WorkerCommand.RemoteNetworkWrite:
       return true;
     case WorkerCommand.Route:
       return request.kind === "query";
@@ -218,6 +219,7 @@ function isOwnershipReplaySafe(request: WorkerRequest): boolean {
     case WorkerCommand.Upload:
     case WorkerCommand.Devtools:
     case WorkerCommand.AuthTokenResult:
+    case WorkerCommand.StorageOwnerWrite:
       return false;
   }
 }

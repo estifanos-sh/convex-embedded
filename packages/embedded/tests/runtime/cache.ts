@@ -72,7 +72,7 @@ const functions = {
       };
     },
   }),
-  // A partial list omits `body`: complete-document matching prunes nothing, so the entry references
+  // A partial list omits `body`: complete-document matching encodes nothing, so the entry references
   // no rows and a body edit produces no list re-emit (§5 benchmark invariant).
   list: query({
     args: { channel: v.string() },
@@ -150,7 +150,7 @@ class CacheStore implements RuntimeStorage {
     });
   }
 
-  readonly capabilities = { exactScanBounds: false };
+  readonly capabilities = { hasExactBounds: false };
 
   readonly doc = {
     read: (_table: string, id: string): Promise<StoredDoc | undefined> =>
@@ -296,6 +296,8 @@ function resultTick(changedResults: string[]): RemoteTick {
     changedTables: [],
     pullAttempted: 1,
     pullDiagnostics: 0,
+    pullChangesApplied: 0,
+    pullSnapshots: 0,
     pushAccepted: 0,
     pushAttempted: 0,
     pushConflicts: 0,
@@ -307,7 +309,7 @@ function resultTick(changedResults: string[]): RemoteTick {
     retainedRevisions: [],
     rowsApplied: 0,
     sent: 0,
-    settlementsAcknowledged: 0,
+    receiptsPushed: 0,
     storeJobs: 0,
   };
 }
@@ -318,7 +320,7 @@ function pullResultSkeleton(r: Runner, keys: string[]): void {
   consumeRemoteTick(resultTick(keys), r, () => undefined);
 }
 
-// A whole-doc point disclosure tick: the pruned root skeleton ships alongside its member row, so the
+// A whole-doc point disclosure tick: the encoded root skeleton ships alongside its member row, so the
 // pull reports the applied member (changedTables) and the rewritten entry (changedResults) together.
 function memberTick(changedTables: string[], changedResults: string[]): RemoteTick {
   return { ...resultTick(changedResults), changedTables, rowsApplied: changedTables.length };
@@ -590,7 +592,7 @@ describe("retained-result cache read path", () => {
 
   test("real tick: whole-doc point disclosure reruns a get watch on an unmapped hosted id", async () => {
     // The Cut 7 benchmark flow: an observer subscribes documents:get{hostedId} for a row it does not
-    // hold. The server prunes the complete-document result to a root skeleton (`null`) and ships the
+    // hold. The server encodes the complete-document result as a root skeleton (`null`) and ships the
     // row as a member. The pull reports the applied member (changedTables) AND the rewritten entry
     // (changedResults). No manual invalidate — this is the production trigger the earlier tests faked.
     const store = new CacheStore();

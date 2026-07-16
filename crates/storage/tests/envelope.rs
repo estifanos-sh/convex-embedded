@@ -29,7 +29,7 @@ fn pull(
     projections: Vec<AuthoritativeRow>,
     cursor: Option<&str>,
     received_time: i64,
-) -> RemotePull {
+) -> RemotePageWrite {
     let members = projections
         .iter()
         .filter(|projection| projection.row.is_some())
@@ -38,7 +38,7 @@ fn pull(
             server_document_id: projection.server_document_id.clone(),
         })
         .collect();
-    RemotePull {
+    RemotePageWrite {
         subscription: "issues:list:{}".into(),
         members,
         projections,
@@ -60,7 +60,7 @@ fn push_envelope_queue_reads_in_ordinal_order_and_drains_on_complete() {
     for (ordinal, op_id) in ["op-a", "op-b"].into_iter().enumerate() {
         let committed = store
             .commit(
-                upserts(vec![issue(
+                doc_writes(vec![issue(
                     &store,
                     &format!("row-{ordinal}"),
                     op_id,
@@ -84,16 +84,24 @@ fn push_envelope_queue_reads_in_ordinal_order_and_drains_on_complete() {
             .unwrap();
         commit_seqs.push(committed.commit_seq);
     }
+    assert_eq!(
+        store.remote_pending_read().unwrap(),
+        RemotePending {
+            mutations: 2,
+            settlements: 0,
+            uploads: 0,
+        }
+    );
 
     let first = store.remote_push_envelope_read(1).unwrap().remove(0);
     assert!(first.contains(r#""mutationId":"op-a""#));
 
     store
-        .remote_push_settle(&RemotePushSettlement {
+        .remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: "op-a".to_owned(),
             expected_commit_seq: commit_seqs[0],
             now_ms: 6,
-            outcome: RemotePushSettlementOutcome::Applied {
+            outcome: RemoteSettlementOutcome::Applied {
                 ids: Vec::new(),
                 schedules: Vec::new(),
                 projections: Vec::new(),
@@ -101,19 +109,19 @@ fn push_envelope_queue_reads_in_ordinal_order_and_drains_on_complete() {
             },
         })
         .unwrap();
-    assert_eq!(store.remote_settlement_ack_read(10).unwrap(), vec!["op-a"]);
-    store
-        .remote_settlement_ack_complete(&["op-a".to_owned()])
-        .unwrap();
+    assert_eq!(store.remote_receipt_read(10).unwrap(), vec!["op-a"]);
+    assert_eq!(store.remote_pending_read().unwrap().mutations, 1);
+    assert_eq!(store.remote_pending_read().unwrap().settlements, 1);
+    store.remote_receipt_delete(&["op-a".to_owned()]).unwrap();
     let second = store.remote_push_envelope_read(1).unwrap().remove(0);
     assert!(second.contains(r#""mutationId":"op-b""#));
 
     store
-        .remote_push_settle(&RemotePushSettlement {
+        .remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: "op-b".to_owned(),
             expected_commit_seq: commit_seqs[1],
             now_ms: 7,
-            outcome: RemotePushSettlementOutcome::Applied {
+            outcome: RemoteSettlementOutcome::Applied {
                 ids: Vec::new(),
                 schedules: Vec::new(),
                 projections: Vec::new(),
@@ -122,11 +130,13 @@ fn push_envelope_queue_reads_in_ordinal_order_and_drains_on_complete() {
         })
         .unwrap();
     assert!(store.remote_push_envelope_read(1).unwrap().is_empty());
-    assert_eq!(store.remote_settlement_ack_read(10).unwrap(), vec!["op-b"]);
-    store
-        .remote_settlement_ack_complete(&["op-b".to_owned()])
-        .unwrap();
-    assert!(store.remote_settlement_ack_read(10).unwrap().is_empty());
+    assert_eq!(store.remote_receipt_read(10).unwrap(), vec!["op-b"]);
+    store.remote_receipt_delete(&["op-b".to_owned()]).unwrap();
+    assert!(store.remote_receipt_read(10).unwrap().is_empty());
+    assert_eq!(
+        store.remote_pending_read().unwrap(),
+        RemotePending::default()
+    );
 }
 
 #[test]
@@ -150,7 +160,7 @@ fn local_commit_writes_its_push_envelope_atomically() {
 
     let committed = store
         .commit(
-            upserts(vec![issue(&store, "first", "first", "open")]),
+            doc_writes(vec![issue(&store, "first", "first", "open")]),
             &options,
         )
         .unwrap();
@@ -160,7 +170,7 @@ fn local_commit_writes_its_push_envelope_atomically() {
     assert!(store.doc_read("issues", "first").unwrap().is_some());
 
     let rejected = store.commit(
-        upserts(vec![issue(&store, "second", "second", "open")]),
+        doc_writes(vec![issue(&store, "second", "second", "open")]),
         &CommitOptions::terminal(
             MutationCall {
                 args: "{}".into(),
@@ -199,7 +209,7 @@ fn push_only_commit_does_not_create_a_local_retry_record() {
 
     store
         .commit(
-            upserts(vec![issue(&store, "push-only", "push-only", "open")]),
+            doc_writes(vec![issue(&store, "push-only", "push-only", "open")]),
             &options,
         )
         .unwrap();
@@ -208,7 +218,7 @@ fn push_only_commit_does_not_create_a_local_retry_record() {
     assert_eq!(store.remote_push_envelope_read(1).unwrap().len(), 1);
     assert_eq!(
         store
-            .mutation_begin(&MutationCall {
+            .mutation_write(&MutationCall {
                 args: "{}".into(),
                 mutation_id: "mutation-push-only".into(),
                 name: "issues:write".into(),
@@ -225,7 +235,7 @@ fn pull_apply_stamps_logical_clock_seq_into_the_read_page_versions_sidecar() {
     store.setup(&schema()).unwrap();
 
     store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "open", 41.0)],
             Some("c:1:41"),
             5,
@@ -254,14 +264,14 @@ fn a_higher_seq_pull_change_wins_over_a_lower_one() {
     store.setup(&schema()).unwrap();
 
     store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "old", 10.0)],
             Some("c:1:10"),
             5,
         ))
         .unwrap();
     store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "new", 20.0)],
             Some("c:1:20"),
             6,
@@ -285,7 +295,7 @@ fn accepted_older_local_write_advances_server_base_without_overwriting_newer_edi
     let store = EmbeddedStore::open(tmp_path("envelope_chain.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "seed", 1.0)],
             None,
             1,
@@ -300,14 +310,14 @@ fn accepted_older_local_write_advances_server_base_without_overwriting_newer_edi
     let local_id = parse_docs(&page)[0]["_id"].as_str().unwrap().to_owned();
     let first = commit(
         &store,
-        upserts(vec![issue(&store, &local_id, "first", "first")]),
+        doc_writes(vec![issue(&store, &local_id, "first", "first")]),
     );
     commit(
         &store,
-        upserts(vec![issue(&store, &local_id, "second", "second")]),
+        doc_writes(vec![issue(&store, &local_id, "second", "second")]),
     );
     let original_projection_hash = store
-        .projection_read("issues", &local_id)
+        .remote_doc_read("issues", &local_id)
         .unwrap()
         .unwrap()
         .projection_hash;
@@ -320,11 +330,11 @@ fn accepted_older_local_write_advances_server_base_without_overwriting_newer_edi
         .unwrap();
 
     store
-        .remote_push_settle(&RemotePushSettlement {
+        .remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: "older-write".to_owned(),
             expected_commit_seq: first.commit_seq,
             now_ms: 6,
-            outcome: RemotePushSettlementOutcome::Applied {
+            outcome: RemoteSettlementOutcome::Applied {
                 ids: Vec::new(),
                 schedules: Vec::new(),
                 projections: vec![confirmed],
@@ -337,7 +347,7 @@ fn accepted_older_local_write_advances_server_base_without_overwriting_newer_edi
         read_doc(&store, "issues", &local_id).unwrap()["title"],
         "second"
     );
-    let projection = store.projection_read("issues", &local_id).unwrap().unwrap();
+    let projection = store.remote_doc_read("issues", &local_id).unwrap().unwrap();
     assert_eq!(projection.server_base.as_deref(), Some("plain:first"));
     assert!((projection.logical_clock - 2.0).abs() < f64::EPSILON);
     assert_eq!(projection.projection_hash, original_projection_hash);
@@ -349,7 +359,7 @@ fn a_complete_membership_exit_removes_the_row() {
     store.setup(&schema()).unwrap();
 
     store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "open", 10.0)],
             Some("c:1:10"),
             5,
@@ -357,7 +367,7 @@ fn a_complete_membership_exit_removes_the_row() {
         .unwrap();
 
     store
-        .remote_pull_page(&pull(Vec::new(), Some("c:1:20"), 6))
+        .remote_page_write(&pull(Vec::new(), Some("c:1:20"), 6))
         .unwrap();
 
     let page = store
@@ -372,7 +382,7 @@ fn a_complete_membership_exit_removes_the_row() {
 fn seed_dirty_row(store: &EmbeddedStore) -> (String, CommitResult) {
     store.setup(&schema()).unwrap();
     store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "seed", 1.0)],
             Some("c:1:1"),
             1,
@@ -391,7 +401,7 @@ fn seed_dirty_row(store: &EmbeddedStore) -> (String, CommitResult) {
         .to_owned();
     let edit = commit(
         store,
-        upserts(vec![issue(store, &local_id, "local-dirty", "dirty")]),
+        doc_writes(vec![issue(store, &local_id, "local-dirty", "dirty")]),
     );
     store
         .remote_push_envelope_write("dirty-edit", edit.commit_seq, "{}", 2)
@@ -412,13 +422,51 @@ fn archived_revs(store: &EmbeddedStore, local_id: &str) -> usize {
 }
 
 #[test]
+fn rejected_equal_after_image_settles_without_archiving_a_conflict() {
+    let store =
+        EmbeddedStore::open(tmp_path("envelope_equal_rejection.db").to_str().unwrap()).unwrap();
+    let (local_id, edit) = seed_dirty_row(&store);
+    let mut authoritative = pull_projection(SERVER_ID, "dirty", 2.0);
+    authoritative.local_document_id = Some(local_id.clone());
+    authoritative.row = Some(format!(
+        r#"{{"_id":"{SERVER_ID}","_creationTime":1,"status":"dirty","title":"local-dirty"}}"#
+    ));
+
+    let result = store
+        .remote_settlement_write(&RemoteSettlementWrite {
+            mutation_id: "dirty-edit".into(),
+            expected_commit_seq: edit.commit_seq,
+            now_ms: 3,
+            outcome: RemoteSettlementOutcome::Rejected {
+                schedules: Vec::new(),
+                targets: vec![RemoteRowTarget {
+                    table: "issues".into(),
+                    local_document_id: local_id.clone(),
+                    server_rev_id: None,
+                    retain: false,
+                }],
+                projections: vec![authoritative],
+            },
+        })
+        .unwrap();
+
+    assert!(result.projection.reroots.is_empty());
+    assert_eq!(archived_revs(&store, &local_id), 0);
+    assert_eq!(
+        read_doc(&store, "issues", &local_id).unwrap()["title"],
+        "local-dirty"
+    );
+    assert!(store.dirty_heads_debug_read().unwrap().is_empty());
+}
+
+#[test]
 fn pull_over_a_dirty_row_retains_the_displaced_edit_and_adopts_the_authoritative_row() {
     let store =
         EmbeddedStore::open(tmp_path("envelope_pull_over_dirty.db").to_str().unwrap()).unwrap();
     let (local_id, _edit) = seed_dirty_row(&store);
 
     let result = store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "hosted", 2.0)],
             Some("c:1:2"),
             3,
@@ -448,7 +496,7 @@ fn a_fault_while_adopting_over_a_dirty_row_leaves_no_mixed_state() {
         (local_id, _) = seed_dirty_row(&store);
         fail_next_commit();
         assert!(matches!(
-            store.remote_pull_page(&pull(
+            store.remote_page_write(&pull(
                 vec![pull_projection(SERVER_ID, "hosted", 2.0)],
                 Some("c:1:2"),
                 3,
@@ -479,7 +527,7 @@ fn a_pull_echoing_the_accepted_base_leaves_a_newer_dirty_edit_current() {
     let (local_id, _edit) = seed_dirty_row(&store);
 
     let result = store
-        .remote_pull_page(&pull(
+        .remote_page_write(&pull(
             vec![pull_projection(SERVER_ID, "seed", 1.0)],
             Some("c:1:1b"),
             4,
@@ -506,7 +554,7 @@ fn a_higher_clock_echo_of_the_dirty_base_still_leaves_the_dirty_edit_current() {
     echo.plain_hash = format!("plain:{SERVER_ID}:1");
 
     let result = store
-        .remote_pull_page(&pull(vec![echo], Some("c:1:3echo"), 5))
+        .remote_page_write(&pull(vec![echo], Some("c:1:3echo"), 5))
         .unwrap();
 
     assert!(

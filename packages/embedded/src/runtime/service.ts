@@ -18,7 +18,7 @@ export type ServiceStore = RuntimeStorageWriter &
       | "dirtyHeadsDebugRead"
       | "file"
       | "id"
-      | "projectionDebugRead"
+      | "remoteDocDebugRead"
       | "schedule"
       | "upload"
     >

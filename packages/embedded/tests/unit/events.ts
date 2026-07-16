@@ -68,11 +68,13 @@ describe("public event mapping", () => {
   });
 
   test("remote status maps to the V5 remote union without tick detail", () => {
-    const ready = mapPublicEvent(remote({ status: "tick", tick: undefined, attempt: 2 }));
-    expect(ready).toEqual({ at: 1, attempt: 2, status: "ready", type: "remote" });
-    expect(ready && "tick" in ready).toBe(false);
-    expect(mapPublicEvent(remote({ status: "started" }))).toMatchObject({ status: "ready" });
+    const progress = mapPublicEvent(remote({ status: "tick", tick: undefined, attempt: 2 }));
+    expect(progress).toEqual({ at: 1, attempt: 2, status: "connected", type: "remote" });
+    expect(progress && "tick" in progress).toBe(false);
+    expect(mapPublicEvent(remote({ status: "started" }))).toMatchObject({ status: "starting" });
+    expect(mapPublicEvent(remote({ status: "connected" }))).toMatchObject({ status: "connected" });
     expect(mapPublicEvent(remote({ status: "idle" }))).toMatchObject({ status: "idle" });
+    expect(mapPublicEvent(remote({ status: "offline" }))).toMatchObject({ status: "offline" });
     expect(mapPublicEvent(remote({ status: "closed" }))).toMatchObject({ status: "closed" });
     expect(mapPublicEvent(remote({ status: "error", error: "net", nextRunAt: 9 }))).toEqual({
       at: 1,
@@ -119,18 +121,18 @@ describe("public event mapping", () => {
         deletes: [],
         source: "remote",
         type: "data",
-        upserts: [],
+        docWrites: [],
       }),
     ).toEqual({ at: 1, source: "remote", tables: ["todos"], type: "data" });
     expect(
-      mapPublicEvent({ at: 1, changedTables: ["todos"], deletes: [], type: "data", upserts: [] }),
+      mapPublicEvent({ at: 1, changedTables: ["todos"], deletes: [], type: "data", docWrites: [] }),
     ).toMatchObject({ source: "local" });
   });
 
   test("internal-only events are not surfaced publicly", () => {
     const internalOnly: EmbeddedInternalEvent[] = [
-      { at: 1, deletes: [], type: "storage", upserts: [] },
-      { at: 1, deletes: [], type: "scheduler", upserts: [] },
+      { at: 1, deletes: [], type: "storage", docWrites: [] },
+      { at: 1, deletes: [], type: "scheduler", docWrites: [] },
       { at: 1, id: "s", name: "span", phase: "start", type: "span" },
       { at: 1, conflicts: [{ id: "r", revId: "v", table: "todos" }], type: "conflict" },
     ];

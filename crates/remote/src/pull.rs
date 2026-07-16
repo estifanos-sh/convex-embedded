@@ -58,17 +58,23 @@ pub struct PullCheckpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BootstrapPage {
+pub struct CheckpointPage {
     pub checkpoint: PullCheckpoint,
     pub head_seq: i64,
-    pub chunks: Vec<BootstrapChunk>,
+    pub chunks: Vec<CheckpointChunk>,
     pub payloads: Vec<PullPayload>,
     pub continue_cursor: Option<String>,
     pub is_done: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BootstrapChunk {
+pub enum CheckpointResult {
+    Page(CheckpointPage),
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointChunk {
     pub ordinal: usize,
     pub bytes: Vec<u8>,
     pub hash: String,
@@ -88,7 +94,7 @@ pub struct PullMember {
 }
 
 /// The retained authored-result cache payload of a live pull (Cut 7 §2): the normalized `result`
-/// skeleton with each matched complete-document subtree pruned to `null` in place, plus the
+/// skeleton with each matched complete-document subtree encoded as `null` in place, plus the
 /// `resultRows` addresses that splice those subtrees back at reconstruction. Absent (older/plain-only
 /// shape) means no cache write; present-but-empty still writes the transformed-scalar cache.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,8 +151,25 @@ pub fn args(
     Ok(args)
 }
 
+pub fn live_args(
+    runtime: &RuntimeWireIdentity,
+    pull_fn: &str,
+    pull_args: &serde_json::Value,
+) -> RemoteResult<ConvexArgs> {
+    let request = BTreeMap::from([
+        ("kind".to_owned(), Value::String("live".to_owned())),
+        ("functionName".to_owned(), Value::String(pull_fn.to_owned())),
+        ("args".to_owned(), json_to_convex(pull_args)?),
+        ("runtime".to_owned(), encode_runtime(runtime)),
+    ]);
+    Ok(BTreeMap::from([(
+        "request".to_owned(),
+        Value::Object(request),
+    )]))
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn bootstrap_args(
+pub fn checkpoint_args(
     runtime: &RuntimeWireIdentity,
     pull_fn: &str,
     pull_args: &serde_json::Value,
@@ -159,7 +182,7 @@ pub fn bootstrap_args(
     cursor: Option<&str>,
 ) -> RemoteResult<ConvexArgs> {
     let request = BTreeMap::from([
-        ("kind".to_owned(), Value::String("bootstrap".to_owned())),
+        ("kind".to_owned(), Value::String("checkpoint".to_owned())),
         ("functionName".to_owned(), Value::String(pull_fn.to_owned())),
         ("args".to_owned(), json_to_convex(pull_args)?),
         ("runtime".to_owned(), encode_runtime(runtime)),
@@ -369,13 +392,13 @@ fn decode_change(value: &Value) -> RemoteResult<PullChange> {
     let id = codec::expect_string(field("rowId")?, "rowId")?;
     let plain_hash = codec::expect_string(field("plainHash")?, "plainHash")?;
     let op = RowChangeOp::parse(match op_raw.as_str() {
-        "put" => "upsert",
+        "put" => "write",
         "del" => "delete",
         other => other,
     })
     .ok_or_else(|| RemoteError::Protocol(format!("embedded:pull change invalid op {op_raw}")))?;
     let row = match (op, fields.get("fields")) {
-        (RowChangeOp::Upsert, Some(value)) => Some(codec::row_json_string(
+        (RowChangeOp::Write, Some(value)) => Some(codec::row_json_string(
             value,
             id.clone(),
             fields.get("creationTime"),
@@ -542,66 +565,69 @@ fn decode_checkpoint(value: Option<&Value>) -> RemoteResult<PullCheckpoint> {
     })
 }
 
-pub fn decode_bootstrap(value: Value) -> RemoteResult<BootstrapPage> {
+pub fn decode_checkpoint_page(value: Value) -> RemoteResult<CheckpointResult> {
     let Value::Object(fields) = value else {
         return Err(RemoteError::Protocol(
-            "bootstrap result must be an object".to_owned(),
+            "checkpoint result must be an object".to_owned(),
         ));
     };
+    if matches!(fields.get("kind"), Some(Value::String(kind)) if kind == "stale") {
+        return Ok(CheckpointResult::Stale);
+    }
     let checkpoint = decode_checkpoint(fields.get("checkpoint"))?;
     let head_seq = fields
         .get("headSeq")
-        .ok_or_else(|| RemoteError::Protocol("bootstrap result missing headSeq".to_owned()))
+        .ok_or_else(|| RemoteError::Protocol("checkpoint result missing headSeq".to_owned()))
         .and_then(|value| codec::expect_integral_number(value, "headSeq"))?;
     let Some(Value::Array(values)) = fields.get("chunks") else {
         return Err(RemoteError::Protocol(
-            "bootstrap chunks must be an array".to_owned(),
+            "checkpoint chunks must be an array".to_owned(),
         ));
     };
     let mut chunks = Vec::with_capacity(values.len());
     for value in values {
         let Value::Object(chunk) = value else {
             return Err(RemoteError::Protocol(
-                "bootstrap chunk must be an object".to_owned(),
+                "checkpoint chunk must be an object".to_owned(),
             ));
         };
         let ordinal = chunk
             .get("ordinal")
-            .ok_or_else(|| RemoteError::Protocol("bootstrap chunk missing ordinal".to_owned()))
+            .ok_or_else(|| RemoteError::Protocol("checkpoint chunk missing ordinal".to_owned()))
             .and_then(|value| codec::expect_integral_number(value, "ordinal"))?;
-        chunks.push(BootstrapChunk {
+        chunks.push(CheckpointChunk {
             ordinal: usize::try_from(ordinal).map_err(|_| {
-                RemoteError::Protocol("bootstrap chunk ordinal is invalid".to_owned())
+                RemoteError::Protocol("checkpoint chunk ordinal is invalid".to_owned())
             })?,
             bytes: match chunk.get("bytes") {
                 Some(Value::Bytes(bytes)) => bytes.clone(),
                 _ => {
                     return Err(RemoteError::Protocol(
-                        "bootstrap chunk bytes are invalid".to_owned(),
+                        "checkpoint chunk bytes are invalid".to_owned(),
                     ));
                 }
             },
             hash: chunk
                 .get("hash")
-                .ok_or_else(|| RemoteError::Protocol("bootstrap chunk missing hash".to_owned()))
+                .ok_or_else(|| RemoteError::Protocol("checkpoint chunk missing hash".to_owned()))
                 .and_then(|value| codec::expect_string(value, "hash"))?,
         });
     }
     let Some(Value::Array(values)) = fields.get("payloads") else {
         return Err(RemoteError::Protocol(
-            "bootstrap payloads must be an array".to_owned(),
+            "checkpoint payloads must be an array".to_owned(),
         ));
     };
     let payloads = values
         .iter()
-        .map(|value| decode_payload(value, "bootstrap payload"))
+        .map(|value| decode_payload(value, "checkpoint payload"))
         .collect::<RemoteResult<Vec<_>>>()?;
     let continue_cursor = match fields.get("continueCursor") {
         Some(Value::String(value)) => Some(value.clone()),
         Some(Value::Null) => None,
         _ => {
             return Err(RemoteError::Protocol(
-                "bootstrap cursor is invalid".to_owned(),
+                "checkpoint cursor is invalid".to_owned(),
             ));
         }
     };
@@ -609,18 +635,18 @@ pub fn decode_bootstrap(value: Value) -> RemoteResult<BootstrapPage> {
         Some(Value::Boolean(value)) => *value,
         _ => {
             return Err(RemoteError::Protocol(
-                "bootstrap isDone is invalid".to_owned(),
+                "checkpoint isDone is invalid".to_owned(),
             ));
         }
     };
-    Ok(BootstrapPage {
+    Ok(CheckpointResult::Page(CheckpointPage {
         checkpoint,
         head_seq,
         chunks,
         payloads,
         continue_cursor,
         is_done,
-    })
+    }))
 }
 
 pub fn decode_cursor(value: Value) -> RemoteResult<CursorPage> {
@@ -703,6 +729,27 @@ mod tests {
     }
 
     #[test]
+    fn live_args_address_an_authoritative_one_shot_refresh() {
+        let out = live_args(&runtime(), "messages:list", &args()).unwrap();
+        let Some(Value::Object(request)) = out.get("request") else {
+            panic!("one-shot live pull must carry a protocol request");
+        };
+        assert_eq!(request.get("kind"), Some(&Value::from("live")));
+        assert_eq!(
+            request.get("functionName"),
+            Some(&Value::from("messages:list"))
+        );
+        assert_eq!(
+            request.get("args"),
+            Some(&Value::Object(BTreeMap::from([(
+                "channel".to_owned(),
+                Value::from("live")
+            )])))
+        );
+        assert!(request.contains_key("runtime"));
+    }
+
+    #[test]
     fn decode_reads_snapshot_page() {
         let value = Value::try_from(serde_json::json!({
             "members": [{ "table": "messages", "rowId": "m1" }],
@@ -723,7 +770,7 @@ mod tests {
         );
         assert_eq!(page.changes.len(), 2);
         let PullChangeBody::Row(first) = &page.changes[0].body;
-        assert_eq!(first.op, RowChangeOp::Upsert);
+        assert_eq!(first.op, RowChangeOp::Write);
         let PullChangeBody::Row(second) = &page.changes[1].body;
         assert_eq!(second.op, RowChangeOp::Delete);
         assert!(second.row.is_none());
@@ -777,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_reads_a_bounded_bootstrap_page() {
+    fn decode_reads_a_bounded_checkpoint_page() {
         let value = Value::try_from(serde_json::json!({
             "checkpoint": { "id": "ready-1", "seq": 8, "bytes": 3, "hash": "whole" },
             "headSeq": 9,
@@ -787,13 +834,24 @@ mod tests {
             "isDone": false,
         }))
         .unwrap();
-        let page = decode_bootstrap(value).unwrap();
+        let CheckpointResult::Page(page) = decode_checkpoint_page(value).unwrap() else {
+            panic!("expected a checkpoint page");
+        };
         assert_eq!(page.checkpoint.id, "ready-1");
         assert_eq!(page.chunks[0].ordinal, 0);
         assert_eq!(page.chunks[0].bytes, vec![1, 2]);
         assert_eq!(page.head_seq, 9);
         assert_eq!(page.continue_cursor.as_deref(), Some("payload:8"));
         assert!(!page.is_done);
+    }
+
+    #[test]
+    fn decode_reads_a_stale_checkpoint_outcome() {
+        let value = Value::try_from(serde_json::json!({ "kind": "stale" })).unwrap();
+        assert_eq!(
+            decode_checkpoint_page(value).unwrap(),
+            CheckpointResult::Stale
+        );
     }
 
     #[test]

@@ -101,11 +101,11 @@ export type StoredDoc = Record<string, unknown> & {
 };
 
 /**
- * Upsert operation in a write batch.
+ * Write operation in a write batch.
  *
  * @internal
  */
-export interface UpsertIn {
+export interface DocWrite {
   table: string;
   id: string;
   data: StoredDocData;
@@ -148,10 +148,10 @@ export type CrdtOp =
  * @internal
  */
 export interface WriteBatch {
-  upserts: UpsertIn[];
+  docWrites: DocWrite[];
   deletes: DeleteIn[];
   crdtOps?: CrdtOp[];
-  /** Existing rows whose staged upsert only materializes {@link crdtOps}. */
+  /** Existing rows whose staged docWrite only materializes {@link crdtOps}. */
   crdtOnlyIds?: DeleteIn[];
   crdtRestores?: CrdtRestore[];
   freshIds?: DeleteIn[];
@@ -196,21 +196,21 @@ export type CommitOptions = CommitChanges &
         mutationName: string;
         mutationArgs: string;
         mutationResult: string;
-        mutationFresh: boolean;
+        mutationIsFresh: boolean;
         push?: { json: string; nowMs: number };
       }
   );
 
 /**
- * Single-upsert commit metadata. This lets the runtime carry the common one-row write shape to
+ * Single-docWrite commit metadata. This lets the runtime carry the common one-row write shape to
  * native storage without first materializing a generic batch.
  *
  * @internal
  */
-export interface OneUpsertCommit {
+export interface OneDocWriteCommit {
   dataOnly?: boolean;
   fresh?: boolean;
-  upsert: UpsertIn;
+  docWrite: DocWrite;
 }
 
 /**
@@ -244,7 +244,7 @@ export interface MutationRecord {
  */
 export type StorageRowChange =
   | { id: string; op: "delete"; table: string }
-  | { id: string; op: "upsert"; row: StoredDoc | Record<string, unknown>; table: string };
+  | { id: string; op: "write"; row: StoredDoc | Record<string, unknown>; table: string };
 
 /**
  * Result metadata for a committed storage batch.
@@ -395,7 +395,7 @@ export type IdMapping = IdMappingBase &
 export interface DirtyHeadDebug {
   table: string;
   id: string;
-  op: "upsert" | "delete";
+  op: "write" | "delete";
   firstCommitSeq: number;
   updatedCommitSeq: number;
   createdTime: number;
@@ -408,7 +408,7 @@ export interface DirtyHeadDebug {
 }
 
 /** Internal projection-state diagnostic exposed only through devtools/metal snapshots. @internal */
-export interface ProjectionDebug {
+export interface RemoteDocDebug {
   table: string;
   localDocumentId: string;
   currentRevId: string;
@@ -597,8 +597,13 @@ export interface KeySurface {
  * @internal
  */
 export interface MutationSurface {
-  begin(call: MutationCall, options?: { fresh?: boolean }): Promise<MutationRecord>;
+  write(call: MutationCall, options?: { fresh?: boolean }): Promise<MutationRecord>;
   fail(mutationId: string, error: string): Promise<void>;
+}
+
+/** SQLite WAL maintenance kept below the document/revision checkpoint vocabulary. @internal */
+export interface WalSurface {
+  write(): Promise<void>;
 }
 
 /**
@@ -656,15 +661,19 @@ export interface FileSurface {
  * @internal
  */
 export type UploadLeaseWrite =
-  | { lease: "claim"; owner: string; nowMs: number; leaseUntil: number }
   | {
-      lease: "renew";
-      localStorageId: string;
+      lease: "claimed";
+      localStorageId?: string;
       owner: string;
       nowMs: number;
       leaseUntil: number;
     }
-  | { lease: "release"; localStorageId: string; owner: string; nowMs: number };
+  | {
+      lease: "pending";
+      localStorageId: string;
+      owner: string;
+      nowMs: number;
+    };
 
 /**
  * Lease lifecycle for a local pending upload, collapsed into one write.
@@ -696,7 +705,7 @@ export interface UploadSurface {
 /**
  * Local scheduled job operations.
  *
- * `lease.write` is the ownership boundary: a runtime claims one due or expired-running job, then
+ * `lease.write` is the ownership boundary: a runtime writes one upload into the claimed state, then
  * completes/fails/cancels it before another runtime can claim it.
  *
  * @internal
@@ -717,7 +726,7 @@ export interface ScheduleSurface {
  */
 /**
  * The pull subscription a client publishes (contract §11 D3): the query the server re-runs under
- * normal in-handler auth to authorize, derive the read-set, and bootstrap. The server owns scoping;
+ * normal in-handler auth to authorize, derive the read-set, and pull initial state. The server owns scoping;
  * the client publishes one exact descriptor per watched query and never sends a computed range.
  *
  * @internal
@@ -780,6 +789,10 @@ export interface RemoteTick {
   changedTables: string[];
   rowsApplied: number;
   pullAttempted: number;
+  /** Authoritative row changes durably applied during this tick. */
+  pullChangesApplied: number;
+  /** Complete authoritative membership snapshots durably committed during this tick. */
+  pullSnapshots: number;
   pushAccepted: number;
   pushAttempted: number;
   pushConflicts: number;
@@ -791,19 +804,33 @@ export interface RemoteTick {
   pushFailed: number;
   retainedRevisions: RemoteReroot[];
   sent: number;
-  settlementsAcknowledged: number;
+  receiptsPushed: number;
   storeJobs: number;
   /**
    * Count of retained pull results this tick that failed to apply for a permanent (non-transient)
-   * reason — an incompatible, corrupt, or unsatisfiable-bootstrap manifest. Reported once and held
+   * reason — an incompatible, corrupt, or unsatisfiable checkpoint manifest. Reported once and held
    * without re-attempt until the live manifest changes; never silently resolved.
    */
   pullDiagnostics: number;
+  /** Permanent pull-application failure detail for diagnostics. */
+  pullError?: string;
   /**
    * Retained-result cache keys (Cut 7 §5) whose reconstruction changed this tick with no member or
    * projection row change. The runtime reruns the matching table-invisible watch by key.
    */
   changedResults: string[];
+  /** Authoritative durable and actor-owned work remaining after this tick. */
+  pending?: RemotePending;
+}
+
+/** Work that must reach zero before remote replication is converged. @internal */
+export interface RemotePending {
+  checkpoints: number;
+  inflight: number;
+  mutations: number;
+  scope: number;
+  settlements: number;
+  uploads: number;
 }
 
 /**
@@ -884,7 +911,7 @@ export interface ClockSurface {
  */
 export interface RuntimeStorageCapabilities {
   /** Backend scans enforce bounds and page size exactly, so query terminals can skip rechecks. */
-  exactScanBounds?: boolean;
+  hasExactBounds?: boolean;
 }
 
 /**
@@ -908,7 +935,7 @@ export interface RuntimeStorage {
   readonly mutation?: MutationSurface;
   readonly remote?: RemoteSurface;
   commit(batch: WriteBatch, options?: CommitOptions): Promise<CommitResult>;
-  commitOneUpsert?(commit: OneUpsertCommit, options?: CommitOptions): Promise<CommitResult>;
+  commitOneDocWrite?(commit: OneDocWriteCommit, options?: CommitOptions): Promise<CommitResult>;
 }
 
 /**
@@ -945,11 +972,11 @@ export interface StorageBackend extends RuntimeStorage {
   readonly id: IdSurface;
   readonly upload: UploadSurface;
   readonly schedule: ScheduleSurface;
+  readonly wal: WalSurface;
   readonly remote?: RemoteSurface;
   dirtyHeadsDebugRead?(): Promise<DirtyHeadDebug[]>;
-  projectionDebugRead?(table: string, localId: string): Promise<ProjectionDebug | undefined>;
+  remoteDocDebugRead?(table: string, localId: string): Promise<RemoteDocDebug | undefined>;
   setup(schema: StoreSchema): Promise<void>;
   clear(): Promise<void>;
   close(): Promise<void>;
-  checkpoint(): Promise<void>;
 }

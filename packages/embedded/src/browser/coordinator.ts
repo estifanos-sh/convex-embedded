@@ -26,7 +26,6 @@ import {
   isPeerMessage,
   PeerOp,
   RejectCode,
-  storageOwnerLockName,
   workerChannelName,
   workerLockName,
   type ControlMessage,
@@ -95,7 +94,7 @@ interface RuntimeAddress {
 
 type Lifecycle =
   | { initReady: Deferred; lifecycle: "starting" }
-  | { idleShutdownTimer?: Timer; lifecycle: "active" }
+  | { lifecycle: "active" }
   | { closePromise: Promise<void>; lifecycle: "closing" }
   | { lifecycle: "closed" };
 
@@ -109,8 +108,6 @@ interface LeaderDiscovery {
 }
 
 const MAX_ATTACH_BACKOFF_EXPONENT = 16;
-const IDLE_SHUTDOWN_DELAY_MS = 1_000;
-
 interface RuntimeResources {
   control?: Mailbox<ControlMessage>;
   localClient: LeaderClient;
@@ -133,7 +130,10 @@ type RuntimeRequest = Exclude<
   Extract<
     WorkerRequest,
     {
-      op: typeof WorkerCommand.Close | typeof WorkerCommand.Init;
+      op:
+        | typeof WorkerCommand.Close
+        | typeof WorkerCommand.Init
+        | typeof WorkerCommand.StorageOwnerWrite;
     }
   >
 >;
@@ -155,6 +155,10 @@ type PeerHandler<T extends PeerMessage = PeerMessage> = (
 
 const localRequestHandlers = new Map<WorkerCommandCode, LocalRequestHandler>([
   [WorkerCommand.Close, (runtime, request) => runtime.handleClose(request as never)],
+  [
+    WorkerCommand.StorageOwnerWrite,
+    (runtime, request) => runtime.handleStorageOwnerWrite(request as never),
+  ],
   [
     WorkerCommand.Init,
     (runtime, request) =>
@@ -181,6 +185,10 @@ const localRequestHandlers = new Map<WorkerCommandCode, LocalRequestHandler>([
   ],
   [
     WorkerCommand.RemoteIdentityRead,
+    (runtime, request) => runtime.handleRuntimeRequest(request as never),
+  ],
+  [
+    WorkerCommand.RemoteNetworkWrite,
     (runtime, request) => runtime.handleRuntimeRequest(request as never),
   ],
   [WorkerCommand.Upload, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
@@ -266,7 +274,9 @@ export function createCoordinatorRuntime(
 }
 
 class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
+  private closeRequestId?: number;
   private readonly state: CoordinatorState;
+  private storagePromotion?: Promise<void>;
 
   constructor(
     private readonly init: InitRequest,
@@ -336,10 +346,12 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
         this.onPeerMessage,
       );
       await this.holdWorkerLock();
-      this.requestStorageLease();
+      if (this.init.storageOwner !== false) void this.acceptStorageOwnership();
       this.ensureConnected();
       const lifecycle = this.state.lifecycle;
-      if (lifecycle.lifecycle === "starting") await lifecycle.initReady.promise;
+      if (lifecycle.lifecycle === "starting") {
+        await lifecycle.initReady.promise;
+      }
     } catch (error) {
       this.fail(error);
     }
@@ -366,7 +378,6 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       });
       return;
     }
-    this.cancelIdleShutdown();
     try {
       const ownership = this.state.resources.ownership;
       if (ownership.ownership === "leader") {
@@ -385,19 +396,20 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       this.postLocal({ id: request.id, op: WorkerEvent.Result });
       return;
     }
-    this.state.outbox.record(request);
-    if (
-      this.state.resources.ownership.ownership === "leader" ||
-      this.state.resources.ownership.ownership === "follower"
-    ) {
-      this.sendThroughTransport(request);
-      void this.state.outbox.onSettled(request.id).finally(() => {
-        this.scheduleIdleShutdown();
-      });
-      return;
-    }
-    this.postRuntimeResponse({ id: request.id, op: WorkerEvent.Result });
-    this.scheduleIdleShutdown();
+    this.closeRequestId = request.id;
+    void this.shutdown();
+  }
+
+  handleStorageOwnerWrite(
+    request: Extract<WorkerRequest, { op: typeof WorkerCommand.StorageOwnerWrite }>,
+  ): void {
+    void this.acceptStorageOwnership().then(
+      () => this.postLocal({ id: request.id, op: WorkerEvent.Result }),
+      (error) => {
+        this.postLocal({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
+        this.fail(error);
+      },
+    );
   }
 
   handleSeekLeader(message: Extract<ControlMessage, { op: typeof ControlOp.SeekLeader }>): void {
@@ -431,7 +443,6 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     const ownership = this.state.resources.ownership;
     if (message.workerId === this.state.address.workerId || ownership.ownership !== "leader")
       return;
-    this.cancelIdleShutdown();
     ownership.leader.attachFollower(
       message,
       (name) => this.env.channels.open(name),
@@ -751,46 +762,60 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     await acquired.promise;
   }
 
-  private requestStorageLease(): void {
-    void this.env.locks
-      .request(storageOwnerLockName(this.state.address.identity), async () => {
-        if (this.isClosedOrClosing()) return;
-        const release = deferred();
-        const released = deferred();
-        const storageLease = { release, released };
-        released.promise.catch(() => undefined);
-        this.state.resources.storageLease = storageLease;
-        let leader: LeaderRuntime | undefined;
-        try {
-          leader = await this.openLeaderRuntime();
-          await release.promise;
-        } finally {
-          if (
-            this.state.resources.ownership.ownership === "leader" &&
-            this.state.resources.ownership.leader === leader
-          ) {
-            this.state.resources.ownership = { ownership: "seeking" };
-          }
-          await leader?.close().catch(() => undefined);
-          if (this.state.resources.storageLease === storageLease) {
-            this.state.resources.storageLease = undefined;
-          }
-          released.resolve();
+  /** Opens OPFS only after the page context grants this worker origin-wide ownership. */
+  private acceptStorageOwnership(): Promise<void> {
+    if (this.storagePromotion) return this.storagePromotion;
+    if (this.isClosedOrClosing()) {
+      return Promise.reject(new Error("ConvexEmbeddedClient has already been closed."));
+    }
+    this.postDebug("worker:coordination:storage-acquired", {
+      storageId: this.state.address.identity.storageId,
+    });
+    const opened = deferred();
+    const release = deferred();
+    const released = deferred();
+    const storageLease = { release, released };
+    released.promise.catch(() => undefined);
+    this.state.resources.storageLease = storageLease;
+    this.storagePromotion = opened.promise;
+    let leader: LeaderRuntime | undefined;
+    void (async () => {
+      try {
+        leader = await this.openLeaderRuntime();
+        opened.resolve();
+        await release.promise;
+      } catch (error) {
+        opened.reject(error);
+        throw error;
+      } finally {
+        if (
+          this.state.resources.ownership.ownership === "leader" &&
+          this.state.resources.ownership.leader === leader
+        ) {
+          this.state.resources.ownership = { ownership: "seeking" };
         }
-      })
-      .catch((error) => this.fail(error));
+        await leader?.close().catch(() => undefined);
+        if (this.state.resources.storageLease === storageLease) {
+          this.state.resources.storageLease = undefined;
+        }
+        this.storagePromotion = undefined;
+        released.resolve();
+      }
+    })().catch((error) => this.fail(error));
+    return opened.promise;
   }
 
-  /**
-   * A dead store instance releases its storage lease so a follower tab promotes with a fresh
-   * worker; `requestStorageLease`'s finally then closes the abandoned leader. Durable state is
-   * untouched, and a page reload of any tab also starts clean.
-   */
+  /** A dead store instance closes its page-granted OPFS ownership without changing durable data. */
   private releaseDeadInstance(error: unknown): void {
+    const terminal = error instanceof Error ? error : new Error(String(error));
     this.postDebug("worker:coordination:store-instance-dead", {
-      error: error instanceof Error ? error.message : String(error),
+      error: terminal.message,
     });
-    this.state.resources.storageLease?.release.resolve();
+    // The OPFS Web Lock is held by the page, not this worker. Tell the proxy to dispose the runner
+    // (whose onDispose releases that lock) before beginning the worker-side shutdown. Either side
+    // completing is sufficient to prevent a dead store from continuing to accept requests.
+    this.postLocal({ error: serializeError(terminal), op: WorkerEvent.Terminal });
+    void this.shutdown();
   }
 
   private monitorFollower(leader: LeaderRuntime | undefined, follower: RemoteFollower): void {
@@ -799,7 +824,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       .request(workerLockName(this.state.address.scope, follower.workerId), async () => {
         const ownership = this.state.resources.ownership;
         if (ownership.ownership !== "leader" || ownership.leader !== leader) return;
-        leader.cleanupFollower(follower.workerId);
+        leader.followerDelete(follower.workerId);
       })
       .catch((error) => this.postDebug("worker:coordination:follower-monitor-error", error));
   }
@@ -895,32 +920,6 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     void this.shutdown();
   }
 
-  private scheduleIdleShutdown(): void {
-    const lifecycle = this.state.lifecycle;
-    if (lifecycle.lifecycle !== "active" || lifecycle.idleShutdownTimer !== undefined) {
-      return;
-    }
-    this.postDebug("worker:coordination:idle-shutdown-scheduled", {
-      delayMs: IDLE_SHUTDOWN_DELAY_MS,
-    });
-    lifecycle.idleShutdownTimer = this.env.setTimer(() => {
-      if (this.state.lifecycle.lifecycle === "active") {
-        this.state.lifecycle.idleShutdownTimer = undefined;
-      }
-      void this.shutdown();
-    }, IDLE_SHUTDOWN_DELAY_MS);
-  }
-
-  private cancelIdleShutdown(): void {
-    const lifecycle = this.state.lifecycle;
-    if (lifecycle.lifecycle !== "active") return;
-    const timer = lifecycle.idleShutdownTimer;
-    if (timer === undefined) return;
-    this.env.clearTimer(timer);
-    lifecycle.idleShutdownTimer = undefined;
-    this.postDebug("worker:coordination:idle-shutdown-cancelled");
-  }
-
   private async shutdown(): Promise<void> {
     const lifecycle = this.state.lifecycle;
     if (lifecycle.lifecycle === "closed") return;
@@ -932,7 +931,6 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
 
   private async doShutdown(): Promise<void> {
     this.stopLeaderBeacon();
-    this.cancelIdleShutdown();
     this.clearRecoveryTimer();
     this.clearPendingAttach();
     this.clearAttachBackoff();
@@ -950,6 +948,9 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.state.resources.workerMailbox?.close();
     this.state.resources.workerLease.resolve();
     this.state.lifecycle = { lifecycle: "closed" };
+    if (this.closeRequestId !== undefined) {
+      this.postLocal({ id: this.closeRequestId, op: WorkerEvent.Result });
+    }
     this.env.closeSelf();
   }
 

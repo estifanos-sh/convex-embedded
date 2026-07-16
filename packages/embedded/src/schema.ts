@@ -54,6 +54,11 @@ interface ExportedTable {
   documentType: ValidatorJSON;
 }
 
+// These indexes serve hosted component functions that are intentionally absent from
+// embeddedComponentModules. Installing them in browser SQLite couples local schema evolution to
+// server maintenance code the local runtime can never execute.
+const REMOTE_COMPONENT_INDEXES = new Set(["crdtCheckpoints.by_field_epoch_state_retain_seq"]);
+
 /**
  * Converts a Convex schema definition into the embedded storage schema.
  *
@@ -116,7 +121,16 @@ export function embeddedComponentStoreSchema(): StoreSchema {
 function embeddedComponentPhysicalTables(): StoreSchema["tables"] {
   const prefix = "__e_";
   return embeddedComponentStoreSchema().tables.map((table) => {
-    const physical = { ...table, name: `${prefix}${table.name}` };
+    const indexes = table.indexes.filter(
+      (index) => !REMOTE_COMPONENT_INDEXES.has(`${table.name}.${index.name}`),
+    );
+    const indexedColumns = new Set(indexes.flatMap((index) => index.columns ?? index.fields));
+    const physical = {
+      ...table,
+      columns: table.columns.filter((column) => indexedColumns.has(column.name)),
+      indexes,
+      name: `${prefix}${table.name}`,
+    };
     assertPhysicalIdentifiers(physical);
     return physical;
   });
@@ -410,6 +424,8 @@ function columnName(field: string, existing: ReadonlyMap<string, unknown>): stri
 function sanitize(field: string): string {
   return (
     field
+      .replaceAll(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+      .replaceAll(/([a-z0-9])([A-Z])/g, "$1_$2")
       .toLowerCase()
       .replaceAll(/[^a-z0-9_]/g, "_")
       .replaceAll(/^_+|_+$/g, "") || "field"

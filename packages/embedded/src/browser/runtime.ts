@@ -11,6 +11,7 @@
 import type { ConvexModules } from "../client";
 import type {
   EmbeddedEventListener,
+  EmbeddedRemoteEvent,
   EmbeddedRuntimeDegradation,
   EmbeddedRuntimeEvent,
   EmbeddedRuntimePhase,
@@ -18,11 +19,18 @@ import type {
 import { EMBEDDED_ERROR_CODES, EmbeddedClientRetiredError, errorMessage } from "../error";
 import { randomId } from "../id/random";
 import { createRunner, type Runner } from "../runtime/runner";
-import { consumeRemoteTick, remoteTickHasWork } from "../rev";
+import {
+  consumeRemoteTick,
+  mergeRemoteTicks,
+  remotePendingIsEmpty,
+  REMOTE_PULL_DIAGNOSTIC_ERROR,
+  remoteTickHasWork,
+} from "../rev";
 import { toRuntimeStoreSchema } from "../schema";
 import type {
   RemoteStartOptions,
   RemoteScope,
+  RemotePending,
   RemoteTick,
   RemoteTransportHost,
   StoreSchema,
@@ -32,11 +40,7 @@ import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { REMOTE_CLIENT_RETIRED_PREFIX, RotationBreaker } from "../retirement";
 import { loadWasmModule, PthreadRegistry, type WasmSource } from "./artifact";
 import { type StoreRecovery } from "./recovery";
-import {
-  OpfsDirectory,
-  registerTursoFiles,
-  resetTursoFiles,
-} from "./opfs";
+import { OpfsDirectory, registerTursoFiles, resetTursoFiles } from "./opfs";
 import {
   deserializeError,
   type EmbeddedWorker,
@@ -71,12 +75,15 @@ export interface WorkerState {
   runner: Runner;
   /** Stops the worker-owned remote replication scheduler. */
   remoteStop?: () => void;
-  /** Wakes the worker-owned remote replication scheduler. */
-  remoteWake?: () => void;
+  /** Wakes the worker-owned remote replication scheduler, optionally clearing retry backoff. */
+  remoteWake?: (immediate?: boolean) => void;
   /** Resets remote replication so identity negotiation runs before another pull or push. */
   remoteReset?: () => Promise<void>;
   /** Resolves after the configured remote client has started. */
   remoteReady?: Promise<void>;
+  /** Clears startup backoff or marks the active startup for an immediate retry. */
+  remoteStartWake?: () => void;
+  remoteStartImmediate?: boolean;
   /** Consecutive failed remote starts used to bound reconnect backoff. */
   remoteStartAttempt?: number;
   /** Deferred remote startup timer, if remote was configured during init. */
@@ -85,8 +92,23 @@ export interface WorkerState {
   remoteKey?: string;
   /** Live remote transport; retained so a rebuild/offline suspect can close its socket synchronously. */
   remoteTransport?: RemoteTransportHost;
+  /** Whether the live transport currently owns an open WebSocket. */
+  remoteConnected?: boolean;
+  /** Current remote event incarnation and its next ordered sequence. */
+  remoteEventGeneration?: number;
+  remoteEventSequence?: number;
+  /** Last authoritative work snapshot returned by the remote actor. */
+  remotePending?: RemotePending;
+  /** Latest fenced snapshot replayed to clients that attach after startup. */
+  remoteEvent?: EmbeddedRemoteEvent;
+  /** Last browser reachability hint; false invalidates readiness and the current socket. */
+  remoteNetworkOnline?: boolean;
+  /** A network loss invalidated the socket before the remote actor could actively replace it. */
+  remoteReconnectRequired?: boolean;
   /** Auth token requests awaiting a main-thread response. */
   remoteAuthPending?: Map<number, RemoteAuthPending>;
+  /** Monotonic for the whole worker lifetime so retired auth responses cannot alias a fresh start. */
+  remoteAuthRequestId?: number;
   /** True after close begins, so delayed remote startup cannot reopen work. */
   closed?: boolean;
   /** True once the instance is abandoned dead; close must not await its store/remote operations. */
@@ -125,11 +147,10 @@ const REMOTE_DEPLOYMENT_MISMATCH_PREFIX = "remote deployment mismatch:";
 /**
  * A pull that only sent outbound work (a connect or subscription) leaves an unanswered server
  * response in flight. The loop is otherwise woken by the transport's `onmessage`, but an idle
- * worker whose event loop holds no pending timer can have that delivery suspended by the host
- * (observed on iOS Safari, where a hot blocking push settles while a dormant pull never does).
+ * worker whose event loop holds no pending timer can have that delivery suspended by the host.
  * While a response is outstanding the loop keeps a bounded timer pending instead of going fully
  * dormant, so the awaited transition is drained even when `onmessage` is throttled. A multi-step
- * bootstrap re-sends on the same tick it receives a chunk, so the timer stays armed until an
+ * checkpoint pull re-sends on the same tick it receives a chunk, so the timer stays armed until an
  * inbound tick queues no further outbound work.
  */
 const REMOTE_RESPONSE_KEEPALIVE_MS = 500;
@@ -142,7 +163,7 @@ const RUNTIME_PHASE_BY_DEBUG: Record<string, EmbeddedRuntimePhase> = {
   "worker:wasm:load:start": "wasm-load",
   "worker:store:open:start": "store-open",
   "worker:store:setup:start": "store-setup",
-  "worker:store:checkpoint:start": "store-checkpoint",
+  "worker:store:wal-write:start": "store-wal-write",
 };
 
 function runtimeEventFromDebug(phase: string, detail: unknown): EmbeddedRuntimeEvent | undefined {
@@ -158,6 +179,10 @@ function runtimeEventFromDebug(phase: string, detail: unknown): EmbeddedRuntimeE
       type: "runtime",
       waitedMs: record.waitedMs,
     };
+  }
+  if (phase === "worker:storage:temporary") {
+    const record = (detail ?? {}) as { error?: string };
+    return runtimeDegradation("temporary-storage", { error: record.error });
   }
   if (phase === "worker:wasm:thread:error" || phase === "worker:wasm:thread:messageerror") {
     const record = (detail ?? {}) as { message?: string };
@@ -231,6 +256,7 @@ export async function initFromMessage(
     onRuntimeEvent: (event) => postResponse({ event, op: WorkerEvent.Event }),
     setupSchema: runtimeStoreSchema,
     storagePath: request.storagePath,
+    temporaryStoragePath: `:memory:${request.storagePath}`,
     storeSchema: runtimeStoreSchema,
     remote: request.remote !== undefined,
   });
@@ -273,17 +299,24 @@ async function startWorkerRemote(
   remote: NonNullable<Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>["remote"]>,
   debug: boolean | undefined,
   postResponse: (message: WorkerResponse) => void,
+  eventGeneration: number,
 ): Promise<void> {
   if (!state.store.remote) {
     throw new Error("Browser remote replication requires a WASM artifact with remote support.");
   }
-  let nextAuthRequestId = 1;
-  state.remoteAuthPending = new Map();
+  rejectPendingRemoteAuth(state, new Error("Browser remote replication restarting."));
+  const pendingAuth = new Map<number, RemoteAuthPending>();
+  state.remoteAuthPending = pendingAuth;
   const auth: RemoteStartOptions["auth"] | undefined = remote.authFetchToken
     ? ({ forceRefreshToken }) =>
         new Promise<string | null>((resolve, reject) => {
-          const authRequestId = nextAuthRequestId++;
-          state.remoteAuthPending?.set(authRequestId, { reject, resolve });
+          if (state.remoteAuthPending !== pendingAuth) {
+            reject(new Error("Browser remote replication auth request is stale."));
+            return;
+          }
+          const authRequestId = (state.remoteAuthRequestId ?? 0) + 1;
+          state.remoteAuthRequestId = authRequestId;
+          pendingAuth.set(authRequestId, { reject, resolve });
           postResponse({
             authRequestId,
             forceRefreshToken,
@@ -294,14 +327,17 @@ async function startWorkerRemote(
 
   postDebug(debug, "worker:remote:store-start:before", undefined, postResponse);
   const generation = state.recovery?.remoteGeneration ?? 0;
-  const stale = () => (state.recovery?.remoteGeneration ?? 0) !== generation;
+  const stale = () =>
+    state.remoteEventGeneration !== eventGeneration ||
+    (state.recovery?.remoteGeneration ?? 0) !== generation;
   const transport = createRemoteTransport(
     remote.operationTimeoutMs ?? 30_000,
     (phase, detail) => postDebug(debug, phase, detail, postResponse),
     () => state.remoteWake?.(),
     (url, blob) => state.runner.handleUpload(url, blob),
     () => state.recovery?.transportActive(generation),
-    () => state.recovery?.progress(generation),
+    () => state.recovery?.progress(generation, "push"),
+    (connected) => writeWorkerRemoteConnection(state, connected, eventGeneration),
   );
   state.remoteTransport = transport;
   await state.store.remote.start({
@@ -337,6 +373,7 @@ async function startWorkerRemote(
     () => {
       void rotateRetiredClient(state, remote, debug, postResponse);
     },
+    eventGeneration,
   );
 }
 
@@ -377,7 +414,7 @@ export async function rotateRetiredClient(
 
 function emitWorkerRemoteEvent(
   state: WorkerState,
-  status: "starting" | "started" | "tick" | "idle" | "error" | "closed",
+  status: "starting" | "started" | "connected" | "tick" | "idle" | "offline" | "error" | "closed",
   detail: {
     attempt?: number;
     durationMs?: number;
@@ -385,23 +422,43 @@ function emitWorkerRemoteEvent(
     foreground?: { actorQueueDepth: number; actorQueueMs: number };
     nextRunIn?: number;
     tick?: RemoteTick;
+    generation?: number;
   } = {},
 ): void {
+  const generation = detail.generation ?? state.remoteEventGeneration ?? 0;
+  if (generation !== (state.remoteEventGeneration ?? 0)) return;
+  if (
+    state.remoteNetworkOnline === false &&
+    (status === "connected" || status === "tick" || status === "idle")
+  ) {
+    return;
+  }
+  const sequence = (state.remoteEventSequence ?? 0) + 1;
+  state.remoteEventSequence = sequence;
   const now = getTimerTime();
-  state.emit?.({
+  const event: EmbeddedRemoteEvent = {
     at: now,
     attempt: detail.attempt ?? 0,
     durationMs: detail.durationMs,
     error: detail.error === undefined ? undefined : errorMessage(detail.error),
     foreground: detail.foreground,
+    generation,
     nextRunAt: detail.nextRunIn === undefined ? undefined : now + detail.nextRunIn,
     status,
+    sequence,
     tick: detail.tick
       ? { ...detail.tick, retainedRevisions: detail.tick.retainedRevisions.length }
       : undefined,
     type: "remote",
     wasmApiVersion: state.wasmApiVersion,
-  });
+  };
+  state.remoteEvent = event;
+  state.emit?.(event);
+}
+
+/** Emits a recovery error through the same generation/sequence fence as transport state. */
+export function emitWorkerRemoteError(state: WorkerState, error: unknown): void {
+  emitWorkerRemoteEvent(state, "error", { error });
 }
 
 export function ensureWorkerRemoteStarted(
@@ -424,29 +481,63 @@ export function ensureWorkerRemoteStarted(
     );
   }
   state.remoteKey = key;
+  state.remoteStartWake = () => {
+    state.remoteStartAttempt = 0;
+    if (state.remoteStartTimer !== undefined) {
+      clearTimeout(state.remoteStartTimer);
+      state.remoteStartTimer = undefined;
+    }
+    if (state.remoteReady) {
+      state.remoteStartImmediate = true;
+      return;
+    }
+    void ensureWorkerRemoteStarted(state, remote, debug, postResponse);
+  };
   if (state.remoteReady) return state.remoteReady;
-  const generation = state.recovery?.remoteGeneration ?? 0;
-  const stale = () => (state.recovery?.remoteGeneration ?? 0) !== generation;
   let ready: Promise<void> | undefined;
   ready = (async () => {
     if (state.closed) return;
+    const eventGeneration = (state.remoteEventGeneration ?? 0) + 1;
+    state.remoteEventGeneration = eventGeneration;
+    state.remoteEventSequence = 0;
+    state.remoteConnected = false;
+    state.remoteNetworkOnline ??= true;
+    state.remoteReconnectRequired = false;
+    state.remotePending = undefined;
+    const recoveryGeneration = state.recovery?.remoteGeneration ?? 0;
+    const stale = () =>
+      state.remoteEventGeneration !== eventGeneration ||
+      (state.recovery?.remoteGeneration ?? 0) !== recoveryGeneration;
     postDebug(debug, "worker:remote:start", undefined, postResponse);
-    emitWorkerRemoteEvent(state, "starting");
+    emitWorkerRemoteEvent(state, state.remoteNetworkOnline === false ? "offline" : "starting", {
+      generation: eventGeneration,
+    });
     try {
-      await startWorkerRemote(state, remote, debug, postResponse);
+      await startWorkerRemote(state, remote, debug, postResponse, eventGeneration);
       if (stale()) return;
       state.remoteStartAttempt = 0;
-      emitWorkerRemoteEvent(state, "started");
+      emitWorkerRemoteEvent(state, "started", { generation: eventGeneration });
     } catch (error) {
       if (stale()) return;
       postDebug(debug, "worker:remote:error", describeError(error), postResponse);
-      emitWorkerRemoteEvent(state, "error", { error });
       if (ready !== undefined && state.remoteReady === ready) state.remoteReady = undefined;
       await state.store.remote?.close().catch(() => undefined);
       if (stale()) return;
-      if (!emitDeploymentMismatch(state, error)) {
-        scheduleWorkerRemoteStart(state, remote, debug, postResponse);
-      }
+      const terminal = emitDeploymentMismatch(state, error);
+      const nextRunIn =
+        terminal || state.remoteNetworkOnline === false
+          ? undefined
+          : scheduleWorkerRemoteStart(state, remote, debug, postResponse);
+      const status = terminal
+        ? "error"
+        : state.remoteNetworkOnline === false
+          ? "offline"
+          : "starting";
+      emitWorkerRemoteEvent(state, status, {
+        error,
+        generation: eventGeneration,
+        nextRunIn,
+      });
     }
   })();
   ready.catch(() => undefined);
@@ -459,22 +550,25 @@ function scheduleWorkerRemoteStart(
   remote: NonNullable<Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>["remote"]>,
   debug: boolean | undefined,
   postResponse: (message: WorkerResponse) => void,
-): void {
-  if (state.closed || state.remoteStartTimer !== undefined) return;
+): number | undefined {
+  if (state.closed || state.remoteStartTimer !== undefined) return undefined;
   const attempt = (state.remoteStartAttempt ?? 0) + 1;
   state.remoteStartAttempt = attempt;
-  const delayMs = Math.min(30_000, 500 * 2 ** Math.min(attempt - 1, 6));
+  const immediate = state.remoteStartImmediate === true;
+  state.remoteStartImmediate = false;
+  const delayMs = immediate ? 0 : Math.min(30_000, 500 * 2 ** Math.min(attempt - 1, 6));
   state.remoteStartTimer = setTimeout(() => {
     state.remoteStartTimer = undefined;
     void ensureWorkerRemoteStarted(state, remote, debug, postResponse);
   }, delayMs);
+  return delayMs;
 }
 
 /**
  * Synchronously tears down the remote replication loop of a suspect instance without touching its
  * store: the loop stop clears timers and unsubscribes only, and the wedged `store.remote.close()`
  * is deliberately never awaited (spec §2 — never await a suspect promise). Remote fields are reset
- * so a post-graft {@link ensureWorkerRemoteStarted} starts a fresh loop.
+ * so a later {@link ensureWorkerRemoteStarted} starts a fresh loop.
  *
  * @internal
  */
@@ -489,9 +583,16 @@ export function abandonWorkerRemote(state: WorkerState): void {
   const stop = state.remoteStop;
   state.remoteStop = undefined;
   stop?.();
+  state.remoteEventGeneration = (state.remoteEventGeneration ?? 0) + 1;
+  state.remoteEventSequence = 0;
+  state.remoteConnected = false;
+  state.remotePending = undefined;
+  state.remoteReconnectRequired = false;
   state.remoteReady = undefined;
   state.remoteReset = undefined;
   state.remoteStartAttempt = 0;
+  state.remoteStartImmediate = false;
+  state.remoteStartWake = undefined;
   state.remoteKey = undefined;
   state.remoteWake = undefined;
   rejectPendingRemoteAuth(state, new Error("Browser remote replication rebuilding."));
@@ -508,6 +609,50 @@ export function closeWorkerRemoteSocket(state: WorkerState): void {
   void state.remoteTransport?.close();
 }
 
+/** Invalidates a suspect socket immediately; only a fresh socket callback can confirm reconnection. */
+export function writeWorkerRemoteNetwork(state: WorkerState, online: boolean): void {
+  const wasOnline = state.remoteNetworkOnline;
+  state.remoteNetworkOnline = online;
+  if (!online) {
+    state.remoteConnected = false;
+    state.remoteReconnectRequired = true;
+    if (
+      wasOnline !== false &&
+      state.remoteWake !== undefined &&
+      state.remoteTransport !== undefined
+    ) {
+      closeWorkerRemoteSocket(state);
+    }
+    emitWorkerRemoteEvent(state, "offline");
+    state.remoteWake?.(false);
+    return;
+  }
+  emitWorkerRemoteEvent(state, "starting");
+  if (state.remoteWake) state.remoteWake(true);
+  else state.remoteStartWake?.();
+}
+
+/** Applies one generation-fenced socket state transition from the transport host. @internal */
+export function writeWorkerRemoteConnection(
+  state: WorkerState,
+  connected: boolean,
+  generation: number,
+): void {
+  if (generation !== state.remoteEventGeneration) return;
+  if (connected && state.remoteNetworkOnline === false) {
+    state.remoteConnected = false;
+    if (state.remoteReconnectRequired !== true) {
+      state.remoteReconnectRequired = true;
+      closeWorkerRemoteSocket(state);
+    }
+    return;
+  }
+  if (state.remoteConnected === connected) return;
+  state.remoteConnected = connected;
+  if (connected) state.remoteReconnectRequired = false;
+  emitWorkerRemoteEvent(state, connected ? "connected" : "offline", { generation });
+}
+
 export async function stopWorkerRemote(state: WorkerState): Promise<void> {
   if (state.remoteStartTimer !== undefined) {
     clearTimeout(state.remoteStartTimer);
@@ -516,8 +661,15 @@ export async function stopWorkerRemote(state: WorkerState): Promise<void> {
   const stop = state.remoteStop;
   state.remoteStop = undefined;
   stop?.();
+  state.remoteEventGeneration = (state.remoteEventGeneration ?? 0) + 1;
+  state.remoteEventSequence = 0;
+  state.remoteConnected = false;
+  state.remotePending = undefined;
+  state.remoteReconnectRequired = false;
   state.remoteReady = undefined;
   state.remoteStartAttempt = 0;
+  state.remoteStartImmediate = false;
+  state.remoteStartWake = undefined;
   state.remoteKey = undefined;
   state.remoteWake = undefined;
   state.remoteTransport = undefined;
@@ -572,6 +724,103 @@ export async function transferRemoteUpload(
   return { storageId };
 }
 
+export interface TransitionChunkBuffer {
+  bytes: number;
+  transitionId: string;
+  totalParts: number;
+  parts: string[];
+}
+
+interface TransitionChunkStep {
+  buffer: TransitionChunkBuffer | undefined;
+  message: string | undefined;
+}
+
+export interface RemoteTransportLimits {
+  inboxBytes: number;
+  inboxCount: number;
+  messageBytes: number;
+  totalParts: number;
+}
+
+export const REMOTE_TRANSPORT_LIMITS: RemoteTransportLimits = {
+  inboxBytes: 32 * 1024 * 1024,
+  inboxCount: 128,
+  messageBytes: 16 * 1024 * 1024,
+  totalParts: 256,
+};
+
+const REMOTE_TRANSPORT_INPUT_ERROR = "websocket transport input limit exceeded";
+
+function utf8Bytes(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) index += 1;
+      bytes += low >= 0xdc00 && low <= 0xdfff ? 4 : 3;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+/** Chunked `Transition` frames must be joined before the actor; the sync client rejects raw chunks. */
+export function assembleTransitionChunk(
+  buffer: TransitionChunkBuffer | undefined,
+  raw: string,
+  limits: RemoteTransportLimits = REMOTE_TRANSPORT_LIMITS,
+): TransitionChunkStep {
+  const rawBytes = utf8Bytes(raw);
+  if (rawBytes > limits.messageBytes) throw new Error(REMOTE_TRANSPORT_INPUT_ERROR);
+  const chunk = JSON.parse(raw) as {
+    type?: string;
+    chunk?: string;
+    partNumber?: number;
+    totalParts?: number;
+    transitionId?: string;
+  };
+  if (chunk.type !== "TransitionChunk") return { buffer: undefined, message: raw };
+  if (
+    typeof chunk.chunk !== "string" ||
+    typeof chunk.transitionId !== "string" ||
+    typeof chunk.totalParts !== "number" ||
+    typeof chunk.partNumber !== "number" ||
+    !Number.isSafeInteger(chunk.totalParts) ||
+    !Number.isSafeInteger(chunk.partNumber) ||
+    chunk.partNumber < 0 ||
+    chunk.totalParts <= 0 ||
+    chunk.partNumber >= chunk.totalParts ||
+    chunk.partNumber !== (buffer?.parts.length ?? 0) ||
+    (buffer &&
+      (buffer.transitionId !== chunk.transitionId || buffer.totalParts !== chunk.totalParts))
+  ) {
+    throw new Error("websocket received an invalid TransitionChunk");
+  }
+  if (chunk.totalParts > limits.totalParts) throw new Error(REMOTE_TRANSPORT_INPUT_ERROR);
+  const next: TransitionChunkBuffer = buffer ?? {
+    bytes: 0,
+    parts: [],
+    totalParts: chunk.totalParts,
+    transitionId: chunk.transitionId,
+  };
+  const chunkBytes = utf8Bytes(chunk.chunk);
+  if (next.bytes + chunkBytes > limits.messageBytes) {
+    throw new Error(REMOTE_TRANSPORT_INPUT_ERROR);
+  }
+  next.bytes += chunkBytes;
+  next.parts.push(chunk.chunk);
+  if (next.parts.length < next.totalParts) return { buffer: next, message: undefined };
+  const message = next.parts.join("");
+  const assembled = JSON.parse(message) as { type?: string };
+  if (assembled.type !== "Transition") {
+    throw new Error(`expected Transition after assembling chunks, got ${assembled.type}`);
+  }
+  return { buffer: undefined, message };
+}
+
 export function createRemoteTransport(
   connectTimeoutMs: number,
   debug: (phase: string, detail?: unknown) => void,
@@ -579,13 +828,58 @@ export function createRemoteTransport(
   handleUpload: (url: string, blob: Blob) => Promise<{ storageId: string }>,
   onTransportActivity: () => void = () => undefined,
   onLaneProgress: () => void = () => undefined,
+  onConnectionChange: (connected: boolean) => void = () => undefined,
+  limits: RemoteTransportLimits = REMOTE_TRANSPORT_LIMITS,
 ): RemoteTransportHost {
   let socket: WebSocket | undefined;
   let generation = 0;
   let pendingConnectReject: ((error: Error) => void) | undefined;
   const inbox: Array<{ kind: "closed"; reason?: string } | { kind: "message"; message: string }> =
     [];
+  let inboxBytes = 0;
   const waiters: Array<() => void> = [];
+  let chunkBuffer: TransitionChunkBuffer | undefined;
+
+  const inboxClear = () => {
+    inbox.splice(0);
+    inboxBytes = 0;
+  };
+
+  const inboxRead = () => {
+    const event = inbox.shift();
+    if (event?.kind === "message") inboxBytes -= utf8Bytes(event.message);
+    return event;
+  };
+
+  const failInput = (reason: string) => {
+    debug("worker:remote:transport:protocol-error", { reason });
+    chunkBuffer = undefined;
+    inboxClear();
+    inbox.push({ kind: "closed", reason });
+    generation += 1;
+    const current = socket;
+    socket = undefined;
+    onConnectionChange(false);
+    if (current) {
+      current.onclose = null;
+      current.onerror = null;
+      current.onmessage = null;
+      current.onopen = null;
+      current.close(1009, "invalid server message");
+    }
+    wake();
+  };
+
+  const inboxWrite = (message: string): boolean => {
+    const bytes = utf8Bytes(message);
+    if (inbox.length >= limits.inboxCount || inboxBytes + bytes > limits.inboxBytes) {
+      failInput(REMOTE_TRANSPORT_INPUT_ERROR);
+      return false;
+    }
+    inbox.push({ kind: "message", message });
+    inboxBytes += bytes;
+    return true;
+  };
 
   const wake = () => {
     for (const waiter of waiters.splice(0)) waiter();
@@ -594,17 +888,33 @@ export function createRemoteTransport(
   const receiveInbox = () => {
     // Arrival owns the wake. Reading an item is already part of the active Rust
     // actor turn and must not manufacture a redundant follow-up pull.
-    return inbox.shift();
+    return inboxRead();
+  };
+  const acceptServerMessage = (raw: string): boolean => {
+    let assembled: TransitionChunkStep;
+    try {
+      assembled = assembleTransitionChunk(chunkBuffer, raw, limits);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failInput(reason);
+      return false;
+    }
+    chunkBuffer = assembled.buffer;
+    if (assembled.message === undefined) return false;
+    return inboxWrite(assembled.message);
   };
 
   return {
     close: async () => {
       debug("worker:remote:transport:close");
       generation += 1;
+      chunkBuffer = undefined;
+      inboxClear();
       const rejectPending = pendingConnectReject;
       pendingConnectReject = undefined;
       const current = socket;
       socket = undefined;
+      onConnectionChange(false);
       if (current) {
         current.onclose = null;
         current.onerror = null;
@@ -632,7 +942,8 @@ export function createRemoteTransport(
           previous.close();
         }
         rejectPrevious?.(new Error("websocket connect superseded"));
-        inbox.splice(0);
+        inboxClear();
+        chunkBuffer = undefined;
         const current = new WebSocket(url);
         let settled = false;
         const isCurrent = () => socket === current && generation === socketGeneration;
@@ -661,11 +972,15 @@ export function createRemoteTransport(
         socket = current;
         current.onopen = () => {
           if (!isCurrent()) return;
+          onConnectionChange(true);
           onTransportActivity();
           resolveOnce();
         };
         current.onerror = () => {
           if (!isCurrent()) return;
+          onConnectionChange(false);
+          chunkBuffer = undefined;
+          debug("worker:remote:transport:error");
           if (!settled) {
             rejectOnce(new Error("websocket error"));
             return;
@@ -675,6 +990,13 @@ export function createRemoteTransport(
         };
         current.onclose = (event) => {
           if (!isCurrent()) return;
+          onConnectionChange(false);
+          chunkBuffer = undefined;
+          debug("worker:remote:transport:closed", {
+            code: event.code,
+            reason: event.reason,
+            wasClean: event.wasClean,
+          });
           socket = undefined;
           rejectOnce(new Error(event.reason || `websocket closed with code ${event.code}`));
           inbox.push({
@@ -688,8 +1010,7 @@ export function createRemoteTransport(
           if (typeof event.data === "string") {
             debug("worker:remote:transport:message", { bytes: event.data.length });
             onTransportActivity();
-            inbox.push({ kind: "message", message: event.data });
-            wake();
+            if (acceptServerMessage(event.data)) wake();
           }
         };
       }),
@@ -759,6 +1080,7 @@ export function startWorkerRemoteLoop(
   state: WorkerState,
   debug: (phase: string, detail?: unknown) => void = () => undefined,
   onRetired: () => void = () => undefined,
+  eventGeneration: number = state.remoteEventGeneration ?? 0,
 ): () => void {
   const remote = state.store.remote;
   if (!remote) {
@@ -770,8 +1092,10 @@ export function startWorkerRemoteLoop(
   const pull = remote.pull.bind(remote);
   const push = remote.doc?.push.bind(remote.doc);
   const generation = state.recovery?.remoteGeneration ?? 0;
+  const isCurrent = () => eventGeneration === (state.remoteEventGeneration ?? 0);
   let attempt = 0;
   let consecutiveErrors = 0;
+  let pullDiagnostic: string | undefined;
   let stopped = false;
   let running = false;
   let wakePending = false;
@@ -780,9 +1104,7 @@ export function startWorkerRemoteLoop(
   let nextAllowedRunAt = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let microtaskPending = false;
-  let pushRunning = false;
-  let pushRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  let pushConsecutiveErrors = 0;
+  let immediateRetryPending = false;
   const scope = remote.scope;
   const scopeWrite = scope?.write.bind(scope);
   let scheduledScopeWrite: ((next: RemoteScope) => Promise<void>) | undefined;
@@ -791,7 +1113,7 @@ export function startWorkerRemoteLoop(
     ? backlogPush
     : undefined;
   const emit = (
-    status: "started" | "tick" | "idle" | "error" | "closed",
+    status: "starting" | "started" | "connected" | "tick" | "idle" | "offline" | "error" | "closed",
     detail: {
       durationMs?: number;
       error?: unknown;
@@ -799,9 +1121,9 @@ export function startWorkerRemoteLoop(
       nextRunIn?: number;
       tick?: Awaited<ReturnType<typeof pull>>;
     } = {},
-  ) => emitWorkerRemoteEvent(state, status, { ...detail, attempt });
+  ) => emitWorkerRemoteEvent(state, status, { ...detail, attempt, generation: eventGeneration });
   const schedule = (delay: number) => {
-    if (stopped) return;
+    if (stopped || state.remoteNetworkOnline === false) return;
     if (timer !== undefined) {
       clearTimeout(timer);
       timer = undefined;
@@ -818,7 +1140,7 @@ export function startWorkerRemoteLoop(
     timer = setTimeout(run, delay);
   };
   const wake = () => {
-    if (stopped) return;
+    if (stopped || state.remoteNetworkOnline === false) return;
     if (running) {
       wakePending = true;
       return;
@@ -827,79 +1149,48 @@ export function startWorkerRemoteLoop(
   };
   if (scope && scopeWrite) {
     scheduledScopeWrite = async (next) => {
+      state.remotePending = undefined;
+      emit(state.remoteConnected === true ? "tick" : "starting");
       await scopeWrite(next);
       wake();
     };
     scope.write = scheduledScopeWrite;
   }
-  const pushRun = () => {
-    if (stopped || pushRunning || !push || !pushPending) return;
-    if (pushRetryTimer !== undefined) {
-      clearTimeout(pushRetryTimer);
-      pushRetryTimer = undefined;
-    }
-    const pending = pushPending;
-    pushPending = undefined;
-    pushRunning = true;
-    attempt += 1;
-    const startedAt = getTimerTime();
-    const disarmPush = state.recovery?.arm("push");
-    state.recovery?.onRemoteActive();
-    void push(pending.table, pending.id, {
-      firstCommitSeq: pending.commitSeq,
-      updatedCommitSeq: pending.commitSeq,
-    })
-      .then((result) => {
-        pushConsecutiveErrors = 0;
-        if (result.state === "stale") pushPending ??= backlogPush;
-        consumeWorkerRemoteTick(state, result.tick);
-        const active = remoteTickHasWork(result.tick);
-        emit(active ? "tick" : "idle", {
-          durationMs: getElapsedTime(startedAt),
-          foreground: {
-            actorQueueDepth: result.actorQueueDepth ?? 0,
-            actorQueueMs: result.actorQueueMs ?? 0,
-          },
-          nextRunIn: 0,
-          tick: result.tick,
-        });
-      })
-      .catch((error) => {
-        if (handleRetirement(startedAt, error)) return;
-        pushConsecutiveErrors += 1;
-        const delay = Math.min(1_000 * 2 ** (pushConsecutiveErrors - 1), 60_000);
-        pushPending ??= pending;
-        emit("error", { durationMs: getElapsedTime(startedAt), error, nextRunIn: delay });
-        pushRetryTimer = setTimeout(pushRun, delay);
-      })
-      .finally(() => {
-        pushRunning = false;
-        disarmPush?.();
-        if (pushRetryTimer === undefined && pushPending) {
-          queueMicrotask(pushRun);
-        } else if (pushRetryTimer === undefined && !pushPending && !running && !wakePending) {
-          state.recovery?.onRemoteIdle();
-        }
-      });
-  };
   const eventStop = state.runner.subscribeEvents?.((event) => {
     if (event.type !== "data" || event.source !== "local") return;
+    state.remotePending = undefined;
+    emit(state.remoteConnected === true ? "tick" : "starting");
     if (event.changedTables.includes("_pending_uploads")) {
       localProgressPending = true;
       wake();
     }
-    const row = event.upserts[0] ?? event.deletes[0];
+    const row = event.docWrites[0] ?? event.deletes[0];
     if (!push || row === undefined || event.commitSeq === undefined) return;
     pushPending = { commitSeq: event.commitSeq, id: row.id, table: row.table };
-    queueMicrotask(pushRun);
+    wake();
   });
   const remoteWakeStop = state.runner.remote?.wake?.subscribe(() => {
     localProgressPending = true;
     pushPending ??= backlogPush;
-    queueMicrotask(pushRun);
+    state.remotePending = undefined;
+    emit(state.remoteConnected === true ? "tick" : "starting");
     wake();
   });
-  state.remoteWake = wake;
+  const remoteWake = (immediate = false) => {
+    if (immediate) {
+      nextAllowedRunAt = 0;
+      consecutiveErrors = 0;
+      immediateRetryPending = true;
+    }
+    pushPending ??= push ? backlogPush : undefined;
+    wake();
+  };
+  state.remoteWake = remoteWake;
+  if (state.remoteReconnectRequired) {
+    state.remoteReconnectRequired = false;
+    closeWorkerRemoteSocket(state);
+    remoteWake(state.remoteNetworkOnline !== false);
+  }
   let torndown = false;
   const teardown = () => {
     if (torndown) return;
@@ -909,14 +1200,10 @@ export function startWorkerRemoteLoop(
       clearTimeout(timer);
       timer = undefined;
     }
-    if (pushRetryTimer !== undefined) {
-      clearTimeout(pushRetryTimer);
-      pushRetryTimer = undefined;
-    }
     if (scope && scopeWrite && scope.write === scheduledScopeWrite) scope.write = scopeWrite;
     eventStop?.();
     remoteWakeStop?.();
-    if (state.remoteWake === wake) state.remoteWake = undefined;
+    if (state.remoteWake === remoteWake) state.remoteWake = undefined;
   };
   const handleRetirement = (startedAt: number, error: unknown): boolean => {
     if (!errorMessage(error).startsWith(REMOTE_CLIENT_RETIRED_PREFIX)) return false;
@@ -930,7 +1217,7 @@ export function startWorkerRemoteLoop(
     return true;
   };
   const run = () => {
-    if (stopped || running) return;
+    if (stopped || running || state.remoteNetworkOnline === false) return;
     debug("worker:remote:loop:run");
     if (timer !== undefined) {
       clearTimeout(timer);
@@ -942,49 +1229,154 @@ export function startWorkerRemoteLoop(
     localProgressPending = false;
     attempt += 1;
     const startedAt = getTimerTime();
-    const disarmPull = state.recovery?.arm("pull");
     state.recovery?.onRemoteActive();
     let nextDelay: number | undefined;
-    void pull(localProgress)
-      .then((tick) => {
-        state.recovery?.progress(generation);
+    let attemptedPush: typeof pushPending;
+    void (async () => {
+      let combined: RemoteTick | undefined;
+      let foreground: { actorQueueDepth: number; actorQueueMs: number } | undefined;
+      if (push && pushPending) {
+        attemptedPush = pushPending;
+        pushPending = undefined;
+        const disarmPush = state.recovery?.arm("push");
+        try {
+          const result = await push(attemptedPush.table, attemptedPush.id, {
+            firstCommitSeq: attemptedPush.commitSeq,
+            updatedCommitSeq: attemptedPush.commitSeq,
+          });
+          attemptedPush = undefined;
+          if (!isCurrent()) return undefined;
+          // A blocked foreground replay still owns durable work. Keep its backlog token, but do
+          // not poll it: transport ingress, a local wake, or an applied pull projection schedules
+          // the next attempt. Dropping the token here strands offline mutations after a rebase.
+          if (result.state !== "settled") pushPending ??= backlogPush;
+          consumeWorkerRemoteTick(state, result.tick);
+          state.remotePending = result.tick.pending;
+          combined = result.tick;
+          foreground = {
+            actorQueueDepth: result.actorQueueDepth ?? 0,
+            actorQueueMs: result.actorQueueMs ?? 0,
+          };
+        } finally {
+          disarmPush?.();
+        }
+      }
+      const disarmPull = state.recovery?.arm("pull");
+      try {
+        const pulled = await pull(localProgress);
+        return {
+          foreground,
+          pulled,
+          tick: combined ? mergeRemoteTicks(combined, pulled) : pulled,
+        };
+      } finally {
+        disarmPull?.();
+      }
+    })()
+      .then((turn) => {
+        if (!turn) return;
+        immediateRetryPending = false;
+        const { foreground, pulled, tick } = turn;
+        if (!isCurrent()) return;
+        state.recovery?.progress(generation, "pull");
         nextAllowedRunAt = 0;
         consecutiveErrors = 0;
-        consumeWorkerRemoteTick(state, tick);
-        const active = remoteTickHasWork(tick);
-        if (tick.sent > 0) awaitingResponse = true;
-        else if (active) awaitingResponse = false;
-        if (!active && !awaitingResponse && !wakePending && pushPending === undefined) {
-          state.recovery?.onRemoteIdle();
+        if (pulled.pullSnapshots > 0) pullDiagnostic = undefined;
+        if (pulled.pullDiagnostics > 0) {
+          pullDiagnostic = pulled.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR;
         }
-        const delay = wakePending ? 0 : awaitingResponse ? REMOTE_RESPONSE_KEEPALIVE_MS : undefined;
-        emit(active ? "tick" : "idle", {
+        consumeWorkerRemoteTick(state, pulled);
+        state.remotePending = pulled.pending;
+        // A blocked push retains the shared backlog token until the actor reports its exact final
+        // pending snapshot. Clear only that retained token when every lane is drained. A concrete
+        // local row token installed while this turn was awaiting the actor must survive the older
+        // snapshot and will be handled by `wakePending` on the next turn.
+        if (pushPending === backlogPush && remotePendingIsEmpty(state.remotePending)) {
+          pushPending = undefined;
+        }
+        const active = remoteTickHasWork(tick);
+        // Transport bookkeeping is observable activity, not proof that another immediate actor
+        // turn can advance durable replay. In particular a received frame or an OPFS job count can
+        // otherwise turn a blocked mutation into an unbounded microtask poll. A completed pull
+        // projection is the local progress that can make a retained blocked push runnable now.
+        const pushUnblocked =
+          pushPending !== undefined &&
+          (tick.pullSnapshots > 0 || tick.pullChangesApplied > 0 || tick.rowsApplied > 0);
+        // A newly subscribed pull can send its query and consume the authoritative result in the
+        // same WASM actor turn. `pullAttempted` proves that result reached the projection lane, so
+        // it must clear the response fence even when the turn also reports outbound protocol
+        // messages. Otherwise an empty follow-up has nothing left to receive and the browser polls
+        // forever while connectionState remains `starting`.
+        if (remotePendingIsEmpty(state.remotePending)) awaitingResponse = false;
+        else if (pulled.pullAttempted > 0) awaitingResponse = false;
+        else if (pulled.sent > 0) awaitingResponse = true;
+        else if (active) awaitingResponse = false;
+        const idle =
+          state.remoteConnected === true &&
+          state.remoteNetworkOnline !== false &&
+          !awaitingResponse &&
+          !wakePending &&
+          pushPending === undefined &&
+          remotePendingIsEmpty(state.remotePending);
+        if (idle) state.recovery?.onRemoteIdle();
+        const delay = wakePending
+          ? 0
+          : awaitingResponse
+            ? REMOTE_RESPONSE_KEEPALIVE_MS
+            : pushUnblocked && !remotePendingIsEmpty(state.remotePending)
+              ? 0
+              : undefined;
+        if (pullDiagnostic) {
+          emit("error", {
+            durationMs: getElapsedTime(startedAt),
+            error: new Error(pullDiagnostic),
+            foreground,
+            nextRunIn: delay,
+            tick,
+          });
+          nextDelay = delay;
+          return;
+        }
+        emit(idle ? "idle" : state.remoteConnected === true ? "tick" : "starting", {
           durationMs: getElapsedTime(startedAt),
+          foreground,
           nextRunIn: delay,
           tick,
         });
         nextDelay = delay;
       })
       .catch((error) => {
+        if (!isCurrent()) return;
         localProgressPending ||= localProgress;
+        if (attemptedPush) pushPending ??= attemptedPush;
         if (handleRetirement(startedAt, error)) return;
         if (emitDeploymentMismatch(state, error)) {
           stopped = true;
           eventStop?.();
           remoteWakeStop?.();
-          if (state.remoteWake === wake) state.remoteWake = undefined;
+          if (state.remoteWake === remoteWake) state.remoteWake = undefined;
           emit("error", { durationMs: getElapsedTime(startedAt), error });
           return;
         }
+        if (state.remoteNetworkOnline === false) {
+          immediateRetryPending = false;
+          nextAllowedRunAt = 0;
+          consecutiveErrors = 0;
+          emit("offline", { durationMs: getElapsedTime(startedAt), error });
+          return;
+        }
+        const retryImmediately = immediateRetryPending;
+        immediateRetryPending = false;
         consecutiveErrors += 1;
-        const delay = Math.min(5_000 * 2 ** (consecutiveErrors - 1), 60_000);
+        const delay = retryImmediately ? 0 : Math.min(5_000 * 2 ** (consecutiveErrors - 1), 60_000);
         nextAllowedRunAt = getTimerTime() + delay;
-        emit("error", { durationMs: getElapsedTime(startedAt), error, nextRunIn: delay });
+        emit("starting", { durationMs: getElapsedTime(startedAt), error, nextRunIn: delay });
         nextDelay = delay;
       })
       .finally(() => {
         running = false;
-        disarmPull?.();
+        state.recovery?.onRemoteSettled();
+        if (state.remoteNetworkOnline === false) return;
         if (wakePending) {
           schedule(Math.max(0, nextAllowedRunAt - getTimerTime()));
         } else if (nextDelay !== undefined) {
@@ -993,9 +1385,9 @@ export function startWorkerRemoteLoop(
       });
   };
   emit("started", { nextRunIn: 0 });
-  if (pushPending) queueMicrotask(pushRun);
   queueMicrotask(run);
   return () => {
+    debug("worker:remote:loop:stop");
     teardown();
     emit("closed");
   };
@@ -1025,6 +1417,7 @@ export async function initRuntime(options: {
   remote?: boolean;
   storageWaitNoticeMs?: number;
   storagePath: string;
+  temporaryStoragePath?: string;
   storeSchema: StoreSchema;
   wasm?: WasmSource;
 }): Promise<WorkerState> {
@@ -1059,6 +1452,7 @@ export async function initRuntime(options: {
       debug: instanceDebug(0),
       setupSchema: options.setupSchema,
       storagePath: options.storagePath,
+      temporaryStoragePath: options.temporaryStoragePath,
       wasm: options.wasm,
     });
     store = opened.store;
@@ -1082,15 +1476,17 @@ export async function initRuntime(options: {
       wasmApiVersion: opened.wasmApiVersion,
     };
     holder.state = state;
+    let activeStoragePath = opened.storagePath;
     state.rebuild = async () => {
       state.pthreads?.terminateAll();
       opfs.closeAll();
       const reopened = await openStoreInstance(opfs, {
         debug: instanceDebug(state.recovery?.remoteGeneration ?? 0),
         setupSchema: options.setupSchema,
-        storagePath: options.storagePath,
+        storagePath: activeStoragePath,
         wasm: options.wasm,
       });
+      activeStoragePath = reopened.storagePath;
       state.store = reopened.store;
       state.pthreads = reopened.pthreads;
       state.wasmApiVersion = reopened.wasmApiVersion;
@@ -1131,14 +1527,29 @@ export async function openStoreInstance(
     debug?: (phase: string, detail?: unknown) => void;
     setupSchema: StoreSchema;
     storagePath: string;
+    temporaryStoragePath?: string;
     wasm?: WasmSource;
   },
-): Promise<{ store: WasmStore; pthreads: PthreadRegistry; wasmApiVersion: number }> {
+): Promise<{
+  store: WasmStore;
+  pthreads: PthreadRegistry;
+  storagePath: string;
+  wasmApiVersion: number;
+}> {
   const debug = options.debug ?? (() => undefined);
   const pthreads = new PthreadRegistry();
-  debug("worker:opfs:register:start");
-  await registerTursoFiles(opfs, options.storagePath);
-  debug("worker:opfs:register:done");
+  let storagePath = options.storagePath;
+  if (!isTemporaryStoragePath(storagePath)) {
+    debug("worker:opfs:register:start");
+    try {
+      await registerTursoFiles(opfs, storagePath);
+      debug("worker:opfs:register:done");
+    } catch (error) {
+      if (options.temporaryStoragePath === undefined || !isUnavailableOpfsError(error)) throw error;
+      storagePath = options.temporaryStoragePath;
+      debug("worker:storage:temporary", { error: errorMessage(error) });
+    }
+  }
   debug("worker:wasm:load:start");
   const wasm = await loadWasmModule(options.wasm, {
     debug: (phase, detail) => debug(phase, detail),
@@ -1149,9 +1560,9 @@ export async function openStoreInstance(
   debug("worker:wasm:load:done");
   const openAndSetup = async (): Promise<WasmStore> => {
     debug("worker:store:open:start");
-    const opened = await WasmStore.openWith(wasm.Store, options.storagePath, {
+    const opened = await WasmStore.openWith(wasm.Store, storagePath, {
       defaultIdentityKey: EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY,
-      selectorKey: options.storagePath,
+      selectorKey: storagePath,
     });
     debug("worker:store:open:done");
     debug("worker:store:setup:start");
@@ -1168,18 +1579,45 @@ export async function openStoreInstance(
     // by a prior turso release), not same-format corruption of an openable store. While v5 is
     // pre-release this resets to the current empty format; the current authority repopulates rows.
     debug("worker:store:reset:start", describeError(error));
-    await resetTursoFiles(opfs, options.storagePath);
+    if (isTemporaryStoragePath(storagePath)) throw error;
+    await resetTursoFiles(opfs, storagePath);
     store = await openAndSetup();
     debug("worker:store:reset:done");
   }
   try {
-    debug("worker:store:checkpoint:start");
-    await store.checkpoint();
-    debug("worker:store:checkpoint:done");
+    debug("worker:store:wal-write:start");
+    await store.wal.write();
+    debug("worker:store:wal-write:done");
   } catch (error) {
-    debug("worker:store:checkpoint:error", describeError(error));
+    debug("worker:store:wal-write:error", describeError(error));
   }
-  return { pthreads, store, wasmApiVersion };
+  return { pthreads, storagePath, store, wasmApiVersion };
+}
+
+function isTemporaryStoragePath(path: string): boolean {
+  return path.startsWith(":memory:");
+}
+
+/** Distinguishes unavailable storage from a live-owner conflict that must fail closed. @internal */
+export function isUnavailableOpfsError(error: unknown): boolean {
+  const name =
+    typeof error === "object" && error !== null ? (error as { name?: unknown }).name : undefined;
+  if (
+    name === "InvalidStateError" ||
+    name === "NotAllowedError" ||
+    name === "NotSupportedError" ||
+    name === "QuotaExceededError" ||
+    name === "SecurityError" ||
+    name === "UnknownError"
+  ) {
+    return true;
+  }
+  const message = errorMessage(error);
+  return (
+    message.includes("requires navigator.storage.getDirectory") ||
+    message.includes("storage is unavailable in this browsing context") ||
+    message.includes("requires OPFS createSyncAccessHandle support")
+  );
 }
 
 function post(message: WorkerResponse): void {

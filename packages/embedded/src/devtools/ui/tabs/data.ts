@@ -563,10 +563,10 @@ export function mountDataTab(host: HTMLElement, source: EmbeddedDevtoolsSource):
       state.rows = next;
       if (state.selectedRowId === deleted.id) state.selectedRowId = null;
     }
-    for (const upsert of event.upserts) {
-      if (upsert.table !== state.table) continue;
-      const index = state.rows.findIndex((row) => rowId(row) === upsert.id);
-      const row = upsert.row;
+    for (const docWrite of event.docWrites) {
+      if (docWrite.table !== state.table) continue;
+      const index = state.rows.findIndex((row) => rowId(row) === docWrite.id);
+      const row = docWrite.row;
       if (index >= 0) {
         state.rows = state.rows.map((current, currentIndex) =>
           currentIndex === index ? row : current,

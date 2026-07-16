@@ -3,7 +3,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use storage::{
-    ColValue, ColumnDef, CommitOptions, EmbeddedStore, IndexDef, StoreSchema, TableDef, UpsertIn,
+    ColValue, ColumnDef, CommitOptions, DocWrite, EmbeddedStore, IndexDef, StoreSchema, TableDef,
     WriteBatch,
 };
 
@@ -41,11 +41,13 @@ fn batch(store: &EmbeddedStore, rows: usize) -> WriteBatch {
 }
 
 fn batch_from(store: &EmbeddedStore, rows: usize, start: usize) -> WriteBatch {
-    let upserts = (0..rows).map(|i| upsert_from(store, start + i)).collect();
+    let doc_writes = (0..rows)
+        .map(|i| doc_write_from(store, start + i))
+        .collect();
     WriteBatch {
         crdt_ops: Vec::new(),
         crdt_restores: vec![],
-        upserts,
+        doc_writes,
         deletes: vec![],
         fresh_ids: vec![],
         data_only_ids: vec![],
@@ -54,8 +56,8 @@ fn batch_from(store: &EmbeddedStore, rows: usize, start: usize) -> WriteBatch {
     }
 }
 
-fn upsert_from(store: &EmbeddedStore, index: usize) -> UpsertIn {
-    UpsertIn {
+fn doc_write_from(store: &EmbeddedStore, index: usize) -> DocWrite {
+    DocWrite {
         table: "vals".into(),
         id: format!("r{index:08}"),
         data: r#"{"v":0}"#.into(),
@@ -67,11 +69,11 @@ fn upsert_from(store: &EmbeddedStore, index: usize) -> UpsertIn {
 fn fresh_batch_from(store: &EmbeddedStore, rows: usize, start: usize) -> WriteBatch {
     let mut batch = batch_from(store, rows, start);
     batch.fresh_ids = batch
-        .upserts
+        .doc_writes
         .iter()
-        .map(|upsert| storage::RowKey {
-            table: upsert.table.clone(),
-            document_id: upsert.id.clone(),
+        .map(|doc_write| storage::RowKey {
+            table: doc_write.table.clone(),
+            document_id: doc_write.id.clone(),
         })
         .collect();
     batch
@@ -81,7 +83,7 @@ fn rewrite_batch(store: &EmbeddedStore, value: usize, data_only: bool) -> WriteB
     WriteBatch {
         crdt_ops: Vec::new(),
         crdt_restores: vec![],
-        upserts: vec![UpsertIn {
+        doc_writes: vec![DocWrite {
             table: "vals".into(),
             id: "hot-row".into(),
             data: format!(r#"{{"v":{value}}}"#),
@@ -196,19 +198,19 @@ fn commit_benches(c: &mut Criterion) {
         );
     });
 
-    c.bench_function("doc/commit_one_upsert_local_hot_fresh", |b| {
+    c.bench_function("doc/commit_one_doc_write_local_hot_fresh", |b| {
         let store = fresh();
         let mut next = 0usize;
         b.iter_batched(
             || {
-                let upsert = upsert_from(&store, next);
+                let doc_write = doc_write_from(&store, next);
                 next += 1;
-                upsert
+                doc_write
             },
-            |upsert| {
+            |doc_write| {
                 black_box(
                     store
-                        .commit_one_upsert(upsert, &CommitOptions::default(), true, false)
+                        .commit_one_doc_write(doc_write, &CommitOptions::default(), true, false)
                         .unwrap(),
                 )
             },
@@ -216,20 +218,20 @@ fn commit_benches(c: &mut Criterion) {
         );
     });
 
-    c.bench_function("doc/commit_one_upsert_local_hot_fresh_no_changes", |b| {
+    c.bench_function("doc/commit_one_doc_write_local_hot_fresh_no_changes", |b| {
         let store = fresh();
         let options = options_no_changes("local");
         let mut next = 0usize;
         b.iter_batched(
             || {
-                let upsert = upsert_from(&store, next);
+                let doc_write = doc_write_from(&store, next);
                 next += 1;
-                upsert
+                doc_write
             },
-            |upsert| {
+            |doc_write| {
                 black_box(
                     store
-                        .commit_one_upsert(upsert, &options, true, false)
+                        .commit_one_doc_write(doc_write, &options, true, false)
                         .unwrap(),
                 )
             },

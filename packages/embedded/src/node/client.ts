@@ -19,7 +19,7 @@ export type {
   ConvexModules,
   EmbeddedDataDelete,
   EmbeddedDataEvent,
-  EmbeddedDataUpsert,
+  EmbeddedDataWrite,
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,

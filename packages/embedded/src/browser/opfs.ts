@@ -33,7 +33,8 @@ declare const self: unknown;
 
 const ACCESS_HANDLE_RETRY_BASE_MS = 10;
 const ACCESS_HANDLE_RETRY_MAX_MS = 250;
-const ACCESS_HANDLE_RETRY_BUDGET_MS = 15_000;
+/** Shared reclaim budget for the database, WAL, and SHM inside the 15s worker init deadline. */
+export const OPFS_ACCESS_HANDLE_RETRY_BUDGET_MS = 5_000;
 
 type OpfsDebug = (phase: string, detail?: unknown) => void;
 type OpfsRoot = () => Promise<DirectoryHandle>;
@@ -47,6 +48,7 @@ export class OpfsDirectory {
   private nextHandle = 0;
   private readonly byHandle = new Map<number, SyncAccessHandle>();
   private readonly byPath = new Map<string, { handle: number; sync: SyncAccessHandle }>();
+  private accessHandleDeadline: number | undefined;
 
   constructor(
     private readonly debug?: OpfsDebug,
@@ -62,7 +64,8 @@ export class OpfsDirectory {
         "ConvexEmbeddedClient browser storage requires OPFS createSyncAccessHandle support.",
       );
     }
-    const sync = await createSyncAccessHandleWithRetry(file, this.debug);
+    this.accessHandleDeadline ??= now() + OPFS_ACCESS_HANDLE_RETRY_BUDGET_MS;
+    const sync = await createSyncAccessHandleWithRetry(file, this.accessHandleDeadline, this.debug);
     this.nextHandle += 1;
     this.byPath.set(path, { handle: this.nextHandle, sync });
     this.byHandle.set(this.nextHandle, sync);
@@ -101,6 +104,7 @@ export class OpfsDirectory {
     }
     this.byPath.clear();
     this.byHandle.clear();
+    this.accessHandleDeadline = undefined;
   }
 
   getFileHandle(path: string): number | null {
@@ -138,9 +142,9 @@ export class OpfsDirectory {
 }
 
 /**
- * Asks the browser to mark this origin's storage persistent so OPFS is exempt from Safari's 7-day
- * ITP eviction of an idle origin. iOS grants silently from interaction history; the result is
- * advisory, so this is fire-and-forget and never blocks or fails store open.
+ * Asks the browser to mark this origin's storage persistent so OPFS is exempt from discretionary
+ * idle-origin eviction. The result is advisory, so this is fire-and-forget and never blocks or
+ * fails store open.
  *
  * @internal
  */
@@ -158,13 +162,24 @@ async function opfsRoot(): Promise<DirectoryHandle> {
       "ConvexEmbeddedClient browser storage requires navigator.storage.getDirectory.",
     );
   }
-  return navigator.storage.getDirectory();
+  try {
+    return await navigator.storage.getDirectory();
+  } catch (cause) {
+    if (!isUnknownError(cause)) throw cause;
+    throw Object.assign(
+      new Error(
+        "ConvexEmbeddedClient browser storage is unavailable in this browsing context. Open the site in a context that provides OPFS, then reload and try again.",
+      ),
+      { cause },
+    );
+  }
 }
 
 async function createSyncAccessHandleWithRetry(
   file: {
     createSyncAccessHandle(options?: { mode: "readwrite" }): Promise<SyncAccessHandle>;
   },
+  deadline: number,
   debug?: OpfsDebug,
 ): Promise<SyncAccessHandle> {
   const startedAt = now();
@@ -176,24 +191,30 @@ async function createSyncAccessHandleWithRetry(
       }
       return sync;
     } catch (error) {
-      if (!isNoModificationAllowedError(error)) throw error;
-      // A dead predecessor's exclusive handle outlives its Web Lock until the browser reclaims it.
-      // The storage-owner lock already serializes LIVE owners, so a NoModificationAllowedError here
-      // is a reclaim race, not a live conflict: back off and wait for the reclaim, capped by budget.
+      if (!isRetryableAccessHandleError(error)) throw error;
+      // A dead predecessor's exclusive handle can outlive its page lock until the browser reclaims
+      // it. Engines may report this race as NoModificationAllowedError or the generic UnknownError.
+      // The storage-owner lock already serializes live owners, so back off for a bounded interval.
       const waitedMs = now() - startedAt;
-      if (waitedMs >= ACCESS_HANDLE_RETRY_BUDGET_MS) {
+      if (now() >= deadline) {
         throw Object.assign(
           new Error(
-            "ConvexEmbeddedClient browser storage is already open in another tab or stale runtime. Close or reload other tabs using this embedded database.",
+            "ConvexEmbeddedClient browser storage could not acquire OPFS. Close or reload other contexts using this embedded database, then try again.",
           ),
           { cause: error },
         );
       }
       const delay = Math.min(
+        Math.max(0, deadline - now()),
         ACCESS_HANDLE_RETRY_MAX_MS,
         ACCESS_HANDLE_RETRY_BASE_MS * 2 ** attempt,
       );
-      debug?.("worker:opfs:acquire:retry", { attempt, delayMs: delay, waitedMs });
+      debug?.("worker:opfs:acquire:retry", {
+        attempt,
+        delayMs: delay,
+        error: errorName(error),
+        waitedMs,
+      });
       await sleep(delay);
     }
   }
@@ -205,7 +226,7 @@ async function openExclusiveSyncAccessHandle(file: {
   try {
     return await file.createSyncAccessHandle({ mode: "readwrite" });
   } catch (error) {
-    if (isNoModificationAllowedError(error)) throw error;
+    if (isRetryableAccessHandleError(error)) throw error;
     return file.createSyncAccessHandle();
   }
 }
@@ -214,12 +235,19 @@ function now(): number {
   return getTimerTime();
 }
 
-function isNoModificationAllowedError(error: unknown): boolean {
-  return error instanceof DOMException
-    ? error.name === "NoModificationAllowedError"
-    : typeof error === "object" &&
-        error !== null &&
-        (error as { name?: unknown }).name === "NoModificationAllowedError";
+function isRetryableAccessHandleError(error: unknown): boolean {
+  const name = errorName(error);
+  return name === "NoModificationAllowedError" || name === "UnknownError";
+}
+
+function isUnknownError(error: unknown): boolean {
+  return errorName(error) === "UnknownError";
+}
+
+function errorName(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const name = (error as { name?: unknown }).name;
+  return typeof name === "string" && name.length > 0 ? name : undefined;
 }
 
 function sleep(ms: number): Promise<void> {

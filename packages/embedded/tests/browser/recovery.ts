@@ -1,19 +1,15 @@
 /**
- * Dedicated worker for the store-instance recovery harness. It exercises the detect -> rebuild ->
- * graft loop end-to-end against a real WASM store and its real emnapi pthread pool, with no server
- * and no coordinator so the case is self-contained and deployment-free.
+ * Dedicated worker for the store-instance recovery harness. It exercises terminal detection of a
+ * genuinely wedged WASM store against a real emnapi pthread pool, with no server and no coordinator.
  *
  * Flow (`op: "recover"`):
- * - opens a runtime, seeds rows, and installs a {@link StoreRecovery} with short deadlines whose
- *   `rebuild` host action runs the runtime's in-place graft;
+ * - opens a runtime, seeds rows, and installs a {@link StoreRecovery} with short deadlines;
  * - arms a lane and `terminate()`s the whole pthread pool mid-flight, wedging the instance so the
  *   progress-based watchdog fires;
- * - waits for the graft to complete, then commits a fresh mutation on the grafted runner and reads
- *   the row count back to prove the seeded data survived and the new instance is usable.
+ * - proves the controller marks the instance dead instead of allocating a second WASM linear memory
+ *   inside the same worker while the first promise may still retain the old one.
  *
- * The "reaches the server post-rebuild" clause of case A, the proxy-30s race of case B, and the
- * two-tab lease-promotion of case C need a live deployment plus the coordinator and are asserted
- * (skipped) by the driver in runtime.ts, not here.
+ * Transparent recovery requires page-level dedicated-worker rotation and is outside this harness.
  */
 import { makeFunctionReference } from "convex/server";
 
@@ -124,11 +120,11 @@ async function recover(request: RecoverRequest): Promise<RecoverResult> {
       dead = true;
       readyGate.resolve();
     },
-    runCheckpoint: () => state.store.checkpoint(),
+    walWrite: () => state.store.wal.write(),
   };
   // Short deadlines keep the harness fast; checkpoint pacing is pushed out of the way.
   const recovery = new StoreRecovery(host, {
-    checkpointPollMs: 60_000,
+    walWritePollMs: 60_000,
     idleMs: 400,
     pollMs: 50,
   });
@@ -142,13 +138,13 @@ async function recover(request: RecoverRequest): Promise<RecoverResult> {
     const pthreadsBefore = state.pthreads?.size ?? 0;
 
     // Wedge the instance: arm a lane, then terminate the whole pthread pool with no further
-    // progress signal. The watchdog abandons the lane and the controller grafts a fresh instance.
+    // progress signal. The watchdog must select the terminal worker boundary.
     recovery.arm("pull");
     const liveness = setInterval(() => recovery.transportActive(), 100);
     state.pthreads?.terminateAll();
 
     try {
-      await withTimeout(readyGate.promise, 15_000, "store-instance rebuild");
+      await withTimeout(readyGate.promise, 15_000, "store-instance terminal detection");
     } finally {
       clearInterval(liveness);
     }

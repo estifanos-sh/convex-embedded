@@ -16,7 +16,7 @@ import {
 import { normalizeObject } from "../../runtime/codec";
 import type { RunMutationTiming, StopOnUpdate, WatchUpdateInfo } from "../../runtime/runner";
 import { remoteConfigKey } from "../remote";
-import type { WorkerState } from "../runtime";
+import { emitWorkerRemoteError, type WorkerState } from "../runtime";
 import type { BroadcastChannelLike, PeerMessage } from "./protocol";
 import {
   AttachRejection,
@@ -71,6 +71,8 @@ export interface LeaderState {
   mutations: Map<string, RunningMutation>;
   /** When present, new leader requests queue behind an in-progress store-instance rebuild. */
   rebuildGate?: Deferred<void>;
+  /** Serializes a last-client remote stop with a concurrently attaching remote client. */
+  remoteIdleStop?: Promise<void>;
   recoveryHooks?: LeaderRecoveryHooks;
   runtime: WorkerState;
   scope: string;
@@ -111,6 +113,7 @@ export class LeaderRuntime {
 
   addLocalClient(client: LeaderClient): void {
     this.state.clients.set(client.id, client);
+    postRemoteSnapshot(this.state, client);
   }
 
   attachFollower(
@@ -127,10 +130,12 @@ export class LeaderRuntime {
       op: PeerOp.Attached,
       protocol: CoordinatorProtocol,
     } satisfies PeerMessage);
+    const client = this.state.clients.get(localClientKey(message.workerId, message.clientId));
+    if (client) postRemoteSnapshot(this.state, client);
   }
 
-  cleanupFollower(workerId: string): void {
-    cleanupFollower(this.state, workerId);
+  followerDelete(workerId: string): void {
+    followerDelete(this.state, workerId);
   }
 
   handle(client: LeaderClient, request: WorkerRequest): Promise<void> {
@@ -147,12 +152,12 @@ export class LeaderRuntime {
       now: () => getTimerTime(),
       emitDegraded: (error) => postEvent(this.state, degradedEvent(error)),
       emitReady: () => postEvent(this.state, readyEvent()),
-      emitRemoteError: (error) => postEvent(this.state, remoteErrorEvent(error)),
+      emitRemoteError: (error) => emitWorkerRemoteError(this.state.runtime, error),
       rebuild: () => this.rebuild(),
       stopRemote: () => hooks.stopRemote(),
       closeRemoteSocket: () => hooks.closeRemoteSocket(),
       deadInstance: (error) => this.deadInstance(error),
-      runCheckpoint: () => this.state.runtime.store.checkpoint(),
+      walWrite: () => this.state.runtime.store.wal.write(),
     };
     const recovery = new StoreRecovery(host);
     this.state.runtime.recovery = recovery;
@@ -235,6 +240,8 @@ const leaderRequestHandlers = {
   [WorkerCommand.IdentityRead]: handleIdentityRead,
   [WorkerCommand.IdentityWrite]: handleIdentityWrite,
   [WorkerCommand.RemoteIdentityRead]: handleRemoteIdentityRead,
+  [WorkerCommand.RemoteNetworkWrite]: handleRemoteNetworkWrite,
+  [WorkerCommand.StorageOwnerWrite]: handleUnexpectedStorageOwnerWrite,
   [WorkerCommand.WatchStart]: handleWatchStart,
   [WorkerCommand.WatchStop]: handleWatchStop,
 } satisfies LeaderRequestHandlers;
@@ -341,10 +348,6 @@ function readyEvent(): EmbeddedEvent {
   return { at: getTimerTime(), phase: "ready", type: "runtime" };
 }
 
-function remoteErrorEvent(error: string): EmbeddedEvent {
-  return { at: getTimerTime(), attempt: 0, error, status: "error", type: "remote" };
-}
-
 export function attachFollower(
   leader: LeaderState,
   message: Extract<PeerMessage, { op: typeof PeerOp.Attach }>,
@@ -428,7 +431,8 @@ export function attachFollower(
       monitor(follower);
     }
     if (message.remote !== undefined) {
-      void import("../runtime")
+      void (leader.remoteIdleStop ?? Promise.resolve())
+        .then(() => import("../runtime"))
         .then(({ ensureWorkerRemoteStarted }) =>
           ensureWorkerRemoteStarted(leader.runtime, message.remote!, false, post),
         )
@@ -475,7 +479,7 @@ export async function handlePeerRequest(
   await handleLeaderRequest(leader, client, message.request);
 }
 
-export function cleanupFollower(leader: LeaderState, workerId: string): void {
+export function followerDelete(leader: LeaderState, workerId: string): void {
   const follower = leader.followers.get(workerId);
   if (!follower) return;
   for (const id of Array.from(follower.clients)) {
@@ -640,7 +644,7 @@ async function handleMutation(
           void leader.runtime.runner
             .runMutation(request.name, request.args, {
               auth: request.auth as never,
-              mutationFresh: request.mutationFresh,
+              mutationIsFresh: request.mutationIsFresh,
               mutationId,
               pushCall: {
                 fn: request.name,
@@ -743,6 +747,24 @@ async function handleAuthTokenResult(
   const { handleWorkerRemoteAuthResult } = await import("../runtime");
   handleWorkerRemoteAuthResult(leader.runtime, request);
   client.post({ id: request.id, op: WorkerEvent.Result });
+}
+
+async function handleRemoteNetworkWrite(
+  leader: LeaderState,
+  client: ClientState,
+  request: Extract<WorkerRequest, { op: typeof WorkerCommand.RemoteNetworkWrite }>,
+): Promise<void> {
+  const { writeWorkerRemoteNetwork } = await import("../runtime");
+  writeWorkerRemoteNetwork(leader.runtime, request.online);
+  client.post({ id: request.id, op: WorkerEvent.Result });
+}
+
+function handleUnexpectedStorageOwnerWrite(
+  _leader: LeaderState,
+  _client: ClientState,
+  _request: Extract<WorkerRequest, { op: typeof WorkerCommand.StorageOwnerWrite }>,
+): never {
+  throw new Error("Storage ownership grants are local to the requesting page runtime.");
 }
 
 function stopClientWatch(leader: LeaderState, client: ClientState, watchId: number): void {
@@ -915,10 +937,19 @@ function flushClientWatchUpdates(leader: LeaderState, client: ClientState): void
 }
 
 function postEvent(leader: LeaderState, event: EmbeddedEvent): void {
-  const response: WorkerResponse = { event, op: WorkerEvent.Event };
+  const forwarded = event.type === "remote" ? { ...event, incarnation: leader.leaderEpoch } : event;
+  const response: WorkerResponse = { event: forwarded, op: WorkerEvent.Event };
   for (const client of leader.clients.values()) {
-    if (canReadEvent(client, event)) client.post(response);
+    if (canReadEvent(client, forwarded)) client.post(response);
   }
+}
+
+function postRemoteSnapshot(leader: LeaderState, client: ClientState): void {
+  if (!client.remoteConfigured || !leader.runtime.remoteEvent) return;
+  client.post({
+    event: { ...leader.runtime.remoteEvent, incarnation: leader.leaderEpoch },
+    op: WorkerEvent.Event,
+  });
 }
 
 function canReadEvent(client: ClientState, event: EmbeddedEvent): boolean {
@@ -979,6 +1010,7 @@ function hasRemoteClient(leader: LeaderState): boolean {
 
 function stopRemoteIfIdle(leader: LeaderState): void {
   if (hasRemoteClient(leader)) return;
+  if (leader.remoteIdleStop !== undefined) return;
   if (
     leader.runtime.remoteKey === undefined &&
     leader.runtime.remoteReady === undefined &&
@@ -987,7 +1019,16 @@ function stopRemoteIfIdle(leader: LeaderState): void {
   ) {
     return;
   }
-  void import("../runtime")
-    .then(({ stopWorkerRemote }) => stopWorkerRemote(leader.runtime))
+  const stopping = import("../runtime")
+    .then(({ stopWorkerRemote }) => {
+      // A client may attach while the runtime chunk is loading. Re-check at the destructive edge;
+      // otherwise that late attachment inherits a runtime whose remote actor was just stopped.
+      if (hasRemoteClient(leader)) return;
+      return stopWorkerRemote(leader.runtime);
+    })
     .catch(() => undefined);
+  leader.remoteIdleStop = stopping;
+  void stopping.finally(() => {
+    if (leader.remoteIdleStop === stopping) leader.remoteIdleStop = undefined;
+  });
 }

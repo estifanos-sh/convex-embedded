@@ -14,6 +14,8 @@ function emptyTick(): RemoteTick {
     changedTables: [],
     pullAttempted: 0,
     pullDiagnostics: 0,
+    pullChangesApplied: 0,
+    pullSnapshots: 0,
     pushAccepted: 0,
     pushAttempted: 0,
     pushConflicts: 0,
@@ -25,7 +27,7 @@ function emptyTick(): RemoteTick {
     retainedRevisions: [],
     rowsApplied: 0,
     sent: 0,
-    settlementsAcknowledged: 0,
+    receiptsPushed: 0,
     storeJobs: 0,
   };
 }

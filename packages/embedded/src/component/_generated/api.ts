@@ -12,6 +12,7 @@ import type * as crdt from "../crdt.js";
 import type * as crdt_checkpoint from "../crdt/checkpoint.js";
 import type * as crdt_field from "../crdt/field.js";
 import type * as crdt_payload from "../crdt/payload.js";
+import type * as crdt_retention from "../crdt/retention.js";
 import type * as file from "../file.js";
 import type * as identity from "../identity.js";
 import type * as local from "../local.js";
@@ -31,6 +32,7 @@ const fullApi: ApiFromModules<{
   "crdt/checkpoint": typeof crdt_checkpoint;
   "crdt/field": typeof crdt_field;
   "crdt/payload": typeof crdt_payload;
+  "crdt/retention": typeof crdt_retention;
   file: typeof file;
   identity: typeof identity;
   local: typeof local;

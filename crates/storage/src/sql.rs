@@ -238,7 +238,7 @@ static MUTATION_COMMIT_EXISTS: LazyLock<String> = LazyLock::new(|| {
         [eq(IDENTITY_KEY), eq(COMMIT_SEQ)],
     )
 });
-static PRUNE_COMMITS: LazyLock<String> =
+static DELETE_COMMITS: LazyLock<String> =
     LazyLock::new(|| delete_where(COMMITS, [eq(IDENTITY_KEY), lte(COMMIT_SEQ)]));
 static CLEAR_COMMITS: LazyLock<String> =
     LazyLock::new(|| delete_where(COMMITS, [eq(IDENTITY_KEY)]));
@@ -347,7 +347,7 @@ static COMMIT_MUTATION: LazyLock<String> = LazyLock::new(|| {
         .cond_where(all([eq(IDENTITY_KEY), eq(MUTATION_ID), eq(STATUS)]));
     query.build(SqliteQueryBuilder).0
 });
-static PRUNE_MUTATIONS: LazyLock<String> = LazyLock::new(|| {
+static DELETE_MUTATIONS: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::delete();
     query.from_table(alias(MUTATIONS)).cond_where(all([
         eq(IDENTITY_KEY),
@@ -414,7 +414,7 @@ static CREATE_REVS: LazyLock<String> = LazyLock::new(|| {
             .to_string(SqliteQueryBuilder),
     )
 });
-static UPSERT_REV: LazyLock<String> = LazyLock::new(|| {
+static WRITE_REV: LazyLock<String> = LazyLock::new(|| {
     write(
         REVS,
         [
@@ -897,7 +897,7 @@ static CREATE_PROJECTIONS_SERVER_INDEX: LazyLock<String> = LazyLock::new(|| {
         .col(alias(SERVER_DOCUMENT_ID))
         .to_string(SqliteQueryBuilder)
 });
-static UPSERT_PROJECTION: LazyLock<String> = LazyLock::new(|| {
+static WRITE_PROJECTION: LazyLock<String> = LazyLock::new(|| {
     write(
         PROJECTIONS,
         [
@@ -1399,6 +1399,8 @@ static READ_UPLOADS: LazyLock<String> = LazyLock::new(|| {
 });
 static HAS_UPLOADS: LazyLock<String> =
     LazyLock::new(|| select_where(UPLOADS, [Expr::cust("1")], [eq(IDENTITY_KEY)]));
+static READ_UPLOAD_PENDING: LazyLock<String> =
+    LazyLock::new(|| format!("SELECT COUNT(*) FROM \"{UPLOADS}\" WHERE \"{IDENTITY_KEY}\" = ?"));
 static READ_UPLOAD: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::select();
     upload_select(&mut query);
@@ -1407,7 +1409,7 @@ static READ_UPLOAD: LazyLock<String> = LazyLock::new(|| {
         .cond_where(all([eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID)]));
     query.build(SqliteQueryBuilder).0
 });
-static CLAIMABLE_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+static UPLOAD_LEASE_PENDING_READ: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::select();
     upload_select(&mut query);
     let mut condition = all([eq(IDENTITY_KEY)]);
@@ -1424,7 +1426,7 @@ static CLAIMABLE_UPLOAD: LazyLock<String> = LazyLock::new(|| {
         .limit(1);
     query.build(SqliteQueryBuilder).0
 });
-static CLAIM_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+static UPLOAD_LEASE_NEXT_CLAIMED_WRITE: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::update();
     let mut condition = all([eq(IDENTITY_KEY), eq(LOCAL_STORAGE_ID)]);
     condition = condition.add(any([
@@ -1441,7 +1443,7 @@ static CLAIM_UPLOAD: LazyLock<String> = LazyLock::new(|| {
         .cond_where(condition);
     query.build(SqliteQueryBuilder).0
 });
-static RENEW_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+static UPLOAD_LEASE_CLAIMED_WRITE: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::update();
     query
         .table(alias(UPLOADS))
@@ -1455,7 +1457,7 @@ static RENEW_UPLOAD: LazyLock<String> = LazyLock::new(|| {
         ]));
     query.build(SqliteQueryBuilder).0
 });
-static RELEASE_UPLOAD: LazyLock<String> = LazyLock::new(|| {
+static UPLOAD_LEASE_PENDING_WRITE: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::update();
     query
         .table(alias(UPLOADS))
@@ -1529,6 +1531,11 @@ static READ_REMOTE_PUSH_ENVELOPES: LazyLock<String> = LazyLock::new(|| {
         "SELECT \"{WATERMARK}\", \"{CURSOR}\" FROM \"{REMOTE}\" WHERE \"{IDENTITY_KEY}\" = ? AND \"{WATERMARK}\" >= ? AND \"{WATERMARK}\" < ? AND \"{CURSOR}\" IS NOT NULL ORDER BY \"{COMMIT_SEQ}\" ASC, \"{WATERMARK}\" ASC"
     )
 });
+static READ_REMOTE_PENDING: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT COUNT(*) FROM \"{REMOTE}\" WHERE \"{IDENTITY_KEY}\" = ? AND \"{WATERMARK}\" >= ? AND \"{WATERMARK}\" < ? AND \"{CURSOR}\" IS NOT NULL"
+    )
+});
 static CLEAR_REMOTE: LazyLock<String> = LazyLock::new(|| delete_where(REMOTE, [eq(IDENTITY_KEY)]));
 
 static CREATE_SCHEDULES: LazyLock<String> = LazyLock::new(|| {
@@ -1569,7 +1576,7 @@ static WRITE_SCHEDULE: LazyLock<String> = LazyLock::new(|| {
         true,
     )
 });
-static READ_DUE_SCHEDULES: LazyLock<String> = LazyLock::new(|| {
+static SCHEDULE_LEASE_READ: LazyLock<String> = LazyLock::new(|| {
     let mut query = Query::select();
     schedule_select(&mut query);
     query
@@ -1676,7 +1683,7 @@ pub(crate) fn mutation_commit_has() -> &'static str {
 }
 
 pub(crate) fn delete_commits() -> &'static str {
-    &PRUNE_COMMITS
+    &DELETE_COMMITS
 }
 
 pub(crate) fn clear_commits() -> &'static str {
@@ -1716,7 +1723,7 @@ pub(crate) fn commit_mutation() -> &'static str {
 }
 
 pub(crate) fn delete_mutations() -> &'static str {
-    &PRUNE_MUTATIONS
+    &DELETE_MUTATIONS
 }
 
 pub(crate) fn clear_mutations() -> &'static str {
@@ -1763,7 +1770,7 @@ pub(crate) fn delete_rev_log() -> &'static str {
     &DELETE_REV_LOG
 }
 
-pub(crate) fn count_rev_log() -> &'static str {
+pub(crate) fn rev_log_count_read() -> &'static str {
     &COUNT_REV_LOG
 }
 
@@ -1841,7 +1848,7 @@ pub(crate) fn create_peers() -> &'static str {
 }
 
 pub(crate) fn write_rev() -> &'static str {
-    &UPSERT_REV
+    &WRITE_REV
 }
 
 pub(crate) fn read_rev() -> &'static str {
@@ -1898,7 +1905,7 @@ pub(crate) fn create_projections_server_index() -> &'static str {
 }
 
 pub(crate) fn write_projection() -> &'static str {
-    &UPSERT_PROJECTION
+    &WRITE_PROJECTION
 }
 
 pub(crate) fn read_projection() -> &'static str {
@@ -1961,7 +1968,7 @@ pub(crate) fn read_result_skeleton_hash() -> &'static str {
     &READ_RESULT_SKELETON_HASH
 }
 
-pub(crate) fn read_result_delete_stale() -> &'static str {
+pub(crate) fn result_stale_read() -> &'static str {
     &READ_RESULT_STALE
 }
 
@@ -2057,24 +2064,28 @@ pub(crate) fn uploads_has() -> &'static str {
     &HAS_UPLOADS
 }
 
+pub(crate) fn read_upload_pending() -> &'static str {
+    &READ_UPLOAD_PENDING
+}
+
 pub(crate) fn read_upload() -> &'static str {
     &READ_UPLOAD
 }
 
-pub(crate) fn read_claimable_upload() -> &'static str {
-    &CLAIMABLE_UPLOAD
+pub(crate) fn upload_lease_pending_read() -> &'static str {
+    &UPLOAD_LEASE_PENDING_READ
 }
 
-pub(crate) fn write_upload_claim() -> &'static str {
-    &CLAIM_UPLOAD
+pub(crate) fn upload_lease_next_claimed_write() -> &'static str {
+    &UPLOAD_LEASE_NEXT_CLAIMED_WRITE
 }
 
-pub(crate) fn write_upload_renew() -> &'static str {
-    &RENEW_UPLOAD
+pub(crate) fn upload_lease_claimed_write() -> &'static str {
+    &UPLOAD_LEASE_CLAIMED_WRITE
 }
 
-pub(crate) fn write_upload_release() -> &'static str {
-    &RELEASE_UPLOAD
+pub(crate) fn upload_lease_pending_write() -> &'static str {
+    &UPLOAD_LEASE_PENDING_WRITE
 }
 
 pub(crate) fn delete_upload() -> &'static str {
@@ -2117,6 +2128,10 @@ pub(crate) fn read_remote_push_envelopes() -> &'static str {
     &READ_REMOTE_PUSH_ENVELOPES
 }
 
+pub(crate) fn read_remote_pending() -> &'static str {
+    &READ_REMOTE_PENDING
+}
+
 pub(crate) fn clear_remote() -> &'static str {
     &CLEAR_REMOTE
 }
@@ -2129,8 +2144,8 @@ pub(crate) fn write_schedule() -> &'static str {
     &WRITE_SCHEDULE
 }
 
-pub(crate) fn read_due_schedules() -> &'static str {
-    &READ_DUE_SCHEDULES
+pub(crate) fn schedule_lease_read() -> &'static str {
+    &SCHEDULE_LEASE_READ
 }
 
 pub(crate) fn read_schedules() -> &'static str {
@@ -2188,6 +2203,16 @@ pub(crate) fn write_doc_column(table: &str, column: &str) -> Result<String, Stor
     validate_bare_ident(column)?;
     Ok(format!(
         "ALTER TABLE {} ADD COLUMN {} BLOB NOT NULL DEFAULT X'00'",
+        quote_ident(&table),
+        quote_ident(column)
+    ))
+}
+
+pub(crate) fn delete_doc_column(table: &str, column: &str) -> Result<String, StorageError> {
+    let table = doc_table_name(table)?;
+    validate_bare_ident(column)?;
+    Ok(format!(
+        "ALTER TABLE {} DROP COLUMN {}",
         quote_ident(&table),
         quote_ident(column)
     ))

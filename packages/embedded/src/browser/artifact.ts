@@ -133,9 +133,8 @@ export const WASM_API_VERSION = EMBEDDED_STORAGE_ABI_VERSION;
 
 /**
  * Thrown when the shared linear memory backing the store cannot be reserved because the device
- * memory budget is exhausted. WebKit charges a shared memory's whole `maximum` at construction, so
- * this is the visible boot failure on memory-constrained iOS Safari. Surfaces through the runtime's
- * boot-error path with an actionable message instead of the raw engine `RangeError`.
+ * memory budget is exhausted. Surfaces through the runtime's boot-error path with an actionable
+ * message instead of the raw engine `RangeError`.
  *
  * @internal
  */
@@ -196,10 +195,10 @@ const MEMORY_HEADROOM_PAGES = 256;
 const PACKAGED_ARTIFACT_MEMORY_PAGES = 1009;
 
 /**
- * Shared linear memory ceiling: 512 MiB. A shared memory cannot relocate when it grows, so WebKit
- * reserves this whole `maximum` at construction; iOS Safari OOMs on shared maxima at or above 2 GiB.
- * A client store's working set is tens of MB, so 512 MiB is ample while keeping the reservation
- * inside every device's budget. Raise uniformly if a real workload needs it — never fork by platform.
+ * Shared linear memory ceiling: 512 MiB. A shared memory cannot relocate when it grows, and engines
+ * may reserve its whole `maximum` at construction. A client store's working set is tens of MB, so
+ * 512 MiB is ample while keeping the reservation inside constrained device budgets. Raise uniformly
+ * if a real workload needs it — never fork by platform.
  */
 const MAX_MEMORY_PAGES = 8192;
 

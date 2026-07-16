@@ -1,18 +1,26 @@
 use super::mutation::CommitResult;
 use super::rev::RevWriteResult;
 
+/// Durable remote work retained by the local store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemotePending {
+    pub mutations: usize,
+    pub settlements: usize,
+    pub uploads: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowHead {
     pub table: String,
     pub local_document_id: String,
-    /// The ref id currently projecting to the visible row.
+    /// The rev id currently projecting to the visible row.
     pub current_rev_id: String,
     pub server_document_id: String,
     pub projection_hash: String,
     pub current_root_id: Option<String>,
     pub current_node_id: Option<String>,
     /// The last server-adopted projection hash. `None` means this row was never confirmed by the
-    /// server (locally-created and not yet round-tripped) — the DIRTY/CLEAN + sweep guard key.
+    /// server (locally-created and not yet round-tripped) — the DIRTY/CLEAN deletion guard key.
     pub server_base: Option<String>,
     /// Last server-accepted materialized row, used to restore an unverified rejection.
     pub server_row: Option<String>,
@@ -76,7 +84,7 @@ pub struct MembershipRange {
 /// One indivisible pull transaction. Cursor progress cannot be recorded without applying the
 /// corresponding projections and complete membership replacement.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RemotePull {
+pub struct RemotePageWrite {
     pub subscription: String,
     pub members: Vec<RemoteMember>,
     pub projections: Vec<AuthoritativeRow>,
@@ -86,7 +94,7 @@ pub struct RemotePull {
     pub received_time: i64,
     /// The retained authored-result cache entry (Cut 7 §5), written inside this page's transaction so
     /// it commits atomically with membership/projection/CRDT and a rollback strands no results row.
-    /// Boxed so a resultless pull keeps `RemotePull` small (the common projection/CRDT page).
+    /// Boxed so a resultless pull keeps `RemotePageWrite` small (the common projection/CRDT page).
     pub result: Option<Box<ResultEntry>>,
 }
 
@@ -94,7 +102,7 @@ pub struct RemotePull {
 pub struct AuthoritativeApplyResult {
     pub committed: Vec<CommitResult>,
     /// Documents the server authoritatively re-rooted (a CAS reject): the local edit lost and was
-    /// preserved on an archived ref. Surfaced as a conflict the app can act on.
+    /// preserved as an archived rev. Surfaced as a conflict the app can act on.
     pub reroots: Vec<RetainedRevision>,
 }
 
@@ -113,10 +121,10 @@ pub struct RetainedRevision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemotePullResult {
+pub struct RemotePageWriteResult {
     pub rev_write: RevWriteResult,
     pub projection: AuthoritativeApplyResult,
-    pub swept: usize,
+    pub projection_deleted: usize,
     pub crdt: Vec<super::doc::RowChange>,
     /// The retained-result cache key this page durably rewrote (Cut 7 §5), or `None` when the page
     /// carried no result or hit the zero-write fast path. Surfaces the membership-free result change
@@ -144,19 +152,21 @@ pub struct RemoteRowTarget {
     pub table: String,
     pub local_document_id: String,
     pub server_rev_id: Option<String>,
+    /// Whether the rejected local after-image actually diverges and must remain inspectable.
+    pub retain: bool,
 }
 
 /// All local state implied by one terminal hosted push verdict.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RemotePushSettlement {
+pub struct RemoteSettlementWrite {
     pub mutation_id: String,
     pub expected_commit_seq: i64,
     pub now_ms: i64,
-    pub outcome: RemotePushSettlementOutcome,
+    pub outcome: RemoteSettlementOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum RemotePushSettlementOutcome {
+pub enum RemoteSettlementOutcome {
     Applied {
         ids: Vec<RemoteIdMapping>,
         schedules: Vec<RemoteScheduleMapping>,
@@ -171,7 +181,7 @@ pub enum RemotePushSettlementOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemotePushSettlementResult {
+pub struct RemoteSettlementWriteResult {
     pub projection: AuthoritativeApplyResult,
 }
 

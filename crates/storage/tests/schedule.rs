@@ -137,11 +137,11 @@ fn remote_schedule_completion_is_atomic_with_its_push_settlement() {
         .unwrap();
 
     store
-        .remote_push_settle(&RemotePushSettlement {
+        .remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: "schedule-a".to_owned(),
             expected_commit_seq: 1,
             now_ms: 120,
-            outcome: RemotePushSettlementOutcome::Applied {
+            outcome: RemoteSettlementOutcome::Applied {
                 ids: Vec::new(),
                 schedules: mappings.clone(),
                 projections: Vec::new(),
@@ -172,11 +172,11 @@ fn remote_schedule_completion_is_atomic_with_its_push_settlement() {
         server_id: "hosted:changed".to_owned(),
     }];
     assert!(store
-        .remote_push_settle(&RemotePushSettlement {
+        .remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: "schedule-b".to_owned(),
             expected_commit_seq: 2,
             now_ms: 140,
-            outcome: RemotePushSettlementOutcome::Applied {
+            outcome: RemoteSettlementOutcome::Applied {
                 ids: Vec::new(),
                 schedules: mismatched,
                 projections: Vec::new(),

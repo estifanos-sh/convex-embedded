@@ -16,7 +16,7 @@ use crate::sql;
 #[cfg(not(target_arch = "wasm32"))]
 use turso_core::PlatformIO;
 use turso_core::{
-    Connection, Database, DatabaseOpts, OpenFlags, Row, Statement, StepResult, Value, IO,
+    Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, Row, Statement, StepResult, Value, IO,
 };
 
 #[cfg(any(test, feature = "testkit"))]
@@ -42,6 +42,9 @@ pub(crate) struct TursoDriver {
 
 impl TursoDriver {
     pub(crate) fn open(path: &str) -> Result<Self, StorageError> {
+        if path.starts_with(":memory:") {
+            return Self::open_tuned(path, Arc::new(MemoryIO::new()));
+        }
         #[cfg(target_arch = "wasm32")]
         let io: Arc<dyn IO> = Arc::new(Opfs);
         #[cfg(not(target_arch = "wasm32"))]
@@ -84,7 +87,7 @@ impl TursoDriver {
         })
     }
 
-    pub(crate) fn checkpoint(&self) -> Result<(), StorageError> {
+    pub(crate) fn wal_write(&self) -> Result<(), StorageError> {
         self.run_rows("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new(), |_| Ok(()))
     }
 
@@ -228,6 +231,19 @@ fn reset_store_artifacts(io: &dyn IO, path: &str) {
     for suffix in ["", "-wal", "-shm"] {
         let artifact = format!("{path}{suffix}");
         io.remove_file(&artifact).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TursoDriver;
+
+    #[test]
+    fn memory_path_uses_the_memory_backend() {
+        let driver = TursoDriver::open(":memory:storage-driver").expect("open memory store");
+        driver
+            .run_rows("SELECT 1", Vec::new(), |_| Ok(()))
+            .expect("read memory store");
     }
 }
 

@@ -26,7 +26,7 @@ import type {
   ReadSpec,
   StoreSchema,
   StoredDoc,
-  UpsertIn,
+  DocWrite,
   WriteBatch,
 } from "../../src/storage/types";
 import { loadNativeModule, type NativeModule } from "../../src/node/artifact";
@@ -199,8 +199,8 @@ export async function seedNativeVolume(options: NativeVolumeSeed): Promise<void>
       await store.commit(
         {
           deletes: [],
-          upserts: Array.from({ length: end - start }, (_, offset) =>
-            adapterUpsert(benchId(start + offset), options.channel, start + offset),
+          docWrites: Array.from({ length: end - start }, (_, offset) =>
+            adapterWrite(benchId(start + offset), options.channel, start + offset),
           ),
         },
         { changes: "include", source: "remote" },
@@ -308,7 +308,7 @@ async function seedRuntimeStore(
     const slice = ids.slice(start, start + 500);
     await store.commit(
       {
-        upserts: slice.map((id, offset) => adapterUpsert(id, channel, start + offset)),
+        docWrites: slice.map((id, offset) => adapterWrite(id, channel, start + offset)),
         deletes: [],
       },
       { changes: "include", source: "remote" },
@@ -324,7 +324,7 @@ export class BenchStorage implements RuntimeStorage {
   private readonly tables = new Map<string, Map<string, StoredDoc>>();
   private readonly mutations = new Map<string, MutationRecord & { args: string; name: string }>();
 
-  readonly capabilities = { exactScanBounds: true };
+  readonly capabilities = { hasExactBounds: true };
 
   readonly clock = {
     read: (): number => this.now++,
@@ -368,7 +368,7 @@ export class BenchStorage implements RuntimeStorage {
   };
 
   readonly mutation = {
-    begin: (call: MutationCall): Promise<MutationRecord> => {
+    write: (call: MutationCall): Promise<MutationRecord> => {
       const existing = this.mutations.get(call.mutationId);
       if (existing) {
         if (existing.args !== call.args || existing.name !== call.name) {
@@ -430,7 +430,7 @@ export class BenchStorage implements RuntimeStorage {
       (options.mutation === "existing" || options.mutation === "terminal")
     ) {
       let record = this.mutations.get(options.mutationId);
-      if (!record && options.mutation === "terminal" && options.mutationFresh) {
+      if (!record && options.mutation === "terminal" && options.mutationIsFresh) {
         record = {
           args: options.mutationArgs ?? "",
           mutationId: options.mutationId,
@@ -445,15 +445,15 @@ export class BenchStorage implements RuntimeStorage {
     }
 
     const changes = [
-      ...batch.upserts.map((upsert) => ({
-        id: upsert.id,
-        op: "upsert" as const,
+      ...batch.docWrites.map((docWrite) => ({
+        id: docWrite.id,
+        op: "write" as const,
         row: {
-          ...upsert.data,
-          _creationTime: upsert.creationTime,
-          _id: upsert.id,
+          ...docWrite.data,
+          _creationTime: docWrite.creationTime,
+          _id: docWrite.id,
         },
-        table: upsert.table,
+        table: docWrite.table,
       })),
       ...batch.deletes.map((deleted) => ({
         id: deleted.id,
@@ -462,11 +462,11 @@ export class BenchStorage implements RuntimeStorage {
       })),
     ];
 
-    for (const upsert of batch.upserts) {
-      this.table(upsert.table).set(upsert.id, {
-        ...upsert.data,
-        _creationTime: upsert.creationTime,
-        _id: upsert.id,
+    for (const docWrite of batch.docWrites) {
+      this.table(docWrite.table).set(docWrite.id, {
+        ...docWrite.data,
+        _creationTime: docWrite.creationTime,
+        _id: docWrite.id,
       });
     }
     for (const deleted of batch.deletes) {
@@ -486,7 +486,9 @@ export class BenchStorage implements RuntimeStorage {
     }
 
     return Promise.resolve({
-      changedTables: [...new Set([...batch.upserts, ...batch.deletes].map((write) => write.table))],
+      changedTables: [
+        ...new Set([...batch.docWrites, ...batch.deletes].map((write) => write.table)),
+      ],
       changes,
       commitSeq: this.seq,
     });
@@ -539,12 +541,12 @@ export function benchId(index: number): string {
   return `messages|${index.toString(16).padStart(32, "0")}`;
 }
 
-export function adapterUpsert(
+export function adapterWrite(
   id: string,
   channel: string,
   sequence: number,
   body = `seed-${sequence}`,
-): UpsertIn {
+): DocWrite {
   return {
     table: "messages",
     id,
@@ -554,12 +556,12 @@ export function adapterUpsert(
   };
 }
 
-export function bindingUpsert(
+export function bindingWrite(
   id: string,
   channel: string,
   sequence: number,
   body = `seed-${sequence}`,
-): BindingWriteBatch["upserts"][number] {
+): BindingWriteBatch["docWrites"][number] {
   return {
     table: "messages",
     id,
@@ -579,7 +581,7 @@ async function seedAdapter(store: NativeStore, channel: string, rows: number): P
     const slice = ids.slice(start, start + 500);
     await store.commit(
       {
-        upserts: slice.map((id, offset) => adapterUpsert(id, channel, start + offset)),
+        docWrites: slice.map((id, offset) => adapterWrite(id, channel, start + offset)),
         deletes: [],
       },
       { changes: "include", source: "remote" },
@@ -597,7 +599,7 @@ async function seedBinding(
   for (let start = 0; start < ids.length; start += 500) {
     const slice = ids.slice(start, start + 500);
     const batch = {
-      upserts: slice.map((id, offset) => bindingUpsert(id, channel, start + offset)),
+      docWrites: slice.map((id, offset) => bindingWrite(id, channel, start + offset)),
       deletes: [],
       freshIds: [],
       idMappings: [],

@@ -1,8 +1,8 @@
 /**
- * Dedicated worker that exercises the WAL-truncating store checkpoint against OPFS. It runs inside
+ * Dedicated worker that exercises WAL truncation against OPFS. It runs inside
  * a Worker so OPFS sync access handles are available, opens the WASM store, writes enough rows to
  * grow the write-ahead log, reads the live `-wal` size through the store's own OPFS bridge before
- * and after {@link WasmStore.checkpoint}, then closes and reopens the same storage to confirm the
+ * and after `store.wal.write()`, then closes and reopens the same storage to confirm the
  * committed rows survived the truncation — with no live backend.
  */
 import { makeFunctionReference } from "convex/server";
@@ -30,7 +30,7 @@ const listDocuments = makeFunctionReference<"query", { limit?: number }, { _id: 
   "documents:list",
 );
 
-interface CheckpointResult {
+interface WalResult {
   walBefore: number;
   walAfter: number;
   rowsBefore: number;
@@ -50,7 +50,7 @@ self.onmessage = (event: MessageEvent<{ storageId: string }>) => {
     );
 };
 
-async function run(storageId: string): Promise<CheckpointResult> {
+async function run(storageId: string): Promise<WalResult> {
   const { schema, modules } = await import("virtual:convex-embedded");
   const schemaAnalysis = analyzeEmbeddedSchema(schema);
   const wasmResponse = await fetch(wasmUrl);
@@ -80,7 +80,7 @@ async function run(storageId: string): Promise<CheckpointResult> {
     }
     rowsBefore = (await state.store.doc.count.read({ table: "documents" })) ?? 0;
     walBefore = walSize(state.opfs, storagePath);
-    await state.store.checkpoint();
+    await state.store.wal.write();
     walAfter = walSize(state.opfs, storagePath);
   } finally {
     await state.store.close().catch(() => undefined);

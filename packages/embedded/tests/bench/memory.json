@@ -1,0 +1,39 @@
+{
+  "version": 2,
+  "source": "Three fresh-worker Chromium samples of packaged release WASM with explicit mobile browser safety budgets",
+  "capturedAt": "2026-07-15",
+  "notes": [
+    "peakKiB is committed WebAssembly.Memory.buffer.byteLength high-water, not JavaScript heap usage.",
+    "maximumKiB is the shared-memory reservation limit supplied to WebAssembly.Memory; it can exceed committed high-water and is gated independently.",
+    "The captured worst peaks were boot of a 2000-row persisted store 87424 KiB (0 KiB spread), steady100 87744 KiB (0 KiB spread), and pull10k 91264 KiB (0 KiB spread).",
+    "The gate repeats those three fresh-worker scenarios and reports the worst run instead of averaging regressions away.",
+    "The 96/96/104 MiB committed ceilings and 512 MiB reservation ceiling are explicit project mobile-safety budgets, not inferred engine kill limits.",
+    "Chromium measures the real release artifact deterministically but is not a substitute for WebKit process limits; physical iPhone and iPad validation remains required."
+  ],
+  "budgets": [
+    {
+      "scenario": "boot",
+      "capturedPeakKiB": 87424,
+      "capturedRuns": 3,
+      "capturedSpreadKiB": 0,
+      "peakKiB": 98304,
+      "maximumKiB": 524288
+    },
+    {
+      "scenario": "steady100",
+      "capturedPeakKiB": 87744,
+      "capturedRuns": 3,
+      "capturedSpreadKiB": 0,
+      "peakKiB": 98304,
+      "maximumKiB": 524288
+    },
+    {
+      "scenario": "pull10k",
+      "capturedPeakKiB": 91264,
+      "capturedRuns": 3,
+      "capturedSpreadKiB": 0,
+      "peakKiB": 106496,
+      "maximumKiB": 524288
+    }
+  ]
+}

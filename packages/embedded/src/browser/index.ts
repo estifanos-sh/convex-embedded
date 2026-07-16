@@ -35,7 +35,7 @@ export type {
   ConvexEmbeddedSchema,
   EmbeddedDataDelete,
   EmbeddedDataEvent,
-  EmbeddedDataUpsert,
+  EmbeddedDataWrite,
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,

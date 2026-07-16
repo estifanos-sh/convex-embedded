@@ -10,7 +10,16 @@ await verifyDeployment(packageDir);
 run("vp", ["pack"]);
 run("node", ["scripts/wasm.ts"]);
 run("vp", ["test", "run", "--project", "browser", "tests/browser/runtime.ts"]);
-run("vp", ["test", "run", "--project", "webkit", "tests/browser/webkit.ts"]);
+run("vp", ["test", "run", "--project", "browser", "tests/browser/memory.ts"]);
+run("vp", ["test", "run", "--project", "browser", "tests/browser/protocol.ts"]);
+run("vp", [
+  "test",
+  "run",
+  "--project",
+  "webkit",
+  "tests/browser/webkit.ts",
+  "tests/browser/protocol.ts",
+]);
 
 function run(command: string, args: string[]): void {
   execFileSync(command, args, {

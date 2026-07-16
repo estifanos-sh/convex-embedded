@@ -15,7 +15,7 @@ const schedule: ScheduledJob = {
 };
 
 const batch: WriteBatch = {
-  upserts: [{ table: "documents", id: "documents:1", data: {}, cols: {}, creationTime: 1 }],
+  docWrites: [{ table: "documents", id: "documents:1", data: {}, cols: {}, creationTime: 1 }],
   deletes: [],
   schedules: [schedule],
 };
@@ -23,7 +23,7 @@ const batch: WriteBatch = {
 describe("namespaceBatch", () => {
   test("carries schedules through a namespaced instance while mapping row tables", () => {
     const namespaced = namespaceBatch("embedded", batch);
-    expect(namespaced.upserts[0]!.table).toBe("__e_documents");
+    expect(namespaced.docWrites[0]!.table).toBe("__e_documents");
     expect(namespaced.schedules).toEqual([schedule]);
   });
 

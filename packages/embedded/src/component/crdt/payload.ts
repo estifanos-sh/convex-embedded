@@ -2,30 +2,29 @@ import type { DataModelFromSchemaDefinition, MutationBuilder } from "convex/serv
 import { mutationGeneric } from "convex/server";
 import { v } from "convex/values";
 
-import { deleteProgress, deleteProgressValidator } from "../model";
+import { deleteResult, deleteResultValidator } from "../model";
 import schema from "../schema";
 import { read as readTime } from "../time";
+import { read as retentionRead } from "./retention";
 
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
 const mutation = mutationGeneric as MutationBuilder<DataModel, "public">;
 const MAX_DELETE = 1_024;
 
-const remove = mutation({
+const deletion = mutation({
   args: { checkpointId: v.id("crdtCheckpoints"), numItems: v.number() },
-  returns: deleteProgressValidator,
+  returns: deleteResultValidator,
   handler: async (ctx, args) => {
     const checkpoint = await ctx.db.get("crdtCheckpoints", args.checkpointId);
     if (!checkpoint || checkpoint.state !== "ready") {
       throw new Error("Payload deletion requires a ready checkpoint.");
     }
     const limit = clamp(args.numItems);
+    const throughSeq = await retentionRead(ctx, checkpoint, readTime());
     const rows = await ctx.db
       .query("crdtPayloads")
       .withIndex("by_fieldid_and_epoch_and_seq", (q) =>
-        q
-          .eq("fieldId", checkpoint.fieldId)
-          .eq("epoch", checkpoint.epoch)
-          .lte("seq", checkpoint.throughSeq),
+        q.eq("fieldId", checkpoint.fieldId).eq("epoch", checkpoint.epoch).lte("seq", throughSeq),
       )
       .take(limit + 1);
     const page = rows.slice(0, limit);
@@ -42,11 +41,11 @@ const remove = mutation({
         updatedAt: readTime(),
       });
     }
-    return deleteProgress(page.length, rows.length <= limit);
+    return deleteResult(page.length, rows.length <= limit);
   },
 });
 
-export { remove as delete };
+export { deletion as delete };
 
 function clamp(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1) {

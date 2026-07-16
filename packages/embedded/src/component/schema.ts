@@ -20,6 +20,7 @@ export default defineSchema({
     identity: v.optional(v.string()),
   })
     .index("by_clientid_and_mutationid", ["clientId", "mutationId"])
+    .index("by_identity_and_mutationid", ["identity", "mutationId"])
     .index("by_clientid_and_settledat", ["clientId", "settledAt"])
     .index("by_identity_and_settledat", ["identity", "settledAt"]),
 
@@ -90,11 +91,19 @@ export default defineSchema({
     responseToken: v.string(),
     state: v.union(v.literal("requested"), v.literal("ready")),
     blobId: v.optional(v.id("blobs")),
+    retainUntil: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_fieldid_and_epoch_and_throughseq", ["fieldId", "epoch", "throughSeq"])
-    .index("by_field_epoch_state_seq", ["fieldId", "epoch", "state", "throughSeq"]),
+    .index("by_field_epoch_state_seq", ["fieldId", "epoch", "state", "throughSeq"])
+    .index("by_field_epoch_state_retain_seq", [
+      "fieldId",
+      "epoch",
+      "state",
+      "retainUntil",
+      "throughSeq",
+    ]),
 
   blobs: defineTable({
     hash: v.string(),
@@ -125,7 +134,7 @@ export default defineSchema({
       v.literal("displaced"),
       v.literal("delete"),
     ),
-    status: v.union(v.literal("active"), v.literal("retained"), v.literal("acknowledged")),
+    status: v.union(v.literal("active"), v.literal("retained")),
     parentRevId: v.optional(v.string()),
     value: v.optional(v.any()),
     deleted: v.boolean(),

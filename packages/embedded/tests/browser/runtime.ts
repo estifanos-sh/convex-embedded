@@ -4,6 +4,7 @@ import { commands } from "vitest/browser";
 
 import type { EmbeddedEvent, EmbeddedOperationEvent, EmbeddedRemoteEvent } from "../../src/events";
 import { getTimerTime } from "../../src/time";
+import { read as readTime } from "../testkit/time";
 
 declare const __CONVEX_EMBEDDED_HOSTED_URL__: string | null;
 declare const __CONVEX_EMBEDDED_BROWSER_BENCH__: boolean;
@@ -110,14 +111,14 @@ interface AutoDrainResult {
 
 type AutoDrainMessage = { error: string; ok: false } | { ok: true; result: AutoDrainResult };
 
-interface CheckpointResult {
+interface WalResult {
   rowsAfterReopen: number;
   rowsBefore: number;
   walAfter: number;
   walBefore: number;
 }
 
-type CheckpointMessage = { error: string; ok: false } | { ok: true; result: CheckpointResult };
+type WalMessage = { error: string; ok: false } | { ok: true; result: WalResult };
 
 describe("browser runtime", () => {
   test("starts the packaged dedicated runtime worker", async () => {
@@ -518,7 +519,16 @@ describe("browser runtime", () => {
       samples,
       totalRuntimeMs: summarize(samples.map((sample) => sample.totalRuntimeMs)),
     });
-    expect(remoteEvents.length).toBeLessThanOrEqual(3);
+    expect(remoteEvents.length).toBeGreaterThan(0);
+    expect(
+      remoteEvents.some(
+        (event) =>
+          typeof event === "object" &&
+          event !== null &&
+          "status" in event &&
+          (event as { status?: string }).status === "idle",
+      ),
+    ).toBe(false);
   });
 
   test.skipIf(!__CONVEX_EMBEDDED_BROWSER_BENCH__)(
@@ -670,17 +680,17 @@ describe("browser runtime", () => {
     }
   }, 45_000);
 
-  test("truncates the OPFS write-ahead log on the store checkpoint", async () => {
-    const storageId = `checkpoint-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
-    const worker = new Worker(new URL("./checkpoint.ts", import.meta.url), { type: "module" });
+  test("truncates the OPFS write-ahead log on wal.write", async () => {
+    const storageId = `wal-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
+    const worker = new Worker(new URL("./wal.ts", import.meta.url), { type: "module" });
     try {
       const message = await withTimeout(
-        new Promise<CheckpointMessage>((resolve, reject) => {
-          worker.onmessage = (event: MessageEvent<CheckpointMessage>) => resolve(event.data);
-          worker.onerror = (event) => reject(new Error(event.message || "checkpoint worker error"));
+        new Promise<WalMessage>((resolve, reject) => {
+          worker.onmessage = (event: MessageEvent<WalMessage>) => resolve(event.data);
+          worker.onerror = (event) => reject(new Error(event.message || "wal worker error"));
           worker.postMessage({ storageId });
         }),
-        "checkpoint worker run",
+        "wal worker run",
       );
       if (!message.ok) throw new Error(message.error);
       const result = message.result;
@@ -792,6 +802,10 @@ describe("browser runtime", () => {
     const text = `browser-remote-first-edit-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
     await browserCommands().embeddedRemoteDocumentCreate(remoteUrl, text, "abc");
     const convex = track(new ConvexEmbeddedClient({ url: remoteUrl }));
+    const remoteEvents: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
+    convex.subscribeInternalEvents?.((event) => {
+      if (event.type === "remote") remoteEvents.push(event);
+    });
     const stop = convex.watchQuery(listDocuments, {}).onUpdate(() => undefined);
 
     try {
@@ -812,6 +826,13 @@ describe("browser runtime", () => {
           browserCommands().embeddedRemoteDocumentMatches(remoteUrl, text, "aXbc"),
         ).resolves.toBe(true);
       }, 15_000);
+    } catch (error) {
+      throw new Error(
+        `first CRDT edit failed: ${JSON.stringify({
+          cause: error instanceof Error ? error.message : String(error),
+          remoteEvents: remoteEvents.slice(-20),
+        })}`,
+      );
     } finally {
       stop();
     }
@@ -856,7 +877,7 @@ describe("browser runtime", () => {
         body: "abc",
         slug: runId,
         title: runId,
-        updatedAt: Date.now(),
+        updatedAt: readTime(),
       });
       firstId = created._id;
       await waitForBody(second, "abc");
@@ -990,7 +1011,7 @@ describe("browser runtime", () => {
         body: "delete-me",
         slug: runId,
         title: runId,
-        updatedAt: Date.now(),
+        updatedAt: readTime(),
       });
       await waitForWithin(async () => {
         await expect(read(second)).resolves.toMatchObject({ body: "delete-me" });
@@ -1275,11 +1296,11 @@ describe("browser boot stress", () => {
     expect(reopenMs).toHaveLength(UNCLEAN_ROUNDS);
   }, 180_000);
 
-  test("preserves data when the OPFS owner dies during open, commit, checkpoint, and close", async () => {
+  test("preserves data when the OPFS owner dies during open, commit, wal write, and close", async () => {
     const storageId = `boot-stage-death-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
     await withTimeout(seedStore(storageId, 120), "seed stage-death store");
 
-    for (const stage of ["open", "commit", "checkpoint", "close"] as const) {
+    for (const stage of ["open", "commit", "wal", "close"] as const) {
       const wounded = spawnBootWorker();
       try {
         await bootRequest<{ stage: typeof stage; wounding: true }>(
@@ -1402,7 +1423,7 @@ describe("browser boot stress", () => {
       "wasm-load",
       "store-open",
       "store-setup",
-      "store-checkpoint",
+      "store-wal-write",
       "ready",
     ]);
     expect(booted.runtimeEvents.every((event) => event.type === "runtime")).toBe(true);
@@ -1440,10 +1461,10 @@ interface RecoverResult {
 type RecoverMessage = { error: string; ok: false } | { ok: true; result: RecoverResult };
 
 describe("browser store-instance recovery", () => {
-  // Case A/B core, self-contained (no server, no coordinator): killing the emnapi pthread pool
-  // mid-session wedges the store, the progress-based watchdog fires, the runtime grafts a fresh
-  // instance in place, and a mutation issued after the graft commits while the seeded rows survive.
-  test("grafts a fresh store instance after the pthread pool is killed", async () => {
+  // A genuinely wedged WASM instance cannot be reclaimed by reopening another WASM instance in
+  // the same worker: the unresolved promise may retain the old linear memory forever. The safe
+  // boundary is terminal worker disposal; the page/coordinator can then create a fresh worker.
+  test("fails terminally after the pthread pool is killed", async () => {
     const storageId = `recover-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
     const worker = new Worker(new URL("./recovery.ts", import.meta.url), { type: "module" });
     try {
@@ -1458,14 +1479,14 @@ describe("browser store-instance recovery", () => {
       );
       if (!message.ok) throw new Error(message.error);
       const result = message.result;
-      // The watchdog fired (degraded), the graft re-instantiated WASM and re-opened the store over
-      // the retained OPFS directory (rebuilt, not dead) with the seeded rows intact.
+      // The watchdog detects the wedge and refuses to allocate a second WASM instance in the same
+      // worker. The seeded rows were durable before the terminal boundary.
       expect(result.degraded).toBe(true);
-      expect(result.rebuilt).toBe(true);
-      expect(result.dead).toBe(false);
+      expect(result.rebuilt).toBe(false);
+      expect(result.ready).toBe(false);
+      expect(result.dead).toBe(true);
       expect(result.rowsBefore).toBe(5);
-      // The seeded rows survived the graft and one post-graft mutation committed on the new runner.
-      expect(result.rowsAfter).toBe(6);
+      expect(result.rowsAfter).toBe(0);
       // The async-work pthread pool is empty in the synchronous local store path (OPFS
       // SyncAccessHandles dispatch no napi_create_async_work), so terminating it is a no-op here;
       // the pool-kill wedge is exercised by remote replication, covered by the skipped cases below.
@@ -1475,10 +1496,8 @@ describe("browser store-instance recovery", () => {
     }
   }, 90_000);
 
-  // Case A tail: a mutation issued during the wedge must reach the CONFIGURED DEPLOYMENT after the
-  // graft, and case B: the 20s watchdog must win the race against the proxy's 30s mutation-fatal
-  // path. Both need a live deployment plus the coordinator/proxy stack, which this bare worker
-  // cannot express; drive them once a coordinator-level pthread-kill hook lands.
+  // Transparent recovery requires rotating the entire dedicated worker from the page/coordinator;
+  // this bare worker intentionally proves only the terminal memory-safety boundary.
   test.skip("commits a wedged mutation to the deployment and beats the proxy 30s path", () => {
     // Requires: live Convex deployment + coordinator + proxy; not expressible in a bare worker.
   });

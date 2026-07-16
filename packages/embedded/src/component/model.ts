@@ -2,15 +2,10 @@ import { v } from "convex/values";
 
 export const crdtKindValidator = v.union(v.literal("text"), v.literal("count"), v.literal("set"));
 
-export const deleteProgressValidator = v.union(
-  v.object({ progress: v.literal("continue"), deleted: v.number() }),
-  v.object({ progress: v.literal("complete"), deleted: v.number() }),
-);
+export const deleteResultValidator = v.object({ deleted: v.number(), isDone: v.boolean() });
 
-export function deleteProgress(deleted: number, complete: boolean) {
-  return complete
-    ? ({ progress: "complete", deleted } as const)
-    : ({ progress: "continue", deleted } as const);
+export function deleteResult(deleted: number, isDone: boolean) {
+  return { deleted, isDone };
 }
 
 const settlementInputFields = {

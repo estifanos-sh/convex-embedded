@@ -23,9 +23,9 @@ import type {
   MutationCall,
   MutationRecord,
   MutationSurface,
-  OneUpsertCommit,
+  OneDocWriteCommit,
   PendingUpload,
-  ProjectionDebug,
+  RemoteDocDebug,
   RemoteStartOptions,
   RemoteSurface,
   RemoteTick,
@@ -82,7 +82,7 @@ export interface BindingCountSpec {
   bounds?: BindingBound[];
 }
 
-export interface BindingUpsert {
+export interface BindingDocWrite {
   table: string;
   id: string;
   data: string;
@@ -91,7 +91,7 @@ export interface BindingUpsert {
 }
 
 export interface BindingWriteBatch {
-  upserts: BindingUpsert[];
+  docWrites: BindingDocWrite[];
   deletes: { table: string; id: string }[];
   crdtOps?: BindingCrdtOp[];
   crdtRestores?: BindingCrdtRestore[];
@@ -132,7 +132,7 @@ export type BindingCrdtOp =
 export interface BindingCommitOptions {
   includeChanges?: boolean;
   mutationArgs?: string;
-  mutationFresh?: boolean;
+  mutationIsFresh?: boolean;
   mutationId?: string;
   mutationName?: string;
   mutationResult?: string;
@@ -143,7 +143,7 @@ export interface BindingCommitOptions {
 
 function bindingCommitMutation(options?: CommitOptions): {
   mutationArgs?: string;
-  mutationFresh?: boolean;
+  mutationIsFresh?: boolean;
   mutationId?: string;
   mutationName?: string;
   mutationResult?: string;
@@ -155,7 +155,7 @@ function bindingCommitMutation(options?: CommitOptions): {
   }
   return {
     mutationArgs: options.mutationArgs,
-    mutationFresh: options.mutationFresh,
+    mutationIsFresh: options.mutationIsFresh,
     mutationId: options.mutationId,
     mutationName: options.mutationName,
     mutationResult: options.mutationResult,
@@ -242,7 +242,7 @@ export interface BindingIdMapping {
 export interface BindingDirtyHeadDebug {
   table: string;
   id: string;
-  op: "upsert" | "delete";
+  op: "write" | "delete";
   firstCommitSeq: bigint | number;
   updatedCommitSeq: bigint | number;
   createdTime: bigint | number;
@@ -266,7 +266,7 @@ export interface BindingResultEntry {
   clock: number;
 }
 
-export interface BindingProjectionDebug {
+export interface BindingRemoteDocDebug {
   table: string;
   localDocumentId: string;
   currentRevId: string;
@@ -307,15 +307,19 @@ export interface BindingPendingUpload {
 }
 
 export type BindingUploadLeaseWrite =
-  | { lease: "claim"; owner: string; nowMs: number; leaseUntil: number }
   | {
-      lease: "renew";
-      localStorageId: string;
+      lease: "claimed";
+      localStorageId?: string;
       owner: string;
       nowMs: number;
       leaseUntil: number;
     }
-  | { lease: "release"; localStorageId: string; owner: string; nowMs: number };
+  | {
+      lease: "pending";
+      localStorageId: string;
+      owner: string;
+      nowMs: number;
+    };
 
 export interface BindingScheduledJob {
   jobId?: string;
@@ -340,13 +344,13 @@ export interface StoreBinding {
   setup(schema: StoreSchema): Promise<void>;
   identityRead?(): Promise<string>;
   identityWrite?(identityKey: string, identityJson?: string): Promise<void>;
-  mutationBegin(call: BindingMutationCall): Promise<BindingMutationRecord>;
-  mutationRead?(call: BindingMutationCall): Promise<BindingMutationRecord>;
-  mutationFresh?(call: BindingMutationCall): Promise<BindingMutationRecord>;
+  mutationWrite(call: BindingMutationCall): Promise<BindingMutationRecord>;
+  mutationCacheRead?(call: BindingMutationCall): Promise<BindingMutationRecord>;
+  mutationCacheWrite?(call: BindingMutationCall): Promise<BindingMutationRecord>;
   mutationFail(mutationId: string, error: string): Promise<void>;
   clockRead(): number;
   commit(batch: BindingWriteBatch, options?: BindingCommitOptions): Promise<BindingCommitResult>;
-  commitOneUpsert?(
+  commitOneDocWrite?(
     table: string,
     id: string,
     data: string,
@@ -360,9 +364,9 @@ export interface StoreBinding {
     includeChanges?: boolean,
     fresh?: boolean,
     dataOnly?: boolean,
-    mutationFresh?: boolean,
+    mutationIsFresh?: boolean,
   ): Promise<BindingCommitResult>;
-  commitOneUpsertEncoded?(
+  commitOneDocWriteEncoded?(
     table: string,
     id: string,
     data: string,
@@ -375,9 +379,9 @@ export interface StoreBinding {
     mutationResult?: string,
     fresh?: boolean,
     dataOnly?: boolean,
-    mutationFresh?: boolean,
+    mutationIsFresh?: boolean,
   ): Promise<bigint | number>;
-  commitOneUpsertEncodedDeferred?(
+  commitOneDocWriteEncodedDeferred?(
     table: string,
     id: string,
     data: string,
@@ -390,7 +394,7 @@ export interface StoreBinding {
     mutationResult?: string,
     fresh?: boolean,
     dataOnly?: boolean,
-    mutationFresh?: boolean,
+    mutationIsFresh?: boolean,
   ): Promise<bigint | number>;
   docRead(table: string, id: string): Promise<string | undefined | null>;
   docVersionRead(table: string, id: string): Promise<number | bigint | undefined | null>;
@@ -408,7 +412,7 @@ export interface StoreBinding {
   keyPageRead(spec: BindingReadSpec): Promise<BindingPage>;
   docCountRead(spec: BindingCountSpec): Promise<number | bigint | null>;
   ledgerDelete(upToSeq: number): Promise<BindingDeleteResult>;
-  checkpoint(): Promise<void> | void;
+  walWrite(): Promise<void> | void;
   blobRead(key: string): Promise<Uint8Array | null>;
   blobWrite(key: string, bytes: Uint8Array): Promise<void>;
   blobDelete(key: string): Promise<void>;
@@ -420,10 +424,10 @@ export interface StoreBinding {
   idRead(table: string, localId: string): Promise<BindingIdMapping | null | undefined>;
   idPageRead(table: string): Promise<BindingIdMapping[]>;
   dirtyHeadsDebugRead?(): Promise<BindingDirtyHeadDebug[]>;
-  projectionDebugRead?(
+  remoteDocDebugRead?(
     table: string,
     localId: string,
-  ): Promise<BindingProjectionDebug | null | undefined>;
+  ): Promise<BindingRemoteDocDebug | null | undefined>;
   idDelete(table: string, localId: string): Promise<void>;
   fileWrite(input: BindingFileStore): Promise<void>;
   fileMetaWrite(metadata: BindingFileMetadata): Promise<void>;
@@ -503,7 +507,7 @@ type ReadCacheKind = "count" | "doc" | "key" | "page";
 export class StoreAdapter implements StorageBackend {
   private readonly inner: StoreBinding;
   private readonly readCache = new ReadCache();
-  readonly capabilities = { exactScanBounds: true };
+  readonly capabilities = { hasExactBounds: true };
   readonly remote: RemoteSurface | undefined;
   readonly identity: StorageBackend["identity"];
 
@@ -688,18 +692,18 @@ export class StoreAdapter implements StorageBackend {
   };
 
   readonly mutation: MutationSurface = {
-    begin: async (call: MutationCall, options?: { fresh?: boolean }) => {
+    write: async (call: MutationCall, options?: { fresh?: boolean }) => {
       const bindingCall = {
         args: call.args,
         mutationId: call.mutationId,
         name: call.name,
       };
-      if (options?.fresh && this.inner.mutationFresh) {
-        return fromBindingMutationRecord(await this.inner.mutationFresh(bindingCall));
+      if (options?.fresh && this.inner.mutationCacheWrite) {
+        return fromBindingMutationRecord(await this.inner.mutationCacheWrite(bindingCall));
       }
-      const record = this.inner.mutationRead
-        ? await this.inner.mutationRead(bindingCall)
-        : await this.inner.mutationBegin(bindingCall);
+      const record = this.inner.mutationCacheRead
+        ? await this.inner.mutationCacheRead(bindingCall)
+        : await this.inner.mutationWrite(bindingCall);
       return fromBindingMutationRecord(record);
     },
     fail: async (mutationId, error) => {
@@ -795,12 +799,12 @@ export class StoreAdapter implements StorageBackend {
 
   async commit(batch: WriteBatch, options?: CommitOptions): Promise<CommitResult> {
     const bindingBatch = {
-      upserts: batch.upserts.map((upsert) => ({
-        table: upsert.table,
-        id: upsert.id,
-        data: encodeDocData(upsert.data),
-        cols: toBindingColValues(upsert.cols),
-        creationTime: upsert.creationTime,
+      docWrites: batch.docWrites.map((docWrite) => ({
+        table: docWrite.table,
+        id: docWrite.id,
+        data: encodeDocData(docWrite.data),
+        cols: toBindingColValues(docWrite.cols),
+        creationTime: docWrite.creationTime,
       })),
       crdtOps: (batch.crdtOps ?? []).map(toBindingCrdtOp),
       crdtRestores: (batch.crdtRestores ?? []).map((restore) => ({
@@ -820,19 +824,22 @@ export class StoreAdapter implements StorageBackend {
     return commit;
   }
 
-  async commitOneUpsert(commit: OneUpsertCommit, options?: CommitOptions): Promise<CommitResult> {
-    const upsert = commit.upsert;
-    const data = encodeDocData(upsert.data);
+  async commitOneDocWrite(
+    commit: OneDocWriteCommit,
+    options?: CommitOptions,
+  ): Promise<CommitResult> {
+    const docWrite = commit.docWrite;
+    const data = encodeDocData(docWrite.data);
     const mutation = bindingCommitMutation(options);
     if (options?.changes === "omit") {
-      const encodedCols = commit.dataOnly ? EMPTY_ENCODED_COL_KEYS : encodeColKeys(upsert.cols);
-      const commitSeq = this.inner.commitOneUpsertEncodedDeferred
-        ? await this.inner.commitOneUpsertEncodedDeferred(
-            upsert.table,
-            upsert.id,
+      const encodedCols = commit.dataOnly ? EMPTY_ENCODED_COL_KEYS : encodeColKeys(docWrite.cols);
+      const commitSeq = this.inner.commitOneDocWriteEncodedDeferred
+        ? await this.inner.commitOneDocWriteEncodedDeferred(
+            docWrite.table,
+            docWrite.id,
             data,
             encodedCols,
-            upsert.creationTime,
+            docWrite.creationTime,
             options.source,
             mutation.mutationId,
             mutation.mutationName,
@@ -840,14 +847,14 @@ export class StoreAdapter implements StorageBackend {
             mutation.mutationResult,
             commit.fresh,
             commit.dataOnly,
-            mutation.mutationFresh,
+            mutation.mutationIsFresh,
           )
-        : await this.inner.commitOneUpsertEncoded?.(
-            upsert.table,
-            upsert.id,
+        : await this.inner.commitOneDocWriteEncoded?.(
+            docWrite.table,
+            docWrite.id,
             data,
             encodedCols,
-            upsert.creationTime,
+            docWrite.creationTime,
             options.source,
             mutation.mutationId,
             mutation.mutationName,
@@ -855,29 +862,29 @@ export class StoreAdapter implements StorageBackend {
             mutation.mutationResult,
             commit.fresh,
             commit.dataOnly,
-            mutation.mutationFresh,
+            mutation.mutationIsFresh,
           );
       if (commitSeq === undefined) {
-        throw new Error("storage artifact is missing commitOneUpsertEncoded");
+        throw new Error("storage artifact is missing commitOneDocWriteEncoded");
       }
       const resultCommit = {
-        changedTables: [upsert.table],
+        changedTables: [docWrite.table],
         changes: [],
         commitSeq: safeCommitSeq(commitSeq),
       };
-      this.applyOneUpsertCommitCaches(resultCommit, commit);
+      this.applyOneDocWriteCommitCaches(resultCommit, commit);
       return resultCommit;
     }
-    if (!this.inner.commitOneUpsert) {
-      throw new Error("storage artifact is missing commitOneUpsert");
+    if (!this.inner.commitOneDocWrite) {
+      throw new Error("storage artifact is missing commitOneDocWrite");
     }
-    const cols = toBindingColValues(upsert.cols);
-    const result = await this.inner.commitOneUpsert(
-      upsert.table,
-      upsert.id,
+    const cols = toBindingColValues(docWrite.cols);
+    const result = await this.inner.commitOneDocWrite(
+      docWrite.table,
+      docWrite.id,
       data,
       cols,
-      upsert.creationTime,
+      docWrite.creationTime,
       options?.source,
       mutation.mutationId,
       mutation.mutationName,
@@ -886,10 +893,10 @@ export class StoreAdapter implements StorageBackend {
       true,
       commit.fresh,
       commit.dataOnly,
-      mutation.mutationFresh,
+      mutation.mutationIsFresh,
     );
     const resultCommit = fromBindingCommitResult(result);
-    this.applyOneUpsertCommitCaches(resultCommit, commit);
+    this.applyOneDocWriteCommitCaches(resultCommit, commit);
     return resultCommit;
   }
 
@@ -902,9 +909,7 @@ export class StoreAdapter implements StorageBackend {
     return Promise.resolve(this.inner.close());
   }
 
-  checkpoint(): Promise<void> {
-    return Promise.resolve(this.inner.checkpoint());
-  }
+  readonly wal = { write: (): Promise<void> => Promise.resolve(this.inner.walWrite()) };
 
   readCacheStats(): ReadCacheStats {
     return this.readCache.stats();
@@ -915,8 +920,8 @@ export class StoreAdapter implements StorageBackend {
     return heads.map(fromBindingDirtyHeadDebug);
   }
 
-  async projectionDebugRead(table: string, localId: string): Promise<ProjectionDebug | undefined> {
-    const state = await (this.inner.projectionDebugRead?.(table, localId) ??
+  async remoteDocDebugRead(table: string, localId: string): Promise<RemoteDocDebug | undefined> {
+    const state = await (this.inner.remoteDocDebugRead?.(table, localId) ??
       Promise.resolve(undefined));
     return state ? fromBindingProjectionDebug(state) : undefined;
   }
@@ -948,7 +953,7 @@ export class StoreAdapter implements StorageBackend {
   private applyCommitCaches(commit: CommitResult, batch: WriteBatch): void {
     if (this.readCache.hasQueryEntries()) {
       if (isDataOnlyQueryCacheSafe(batch)) {
-        this.readCache.writePageDocs(batch.upserts.map(upsertToStoredDoc));
+        this.readCache.writePageDocs(batch.docWrites.map(docWriteToStoredDoc));
       } else {
         this.readCache.invalidateTableQueries(commit.changedTables);
       }
@@ -960,27 +965,27 @@ export class StoreAdapter implements StorageBackend {
     for (const deleteRow of batch.deletes) {
       this.readCache.deleteDoc(this.readCache.docKey(deleteRow.table, deleteRow.id));
     }
-    for (const upsert of batch.upserts) {
-      if (freshIds?.has(`${upsert.table}\0${upsert.id}`)) continue;
+    for (const docWrite of batch.docWrites) {
+      if (freshIds?.has(`${docWrite.table}\0${docWrite.id}`)) continue;
       this.readCache.writeDoc(
-        this.readCache.docKey(upsert.table, upsert.id),
-        upsertToStoredDoc(upsert),
+        this.readCache.docKey(docWrite.table, docWrite.id),
+        docWriteToStoredDoc(docWrite),
       );
     }
   }
 
-  private applyOneUpsertCommitCaches(commit: CommitResult, one: OneUpsertCommit): void {
+  private applyOneDocWriteCommitCaches(commit: CommitResult, one: OneDocWriteCommit): void {
     if (this.readCache.hasQueryEntries()) {
       if (one.dataOnly === true) {
-        this.readCache.writePageDocs([upsertToStoredDoc(one.upsert)]);
+        this.readCache.writePageDocs([docWriteToStoredDoc(one.docWrite)]);
       } else {
         this.readCache.invalidateTableQueries(commit.changedTables);
       }
     }
     if (one.fresh !== true) {
       this.readCache.writeDoc(
-        this.readCache.docKey(one.upsert.table, one.upsert.id),
-        upsertToStoredDoc(one.upsert),
+        this.readCache.docKey(one.docWrite.table, one.docWrite.id),
+        docWriteToStoredDoc(one.docWrite),
       );
     }
   }
@@ -1027,20 +1032,20 @@ export class StoreAdapter implements StorageBackend {
 }
 
 function isDataOnlyQueryCacheSafe(batch: WriteBatch): boolean {
-  if (batch.upserts.length === 0 || batch.deletes.length > 0) return false;
+  if (batch.docWrites.length === 0 || batch.deletes.length > 0) return false;
   if ((batch.crdtOps?.length ?? 0) > 0) return false;
   if ((batch.freshIds?.length ?? 0) > 0) return false;
   const dataOnlyIds = batch.dataOnlyIds ?? [];
-  if (dataOnlyIds.length !== batch.upserts.length) return false;
+  if (dataOnlyIds.length !== batch.docWrites.length) return false;
   const dataOnly = new Set(dataOnlyIds.map((row) => `${row.table}\0${row.id}`));
-  return batch.upserts.every((upsert) => dataOnly.has(`${upsert.table}\0${upsert.id}`));
+  return batch.docWrites.every((docWrite) => dataOnly.has(`${docWrite.table}\0${docWrite.id}`));
 }
 
-function upsertToStoredDoc(upsert: WriteBatch["upserts"][number]): StoredDoc {
+function docWriteToStoredDoc(docWrite: WriteBatch["docWrites"][number]): StoredDoc {
   return {
-    _creationTime: upsert.creationTime,
-    _id: upsert.id,
-    ...upsert.data,
+    _creationTime: docWrite.creationTime,
+    _id: docWrite.id,
+    ...docWrite.data,
   };
 }
 
@@ -1075,7 +1080,7 @@ function fromBindingCrdtWireOp(op: BindingCrdtWireOp): CommitCrdtWireOp {
 
 function fromBindingRowChange(change: BindingRowChange): StorageRowChange {
   if (change.op === "delete") return { id: change.id, op: "delete", table: change.table };
-  if (change.op !== "upsert") throw new Error(`unknown storage row change op: ${change.op}`);
+  if (change.op !== "write") throw new Error(`unknown storage row change op: ${change.op}`);
   const row =
     typeof change.row === "string"
       ? (JSON.parse(change.row) as Record<string, unknown>)
@@ -1084,7 +1089,7 @@ function fromBindingRowChange(change: BindingRowChange): StorageRowChange {
     throw new Error(`storage row change for ${change.table}:${change.id} is missing row`);
   }
   reviveDoc(row);
-  return { id: change.id, op: "upsert", row, table: change.table };
+  return { id: change.id, op: "write", row, table: change.table };
 }
 
 function toBindingIdMapping(mapping: IdMapping): BindingIdMapping {
@@ -1187,7 +1192,7 @@ function fromBindingDirtyHeadDebug(head: BindingDirtyHeadDebug): DirtyHeadDebug 
   };
 }
 
-function fromBindingProjectionDebug(state: BindingProjectionDebug): ProjectionDebug {
+function fromBindingProjectionDebug(state: BindingRemoteDocDebug): RemoteDocDebug {
   return {
     table: state.table,
     localDocumentId: state.localDocumentId,

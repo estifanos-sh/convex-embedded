@@ -90,13 +90,13 @@ function loadableArtifactPath(path: string): string {
     .slice(0, 16);
   const name = `convex-embedded-${key}-${basename(path)}.node`;
   const copy = join(tmpdir(), name);
-  pruneArtifactCopies(basename(path), name);
+  artifactCopyDelete(basename(path), name);
   copyFileSync(path, copy);
   return copy;
 }
 
-/** Every rebuild changes the copy key, so a load prunes this artifact's stale siblings. */
-function pruneArtifactCopies(sourceName: string, keep: string): void {
+/** Every rebuild changes the copy key, so a load deletes this artifact's stale siblings. */
+function artifactCopyDelete(sourceName: string, keep: string): void {
   let entries: string[];
   try {
     entries = readdirSync(tmpdir());

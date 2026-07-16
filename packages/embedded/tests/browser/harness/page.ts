@@ -144,6 +144,7 @@ export async function installMetalDevicePage(
       const { ConvexEmbeddedClient } = await import(browserUrl);
       type BrowserClient = {
         close(): Promise<void>;
+        connectionState(): { local: string; remote: string };
         mutation(name: string, args: Record<string, unknown>): Promise<unknown>;
         query(name: string, args: Record<string, unknown>): Promise<unknown>;
         __devtoolsRuntime?(
@@ -165,6 +166,7 @@ export async function installMetalDevicePage(
             projections: Array<Record<string, unknown>>;
           };
         }>;
+        subscribeInternalEvents?(listener: (event: unknown) => void): () => void;
         subscribeEvents(listener: (event: unknown) => void): () => void;
         watchQuery(
           name: string,
@@ -194,7 +196,7 @@ export async function installMetalDevicePage(
         retainedRevisions: 0,
         rowsApplied: 0,
         sent: 0,
-        settlementsAcknowledged: 0,
+        receiptsPushed: 0,
         storeJobs: 0,
       };
       const pushEvent = (event: MetalEventSummary) => {
@@ -216,7 +218,7 @@ export async function installMetalDevicePage(
           remoteTickTotals.retainedRevisions += event.tick.retainedRevisions ?? 0;
           remoteTickTotals.rowsApplied += event.tick.rowsApplied ?? 0;
           remoteTickTotals.sent += event.tick.sent ?? 0;
-          remoteTickTotals.settlementsAcknowledged += event.tick.settlementsAcknowledged ?? 0;
+          remoteTickTotals.receiptsPushed += event.tick.receiptsPushed ?? 0;
           remoteTickTotals.storeJobs += event.tick.storeJobs ?? 0;
         }
         events.push(event);
@@ -280,11 +282,15 @@ export async function installMetalDevicePage(
         if (!event || typeof event !== "object") return {};
         const item = event as {
           conflicts?: unknown[];
+          degradation?: string;
+          incarnation?: string;
           durationMs?: number;
           error?: string;
+          generation?: number;
           name?: string;
           phase?: string;
           status?: string;
+          sequence?: number;
           tick?: {
             changedTables?: string[];
             pullAttempted?: number;
@@ -299,8 +305,16 @@ export async function installMetalDevicePage(
             retainedRevisions?: number;
             rowsApplied?: number;
             sent?: number;
-            settlementsAcknowledged?: number;
+            receiptsPushed?: number;
             storeJobs?: number;
+            pending?: {
+              checkpoints: number;
+              inflight: number;
+              mutations: number;
+              scope: number;
+              settlements: number;
+              uploads: number;
+            };
           };
           type?: string;
         };
@@ -312,6 +326,18 @@ export async function installMetalDevicePage(
           ...(item.durationMs === undefined ? {} : { durationMs: Number(item.durationMs) }),
           ...(item.error === undefined ? {} : { error: item.error }),
           ...(item.conflicts === undefined ? {} : { conflicts: item.conflicts }),
+          ...(item.degradation === undefined ? {} : { degradation: item.degradation }),
+          ...(item.incarnation === undefined &&
+          item.generation === undefined &&
+          item.sequence === undefined
+            ? {}
+            : {
+                detail: {
+                  generation: item.generation,
+                  incarnation: item.incarnation,
+                  sequence: item.sequence,
+                },
+              }),
           ...(item.tick === undefined
             ? {}
             : {
@@ -329,8 +355,9 @@ export async function installMetalDevicePage(
                   retainedRevisions: item.tick.retainedRevisions,
                   rowsApplied: item.tick.rowsApplied,
                   sent: item.tick.sent,
-                  settlementsAcknowledged: item.tick.settlementsAcknowledged,
+                  receiptsPushed: item.tick.receiptsPushed,
                   storeJobs: item.tick.storeJobs,
+                  pending: item.tick.pending,
                 },
               }),
         };
@@ -443,7 +470,9 @@ export async function installMetalDevicePage(
           remoteEnabled ? { url: remoteUrl } : {},
         ) as BrowserClient;
         client = created;
-        stopEvents = created.subscribeEvents((event) => {
+        const subscribe =
+          created.subscribeInternalEvents?.bind(created) ?? created.subscribeEvents.bind(created);
+        stopEvents = subscribe((event) => {
           const summary = summarizeEvent(event);
           pushEvent(summary);
         });
@@ -459,7 +488,10 @@ export async function installMetalDevicePage(
       const open = async (remoteEnabled: boolean) => {
         await openTimed(remoteEnabled);
       };
-      const state: MetalDeviceState = {
+      const state: MetalDeviceState & {
+        connectionState(): { local: string; remote: string };
+      } = {
+        connectionState: () => currentClient().connectionState(),
         writeBody: async (id, body) => {
           await currentClient().mutation("documents:writeBody", { id, splices: [body] });
         },
@@ -467,7 +499,7 @@ export async function installMetalDevicePage(
           await currentClient().mutation("documents:update", {
             id,
             title,
-            updatedAt: Math.trunc(performance.now()),
+            updatedAt: performance.now(),
           });
         },
         close,
@@ -476,7 +508,7 @@ export async function installMetalDevicePage(
             body: bodyFor(title),
             slug: title,
             title,
-            updatedAt: Math.trunc(performance.now()),
+            updatedAt: performance.now(),
           })) as MetalDocument;
           return doc._id;
         },
@@ -1409,6 +1441,7 @@ export function observePageFailures(page: import("playwright").Page, failures: s
     }
   });
   page.on("pageerror", (error) => {
+    if (/worker was terminated during page teardown/i.test(error.message)) return;
     failures.push(`[pageerror] ${error.message}`);
   });
 }

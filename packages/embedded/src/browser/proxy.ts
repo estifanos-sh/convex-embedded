@@ -9,7 +9,7 @@ import type {
   StopOnUpdate,
 } from "../runtime/runner";
 import { functionName } from "../runtime/service";
-import type { EmbeddedEventListener, EmbeddedRuntimeEvent } from "../events";
+import type { EmbeddedEvent, EmbeddedEventListener, EmbeddedRuntimeEvent } from "../events";
 import type { ConvexEmbeddedRemoteOptions } from "../client";
 import type { FunctionReference } from "../runtime/functions";
 import { getTimerTime } from "../time";
@@ -35,10 +35,13 @@ export interface WorkerRunnerInit {
   closeTimeoutMs?: number;
   debug?: boolean;
   identity?: RuntimeIdentity;
+  initTimeoutMs?: number;
+  onDispose?: () => void;
   remote?: ConvexEmbeddedRemoteOptions;
   remoteAuth?: (args: { forceRefreshToken: boolean }) => Promise<string | null> | string | null;
   requestTimeoutMs?: number;
   storagePath: string;
+  storageOwner?: boolean | Promise<boolean>;
 }
 
 interface PendingRequest {
@@ -49,6 +52,8 @@ interface PendingRequest {
   reject(error: unknown): void;
   resolve(value: unknown): void;
   timer: ReturnType<typeof setTimeout> | undefined;
+  timeoutMs: number | undefined;
+  timeoutPolicy: "fatal" | "reject" | undefined;
   op: WorkerCommandCode;
 }
 
@@ -61,8 +66,26 @@ interface WatchCallbacks {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_INIT_TIMEOUT_MS = 15_000;
 const DEFAULT_ACCEPTED_RESULT_TIMEOUT_MS = 300_000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 1_000;
+
+const INIT_PROGRESS_PHASES = new Set([
+  "opfs-register",
+  "remote-attach",
+  "ready",
+  "store-wal-write",
+  "store-open",
+  "store-setup",
+  "wasm-load",
+]);
+
+const INIT_PROGRESS_DEGRADATIONS = new Set([
+  "opfs-acquire-reclaimed",
+  "opfs-acquire-retry",
+  "temporary-storage",
+  "slow-open",
+]);
 
 type WorkerEventHandler = (runner: WorkerRunner, message: Partial<WorkerResponse>) => void;
 
@@ -75,6 +98,7 @@ const workerEventHandlers = new Map<number, WorkerEventHandler>([
   [WorkerEvent.Debug, (runner, message) => runner.handleDebug(message)],
   [WorkerEvent.Event, (runner, message) => runner.handleEvent(message)],
   [WorkerEvent.AuthTokenRequest, (runner, message) => runner.handleAuthTokenRequest(message)],
+  [WorkerEvent.Terminal, (runner, message) => runner.handleTerminal(message)],
 ]);
 
 /**
@@ -98,12 +122,15 @@ export class IndeterminateMutationError extends Error {
 export class WorkerRunner implements Runner {
   private readonly clientId = randomId("client");
   private closed = false;
+  private closedError = new Error("ConvexEmbeddedClient has already been closed.");
   private nextId = 1;
   private nextWatchId = 1;
   private readonly acceptedResultTimeoutMs: number;
   private readonly closeTimeoutMs: number;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly ready: Promise<unknown>;
+  private readonly initTimeoutMs: number;
+  private readonly onDispose: (() => void) | undefined;
   private readonly requestTimeoutMs: number;
   private readonly eventListeners = new Set<EmbeddedEventListener>();
   private readonly remoteAuth:
@@ -113,38 +140,51 @@ export class WorkerRunner implements Runner {
   private readonly worker: EmbeddedWorker;
   constructor(source: EmbeddedWorkerSource, init?: WorkerRunnerInit) {
     this.worker = typeof source === "function" ? source() : source;
+    debugHook()?.({
+      detail: { clientId: this.clientId },
+      phase: "main:worker:init",
+      source: "worker",
+    });
     this.acceptedResultTimeoutMs =
       init?.acceptedResultTimeoutMs ?? DEFAULT_ACCEPTED_RESULT_TIMEOUT_MS;
     this.closeTimeoutMs = init?.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
+    this.onDispose = init?.onDispose;
     this.requestTimeoutMs = init?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    // Opening an existing store may include WAL recovery and pre-release format replacement.
+    // Initialization can legitimately take longer than an ordinary operation, and killing the
+    // worker at the generic request deadline only makes it repeat that work on every reload.
+    this.initTimeoutMs = init?.initTimeoutMs ?? init?.requestTimeoutMs ?? DEFAULT_INIT_TIMEOUT_MS;
     this.remoteAuth = init?.remoteAuth;
     this.worker.addEventListener("message", this.onMessage);
     this.worker.addEventListener("error", this.onWorkerError);
     this.worker.addEventListener("messageerror", this.onWorkerError);
     this.worker.start?.();
     this.ready = init
-      ? this.request(
-          {
-            clientId: this.clientId,
-            debug: init.debug ?? debugHook() !== undefined,
-            id: this.allocateId(),
-            identity: init.identity,
-            remote: init.remote
-              ? {
-                  authFetchToken: init.remoteAuth !== undefined,
-                  clientId: this.clientId,
-                  moduleGraphHash: init.identity?.moduleGraphHash ?? "local",
-                  operationTimeoutMs: init.remote.operationTimeoutMs,
-                  protocolVersion: init.identity?.protocolVersion ?? EMBEDDED_PROTOCOL_VERSION,
-                  receiveTimeoutMs: init.remote.receiveTimeoutMs,
-                  schemaHash: init.identity?.schemaHash ?? "local",
-                  url: init.remote.url,
-                }
-              : undefined,
-            storagePath: init.storagePath,
-            op: WorkerCommand.Init,
-          },
-          { timeoutMs: this.requestTimeoutMs },
+      ? Promise.resolve(init.storageOwner ?? false).then((storageOwner) =>
+          this.request(
+            {
+              clientId: this.clientId,
+              debug: init.debug ?? debugHook() !== undefined,
+              id: this.allocateId(),
+              identity: init.identity,
+              remote: init.remote
+                ? {
+                    authFetchToken: init.remoteAuth !== undefined,
+                    clientId: this.clientId,
+                    moduleGraphHash: init.identity?.moduleGraphHash ?? "local",
+                    operationTimeoutMs: init.remote.operationTimeoutMs,
+                    protocolVersion: init.identity?.protocolVersion ?? EMBEDDED_PROTOCOL_VERSION,
+                    receiveTimeoutMs: init.remote.receiveTimeoutMs,
+                    schemaHash: init.identity?.schemaHash ?? "local",
+                    url: init.remote.url,
+                  }
+                : undefined,
+              storagePath: init.storagePath,
+              storageOwner,
+              op: WorkerCommand.Init,
+            },
+            { timeoutMs: this.initTimeoutMs },
+          ),
         )
       : Promise.resolve();
     this.ready.catch(() => undefined);
@@ -194,7 +234,38 @@ export class WorkerRunner implements Runner {
         );
       },
     },
+    network: {
+      write: async (online: boolean) => {
+        await this.ready;
+        await this.request(
+          {
+            clientId: this.clientId,
+            id: this.allocateId(),
+            online,
+            op: WorkerCommand.RemoteNetworkWrite,
+          },
+          { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+        );
+      },
+    },
     scope: { write: async () => undefined },
+  };
+
+  /** Main-thread storage ownership hand-off. @internal */
+  readonly storage = {
+    owner: {
+      write: async () => {
+        await this.ready;
+        await this.request(
+          {
+            clientId: this.clientId,
+            id: this.allocateId(),
+            op: WorkerCommand.StorageOwnerWrite,
+          },
+          { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+        );
+      },
+    },
   };
 
   async route(
@@ -249,7 +320,7 @@ export class WorkerRunner implements Runner {
         auth: options.auth,
         clientId: this.clientId,
         id,
-        mutationFresh: generatedMutationId,
+        mutationIsFresh: generatedMutationId,
         mutationId: options.mutationId ?? `${this.clientId}:${id}`,
         name: functionName(ref),
         op: WorkerCommand.Mutation,
@@ -408,6 +479,11 @@ export class WorkerRunner implements Runner {
     }
   }
 
+  /** Immediately terminates the worker so page teardown cannot strand its storage ownership. */
+  terminate(): void {
+    this.dispose(new Error("ConvexEmbeddedClient worker was terminated during page teardown."));
+  }
+
   private request<T = unknown>(
     message: WorkerRequest,
     options: {
@@ -428,47 +504,61 @@ export class WorkerRunner implements Runner {
     return new Promise((resolve, reject) => {
       const resolveUnknown = (value: unknown) => resolve(value as T);
       const requestStartedAt = getTimerTime();
-      const timer =
-        options.timeoutMs === undefined
-          ? undefined
-          : setTimeout(() => {
-              const pending = this.pending.get(message.id);
-              if (!pending) return;
-              if (pending.op === WorkerCommand.Mutation && pending.accepted) {
-                this.rejectAcceptedMutation(message.id);
-                return;
-              }
-              const timeout = new Error(
-                `ConvexEmbeddedClient worker request "${commandName(pending.op)}" timed out after ${options.timeoutMs}ms.`,
-              );
-              if (options.timeoutPolicy === "reject") {
-                this.pending.delete(message.id);
-                pending.reject(timeout);
-                return;
-              }
-              this.dispose(new Error(`${timeout.message} Worker was terminated.`));
-            }, options.timeoutMs);
-      this.pending.set(message.id, {
+      const pending: PendingRequest = {
         accepted: false,
         onAccepted: options.onAccepted,
         onTiming: options.onTiming,
         requestStartedAt,
         reject,
         resolve: resolveUnknown,
-        timer,
+        timer: undefined,
+        timeoutMs: options.timeoutMs,
+        timeoutPolicy: options.timeoutPolicy,
         op: message.op,
-      });
+      };
+      this.pending.set(message.id, pending);
+      pending.timer = this.requestTimeout(message.id);
       try {
         // Query/mutation args remain caller-owned after the send. Upload bytes are the one safe
         // transfer point: the caller has already materialized a Blob body and no longer needs the
         // ArrayBuffer after the runtime owns it.
         this.worker.postMessage(message, options.transfer);
       } catch (error) {
-        if (timer !== undefined) clearTimeout(timer);
+        if (pending.timer !== undefined) clearTimeout(pending.timer);
         this.pending.delete(message.id);
         reject(error);
       }
     });
+  }
+
+  private requestTimeout(id: number): ReturnType<typeof setTimeout> | undefined {
+    const pending = this.pending.get(id);
+    if (!pending || pending.timeoutMs === undefined) return undefined;
+    return setTimeout(() => {
+      const current = this.pending.get(id);
+      if (!current) return;
+      if (current.op === WorkerCommand.Mutation && current.accepted) {
+        this.rejectAcceptedMutation(id);
+        return;
+      }
+      const timeout = new Error(
+        `ConvexEmbeddedClient worker request "${commandName(current.op)}" timed out after ${current.timeoutMs}ms${current.op === WorkerCommand.Init ? " without progress" : ""}.`,
+      );
+      if (current.timeoutPolicy === "reject") {
+        this.pending.delete(id);
+        current.reject(timeout);
+        return;
+      }
+      this.dispose(new Error(`${timeout.message} Worker was terminated.`));
+    }, pending.timeoutMs);
+  }
+
+  private writeInitProgress(): void {
+    for (const [id, pending] of this.pending) {
+      if (pending.op !== WorkerCommand.Init || pending.timeoutMs === undefined) continue;
+      if (pending.timer !== undefined) clearTimeout(pending.timer);
+      pending.timer = this.requestTimeout(id);
+    }
   }
 
   private allocateId(): number {
@@ -477,13 +567,14 @@ export class WorkerRunner implements Runner {
 
   private ensureOpen(): void {
     if (this.closed) {
-      throw new Error("ConvexEmbeddedClient has already been closed.");
+      throw this.closedError;
     }
   }
 
   private dispose(error: Error, options: { terminate?: boolean } = {}): void {
     if (this.closed) return;
     this.closed = true;
+    this.closedError = error;
     this.worker.removeEventListener("message", this.onMessage);
     this.worker.removeEventListener("error", this.onWorkerError);
     this.worker.removeEventListener("messageerror", this.onWorkerError);
@@ -491,6 +582,9 @@ export class WorkerRunner implements Runner {
       this.worker.close?.();
       this.worker.terminate?.();
     }
+    try {
+      this.onDispose?.();
+    } catch {}
     for (const pending of this.pending.values()) {
       if (pending.timer !== undefined) clearTimeout(pending.timer);
       pending.reject(
@@ -602,6 +696,7 @@ export class WorkerRunner implements Runner {
 
   handleEvent(message: Partial<WorkerResponse>): void {
     if (message.op !== WorkerEvent.Event || !message.event) return;
+    if (isInitProgress(message.event)) this.writeInitProgress();
     for (const listener of Array.from(this.eventListeners)) {
       try {
         listener(message.event);
@@ -643,6 +738,11 @@ export class WorkerRunner implements Runner {
       );
   }
 
+  handleTerminal(message: Partial<WorkerResponse>): void {
+    if (message.op !== WorkerEvent.Terminal || !message.error) return;
+    this.dispose(deserializeError(message.error));
+  }
+
   private readonly onWorkerError = (event: unknown): void => {
     const error = workerEventError(event);
     this.emitRuntimeFailed(error);
@@ -681,6 +781,12 @@ export class WorkerRunner implements Runner {
   }
 }
 
+function isInitProgress(event: EmbeddedEvent): boolean {
+  if (event.type !== "runtime") return false;
+  if (event.phase !== undefined && INIT_PROGRESS_PHASES.has(event.phase)) return true;
+  return event.degradation !== undefined && INIT_PROGRESS_DEGRADATIONS.has(event.degradation);
+}
+
 function commandName(op: WorkerCommandCode): string {
   return workerCommandNames.get(op) ?? `unknown:${op}`;
 }
@@ -699,6 +805,8 @@ const workerCommandNames = new Map<WorkerCommandCode, string>([
   [WorkerCommand.IdentityRead, "identityRead"],
   [WorkerCommand.IdentityWrite, "identityWrite"],
   [WorkerCommand.RemoteIdentityRead, "remoteIdentityRead"],
+  [WorkerCommand.RemoteNetworkWrite, "remoteNetworkWrite"],
+  [WorkerCommand.StorageOwnerWrite, "storageOwnerWrite"],
 ]);
 
 function workerEventError(event: unknown): Error {

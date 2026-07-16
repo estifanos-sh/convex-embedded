@@ -57,7 +57,7 @@ export const read = query({
   },
 });
 
-const remove = mutation({
+const deletion = mutation({
   args: { storageId: v.string(), expectedVersion: v.number() },
   returns: v.union(
     v.object({ deletion: v.literal("deleted") }),
@@ -78,7 +78,7 @@ const remove = mutation({
   },
 });
 
-export { remove as delete };
+export { deletion as delete };
 
 function clamp(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1) {

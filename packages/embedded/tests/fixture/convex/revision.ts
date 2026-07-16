@@ -44,9 +44,7 @@ export const scan = query({
         v.literal("delete"),
       ),
     ),
-    status: v.optional(
-      v.union(v.literal("active"), v.literal("retained"), v.literal("acknowledged")),
-    ),
+    status: v.optional(v.union(v.literal("active"), v.literal("retained"))),
     createdBefore: v.optional(v.number()),
     paginationOpts: paginationOptsValidator,
   },

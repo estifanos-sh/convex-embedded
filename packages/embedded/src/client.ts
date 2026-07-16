@@ -31,7 +31,12 @@ import {
   type RunMutationTiming,
   type StopOnUpdate,
 } from "./runtime/runner";
-import { consumeRemoteTick, remoteTickHasWork } from "./rev";
+import {
+  consumeRemoteTick,
+  remotePendingIsEmpty,
+  REMOTE_PULL_DIAGNOSTIC_ERROR,
+  remoteTickHasWork,
+} from "./rev";
 import { toRuntimeStoreSchema, type ConvexEmbeddedSchema } from "./schema";
 import type {
   RemoteStartOptions,
@@ -73,7 +78,7 @@ export type {
 export type {
   EmbeddedDataDelete,
   EmbeddedDataEvent,
-  EmbeddedDataUpsert,
+  EmbeddedDataWrite,
   EmbeddedMutationTiming,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
@@ -124,12 +129,12 @@ export interface ConvexEmbeddedMutationOptions<_Args extends Record<string, Valu
 }
 
 /**
- * A local watched query handle.
+ * A watched query handle.
  *
  * @remarks
  * Watches are lazy. Calling {@link Watch.onUpdate} starts the underlying local
- * subscription, and the returned cleanup function stops that subscription when
- * the last listener is removed.
+ * or hosted subscription, and the returned cleanup function stops that
+ * subscription when the last listener is removed.
  *
  * @typeParam T - Return type of the watched Convex query.
  *
@@ -153,7 +158,7 @@ export interface Watch<T> {
   onUpdate(callback: () => void): () => void;
 
   /**
-   * Returns the latest local query result, or `undefined` while no result has been produced.
+   * Returns the latest query result, or `undefined` while no result has been produced.
    *
    * @returns The most recent query result, or `undefined` before the first result.
    * @throws The latest query error when the watched query is currently in an error state.
@@ -280,7 +285,7 @@ export type EmbeddedConnectionState = {
   local: EmbeddedLocalConnectionState;
   localError?: string;
 } & (
-  | { remote: "disabled" | "starting" | "ready" | "closed" }
+  | { remote: "disabled" | "starting" | "connected" | "ready" | "offline" | "closed" }
   | { remote: "error"; remoteError: string }
 );
 
@@ -381,6 +386,9 @@ export class EmbeddedClient {
   private localState: EmbeddedConnectionState["local"] = "starting";
   private remoteState: EmbeddedConnectionState["remote"] = "disabled";
   private remoteError: string | undefined;
+  private remoteIncarnation: string | undefined;
+  private remoteGeneration = -1;
+  private remoteSequence = -1;
   private localError: string | undefined;
   private nextDebugOperationId = 1;
   private nextSpanId = 1;
@@ -396,9 +404,8 @@ export class EmbeddedClient {
     this.remoteState = remoteConfigured ? "starting" : "disabled";
     this.state = this.init(options);
     void this.state.then(
-      (state) => {
+      () => {
         this.localState = "ready";
-        if (state.remoteConfigured && this.remoteState === "starting") this.remoteState = "ready";
       },
       (error) => {
         this.localState = "failed";
@@ -563,7 +570,7 @@ export class EmbeddedClient {
         }
         const value = await runner.runMutation(mutation, normalized, {
           auth,
-          mutationFresh: true,
+          mutationIsFresh: true,
           mutationId,
           pushCall: {
             fn: getFunctionName(mutation),
@@ -713,12 +720,13 @@ export class EmbeddedClient {
   }
 
   /**
-   * Creates a local watched query handle.
+   * Creates a watched query handle.
    *
    * @remarks
    * The watch starts when a callback is registered with {@link Watch.onUpdate}.
    * Call {@link Watch.localQueryResult} from the callback to read the latest
-   * local result.
+   * result. Locally executable functions are watched against the embedded store;
+   * server-only functions are watched against the configured Convex deployment.
    *
    * @typeParam Query - Convex query function reference type.
    * @param query - Convex query function reference.
@@ -989,8 +997,36 @@ export class EmbeddedClient {
       const route = this.hasLocalRoute(query, "query")
         ? ({ execution: "local" } as const)
         : await this.resolveRoute(runner, query, args, "query");
-      if (route.execution !== "local") {
-        throw new Error("watchQuery only supports locally executable queries.");
+      if (
+        this.closed ||
+        state.stop ||
+        !state.callbacks.size ||
+        this.queries.get(state.key) !== state
+      ) {
+        return;
+      }
+      if (route.execution === "hosted") {
+        const hosted = this.hosted;
+        if (!hosted) throw new EmbeddedOfflineError();
+        const client = this.hostedClient ?? this.createHostedClient(hosted);
+        state.stop = client.onUpdate(
+          query,
+          route.args as FunctionArgs<Query>,
+          (value) => {
+            if (this.closed || this.queries.get(state.key) !== state) return;
+            state.baseError = undefined;
+            state.baseValue = value;
+            state.logs = undefined;
+            this.publish(state);
+          },
+          (error) => {
+            if (this.closed || this.queries.get(state.key) !== state) return;
+            state.baseError = error;
+            state.logs = undefined;
+            this.publish(state);
+          },
+        );
+        return;
       }
       state.stop = runner.onUpdate(
         query,
@@ -1121,14 +1157,51 @@ export class EmbeddedClient {
 
   private emitEvent(event: EmbeddedInternalEvent): void {
     if (event.type === "remote") {
+      if (event.incarnation !== undefined && event.incarnation !== this.remoteIncarnation) {
+        this.remoteIncarnation = event.incarnation;
+        this.remoteGeneration = -1;
+        this.remoteSequence = -1;
+      }
+      if (event.generation !== undefined) {
+        if (event.generation < this.remoteGeneration) return;
+        if (event.generation > this.remoteGeneration) {
+          this.remoteGeneration = event.generation;
+          this.remoteSequence = -1;
+        }
+        if (event.sequence !== undefined) {
+          if (event.sequence <= this.remoteSequence) return;
+          this.remoteSequence = event.sequence;
+        }
+      }
       if (event.status === "error") {
         this.remoteState = "error";
         this.remoteError = event.error;
+      } else if (event.status === "offline") {
+        this.remoteState = "offline";
+        this.remoteError = undefined;
       } else if (event.status === "closed") {
         this.remoteState = "closed";
         this.remoteError = undefined;
-      } else if (event.status === "started" || event.status === "tick" || event.status === "idle") {
-        this.remoteState = "ready";
+      } else if (event.status === "starting") {
+        this.remoteState = "starting";
+        this.remoteError = undefined;
+      } else if (event.status === "started") {
+        if (
+          this.remoteState !== "offline" &&
+          this.remoteState !== "connected" &&
+          this.remoteState !== "ready"
+        ) {
+          this.remoteState = "starting";
+        }
+        this.remoteError = undefined;
+      } else if (event.status === "connected") {
+        this.remoteState = "connected";
+        this.remoteError = undefined;
+      } else if (event.status === "tick") {
+        if (this.remoteState !== "offline") this.remoteState = "connected";
+        this.remoteError = undefined;
+      } else if (event.status === "idle") {
+        this.remoteState = remotePendingIsEmpty(event.tick?.pending) ? "ready" : "connected";
         this.remoteError = undefined;
       }
     }
@@ -1381,6 +1454,7 @@ export function startRemoteLoop(
   let microtaskPending = false;
   let attempt = 0;
   let consecutiveErrors = 0;
+  let pullDiagnostic: string | undefined;
   const schedule = (delay: number) => {
     if (stopped) return;
     if (timer !== undefined) {
@@ -1437,16 +1511,33 @@ export function startRemoteLoop(
       .then((tick) => {
         nextAllowedRunAt = 0;
         consecutiveErrors = 0;
+        if (tick.pullSnapshots > 0) pullDiagnostic = undefined;
+        if (tick.pullDiagnostics > 0) {
+          pullDiagnostic = tick.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR;
+        }
         if (!stopped) consumeRemoteTick(tick, runner, emit);
         const active = remoteTickHasWork(tick);
         // The native actor owns websocket ingress after this bounded wake turn. JavaScript enters
         // it again only for new local durable work or a changed authored-query scope.
         const delay = wakePending ? 0 : undefined;
+        if (pullDiagnostic) {
+          emit({
+            at: getTimerTime(),
+            attempt,
+            error: pullDiagnostic,
+            ...(delay === undefined ? {} : { nextRunAt: getTimerTime() + delay }),
+            status: "error",
+            tick: toRemoteEventTick(tick),
+            type: "remote",
+          });
+          nextDelay = delay;
+          return;
+        }
         emit({
           at: getTimerTime(),
           attempt,
           ...(delay === undefined ? {} : { nextRunAt: getTimerTime() + delay }),
-          status: active ? "tick" : "idle",
+          status: active || !remotePendingIsEmpty(tick.pending) ? "tick" : "idle",
           tick: toRemoteEventTick(tick),
           type: "remote",
         });
@@ -1516,10 +1607,20 @@ function toRemoteEventTick(tick: RemoteTick): NonNullable<EmbeddedRemoteEvent["t
 
 /** Report progress completed autonomously by the native remote actor. */
 function remoteTickEvent(tick: RemoteTick): EmbeddedRemoteEvent {
+  if (tick.pullDiagnostics > 0) {
+    return {
+      at: getTimerTime(),
+      attempt: 0,
+      error: REMOTE_PULL_DIAGNOSTIC_ERROR,
+      status: "error",
+      tick: toRemoteEventTick(tick),
+      type: "remote",
+    };
+  }
   return {
     at: getTimerTime(),
     attempt: 0,
-    status: remoteTickHasWork(tick) ? "tick" : "idle",
+    status: remoteTickHasWork(tick) || !remotePendingIsEmpty(tick.pending) ? "tick" : "idle",
     tick: toRemoteEventTick(tick),
     type: "remote",
   };

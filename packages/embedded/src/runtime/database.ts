@@ -6,12 +6,12 @@ import type {
   FileSurface,
   DeleteIn,
   IdMapping,
-  OneUpsertCommit,
+  OneDocWriteCommit,
   RuntimeStorageReader,
   RuntimeStorageWriter,
   StoreSchema,
   TableDef,
-  UpsertIn,
+  DocWrite,
   WriteBatch,
 } from "../storage/types";
 import { hashDocument, hashValue } from "../hash";
@@ -319,12 +319,12 @@ export function createWriter<DM extends GenericDataModel>(
   ): void;
   restore(snapshot: WriterSnapshot): void;
   snapshot(): WriterSnapshot;
-  oneUpsert: () => OneUpsertCommit | undefined;
+  oneDocWrite: () => OneDocWriteCommit | undefined;
   toBatch: () => WriteBatch;
 } {
-  const upsertsByTable = new Map<
+  const docWritesByTable = new Map<
     string,
-    Map<string, { crdtOnly: boolean; dataOnly: boolean; input: UpsertIn; doc: StagedDoc }>
+    Map<string, { crdtOnly: boolean; dataOnly: boolean; input: DocWrite; doc: StagedDoc }>
   >();
   const deletesByTable = new Map<string, Set<string>>();
   const crdtOps: CrdtOp[] = [];
@@ -338,11 +338,11 @@ export function createWriter<DM extends GenericDataModel>(
 
   const tableUpserts = (
     table: string,
-  ): Map<string, { crdtOnly: boolean; dataOnly: boolean; input: UpsertIn; doc: StagedDoc }> => {
-    let map = upsertsByTable.get(table);
+  ): Map<string, { crdtOnly: boolean; dataOnly: boolean; input: DocWrite; doc: StagedDoc }> => {
+    let map = docWritesByTable.get(table);
     if (!map) {
       map = new Map();
-      upsertsByTable.set(table, map);
+      docWritesByTable.set(table, map);
     }
     return map;
   };
@@ -365,9 +365,9 @@ export function createWriter<DM extends GenericDataModel>(
   ): void => {
     if (def.document) validateJson(data, def.document, def.name);
     deletesByTable.get(def.name)?.delete(id);
-    const upserts = tableUpserts(def.name);
-    const previous = upserts.get(id);
-    upserts.set(id, {
+    const docWrites = tableUpserts(def.name);
+    const previous = docWrites.get(id);
+    docWrites.set(id, {
       crdtOnly: options.crdtOnly === true && previous?.crdtOnly !== false,
       dataOnly: options.dataOnly === true,
       input: {
@@ -384,7 +384,7 @@ export function createWriter<DM extends GenericDataModel>(
   const read = async (id: string): Promise<RawDoc | null> => {
     const table = tableFromId(id);
     if (deletesByTable.get(table)?.has(id)) return null;
-    const staged = upsertsByTable.get(table)?.get(id);
+    const staged = docWritesByTable.get(table)?.get(id);
     if (staged) return cloneTree(materialize(staged.doc));
     tracker?.doc?.(id);
     const stored = await store.doc.read(table, id);
@@ -403,7 +403,7 @@ export function createWriter<DM extends GenericDataModel>(
   };
 
   const overlayFor = (table: string): QueryOverlay => ({
-    staged: [...(upsertsByTable.get(table)?.values() ?? [])].map((e) =>
+    staged: [...(docWritesByTable.get(table)?.values() ?? [])].map((e) =>
       cloneTree(materialize(e.doc)),
     ),
     deleted: deletesByTable.get(table) ?? EMPTY_DELETES,
@@ -511,7 +511,7 @@ export function createWriter<DM extends GenericDataModel>(
       assertNoExplicitCrdtWrite(def, "patch", partial);
       const merged = { ...current, ...partial };
       const mergedData = dataOf(merged);
-      const previous = upsertsByTable.get(table)?.get(id);
+      const previous = docWritesByTable.get(table)?.get(id);
       if (!patchTouchesIndexedColumn(def, partial)) {
         const fresh = freshIds.some((row) => row.table === table && row.id === id);
         const previousCols =
@@ -633,7 +633,7 @@ export function createWriter<DM extends GenericDataModel>(
           ? existingMapping.convexId
           : undefined;
       const restore = revisionRestores.get(`${table}\u0000${id}`);
-      upsertsByTable.get(table)?.delete(id);
+      docWritesByTable.get(table)?.delete(id);
       tableDeletes(table).add(id);
       for (let index = crdtOps.length - 1; index >= 0; index -= 1) {
         const op = crdtOps[index]!;
@@ -676,12 +676,12 @@ export function createWriter<DM extends GenericDataModel>(
   };
 
   const toBatch = (): WriteBatch => {
-    const upserts: UpsertIn[] = [];
+    const docWrites: DocWrite[] = [];
     const crdtOnlyIds: DeleteIn[] = [];
     const dataOnlyIds: DeleteIn[] = [];
-    for (const map of upsertsByTable.values()) {
+    for (const map of docWritesByTable.values()) {
       for (const entry of map.values()) {
-        upserts.push(entry.input);
+        docWrites.push(entry.input);
         if (entry.crdtOnly) {
           crdtOnlyIds.push({ table: entry.input.table, id: entry.input.id });
         }
@@ -702,11 +702,11 @@ export function createWriter<DM extends GenericDataModel>(
       deletes,
       freshIds: [...freshIds],
       idMappings: [...idMappings],
-      upserts,
+      docWrites,
     };
   };
 
-  const oneUpsert = (): OneUpsertCommit | undefined => {
+  const oneDocWrite = (): OneDocWriteCommit | undefined => {
     if (
       crdtOps.length > 0 ||
       crdtRestores.length > 0 ||
@@ -715,8 +715,8 @@ export function createWriter<DM extends GenericDataModel>(
     ) {
       return undefined;
     }
-    if (upsertsByTable.size !== 1) return undefined;
-    const entries = [...upsertsByTable.values()][0];
+    if (docWritesByTable.size !== 1) return undefined;
+    const entries = [...docWritesByTable.values()][0];
     if (!entries || entries.size !== 1) return undefined;
     const entry = [...entries.values()][0];
     if (!entry) return undefined;
@@ -732,7 +732,7 @@ export function createWriter<DM extends GenericDataModel>(
     return {
       dataOnly: entry.dataOnly,
       fresh,
-      upsert: entry.input,
+      docWrite: entry.input,
     };
   };
 
@@ -743,12 +743,12 @@ export function createWriter<DM extends GenericDataModel>(
     crdtRestores: [...crdtRestores],
     idMappings: [...idMappings],
     revisionRestores: new Map(revisionRestores),
-    upserts: new Map([...upsertsByTable].map(([table, map]) => [table, new Map(map)])),
+    docWrites: new Map([...docWritesByTable].map(([table, map]) => [table, new Map(map)])),
   });
 
   const restore = (snapshot: WriterSnapshot): void => {
-    upsertsByTable.clear();
-    for (const [table, map] of snapshot.upserts) upsertsByTable.set(table, new Map(map));
+    docWritesByTable.clear();
+    for (const [table, map] of snapshot.docWrites) docWritesByTable.set(table, new Map(map));
     deletesByTable.clear();
     for (const [table, ids] of snapshot.deletes) deletesByTable.set(table, new Set(ids));
     freshIds.length = 0;
@@ -781,7 +781,7 @@ export function createWriter<DM extends GenericDataModel>(
     restoreDocument,
     restore,
     snapshot,
-    oneUpsert,
+    oneDocWrite,
     toBatch,
   };
 }
@@ -850,9 +850,9 @@ export interface WriterSnapshot {
     string,
     { table: string; rowId: string; deleted: boolean; value?: Record<string, unknown> }
   >;
-  upserts: Map<
+  docWrites: Map<
     string,
-    Map<string, { crdtOnly: boolean; dataOnly: boolean; input: UpsertIn; doc: StagedDoc }>
+    Map<string, { crdtOnly: boolean; dataOnly: boolean; input: DocWrite; doc: StagedDoc }>
   >;
 }
 

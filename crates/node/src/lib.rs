@@ -48,18 +48,18 @@ use remote::{
     DeploymentUrl, RemoteAuth, RemoteConfig, RemoteCursor, RemoteError, RemoteScope,
     RemoteSubscription, RemoteTiming,
 };
-use storage::RemotePullResult;
+use storage::RemotePageWriteResult;
 use storage::{
     Bound, ColValue, ColumnDef, CommitOptions, CommitResult, CountSpec, CrdtFieldDef,
     CrdtFieldKind, CrdtOp, CrdtOperation, CrdtRestore, CrdtSnapshot, CrdtWireOp, DeleteIn,
-    DeleteResult, DirtyHeadDebug, EmbeddedStore, FileMetadata, FileStore, IdMapping,
+    DeleteResult, DirtyHeadDebug, DocWrite, EmbeddedStore, FileMetadata, FileStore, IdMapping,
     IdMappingContent, IndexDef, MutationCall, MutationRecord, MutationStatus, Order, Page,
     PendingUpload, ReadSpec, ResultEntry, RowChange, RowHead, RowKey, ScheduledFunctionKind,
     ScheduledJob, ScheduledState, StorageError, StoreSchema, TableDef, UploadLease,
-    UploadLeaseWrite, UpsertIn, WriteBatch,
+    UploadLeaseWrite, WriteBatch,
 };
 
-const API_VERSION: u32 = 19;
+const API_VERSION: u32 = 20;
 
 #[napi(js_name = "apiVersion")]
 #[must_use]
@@ -164,7 +164,7 @@ pub struct JsCountSpec {
 }
 
 #[napi(object)]
-pub struct JsUpsert {
+pub struct JsDocWrite {
     pub table: String,
     pub id: String,
     pub data: String,
@@ -180,7 +180,7 @@ pub struct JsDelete {
 
 #[napi(object)]
 pub struct JsWriteBatch {
-    pub upserts: Vec<JsUpsert>,
+    pub doc_writes: Vec<JsDocWrite>,
     pub deletes: Vec<JsDelete>,
     pub crdt_ops: Option<Vec<JsCrdtOp>>,
     pub crdt_restores: Option<Vec<JsCrdtRestore>>,
@@ -224,7 +224,7 @@ pub struct JsCommitOptions {
     pub mutation_result: Option<String>,
     pub push_envelope_json: Option<String>,
     pub push_envelope_now_ms: Option<f64>,
-    pub mutation_fresh: Option<bool>,
+    pub mutation_is_fresh: Option<bool>,
     pub include_changes: Option<bool>,
 }
 
@@ -282,7 +282,7 @@ pub struct JsDirtyHeadDebug {
 }
 
 #[napi(object)]
-pub struct JsProjectionDebug {
+pub struct JsRemoteDocDebug {
     pub table: String,
     pub local_document_id: String,
     pub current_rev_id: String,
@@ -470,6 +470,16 @@ pub struct JsReroot {
 }
 
 #[napi(object)]
+pub struct JsRemotePending {
+    pub checkpoints: u32,
+    pub inflight: u32,
+    pub mutations: u32,
+    pub scope: u32,
+    pub settlements: u32,
+    pub uploads: u32,
+}
+
+#[napi(object)]
 pub struct JsRemoteTick {
     pub changed_tables: Vec<String>,
     pub rows_applied: u32,
@@ -484,12 +494,14 @@ pub struct JsRemoteTick {
     pub push_rebases: u32,
     pub retained_revisions: Vec<JsReroot>,
     pub sent: u32,
-    pub settlements_acknowledged: u32,
+    pub receipts_pushed: u32,
     pub store_jobs: u32,
     pub pull_changes_applied: u32,
     pub pull_snapshots: u32,
     pub pull_diagnostics: u32,
+    pub pull_error: Option<String>,
     pub changed_results: Vec<String>,
+    pub pending: Option<JsRemotePending>,
 }
 
 #[napi(object)]
@@ -691,23 +703,29 @@ impl Store {
     }
 
     #[napi]
-    pub async fn mutation_begin(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
+    pub async fn mutation_write(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
         let call = to_mutation_call(call);
-        self.run(move |store| store.mutation_begin(&call).map(js_mutation_record))
+        self.run(move |store| store.mutation_write(&call).map(js_mutation_record))
             .await
     }
 
     #[napi]
-    pub async fn mutation_read(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
+    pub async fn mutation_cache_read(
+        &self,
+        call: JsMutationCall,
+    ) -> napi::Result<JsMutationRecord> {
         let call = to_mutation_call(call);
-        self.run(move |store| store.mutation_read(&call).map(js_mutation_record))
+        self.run(move |store| store.mutation_cache_read(&call).map(js_mutation_record))
             .await
     }
 
     #[napi]
-    pub async fn mutation_fresh(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
+    pub async fn mutation_cache_write(
+        &self,
+        call: JsMutationCall,
+    ) -> napi::Result<JsMutationRecord> {
         let call = to_mutation_call(call);
-        self.run(move |store| store.mutation_fresh(&call).map(js_mutation_record))
+        self.run(move |store| store.mutation_cache_write(&call).map(js_mutation_record))
             .await
     }
 
@@ -736,7 +754,7 @@ impl Store {
 
     #[napi]
     #[allow(clippy::too_many_arguments)]
-    pub async fn commit_one_upsert(
+    pub async fn commit_one_doc_write(
         &self,
         table: String,
         id: String,
@@ -751,13 +769,13 @@ impl Store {
         include_changes: Option<bool>,
         fresh: Option<bool>,
         data_only: Option<bool>,
-        mutation_fresh: Option<bool>,
+        mutation_is_fresh: Option<bool>,
     ) -> napi::Result<JsCommitResult> {
         let cols = cols
             .into_iter()
             .map(to_col)
             .collect::<napi::Result<Vec<_>>>()?;
-        let upsert = UpsertIn {
+        let doc_write = DocWrite {
             table,
             id,
             data,
@@ -773,14 +791,14 @@ impl Store {
             mutation_result,
             None,
             None,
-            mutation_fresh,
+            mutation_is_fresh,
             Some(include_changes),
         )?;
         let fresh = fresh.unwrap_or(false);
         let data_only = data_only.unwrap_or(false);
         self.run(move |store| {
             store
-                .commit_one_upsert(upsert, &options, fresh, data_only)
+                .commit_one_doc_write(doc_write, &options, fresh, data_only)
                 .map(|result| js_commit_result(result, include_changes))
         })
         .await
@@ -788,7 +806,7 @@ impl Store {
 
     #[napi]
     #[allow(clippy::too_many_arguments)]
-    pub async fn commit_one_upsert_encoded(
+    pub async fn commit_one_doc_write_encoded(
         &self,
         table: String,
         id: String,
@@ -802,7 +820,7 @@ impl Store {
         mutation_result: Option<String>,
         fresh: Option<bool>,
         data_only: Option<bool>,
-        mutation_fresh: Option<bool>,
+        mutation_is_fresh: Option<bool>,
     ) -> napi::Result<i64> {
         let encoded_cols = decode_encoded_col_keys(&encoded_cols)?;
         let options = decode_commit_options(
@@ -813,14 +831,14 @@ impl Store {
             mutation_result,
             None,
             None,
-            mutation_fresh,
+            mutation_is_fresh,
             Some(false),
         )?;
         let fresh = fresh.unwrap_or(false);
         let data_only = data_only.unwrap_or(false);
         self.run(move |store| {
             store
-                .commit_one_upsert_encoded(
+                .commit_one_doc_write_encoded(
                     table,
                     id,
                     data,
@@ -837,7 +855,7 @@ impl Store {
 
     #[napi]
     #[allow(clippy::too_many_arguments)]
-    pub fn commit_one_upsert_encoded_deferred(
+    pub fn commit_one_doc_write_encoded_deferred(
         &self,
         env: Env,
         table: String,
@@ -852,7 +870,7 @@ impl Store {
         mutation_result: Option<String>,
         fresh: Option<bool>,
         data_only: Option<bool>,
-        mutation_fresh: Option<bool>,
+        mutation_is_fresh: Option<bool>,
     ) -> napi::Result<JsObject> {
         let encoded_cols = decode_encoded_col_keys(&encoded_cols)?;
         let options = decode_commit_options(
@@ -863,7 +881,7 @@ impl Store {
             mutation_result,
             None,
             None,
-            mutation_fresh,
+            mutation_is_fresh,
             Some(false),
         )?;
         let fresh = fresh.unwrap_or(false);
@@ -875,7 +893,7 @@ impl Store {
         let (deferred, promise) = env.create_deferred::<i64, _>()?;
         jobs.send(Box::new(move |store| {
             let result = store
-                .commit_one_upsert_encoded(
+                .commit_one_doc_write_encoded(
                     table,
                     id,
                     data,
@@ -961,8 +979,8 @@ impl Store {
     }
 
     #[napi]
-    pub async fn checkpoint(&self) -> napi::Result<()> {
-        self.run(storage::EmbeddedStore::checkpoint).await
+    pub async fn wal_write(&self) -> napi::Result<()> {
+        self.run(storage::EmbeddedStore::wal_write).await
     }
 
     #[napi]
@@ -1005,7 +1023,7 @@ impl Store {
 
     #[napi]
     pub async fn doc_base_read(&self, table: String, id: String) -> napi::Result<Option<String>> {
-        self.run(move |store| store.projection_read(&table, &id).map(base_row_of))
+        self.run(move |store| store.remote_doc_read(&table, &id).map(base_row_of))
             .await
     }
 
@@ -1050,15 +1068,15 @@ impl Store {
     }
 
     #[napi]
-    pub async fn projection_debug_read(
+    pub async fn remote_doc_debug_read(
         &self,
         table: String,
         local_id: String,
-    ) -> napi::Result<Option<JsProjectionDebug>> {
+    ) -> napi::Result<Option<JsRemoteDocDebug>> {
         self.run(move |store| {
             store
-                .projection_read(&table, &local_id)
-                .map(|row| row.map(js_projection_debug))
+                .remote_doc_read(&table, &local_id)
+                .map(|row| row.map(js_remote_doc_debug))
         })
         .await
     }
@@ -1429,26 +1447,26 @@ impl Store {
     }
 
     #[napi]
-    pub fn checkpoint(&self) -> napi::Result<()> {
-        self.run(|store| store.checkpoint())
+    pub fn wal_write(&self) -> napi::Result<()> {
+        self.run(|store| store.wal_write())
     }
 
     #[napi]
-    pub fn mutation_begin(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
+    pub fn mutation_write(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
         let call = to_mutation_call(call);
-        self.run(|store| store.mutation_begin(&call).map(js_mutation_record))
+        self.run(|store| store.mutation_write(&call).map(js_mutation_record))
     }
 
     #[napi]
-    pub fn mutation_read(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
+    pub fn mutation_cache_read(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
         let call = to_mutation_call(call);
-        self.run(|store| store.mutation_read(&call).map(js_mutation_record))
+        self.run(|store| store.mutation_cache_read(&call).map(js_mutation_record))
     }
 
     #[napi]
-    pub fn mutation_fresh(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
+    pub fn mutation_cache_write(&self, call: JsMutationCall) -> napi::Result<JsMutationRecord> {
         let call = to_mutation_call(call);
-        self.run(|store| store.mutation_fresh(&call).map(js_mutation_record))
+        self.run(|store| store.mutation_cache_write(&call).map(js_mutation_record))
     }
 
     #[napi]
@@ -1474,7 +1492,7 @@ impl Store {
 
     #[napi]
     #[allow(clippy::too_many_arguments)]
-    pub fn commit_one_upsert_encoded(
+    pub fn commit_one_doc_write_encoded(
         &self,
         table: String,
         id: String,
@@ -1488,7 +1506,7 @@ impl Store {
         mutation_result: Option<String>,
         fresh: Option<bool>,
         data_only: Option<bool>,
-        mutation_fresh: Option<bool>,
+        mutation_is_fresh: Option<bool>,
     ) -> napi::Result<i64> {
         let encoded_cols = decode_encoded_col_keys(&encoded_cols)?;
         let options = decode_commit_options(
@@ -1499,12 +1517,12 @@ impl Store {
             mutation_result,
             None,
             None,
-            mutation_fresh,
+            mutation_is_fresh,
             Some(false),
         )?;
         self.run(|store| {
             store
-                .commit_one_upsert_encoded(
+                .commit_one_doc_write_encoded(
                     table,
                     id,
                     data,
@@ -1616,7 +1634,7 @@ impl Store {
 
     #[napi]
     pub fn doc_base_read(&self, table: String, id: String) -> napi::Result<Option<String>> {
-        self.run(|store| store.projection_read(&table, &id).map(base_row_of))
+        self.run(|store| store.remote_doc_read(&table, &id).map(base_row_of))
     }
 
     #[napi]
@@ -1653,15 +1671,15 @@ impl Store {
     }
 
     #[napi]
-    pub fn projection_debug_read(
+    pub fn remote_doc_debug_read(
         &self,
         table: String,
         local_id: String,
-    ) -> napi::Result<Option<JsProjectionDebug>> {
+    ) -> napi::Result<Option<JsRemoteDocDebug>> {
         self.run(|store| {
             store
-                .projection_read(&table, &local_id)
-                .map(|row| row.map(js_projection_debug))
+                .remote_doc_read(&table, &local_id)
+                .map(|row| row.map(js_remote_doc_debug))
         })
     }
 
@@ -1973,7 +1991,7 @@ impl Store {
     #[napi]
     pub fn close(&self, env: Env) -> napi::Result<JsObject> {
         if lock(&self.inner).is_some() {
-            let _ = self.run(|store| store.checkpoint());
+            let _ = self.run(|store| store.wal_write());
         }
         let inner = lock(&self.inner).take();
         env.execute_tokio_future(
@@ -2211,19 +2229,19 @@ impl RemoteStore for NativeRemoteStore {
         self.run(move |store| store.id_local_read(&table, &server_document_id))
     }
 
-    fn projection_read(
+    fn remote_doc_read(
         &self,
         table: &str,
         local_id: &str,
     ) -> Result<Option<storage::RowHead>, StorageError> {
         let table = table.to_owned();
         let local_id = local_id.to_owned();
-        self.run(move |store| store.projection_read(&table, &local_id))
+        self.run(move |store| store.remote_doc_read(&table, &local_id))
     }
 
-    fn remote_read_cursor(&self, subscription: &str) -> Result<Option<String>, StorageError> {
+    fn remote_cursor_read(&self, subscription: &str) -> Result<Option<String>, StorageError> {
         let subscription = subscription.to_owned();
-        self.run(move |store| store.remote_read_cursor(&subscription))
+        self.run(move |store| store.remote_cursor_read(&subscription))
     }
 
     fn remote_progress_has(&self) -> Result<bool, StorageError> {
@@ -2234,25 +2252,29 @@ impl RemoteStore for NativeRemoteStore {
         self.run(EmbeddedStore::remote_subscription_read)
     }
 
+    fn remote_pending_read(&self) -> Result<storage::RemotePending, StorageError> {
+        self.run(EmbeddedStore::remote_pending_read)
+    }
+
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         self.run(move |store| store.remote_push_envelope_read(num_items))
     }
 
-    fn remote_push_settle(
+    fn remote_settlement_write(
         &self,
-        settlement: &storage::RemotePushSettlement,
-    ) -> Result<storage::RemotePushSettlementResult, StorageError> {
+        settlement: &storage::RemoteSettlementWrite,
+    ) -> Result<storage::RemoteSettlementWriteResult, StorageError> {
         let settlement = settlement.clone();
-        self.run(move |store| store.remote_push_settle(&settlement))
+        self.run(move |store| store.remote_settlement_write(&settlement))
     }
 
-    fn remote_settlement_ack_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
-        self.run(move |store| store.remote_settlement_ack_read(num_items))
+    fn remote_receipt_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
+        self.run(move |store| store.remote_receipt_read(num_items))
     }
 
-    fn remote_settlement_ack_complete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
+    fn remote_receipt_delete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
         let mutation_ids = mutation_ids.to_vec();
-        self.run(move |store| store.remote_settlement_ack_complete(&mutation_ids))
+        self.run(move |store| store.remote_receipt_delete(&mutation_ids))
     }
 
     fn crdt_remote_state(
@@ -2307,18 +2329,18 @@ impl RemoteStore for NativeRemoteStore {
         self.run(move |store| store.crdt_read_states(&table, &id))
     }
 
-    fn remote_pull_page_queue(
+    fn remote_page_write(
         &self,
-        pull: storage::RemotePull,
-    ) -> remote::RemoteStoreFuture<RemotePullResult> {
-        self.queue(move |store| store.remote_pull_page(&pull))
+        pull: storage::RemotePageWrite,
+    ) -> remote::RemoteStoreFuture<RemotePageWriteResult> {
+        self.queue(move |store| store.remote_page_write(&pull))
     }
 
     fn remote_subscription_delete_queue(
         &self,
         subscription: String,
         now_ms: i64,
-    ) -> remote::RemoteStoreFuture<RemotePullResult> {
+    ) -> remote::RemoteStoreFuture<RemotePageWriteResult> {
         self.queue(move |store| store.remote_subscription_delete(&subscription, now_ms))
     }
 }
@@ -2351,25 +2373,29 @@ impl RemoteStore for WasmRemoteStore {
         self.run(EmbeddedStore::remote_subscription_read)
     }
 
+    fn remote_pending_read(&self) -> Result<storage::RemotePending, StorageError> {
+        self.run(EmbeddedStore::remote_pending_read)
+    }
+
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         self.run(move |store| store.remote_push_envelope_read(num_items))
     }
 
-    fn remote_push_settle(
+    fn remote_settlement_write(
         &self,
-        settlement: &storage::RemotePushSettlement,
-    ) -> Result<storage::RemotePushSettlementResult, StorageError> {
+        settlement: &storage::RemoteSettlementWrite,
+    ) -> Result<storage::RemoteSettlementWriteResult, StorageError> {
         let settlement = settlement.clone();
-        self.run(move |store| store.remote_push_settle(&settlement))
+        self.run(move |store| store.remote_settlement_write(&settlement))
     }
 
-    fn remote_settlement_ack_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
-        self.run(move |store| store.remote_settlement_ack_read(num_items))
+    fn remote_receipt_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
+        self.run(move |store| store.remote_receipt_read(num_items))
     }
 
-    fn remote_settlement_ack_complete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
+    fn remote_receipt_delete(&self, mutation_ids: &[String]) -> Result<(), StorageError> {
         let mutation_ids = mutation_ids.to_vec();
-        self.run(move |store| store.remote_settlement_ack_complete(&mutation_ids))
+        self.run(move |store| store.remote_receipt_delete(&mutation_ids))
     }
 
     fn crdt_remote_state(
@@ -2474,33 +2500,33 @@ impl RemoteStore for WasmRemoteStore {
         self.run(move |store| store.id_local_read(&table, &server_document_id))
     }
 
-    fn projection_read(
+    fn remote_doc_read(
         &self,
         table: &str,
         local_id: &str,
     ) -> Result<Option<storage::RowHead>, StorageError> {
         let table = table.to_owned();
         let local_id = local_id.to_owned();
-        self.run(move |store| store.projection_read(&table, &local_id))
+        self.run(move |store| store.remote_doc_read(&table, &local_id))
     }
 
-    fn remote_read_cursor(&self, subscription: &str) -> Result<Option<String>, StorageError> {
+    fn remote_cursor_read(&self, subscription: &str) -> Result<Option<String>, StorageError> {
         let subscription = subscription.to_owned();
-        self.run(move |store| store.remote_read_cursor(&subscription))
+        self.run(move |store| store.remote_cursor_read(&subscription))
     }
 
-    fn remote_pull_page_queue(
+    fn remote_page_write(
         &self,
-        pull: storage::RemotePull,
-    ) -> remote::RemoteStoreFuture<RemotePullResult> {
-        self.queue(move |store| store.remote_pull_page(&pull))
+        pull: storage::RemotePageWrite,
+    ) -> remote::RemoteStoreFuture<RemotePageWriteResult> {
+        self.queue(move |store| store.remote_page_write(&pull))
     }
 
     fn remote_subscription_delete_queue(
         &self,
         subscription: String,
         now_ms: i64,
-    ) -> remote::RemoteStoreFuture<RemotePullResult> {
+    ) -> remote::RemoteStoreFuture<RemotePageWriteResult> {
         self.queue(move |store| store.remote_subscription_delete(&subscription, now_ms))
     }
 }
@@ -2967,12 +2993,21 @@ fn js_remote_tick(tick: remote::RemoteTick) -> JsRemoteTick {
             })
             .collect(),
         sent: saturating_u32(tick.sent),
-        settlements_acknowledged: saturating_u32(tick.settlements_acknowledged),
+        receipts_pushed: saturating_u32(tick.receipts_pushed),
         store_jobs: saturating_u32(tick.store_jobs),
         pull_changes_applied: saturating_u32(tick.pull_changes_applied),
         pull_snapshots: saturating_u32(tick.pull_snapshots),
         pull_diagnostics: saturating_u32(tick.pull_diagnostics),
+        pull_error: tick.pull_error,
         changed_results: tick.changed_results,
+        pending: tick.pending.map(|pending| JsRemotePending {
+            checkpoints: saturating_u32(pending.checkpoints),
+            inflight: saturating_u32(pending.inflight),
+            mutations: saturating_u32(pending.mutations),
+            scope: saturating_u32(pending.scope),
+            settlements: saturating_u32(pending.settlements),
+            uploads: saturating_u32(pending.uploads),
+        }),
     }
 }
 
@@ -3132,11 +3167,11 @@ fn to_write_batch(batch: JsWriteBatch) -> napi::Result<WriteBatch> {
         fresh_ids,
         id_mappings,
         schedules,
-        upserts,
+        doc_writes,
     } = batch;
 
     Ok(WriteBatch {
-        upserts: upserts
+        doc_writes: doc_writes
             .into_iter()
             .map(to_upsert)
             .collect::<napi::Result<Vec<_>>>()?,
@@ -3258,7 +3293,7 @@ fn to_commit_options(options: Option<JsCommitOptions>) -> napi::Result<CommitOpt
             options.mutation_result,
             options.push_envelope_json,
             options.push_envelope_now_ms.map(|value| value as i64),
-            options.mutation_fresh,
+            options.mutation_is_fresh,
             options.include_changes,
         ),
         None => Ok(CommitOptions::default()),
@@ -3274,7 +3309,7 @@ fn decode_commit_options(
     mutation_result: Option<String>,
     push_json: Option<String>,
     push_now_ms: Option<i64>,
-    mutation_fresh: Option<bool>,
+    mutation_is_fresh: Option<bool>,
     include_changes: Option<bool>,
 ) -> napi::Result<CommitOptions> {
     CommitOptions::decode(
@@ -3285,7 +3320,7 @@ fn decode_commit_options(
         mutation_result,
         push_json,
         push_now_ms,
-        mutation_fresh.unwrap_or(false),
+        mutation_is_fresh.unwrap_or(false),
         include_changes.unwrap_or(true),
     )
     .ok_or_else(|| napi::Error::from_reason("invalid exact commit metadata"))
@@ -3297,8 +3332,8 @@ fn commit_include_changes(options: Option<&JsCommitOptions>) -> bool {
         .unwrap_or(true)
 }
 
-fn to_upsert(u: JsUpsert) -> napi::Result<UpsertIn> {
-    Ok(UpsertIn {
+fn to_upsert(u: JsDocWrite) -> napi::Result<DocWrite> {
+    Ok(DocWrite {
         table: u.table,
         id: u.id,
         data: u.data,
@@ -3468,8 +3503,8 @@ fn js_dirty_head_debug(head: DirtyHeadDebug) -> JsDirtyHeadDebug {
     }
 }
 
-fn js_projection_debug(state: RowHead) -> JsProjectionDebug {
-    JsProjectionDebug {
+fn js_remote_doc_debug(state: RowHead) -> JsRemoteDocDebug {
+    JsRemoteDocDebug {
         table: state.table,
         local_document_id: state.local_document_id,
         current_rev_id: state.current_rev_id,
@@ -3617,18 +3652,13 @@ fn to_pending_upload(upload: JsPendingUpload) -> napi::Result<PendingUpload> {
 
 fn to_upload_lease_write(args: JsUploadLeaseWrite) -> napi::Result<UploadLeaseWrite> {
     match (args.lease.as_str(), args.local_storage_id, args.lease_until) {
-        ("claim", None, Some(lease_until)) => Ok(UploadLeaseWrite::Claim {
-            owner: args.owner,
-            now_ms: args.now_ms,
-            lease_until,
-        }),
-        ("renew", Some(local_storage_id), Some(lease_until)) => Ok(UploadLeaseWrite::Renew {
+        ("claimed", local_storage_id, Some(lease_until)) => Ok(UploadLeaseWrite::Claimed {
             local_storage_id,
             owner: args.owner,
             now_ms: args.now_ms,
             lease_until,
         }),
-        ("release", Some(local_storage_id), None) => Ok(UploadLeaseWrite::Release {
+        ("pending", Some(local_storage_id), None) => Ok(UploadLeaseWrite::Pending {
             local_storage_id,
             owner: args.owner,
             now_ms: args.now_ms,
@@ -3788,8 +3818,8 @@ fn parse_remote_scope(scope_json: &str) -> napi::Result<RemoteScope> {
 #[cfg(test)]
 mod tests {
     use storage::{
-        AuthoritativeRow, ColValue, ColumnDef, CommitOptions, EmbeddedStore, IndexDef, Order,
-        ReadSpec, RevLifecycle, RowKey, StoreSchema, TableDef, UpsertIn, WriteBatch,
+        AuthoritativeRow, ColValue, ColumnDef, CommitOptions, DocWrite, EmbeddedStore, IndexDef,
+        Order, ReadSpec, RevLifecycle, RowKey, StoreSchema, TableDef, WriteBatch,
     };
 
     fn reroot_schema() -> StoreSchema {
@@ -3814,7 +3844,7 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
-    fn pull(projections: Vec<AuthoritativeRow>, received_time: i64) -> storage::RemotePull {
+    fn pull(projections: Vec<AuthoritativeRow>, received_time: i64) -> storage::RemotePageWrite {
         let members = projections
             .iter()
             .filter(|projection| projection.row.is_some())
@@ -3823,7 +3853,7 @@ mod tests {
                 server_document_id: projection.server_document_id.clone(),
             })
             .collect();
-        storage::RemotePull {
+        storage::RemotePageWrite {
             subscription: "issues:list:{}".into(),
             members,
             projections,
@@ -3852,7 +3882,7 @@ mod tests {
         let server_id = "j575pnjjhzf95ze91djp5v26b188xreb";
 
         store
-            .remote_pull_page(&pull(
+            .remote_page_write(&pull(
                 vec![AuthoritativeRow {
                     current_node_id: Some("node:server-v1".into()),
                     current_root_id: Some("root:server-v1".into()),
@@ -3885,7 +3915,7 @@ mod tests {
         let local_commit = store
             .commit(
                 WriteBatch {
-                    upserts: vec![UpsertIn {
+                    doc_writes: vec![DocWrite {
                         cols: vec![("status".into(), ColValue::Text("local".into()))],
                         creation_time: store.clock_read().unwrap(),
                         data: r#"{"title":"local dirty"}"#.into(),
@@ -3902,16 +3932,17 @@ mod tests {
             .remote_push_envelope_write("rejected-dirty", local_commit.commit_seq, "{}", 10)
             .unwrap();
         let produced = store
-            .remote_push_settle(&storage::RemotePushSettlement {
+            .remote_settlement_write(&storage::RemoteSettlementWrite {
                 mutation_id: "rejected-dirty".to_owned(),
                 expected_commit_seq: local_commit.commit_seq,
                 now_ms: 10,
-                outcome: storage::RemotePushSettlementOutcome::Rejected {
+                outcome: storage::RemoteSettlementOutcome::Rejected {
                     schedules: Vec::new(),
                     targets: vec![storage::RemoteRowTarget {
                         table: "issues".to_owned(),
                         local_document_id: local_id.clone(),
                         server_rev_id: Some("rev:server-retained".to_owned()),
+                        retain: true,
                     }],
                     projections: vec![AuthoritativeRow {
                         current_node_id: Some("node:server-current".into()),

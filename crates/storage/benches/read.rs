@@ -3,8 +3,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use storage::{
-    Bound, ColValue, ColumnDef, CommitOptions, CountSpec, EmbeddedStore, IndexDef, Order, ReadSpec,
-    StoreSchema, TableDef, UpsertIn, WriteBatch,
+    Bound, ColValue, ColumnDef, CommitOptions, CountSpec, DocWrite, EmbeddedStore, IndexDef, Order,
+    ReadSpec, StoreSchema, TableDef, WriteBatch,
 };
 
 fn schema() -> StoreSchema {
@@ -35,8 +35,8 @@ fn seeded(rows: usize) -> EmbeddedStore {
     }
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    let upserts: Vec<UpsertIn> = (0..rows)
-        .map(|i| UpsertIn {
+    let doc_writes: Vec<DocWrite> = (0..rows)
+        .map(|i| DocWrite {
             table: "vals".into(),
             id: format!("r{i:08}"),
             data: r#"{"v":0}"#.into(),
@@ -49,7 +49,7 @@ fn seeded(rows: usize) -> EmbeddedStore {
             WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
-                upserts,
+                doc_writes,
                 deletes: vec![],
                 fresh_ids: vec![],
                 data_only_ids: vec![],

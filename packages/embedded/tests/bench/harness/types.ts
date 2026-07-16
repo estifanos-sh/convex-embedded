@@ -250,7 +250,7 @@ export interface BrowserRemotePageState {
 export interface BrowserStartupPhaseTimings {
   opfsRegisterMs?: number;
   openSetupMs: number;
-  storeCheckpointMs?: number;
+  storeWalWriteMs?: number;
   storeOpenMs?: number;
   storeSetupMs?: number;
   wasmBeforeInitMs?: number;
@@ -355,7 +355,7 @@ export interface BrowserStartupBenchResult {
     opfsRegisterMs: BenchStats;
     openSetupMs: BenchStats;
     readyQueryMs: BenchStats;
-    storeCheckpointMs: BenchStats;
+    storeWalWriteMs: BenchStats;
     storeOpenMs: BenchStats;
     storeSetupMs: BenchStats;
     totalMs: BenchStats;
@@ -428,7 +428,7 @@ export interface MetalScaleBenchReport {
     retainedRevisions: number;
     rowsApplied: number;
     sent: number;
-    settlementsAcknowledged: number;
+    receiptsPushed: number;
     storeJobs: number;
   };
   revs: number;
@@ -558,6 +558,7 @@ export interface MetalRevEntry {
 
 export interface MetalEventSummary {
   conflicts?: unknown[];
+  degradation?: string;
   detail?: unknown;
   durationMs?: number;
   error?: string;
@@ -578,8 +579,16 @@ export interface MetalEventSummary {
     retainedRevisions?: number;
     rowsApplied?: number;
     sent?: number;
-    settlementsAcknowledged?: number;
+    receiptsPushed?: number;
     storeJobs?: number;
+    pending?: {
+      checkpoints: number;
+      inflight: number;
+      mutations: number;
+      scope: number;
+      settlements: number;
+      uploads: number;
+    };
   };
   type?: string;
 }

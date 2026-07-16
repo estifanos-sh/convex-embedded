@@ -437,7 +437,7 @@ impl CommitOptions {
         mutation_result: Option<String>,
         push_json: Option<String>,
         push_now_ms: Option<i64>,
-        mutation_fresh: bool,
+        mutation_is_fresh: bool,
         include_changes: bool,
     ) -> Option<Self> {
         let source = match source.unwrap_or("local") {
@@ -459,7 +459,7 @@ impl CommitOptions {
             mutation_name,
             mutation_args,
             mutation_result,
-            mutation_fresh,
+            mutation_is_fresh,
             push.is_some(),
         ) {
             (None, None, None, None, false, false) | (Some(_), None, None, None, false, true) => {
@@ -569,7 +569,7 @@ impl CommitOptions {
     }
 
     #[must_use]
-    pub fn mutation_fresh(&self) -> bool {
+    pub fn mutation_is_fresh(&self) -> bool {
         matches!(self.mutation, CommitMutation::Terminal { fresh: true, .. })
     }
 

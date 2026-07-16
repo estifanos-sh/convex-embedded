@@ -58,9 +58,7 @@ test.skipIf(!__CONVEX_EMBEDDED_METAL_BENCH_SCALE__)(
     );
     expect(result.report.observerStorageIds).toHaveLength(__CONVEX_EMBEDDED_METAL_BENCH_CLIENTS__);
     expect(result.report.remoteTicks.pushAccepted).toBeGreaterThan(0);
-    expect(result.report.remoteTicks.settlementsAcknowledged).toBe(
-      result.report.remoteTicks.pushAccepted,
-    );
+    expect(result.report.remoteTicks.receiptsPushed).toBe(result.report.remoteTicks.pushAccepted);
     expect(result.report.remoteTicks.rowsApplied).toBeGreaterThan(0);
     expect(result.report.remoteTicks.received).toBeGreaterThan(0);
     expect(Number.isFinite(result.report.results.revCreateMs.p99)).toBe(true);
@@ -124,7 +122,7 @@ interface MetalScaleBenchReport {
     retainedRevisions: number;
     rowsApplied: number;
     sent: number;
-    settlementsAcknowledged: number;
+    receiptsPushed: number;
     storeJobs: number;
   };
   results: {

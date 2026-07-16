@@ -9,7 +9,7 @@ import type {
   ReadSpec,
   StorageBackend,
   StoreSchema,
-  UpsertIn,
+  DocWrite,
 } from "../../src/storage/types";
 
 const schema: StoreSchema = {
@@ -56,7 +56,7 @@ export function defineConformance(factory: ConformanceFactory): void {
           await store.setup(schema);
           const first = issue("i1", "hello", "open", 1, store.clock.read());
           firstCreationTime = first.creationTime;
-          await store.commit({ upserts: [first], deletes: [] });
+          await store.commit({ docWrites: [first], deletes: [] });
 
           const got = await store.doc.read("issues", "i1");
           expect(got?._id).toBe("i1");
@@ -71,8 +71,8 @@ export function defineConformance(factory: ConformanceFactory): void {
         expect((await store.doc.read("issues", "i1"))?._id).toBe("i1");
         const second = issue("i2", "world", "open", 2, store.clock.read());
         expect(second.creationTime).toBeGreaterThan(firstCreationTime);
-        await store.commit({ upserts: [second], deletes: [] });
-        await store.commit({ upserts: [], deletes: [{ table: "issues", id: "i1" }] });
+        await store.commit({ docWrites: [second], deletes: [] });
+        await store.commit({ docWrites: [], deletes: [{ table: "issues", id: "i1" }] });
 
         expect(await store.doc.read("issues", "i1")).toBeUndefined();
         const page = await store.doc.page.read({ table: "issues", order: "asc" });
@@ -90,11 +90,11 @@ export function defineConformance(factory: ConformanceFactory): void {
       await b.setup(schema);
 
       await a.commit({
-        upserts: [issue("same", "A", "open", 1, a.clock.read())],
+        docWrites: [issue("same", "A", "open", 1, a.clock.read())],
         deletes: [],
       });
       await b.commit({
-        upserts: [issue("same", "B", "closed", 2, b.clock.read())],
+        docWrites: [issue("same", "B", "closed", 2, b.clock.read())],
         deletes: [],
       });
 
@@ -127,7 +127,7 @@ export function defineConformance(factory: ConformanceFactory): void {
       const store = await factory.open(path("mixed_types"));
       await store.setup(boolSchema);
       await store.commit({
-        upserts: [
+        docWrites: [
           flag("yes", true, store.clock.read()),
           flag("mixed", "not-a-boolean" as never, store.clock.read()),
         ],
@@ -142,7 +142,7 @@ export function defineConformance(factory: ConformanceFactory): void {
       const store = await factory.open(path("scan"));
       await store.setup(schema);
       await store.commit({
-        upserts: [
+        docWrites: [
           issue("a", "A", "open", 1, store.clock.read()),
           issue("b", "B", "closed", 2, store.clock.read()),
           issue("c", "C", "open", 3, store.clock.read()),
@@ -186,13 +186,13 @@ export function defineConformance(factory: ConformanceFactory): void {
     test("pages through keyset cursors in both orders", async () => {
       const store = await factory.open(path("paging"));
       await store.setup(schema);
-      const upserts: UpsertIn[] = [];
+      const docWrites: DocWrite[] = [];
       for (let i = 0; i < 7; i += 1) {
-        upserts.push(
+        docWrites.push(
           issue(`i${i}`, `Issue ${i}`, i % 2 === 0 ? "open" : "closed", i, store.clock.read()),
         );
       }
-      await store.commit({ upserts, deletes: [] });
+      await store.commit({ docWrites, deletes: [] });
 
       for (const order of ["asc", "desc"] as const) {
         const spec: ReadSpec = { table: "issues", order };
@@ -213,9 +213,9 @@ export function defineConformance(factory: ConformanceFactory): void {
     test("pages a multi-page run of equal index values in descending order", async () => {
       const store = await factory.open(path("null_run_paging"));
       await store.setup(schema);
-      const upserts: UpsertIn[] = [];
+      const docWrites: DocWrite[] = [];
       for (let i = 0; i < 7; i += 1) {
-        upserts.push({
+        docWrites.push({
           table: "issues",
           id: `n${i}`,
           data: { title: `t${i}`, rank: i },
@@ -223,7 +223,7 @@ export function defineConformance(factory: ConformanceFactory): void {
           creationTime: store.clock.read(),
         });
       }
-      await store.commit({ upserts, deletes: [] });
+      await store.commit({ docWrites, deletes: [] });
 
       const spec: ReadSpec = { table: "issues", index: "by_status", order: "desc" };
       const full = (await store.doc.page.read(spec)).docs.map((doc) => doc._id);
@@ -243,7 +243,7 @@ export function defineConformance(factory: ConformanceFactory): void {
       const store = await factory.open(path("keys"));
       await store.setup(schema);
       await store.commit({
-        upserts: [
+        docWrites: [
           issue("a", "A", "open", 1, store.clock.read()),
           issue("b", "B", "open", 2, store.clock.read()),
         ],
@@ -265,7 +265,7 @@ export function defineConformance(factory: ConformanceFactory): void {
       const store = await factory.open(path("null_bounds"));
       await store.setup(schema);
       await store.commit({
-        upserts: [
+        docWrites: [
           {
             table: "issues",
             id: "missing",
@@ -308,19 +308,19 @@ export function defineConformance(factory: ConformanceFactory): void {
       await store.close();
     });
 
-    test("ledger prune preserves local commit sequence and keeps blobs binary", async () => {
-      const store = await factory.open(path("prune_blobs"));
+    test("ledger deletion preserves local commit sequence and keeps blobs binary", async () => {
+      const store = await factory.open(path("delete_blobs"));
       await store.setup(schema);
       for (let i = 0; i < 3; i += 1) {
         await store.commit({
-          upserts: [issue(`i${i}`, "t", "open", i, store.clock.read())],
+          docWrites: [issue(`i${i}`, "t", "open", i, store.clock.read())],
           deletes: [],
         });
       }
-      const pruned = await store.ledger.delete(Number.MAX_SAFE_INTEGER);
-      expect(pruned.commitsDeleted).toBe(0);
+      const deleted = await store.ledger.delete(Number.MAX_SAFE_INTEGER);
+      expect(deleted.commitsDeleted).toBe(0);
       const next = await store.commit({
-        upserts: [issue("i3", "t", "open", 3, store.clock.read())],
+        docWrites: [issue("i3", "t", "open", 3, store.clock.read())],
         deletes: [],
       });
       expect(next.commitSeq).toBe(4);
@@ -338,7 +338,7 @@ export function defineConformance(factory: ConformanceFactory): void {
       const store = await factory.open(path("bool"));
       await store.setup(boolSchema);
       await store.commit({
-        upserts: [flag("yes", true, store.clock.read()), flag("no", false, store.clock.read())],
+        docWrites: [flag("yes", true, store.clock.read()), flag("no", false, store.clock.read())],
         deletes: [],
       });
 
@@ -356,7 +356,7 @@ export function defineConformance(factory: ConformanceFactory): void {
       const store = await factory.open(path("bigint"));
       await store.setup(schema);
       await store.commit({
-        upserts: [
+        docWrites: [
           {
             table: "issues",
             id: "i64",
@@ -392,7 +392,7 @@ function issue(
   status: string,
   rank: number,
   creationTime: number,
-): UpsertIn {
+): DocWrite {
   return {
     table: "issues",
     id,
@@ -402,7 +402,7 @@ function issue(
   };
 }
 
-function flag(id: string, active: ColValue, creationTime: number): UpsertIn {
+function flag(id: string, active: ColValue, creationTime: number): DocWrite {
   return {
     table: "flags",
     id,

@@ -43,15 +43,15 @@ fn builds_schema_with_strict_tables_and_partial_indexes() {
 }
 
 #[test]
-fn builds_doc_upsert_and_read_shapes() {
-    let upsert = write_doc(&sql_table());
-    assert!(upsert.starts_with("INSERT INTO doc__issues"));
-    assert!(upsert.contains("ON CONFLICT(identity_key, id) DO UPDATE SET"));
-    assert!(upsert.contains("creation_time_ms = excluded.creation_time_ms"));
-    assert!(upsert.contains("data = excluded.data"));
-    assert!(upsert.contains("status = excluded.status"));
-    assert!(upsert.contains("rank = excluded.rank"));
-    assert_eq!(upsert.matches('?').count(), 6);
+fn builds_doc_write_and_read_shapes() {
+    let doc_write = write_doc(&sql_table());
+    assert!(doc_write.starts_with("INSERT INTO doc__issues"));
+    assert!(doc_write.contains("ON CONFLICT(identity_key, id) DO UPDATE SET"));
+    assert!(doc_write.contains("creation_time_ms = excluded.creation_time_ms"));
+    assert!(doc_write.contains("data = excluded.data"));
+    assert!(doc_write.contains("status = excluded.status"));
+    assert!(doc_write.contains("rank = excluded.rank"));
+    assert_eq!(doc_write.matches('?').count(), 6);
     let read = read_doc_sql("issues");
     assert!(read.contains("FROM \"doc__issues\" INDEXED BY ix__issues__by_id"));
     assert_eq!(read.matches('?').count(), 2);

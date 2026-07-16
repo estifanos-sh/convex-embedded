@@ -67,7 +67,7 @@ fn round_trips_and_persists() {
         store.setup(&schema()).unwrap();
         let up = issue(&store, "i1", "hello", "open");
         first_ct = up.creation_time;
-        commit(&store, upserts(vec![up]));
+        commit(&store, doc_writes(vec![up]));
 
         let got = read_doc(&store, "issues", "i1").expect("row");
         assert_eq!(got["_id"], "i1");
@@ -85,7 +85,7 @@ fn round_trips_and_persists() {
 
     let up2 = issue(&store, "i2", "world", "open");
     let second_ct = up2.creation_time;
-    commit(&store, upserts(vec![up2]));
+    commit(&store, doc_writes(vec![up2]));
     assert!(second_ct > first_ct);
 
     let all = store
@@ -104,15 +104,23 @@ fn commit_reports_row_changes_for_observability() {
     let store = EmbeddedStore::open(tmp_path("rs_commit_changes.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
 
-    let result = commit(&store, upserts(vec![issue(&store, "i1", "First", "open")]));
+    let result = commit(
+        &store,
+        doc_writes(vec![issue(&store, "i1", "First", "open")]),
+    );
     assert_eq!(result.changed_tables, vec!["issues"]);
     assert_eq!(result.changes.len(), 1);
-    let upsert = &result.changes[0];
-    assert_eq!(upsert.op, RowChangeOp::Upsert);
-    assert_eq!(upsert.table, "issues");
-    assert_eq!(upsert.id, "i1");
-    let row: serde_json::Value =
-        serde_json::from_str(upsert.row.as_deref().expect("upsert carries row body")).unwrap();
+    let doc_write = &result.changes[0];
+    assert_eq!(doc_write.op, RowChangeOp::Write);
+    assert_eq!(doc_write.table, "issues");
+    assert_eq!(doc_write.id, "i1");
+    let row: serde_json::Value = serde_json::from_str(
+        doc_write
+            .row
+            .as_deref()
+            .expect("doc_write carries row body"),
+    )
+    .unwrap();
     assert_eq!(row["_id"], "i1");
     assert_eq!(row["title"], "First");
 
@@ -121,7 +129,7 @@ fn commit_reports_row_changes_for_observability() {
         WriteBatch {
             crdt_ops: Vec::new(),
             crdt_restores: vec![],
-            upserts: vec![],
+            doc_writes: vec![],
             deletes: vec![DeleteIn {
                 table: "issues".into(),
                 id: "i1".into(),
@@ -146,14 +154,14 @@ fn data_only_update_changes_body_without_rewriting_index_columns() {
     store.setup(&schema()).unwrap();
     let first = issue(&store, "i1", "before", "open");
     let creation_time = first.creation_time;
-    commit(&store, upserts(vec![first]));
+    commit(&store, doc_writes(vec![first]));
 
     commit(
         &store,
         WriteBatch {
             crdt_ops: Vec::new(),
             crdt_restores: vec![],
-            upserts: vec![UpsertIn {
+            doc_writes: vec![DocWrite {
                 table: "issues".into(),
                 id: "i1".into(),
                 data: r#"{"title":"after"}"#.into(),
@@ -208,15 +216,15 @@ fn supports_camel_case_indexed_fields() {
     store.setup(&schema).unwrap();
     commit(
         &store,
-        upserts(vec![
-            UpsertIn {
+        doc_writes(vec![
+            DocWrite {
                 table: "documents".into(),
                 id: "documents|old".into(),
                 data: r#"{"title":"Old","updatedAt":10}"#.into(),
                 cols: vec![("idx_updatedat".into(), ColValue::Integer(10))],
                 creation_time: store.clock_read().unwrap(),
             },
-            UpsertIn {
+            DocWrite {
                 table: "documents".into(),
                 id: "documents|new".into(),
                 data: r#"{"title":"New","updatedAt":20}"#.into(),
@@ -248,7 +256,10 @@ fn supports_camel_case_indexed_fields() {
 fn setup_resets_nonempty_store_when_format_version_changes() {
     let store = EmbeddedStore::open(tmp_path("rs_format_reset.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    commit(&store, upserts(vec![issue(&store, "i1", "First", "open")]));
+    commit(
+        &store,
+        doc_writes(vec![issue(&store, "i1", "First", "open")]),
+    );
     assert!(read_doc(&store, "issues", "i1").is_some());
 
     store.force_user_version_for_test(0);
@@ -261,13 +272,19 @@ fn setup_resets_nonempty_store_when_format_version_changes() {
 
     store.setup(&schema()).unwrap();
     assert!(read_doc(&store, "issues", "i1").is_none());
-    let next = commit(&store, upserts(vec![issue(&store, "i2", "Second", "open")]));
+    let next = commit(
+        &store,
+        doc_writes(vec![issue(&store, "i2", "Second", "open")]),
+    );
     assert_eq!(next.commit_seq, 1);
 
     store.force_user_version_for_test(39);
     store.setup(&schema()).unwrap();
     assert!(read_doc(&store, "issues", "i2").is_none());
-    let reseeded = commit(&store, upserts(vec![issue(&store, "i3", "Third", "open")]));
+    let reseeded = commit(
+        &store,
+        doc_writes(vec![issue(&store, "i3", "Third", "open")]),
+    );
     assert_eq!(reseeded.commit_seq, 1);
 
     store.setup(&schema()).unwrap();
@@ -278,7 +295,10 @@ fn setup_resets_nonempty_store_when_format_version_changes() {
 fn setup_preserves_data_when_format_version_matches() {
     let store = EmbeddedStore::open(tmp_path("rs_format_match.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    commit(&store, upserts(vec![issue(&store, "i1", "First", "open")]));
+    commit(
+        &store,
+        doc_writes(vec![issue(&store, "i1", "First", "open")]),
+    );
 
     store.setup(&schema()).unwrap();
     assert!(read_doc(&store, "issues", "i1").is_some());
@@ -288,7 +308,10 @@ fn setup_preserves_data_when_format_version_matches() {
 fn setup_reconciles_schema_changes_without_deleting_existing_rows() {
     let store = EmbeddedStore::open(tmp_path("rs_schema_signature.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    commit(&store, upserts(vec![issue(&store, "i1", "First", "open")]));
+    commit(
+        &store,
+        doc_writes(vec![issue(&store, "i1", "First", "open")]),
+    );
 
     let mut changed = schema();
     changed.tables.push(TableDef {
@@ -305,7 +328,7 @@ fn setup_reconciles_schema_changes_without_deleting_existing_rows() {
     assert!(read_doc(&store, "issues", "i1").is_some());
     commit(
         &store,
-        upserts(vec![UpsertIn {
+        doc_writes(vec![DocWrite {
             table: "notes".into(),
             id: "n1".into(),
             data: r#"{"text":"kept"}"#.into(),
@@ -323,7 +346,7 @@ fn setup_backfills_new_index_columns_from_existing_documents() {
     store.setup(&legacy_document_schema()).unwrap();
     commit(
         &store,
-        upserts(vec![UpsertIn {
+        doc_writes(vec![DocWrite {
             table: "documents".into(),
             id: "documents|indexed".into(),
             data: r#"{"slug":"indexed","title":"Indexed","updatedAt":36}"#.into(),
@@ -350,7 +373,7 @@ fn setup_backfills_new_index_columns_from_existing_documents() {
 }
 
 #[test]
-fn setup_preserves_store_when_physical_doc_columns_do_not_match_signature() {
+fn setup_repairs_missing_index_columns_without_deleting_existing_rows() {
     let store =
         EmbeddedStore::open(tmp_path("rs_schema_physical_mismatch.db").to_str().unwrap()).unwrap();
     let schema = StoreSchema {
@@ -371,7 +394,7 @@ fn setup_preserves_store_when_physical_doc_columns_do_not_match_signature() {
     store.setup(&schema).unwrap();
     commit(
         &store,
-        upserts(vec![UpsertIn {
+        doc_writes(vec![DocWrite {
             table: "documents".into(),
             id: "documents|field-notes".into(),
             data: r#"{"slug":"field-notes"}"#.into(),
@@ -382,15 +405,64 @@ fn setup_preserves_store_when_physical_doc_columns_do_not_match_signature() {
 
     store.execute_sql_for_test("ALTER TABLE doc__documents RENAME COLUMN idx_slug TO idx_wrong");
 
-    let error = store
+    store
         .setup(&schema)
-        .expect_err("physical mismatch must fail");
-
-    assert!(error.to_string().contains("physical schema"));
-    store.execute_sql_for_test("ALTER TABLE doc__documents RENAME COLUMN idx_wrong TO idx_slug");
+        .expect("physical mismatch is repairable");
     assert_eq!(
         read_doc(&store, "documents", "documents|field-notes").unwrap()["slug"],
         "field-notes"
+    );
+    let page = store
+        .doc_page_read(&ReadSpec {
+            table: "documents".into(),
+            index: Some("by_slug".into()),
+            bounds: Some(vec![Bound::Eq {
+                value: ColValue::Text("field-notes".into()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(doc_ids(&page), vec!["documents|field-notes"]);
+    commit(
+        &store,
+        doc_writes(vec![DocWrite {
+            table: "documents".into(),
+            id: "documents|new".into(),
+            data: r#"{"slug":"new"}"#.into(),
+            cols: vec![("idx_slug".into(), ColValue::Text("new".into()))],
+            creation_time: store.clock_read().unwrap(),
+        }]),
+    );
+    assert_eq!(
+        read_doc(&store, "documents", "documents|new").unwrap()["slug"],
+        "new"
+    );
+}
+
+#[test]
+fn setup_recreates_a_missing_physical_doc_table() {
+    let store =
+        EmbeddedStore::open(tmp_path("rs_schema_missing_table.db").to_str().unwrap()).unwrap();
+    let schema = current_document_schema();
+    store.setup(&schema).unwrap();
+    store.execute_sql_for_test("DROP TABLE doc__documents");
+
+    store
+        .setup(&schema)
+        .expect("a missing physical table is repairable");
+    commit(
+        &store,
+        doc_writes(vec![DocWrite {
+            table: "documents".into(),
+            id: "documents|restored".into(),
+            data: r#"{"title":"Restored"}"#.into(),
+            cols: vec![("idx_title".into(), ColValue::Text("Restored".into()))],
+            creation_time: store.clock_read().unwrap(),
+        }]),
+    );
+    assert_eq!(
+        read_doc(&store, "documents", "documents|restored").unwrap()["title"],
+        "Restored"
     );
 }
 
@@ -403,8 +475,8 @@ fn identity_keys_are_isolated() {
     a.setup(&schema()).unwrap();
     b.setup(&schema()).unwrap();
 
-    commit(&a, upserts(vec![issue(&a, "same", "A", "open")]));
-    commit(&b, upserts(vec![issue(&b, "same", "B", "closed")]));
+    commit(&a, doc_writes(vec![issue(&a, "same", "A", "open")]));
+    commit(&b, doc_writes(vec![issue(&b, "same", "B", "closed")]));
 
     assert_eq!(read_doc(&a, "issues", "same").expect("a row")["title"], "A");
     assert_eq!(read_doc(&b, "issues", "same").expect("b row")["title"], "B");
@@ -426,7 +498,7 @@ fn concurrent_writers_for_same_identity_are_serialized() {
                 store.setup(&schema()).unwrap();
                 commit(
                     &store,
-                    upserts(vec![issue(
+                    doc_writes(vec![issue(
                         &store,
                         &format!("i{i}"),
                         &format!("issue {i}"),
@@ -493,7 +565,7 @@ fn commit_applies_mixed_batch_and_rolls_back_failed_writes() {
     store.setup(&bool_schema()).unwrap();
     commit(
         &store,
-        upserts(vec![
+        doc_writes(vec![
             flag(&store, "keep", ColValue::Bool(true)),
             flag(&store, "remove", ColValue::Bool(false)),
         ]),
@@ -503,7 +575,7 @@ fn commit_applies_mixed_batch_and_rolls_back_failed_writes() {
         WriteBatch {
             crdt_ops: Vec::new(),
             crdt_restores: vec![],
-            upserts: vec![flag(&store, "new", ColValue::Bool(true))],
+            doc_writes: vec![flag(&store, "new", ColValue::Bool(true))],
             deletes: vec![DeleteIn {
                 table: "flags".into(),
                 id: "remove".into(),
@@ -519,7 +591,7 @@ fn commit_applies_mixed_batch_and_rolls_back_failed_writes() {
 
     commit(
         &store,
-        upserts(vec![flag(
+        doc_writes(vec![flag(
             &store,
             "mixed",
             ColValue::Text("not-an-integer".into()),
@@ -535,7 +607,7 @@ fn commit_failure_rolls_back_before_checking_commit_existence() {
 
     fail_next_commit();
     let failed = store.commit(
-        upserts(vec![issue(&store, "phantom", "phantom", "open")]),
+        doc_writes(vec![issue(&store, "phantom", "phantom", "open")]),
         &CommitOptions::default(),
     );
     assert!(matches!(failed, Err(StorageError::Turso(_))));
@@ -543,7 +615,7 @@ fn commit_failure_rolls_back_before_checking_commit_existence() {
 
     commit(
         &store,
-        upserts(vec![issue(&store, "after", "after", "open")]),
+        doc_writes(vec![issue(&store, "after", "after", "open")]),
     );
     assert!(store.doc_read("issues", "after").unwrap().is_some());
 }
@@ -554,7 +626,7 @@ fn splices_empty_documents_without_a_trailing_comma() {
     store.setup(&schema()).unwrap();
     commit(
         &store,
-        upserts(vec![UpsertIn {
+        doc_writes(vec![DocWrite {
             table: "t".into(),
             id: "empty".into(),
             data: "{}".into(),
@@ -584,7 +656,7 @@ fn splices_ids_that_need_json_escaping() {
     let id = "t|quote\"back\\slash\u{1}end";
     commit(
         &store,
-        upserts(vec![UpsertIn {
+        doc_writes(vec![DocWrite {
             table: "t".into(),
             id: id.into(),
             data: r#"{"v":1}"#.into(),
@@ -617,7 +689,7 @@ fn creation_times_round_trip_exactly_through_page_text() {
     for (i, ct) in times.iter().enumerate() {
         commit(
             &store,
-            upserts(vec![UpsertIn {
+            doc_writes(vec![DocWrite {
                 table: "t".into(),
                 id: format!("f{i}"),
                 data: "{}".into(),
@@ -639,7 +711,7 @@ fn rejects_corrupt_non_object_data_when_splicing() {
     let store = EmbeddedStore::open(tmp_path("rs_splice_corrupt.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     let result = store.commit(
-        upserts(vec![UpsertIn {
+        doc_writes(vec![DocWrite {
             table: "t".into(),
             id: "bad".into(),
             data: "[1]".into(),
@@ -655,15 +727,15 @@ fn rejects_corrupt_non_object_data_when_splicing() {
 
 /// The WAL folds into the main file and truncates on checkpoint, and the data survives a reopen.
 #[test]
-fn checkpoint_truncates_the_wal_and_preserves_data() {
-    let path = tmp_path("checkpoint_truncates_wal.db");
+fn wal_write_truncates_and_preserves_data() {
+    let path = tmp_path("wal_write_truncates.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     for index in 0..50 {
         store
             .commit(
                 WriteBatch {
-                    upserts: vec![UpsertIn {
+                    doc_writes: vec![DocWrite {
                         cols: Vec::new(),
                         creation_time: f64::from(index),
                         data: format!(r#"{{"title":"row {index}"}}"#),
@@ -680,7 +752,7 @@ fn checkpoint_truncates_the_wal_and_preserves_data() {
     let before = std::fs::metadata(&wal).map_or(0, |meta| meta.len());
     assert!(before > 0, "commits should have grown the WAL");
 
-    store.checkpoint().unwrap();
+    store.wal_write().unwrap();
 
     let after = std::fs::metadata(&wal).map_or(0, |meta| meta.len());
     assert!(

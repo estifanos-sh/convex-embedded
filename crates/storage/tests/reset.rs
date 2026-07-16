@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use storage::testkit::{issue, schema, tmp_path, upserts};
+use storage::testkit::{doc_writes, issue, schema, tmp_path};
 use storage::{CommitOptions, EmbeddedStore};
 
 /// A 512-byte `SQLite` header with a valid magic string but a zero page-size field (bytes 16..18).
@@ -39,7 +39,7 @@ fn open_resets_an_unreadable_store_to_the_current_empty_format() {
 
     store
         .commit(
-            upserts(vec![issue(&store, "a", "first", "open")]),
+            doc_writes(vec![issue(&store, "a", "first", "open")]),
             &CommitOptions::default(),
         )
         .expect("the reset store is writable");
@@ -64,7 +64,7 @@ fn open_preserves_a_readable_store_with_data() {
         store.setup(&schema()).unwrap();
         store
             .commit(
-                upserts(vec![issue(&store, "keep", "kept", "open")]),
+                doc_writes(vec![issue(&store, "keep", "kept", "open")]),
                 &CommitOptions::default(),
             )
             .unwrap();

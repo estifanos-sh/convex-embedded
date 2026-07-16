@@ -36,7 +36,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       "mutation",
       "internal",
       { expectedEpoch: number; fieldId: string; numItems: number },
-      { deleted: number; progress: "continue" } | { deleted: number; progress: "complete" },
+      { deleted: number; isDone: boolean },
       Name
     >;
     field: {
@@ -112,7 +112,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         { checkpointId: string; numItems: number },
-        { deleted: number; progress: "continue" } | { deleted: number; progress: "complete" },
+        { deleted: number; isDone: boolean },
         Name
       >;
     };
@@ -166,7 +166,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         numItems: number;
         settledBefore: number;
       },
-      { deleted: number; progress: "continue" } | { deleted: number; progress: "complete" },
+      { deleted: number; isDone: boolean },
       Name
     >;
     read: FunctionReference<
@@ -204,7 +204,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
     acknowledge: FunctionReference<
       "mutation",
       "internal",
-      { clientId: string; mutationId: string },
+      { clientId: string; identity?: string; mutationId: string },
       null,
       Name
     >;
@@ -222,7 +222,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       { blobId: string; ready: boolean },
       Name
     >;
-    bootstrap: FunctionReference<
+    checkpointRead: FunctionReference<
       "query",
       "internal",
       {
@@ -234,14 +234,24 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         rowId: string;
         table: string;
       },
-      {
-        checkpoint: { bytes: number; hash: string; id: string; seq: number };
-        chunks: Array<{ bytes: ArrayBuffer; hash: string; ordinal: number }>;
-        continueCursor: string | null;
-        headSeq: number;
-        isDone: boolean;
-        payloads: Array<{ bytes: ArrayBuffer; hash: string; seq: number }>;
-      },
+      | { kind: "stale" }
+      | {
+          checkpoint: {
+            bytes: number;
+            hash: string;
+            id: string;
+            seq: number;
+          };
+          chunks: Array<{
+            bytes: ArrayBuffer;
+            hash: string;
+            ordinal: number;
+          }>;
+          continueCursor: string | null;
+          headSeq: number;
+          isDone: boolean;
+          payloads: Array<{ bytes: ArrayBuffer; hash: string; seq: number }>;
+        },
       Name
     >;
     checkpointWrite: FunctionReference<
@@ -718,6 +728,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         expiresAt: number;
         fingerprint: string;
         functionName: string;
+        identity?: string;
         inserts: Array<{
           mutationId: string;
           ordinal: number;
@@ -1110,29 +1121,6 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
     };
   };
   rev: {
-    ack: FunctionReference<
-      "mutation",
-      "internal",
-      { revId: string; rowId: string; table: string },
-      {
-        crdt: Array<{
-          field: string;
-          kind: "text" | "count" | "set";
-          projectionHash: string;
-        }>;
-        createdAt: number;
-        deleted: boolean;
-        groupId: string;
-        origin: "savepoint" | "conflict" | "rejected" | "displaced" | "delete";
-        parentRevId?: string;
-        revId: string;
-        rowId: string;
-        status: "active" | "retained" | "acknowledged";
-        table: string;
-        value?: any;
-      },
-      Name
-    >;
     checkpointWrite: FunctionReference<
       "mutation",
       "internal",
@@ -1168,7 +1156,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         parentRevId?: string;
         revId: string;
         rowId: string;
-        status: "active" | "retained" | "acknowledged";
+        status: "active" | "retained";
         table: string;
         value?: any;
       },
@@ -1205,7 +1193,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         parentRevId?: string;
         revId: string;
         rowId: string;
-        status: "active" | "retained" | "acknowledged";
+        status: "active" | "retained";
         table: string;
         value?: any;
       },
@@ -1215,7 +1203,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       "mutation",
       "internal",
       { numItems: number; revId: string; rowId: string; table: string },
-      { deleted: number; progress: "continue" } | { deleted: number; progress: "complete" },
+      { deleted: number; isDone: boolean },
       Name
     >;
     get: FunctionReference<
@@ -1235,7 +1223,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         parentRevId?: string;
         revId: string;
         rowId: string;
-        status: "active" | "retained" | "acknowledged";
+        status: "active" | "retained";
         table: string;
         value?: any;
       } | null,
@@ -1256,7 +1244,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           numItems: number;
         };
         rowId?: string;
-        status?: "active" | "retained" | "acknowledged";
+        status?: "active" | "retained";
         table?: string;
       },
       {
@@ -1275,10 +1263,33 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           parentRevId?: string;
           revId: string;
           rowId: string;
-          status: "active" | "retained" | "acknowledged";
+          status: "active" | "retained";
           table: string;
           value?: any;
         }>;
+      },
+      Name
+    >;
+    restore: FunctionReference<
+      "mutation",
+      "internal",
+      { revId: string; rowId: string; table: string },
+      {
+        crdt: Array<{
+          field: string;
+          kind: "text" | "count" | "set";
+          projectionHash: string;
+        }>;
+        createdAt: number;
+        deleted: boolean;
+        groupId: string;
+        origin: "savepoint" | "conflict" | "rejected" | "displaced" | "delete";
+        parentRevId?: string;
+        revId: string;
+        rowId: string;
+        status: "active" | "retained";
+        table: string;
+        value?: any;
       },
       Name
     >;
@@ -1305,30 +1316,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         parentRevId?: string;
         revId: string;
         rowId: string;
-        status: "active" | "retained" | "acknowledged";
-        table: string;
-        value?: any;
-      },
-      Name
-    >;
-    set: FunctionReference<
-      "mutation",
-      "internal",
-      { revId: string; rowId: string; table: string },
-      {
-        crdt: Array<{
-          field: string;
-          kind: "text" | "count" | "set";
-          projectionHash: string;
-        }>;
-        createdAt: number;
-        deleted: boolean;
-        groupId: string;
-        origin: "savepoint" | "conflict" | "rejected" | "displaced" | "delete";
-        parentRevId?: string;
-        revId: string;
-        rowId: string;
-        status: "active" | "retained" | "acknowledged";
+        status: "active" | "retained";
         table: string;
         value?: any;
       },

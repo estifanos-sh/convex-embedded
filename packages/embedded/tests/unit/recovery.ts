@@ -1,14 +1,14 @@
 import { describe, expect, test } from "vite-plus/test";
 
 import {
-  CHECKPOINT_IDLE_MS,
+  WAL_WRITE_IDLE_MS,
   CrashBreaker,
   REBUILD_MAX,
   REBUILD_WINDOW_MS,
   StoreRecovery,
   Watchdog,
   WATCHDOG_IDLE_MS,
-  checkpointDue,
+  walWriteDue,
   classifyTrip,
   laneClassOf,
   rebuildIndeterminateMutationError,
@@ -17,11 +17,14 @@ import {
   type RecoveryTimer,
 } from "../../src/browser/recovery";
 import { deferred } from "../../src/promise";
+import type { EmbeddedEvent } from "../../src/events";
 import { LeaderRuntime, type LeaderRecoveryHooks } from "../../src/browser/coordinator/leader";
 import { WorkerCommand, WorkerEvent, type WorkerResponse } from "../../src/browser/protocol";
 import {
+  abandonWorkerRemote,
   createRemoteTransport,
   ensureWorkerRemoteStarted,
+  handleWorkerRemoteAuthResult,
   type WorkerState,
 } from "../../src/browser/runtime";
 
@@ -95,12 +98,26 @@ describe("Watchdog", () => {
     expect(suspects).toEqual(["push"]);
   });
 
+  test("progress in one lane cannot mask another wedged lane", () => {
+    const timer = new FakeTimer();
+    const suspects: string[] = [];
+    const watchdog = new Watchdog((lane) => suspects.push(lane), WATCHDOG_IDLE_MS, timer);
+
+    watchdog.arm("pull");
+    watchdog.arm("push");
+    timer.advance(WATCHDOG_IDLE_MS - 1_000);
+    watchdog.progress("push");
+    timer.advance(1_000);
+
+    expect(suspects).toEqual(["pull"]);
+  });
+
   test("a disarmed lane never fires and stops the poller when idle", () => {
     const timer = new FakeTimer();
     const suspects: string[] = [];
     const watchdog = new Watchdog((lane) => suspects.push(lane), WATCHDOG_IDLE_MS, timer);
 
-    const disarm = watchdog.arm("checkpoint");
+    const disarm = watchdog.arm("wal-write");
     expect(timer.activeIntervals).toBe(1);
     disarm();
     expect(timer.activeIntervals).toBe(0);
@@ -145,7 +162,7 @@ describe("CrashBreaker", () => {
     expect(breaker.record(REBUILD_MAX * 1_000, "remote")).toBe(true);
   });
 
-  test("prunes rebuilds older than the window so an old burst does not trip", () => {
+  test("deletes rebuilds older than the window so an old burst does not trip", () => {
     const breaker = new CrashBreaker();
     breaker.record(0, "remote");
     breaker.record(0, "remote");
@@ -173,30 +190,30 @@ describe("CrashBreaker", () => {
     expect(laneClassOf("push")).toBe("remote");
     expect(laneClassOf("pull")).toBe("remote");
     expect(laneClassOf("remote-start")).toBe("instance");
-    expect(laneClassOf("checkpoint")).toBe("instance");
+    expect(laneClassOf("wal-write")).toBe("instance");
   });
 });
 
-describe("checkpointDue", () => {
-  const base = { lastActivityAt: 0, lastCheckpointAt: 0, now: 0, remoteBusy: false };
+describe("walWriteDue", () => {
+  const base = { lastActivityAt: 0, lastWalWriteAt: 0, now: 0, remoteBusy: false };
 
-  test("fires after the idle window since drain and last checkpoint", () => {
-    expect(checkpointDue({ ...base, now: CHECKPOINT_IDLE_MS })).toBe(true);
+  test("fires after the idle window since drain and last WAL write", () => {
+    expect(walWriteDue({ ...base, now: WAL_WRITE_IDLE_MS })).toBe(true);
   });
 
   test("holds while the push queue or a pull is still in flight", () => {
-    expect(checkpointDue({ ...base, now: CHECKPOINT_IDLE_MS, remoteBusy: true })).toBe(false);
+    expect(walWriteDue({ ...base, now: WAL_WRITE_IDLE_MS, remoteBusy: true })).toBe(false);
   });
 
   test("holds until the store has been idle for the whole window", () => {
     expect(
-      checkpointDue({ ...base, lastActivityAt: CHECKPOINT_IDLE_MS - 1, now: CHECKPOINT_IDLE_MS }),
+      walWriteDue({ ...base, lastActivityAt: WAL_WRITE_IDLE_MS - 1, now: WAL_WRITE_IDLE_MS }),
     ).toBe(false);
   });
 
-  test("holds until the window elapses since the last checkpoint", () => {
+  test("holds until the window elapses since the last WAL write", () => {
     expect(
-      checkpointDue({ ...base, lastCheckpointAt: CHECKPOINT_IDLE_MS - 1, now: CHECKPOINT_IDLE_MS }),
+      walWriteDue({ ...base, lastWalWriteAt: WAL_WRITE_IDLE_MS - 1, now: WAL_WRITE_IDLE_MS }),
     ).toBe(false);
   });
 });
@@ -228,7 +245,7 @@ describe("rejectMutationsForRebuild", () => {
   });
 });
 
-/** A recording host that lets a test drive the controller's rebuild/trip/checkpoint outcomes. */
+/** A recording host that lets a test drive terminal, reconnect, and WAL-write outcomes. */
 function recordingHost(timer: FakeTimer, overrides: Partial<RecoveryHost> = {}) {
   const calls: string[] = [];
   const host: RecoveryHost = {
@@ -242,8 +259,8 @@ function recordingHost(timer: FakeTimer, overrides: Partial<RecoveryHost> = {}) 
     stopRemote: () => calls.push("stop-remote"),
     closeRemoteSocket: () => calls.push("close-socket"),
     deadInstance: () => calls.push("dead"),
-    runCheckpoint: async () => {
-      calls.push("checkpoint");
+    walWrite: async () => {
+      calls.push("wal-write");
     },
     ...overrides,
   };
@@ -251,7 +268,7 @@ function recordingHost(timer: FakeTimer, overrides: Partial<RecoveryHost> = {}) 
 }
 
 describe("StoreRecovery", () => {
-  test("a lane wedged behind a live transport emits degraded, rebuilds, then emits ready", async () => {
+  test("a wedged lane terminates instead of opening a second store in the same worker", async () => {
     const timer = new FakeTimer();
     const { calls, host } = recordingHost(timer);
     const recovery = new StoreRecovery(host, { timer });
@@ -262,28 +279,32 @@ describe("StoreRecovery", () => {
     timer.advance(1);
     await drainMicrotasks();
 
-    expect(calls).toEqual(["degraded", "rebuild", "ready"]);
+    expect(calls).toEqual(["degraded", "dead"]);
+    expect(calls).not.toContain("rebuild");
+    expect(calls).not.toContain("ready");
     expect(calls).not.toContain("close-socket");
     recovery.dispose();
   });
 
-  test("an offline transport-silent lane reconnects without a rebuild or breaker count", async () => {
+  test("an offline transport-silent lane is still supervised after reconnect interruption", async () => {
     const timer = new FakeTimer();
     const { calls, host } = recordingHost(timer);
-    const recovery = new StoreRecovery(host, { timer, checkpointIdleMs: 10_000_000 });
+    const recovery = new StoreRecovery(host, { timer, walWriteIdleMs: 10_000_000 });
 
-    for (let attempt = 0; attempt <= REBUILD_MAX + 1; attempt += 1) {
-      recovery.arm("pull");
-      timer.advance(WATCHDOG_IDLE_MS);
-      await drainMicrotasks();
-    }
+    recovery.arm("pull");
+    timer.advance(WATCHDOG_IDLE_MS);
+    await drainMicrotasks();
 
     expect(calls).toContain("remote-error");
     expect(calls).toContain("close-socket");
-    expect(calls).not.toContain("rebuild");
-    expect(calls).not.toContain("dead");
-    expect(calls).not.toContain("stop-remote");
     expect(calls).not.toContain("degraded");
+    expect(calls).not.toContain("dead");
+
+    timer.advance(WATCHDOG_IDLE_MS);
+    await drainMicrotasks();
+    expect(calls).toContain("degraded");
+    expect(calls).toContain("dead");
+    expect(calls).not.toContain("rebuild");
     recovery.dispose();
   });
 
@@ -304,7 +325,7 @@ describe("StoreRecovery", () => {
     recovery.dispose();
   });
 
-  test("a store-side remote-start hang behind a live transport rebuilds", async () => {
+  test("a store-side remote-start hang behind a live transport is terminal", async () => {
     const timer = new FakeTimer();
     const { calls, host } = recordingHost(timer);
     const recovery = new StoreRecovery(host, { timer });
@@ -315,7 +336,8 @@ describe("StoreRecovery", () => {
     timer.advance(1);
     await drainMicrotasks();
 
-    expect(calls).toContain("rebuild");
+    expect(calls).toContain("dead");
+    expect(calls).not.toContain("rebuild");
     expect(calls).not.toContain("close-socket");
     recovery.dispose();
   });
@@ -331,133 +353,67 @@ describe("StoreRecovery", () => {
 
     recovery.reportThreadError(recovery.remoteGeneration);
     await drainMicrotasks();
-    expect(calls).toContain("rebuild");
-    recovery.dispose();
-  });
-
-  test("a stale-generation progress signal does not extend the fresh instance deadline", async () => {
-    const timer = new FakeTimer();
-    const { calls, host } = recordingHost(timer);
-    const recovery = new StoreRecovery(host, { timer });
-    const staleGen = recovery.remoteGeneration;
-
-    recovery.arm("pull");
-    timer.advance(WATCHDOG_IDLE_MS - 1);
-    recovery.transportActive();
-    timer.advance(1);
-    await drainMicrotasks();
-    expect(calls).toEqual(["degraded", "rebuild", "ready"]);
-    expect(recovery.remoteGeneration).toBe(staleGen + 1);
-
-    recovery.arm("checkpoint");
-    timer.advance(WATCHDOG_IDLE_MS - 1);
-    recovery.progress(staleGen);
-    timer.advance(1);
-    await drainMicrotasks();
-
-    expect(calls.filter((call) => call === "rebuild").length).toBe(2);
-    recovery.dispose();
-  });
-
-  test("watchdog reset runs before the rebuild so a lane armed mid-rebuild survives", async () => {
-    const timer = new FakeTimer();
-    const holder: { recovery?: StoreRecovery } = {};
-    const { calls, host } = recordingHost(timer, {
-      rebuild: async () => {
-        calls.push("rebuild");
-        holder.recovery!.arm("checkpoint");
-      },
-    });
-    const recovery = new StoreRecovery(host, { timer });
-    holder.recovery = recovery;
-
-    recovery.arm("checkpoint");
-    timer.advance(WATCHDOG_IDLE_MS);
-    await drainMicrotasks();
-    timer.advance(WATCHDOG_IDLE_MS);
-    await drainMicrotasks();
-
-    expect(calls.filter((call) => call === "rebuild").length).toBe(2);
-    recovery.dispose();
-  });
-
-  test("trips to a dead instance when a checkpoint lane keeps wedging", async () => {
-    const timer = new FakeTimer();
-    const { calls, host } = recordingHost(timer, { rebuild: async () => undefined });
-    const recovery = new StoreRecovery(host, { timer });
-
-    for (let attempt = 0; attempt <= REBUILD_MAX; attempt += 1) {
-      recovery.arm("checkpoint");
-      timer.advance(WATCHDOG_IDLE_MS);
-      await drainMicrotasks();
-      recovery.watchdog.reset();
-    }
-
     expect(calls).toContain("dead");
-    expect(calls).not.toContain("stop-remote");
+    expect(calls).not.toContain("rebuild");
     recovery.dispose();
   });
 
-  test("trips to lane-only keep-last-good for a live-transport remote-lane crash loop", async () => {
+  test("a terminal instance ignores later watchdog activity", async () => {
     const timer = new FakeTimer();
     const { calls, host } = recordingHost(timer);
     const recovery = new StoreRecovery(host, { timer });
 
-    for (let attempt = 0; attempt <= REBUILD_MAX; attempt += 1) {
-      recovery.arm("pull");
-      timer.advance(WATCHDOG_IDLE_MS - 1);
-      recovery.transportActive();
-      timer.advance(1);
-      await drainMicrotasks();
-      recovery.watchdog.reset();
-    }
+    recovery.arm("wal-write");
+    timer.advance(WATCHDOG_IDLE_MS);
+    await drainMicrotasks();
+    recovery.reportThreadError();
+    timer.advance(WATCHDOG_IDLE_MS);
+    await drainMicrotasks();
 
-    expect(calls).toContain("stop-remote");
-    expect(calls).toContain("remote-error");
-    expect(calls).not.toContain("dead");
+    expect(calls.filter((call) => call === "dead")).toHaveLength(1);
     recovery.dispose();
   });
 
-  test("a push-only session clears remoteBusy so a checkpoint paces", async () => {
+  test("a push-only session clears remoteBusy so a WAL write paces", async () => {
     const timer = new FakeTimer();
     const { calls, host } = recordingHost(timer);
-    const recovery = new StoreRecovery(host, { timer, checkpointPollMs: CHECKPOINT_IDLE_MS });
+    const recovery = new StoreRecovery(host, { timer, walWritePollMs: WAL_WRITE_IDLE_MS });
 
     recovery.onRemoteActive();
-    timer.advance(CHECKPOINT_IDLE_MS * 2);
+    timer.advance(WAL_WRITE_IDLE_MS * 2);
     await drainMicrotasks();
-    expect(calls).not.toContain("checkpoint");
+    expect(calls).not.toContain("wal-write");
 
     recovery.onRemoteIdle();
-    timer.advance(CHECKPOINT_IDLE_MS);
+    timer.advance(WAL_WRITE_IDLE_MS);
     await drainMicrotasks();
-    expect(calls).toContain("checkpoint");
+    expect(calls).toContain("wal-write");
     recovery.dispose();
   });
 
-  test("paces a checkpoint once the store has drained and gone idle", async () => {
+  test("paces a WAL write once the store has drained and gone idle", async () => {
     const timer = new FakeTimer();
     const { calls, host } = recordingHost(timer);
-    const recovery = new StoreRecovery(host, { timer, checkpointPollMs: CHECKPOINT_IDLE_MS });
+    const recovery = new StoreRecovery(host, { timer, walWritePollMs: WAL_WRITE_IDLE_MS });
 
     recovery.onRemoteIdle();
-    timer.advance(CHECKPOINT_IDLE_MS);
+    timer.advance(WAL_WRITE_IDLE_MS);
     await drainMicrotasks();
 
-    expect(calls).toContain("checkpoint");
+    expect(calls).toContain("wal-write");
     recovery.dispose();
   });
 
-  test("does not checkpoint while remote work is in flight", async () => {
+  test("does not write the WAL while remote work is in flight", async () => {
     const timer = new FakeTimer();
     const { calls, host } = recordingHost(timer);
-    const recovery = new StoreRecovery(host, { timer, checkpointPollMs: CHECKPOINT_IDLE_MS });
+    const recovery = new StoreRecovery(host, { timer, walWritePollMs: WAL_WRITE_IDLE_MS });
 
     recovery.onRemoteActive();
-    timer.advance(CHECKPOINT_IDLE_MS * 3);
+    timer.advance(WAL_WRITE_IDLE_MS * 3);
     await drainMicrotasks();
 
-    expect(calls).not.toContain("checkpoint");
+    expect(calls).not.toContain("wal-write");
     recovery.dispose();
   });
 });
@@ -588,7 +544,27 @@ describe("stale-generation start continuation", () => {
     expect(state.remoteStop).toBeUndefined();
   });
 
-  test("a stale continuation after a failed start neither closes the grafted remote nor schedules a retry", async () => {
+  test("an abandoned startup cannot install identity or a remote loop in the next event generation", async () => {
+    const calls: string[] = [];
+    const events: unknown[] = [];
+    const gate = deferred<void>();
+    const state = remoteStartState(calls, gate.promise);
+    state.emit = (event) => events.push(event);
+
+    const ready = ensureWorkerRemoteStarted(state, remoteOptions, false, () => undefined);
+    expect(state.remoteEventGeneration).toBe(1);
+    abandonWorkerRemote(state);
+    expect(state.remoteEventGeneration).toBe(2);
+    const eventsAfterAbandon = events.length;
+    gate.resolve();
+    await ready;
+
+    expect(calls).toEqual(["start"]);
+    expect(events).toHaveLength(eventsAfterAbandon);
+    expect(state.remoteStop).toBeUndefined();
+  });
+
+  test("a stale continuation after a failed start neither closes the replacement remote nor schedules a retry", async () => {
     const calls: string[] = [];
     const gate = deferred<void>();
     gate.promise.catch(() => undefined);
@@ -603,6 +579,75 @@ describe("stale-generation start continuation", () => {
 
     expect(calls).not.toContain("close");
     expect(state.remoteStartTimer).toBeUndefined();
+  });
+
+  test("a retryable startup failure reports connecting backoff instead of terminal error", async () => {
+    const calls: string[] = [];
+    const events: EmbeddedEvent[] = [];
+    const gate = deferred<void>();
+    gate.promise.catch(() => undefined);
+    const state = remoteStartState(calls, gate.promise);
+    state.emit = (event) => events.push(event);
+
+    const ready = ensureWorkerRemoteStarted(state, remoteOptions, false, () => undefined);
+    gate.reject(new Error("network unavailable"));
+    await ready;
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        error: "network unavailable",
+        nextRunAt: expect.any(Number),
+        status: "starting",
+        type: "remote",
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ error: "network unavailable", status: "error", type: "remote" }),
+    );
+    expect(state.remoteStartTimer).toBeDefined();
+    abandonWorkerRemote(state);
+  });
+
+  test("a retired auth response cannot satisfy the next remote generation", async () => {
+    const requests: number[] = [];
+    const tokens: Array<string | null> = [];
+    const state = remoteStartState([], Promise.resolve());
+    state.store.remote!.start = async (options) => {
+      tokens.push((await options.auth?.({ forceRefreshToken: false })) ?? null);
+    };
+    const options = { ...remoteOptions, authFetchToken: true };
+    const post = (message: WorkerResponse) => {
+      if (message.op === WorkerEvent.AuthTokenRequest) requests.push(message.authRequestId);
+    };
+
+    const first = ensureWorkerRemoteStarted(state, options, false, post);
+    await Promise.resolve();
+    expect(requests).toHaveLength(1);
+    abandonWorkerRemote(state);
+    await first;
+
+    const second = ensureWorkerRemoteStarted(state, options, false, post);
+    await Promise.resolve();
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toBeGreaterThan(requests[0]!);
+
+    handleWorkerRemoteAuthResult(state, {
+      authRequestId: requests[0]!,
+      id: 1,
+      op: WorkerCommand.AuthTokenResult,
+      token: "stale",
+    });
+    expect(state.remoteAuthPending?.has(requests[1]!)).toBe(true);
+    handleWorkerRemoteAuthResult(state, {
+      authRequestId: requests[1]!,
+      id: 2,
+      op: WorkerCommand.AuthTokenResult,
+      token: "fresh",
+    });
+    await second;
+
+    expect(tokens).toEqual(["fresh"]);
+    abandonWorkerRemote(state);
   });
 });
 
@@ -648,6 +693,47 @@ describe("dead-instance fast-fail", () => {
     return { leader, ran, runtime };
   }
 
+  test("publishes degraded runtime state before asking the page to dispose", async () => {
+    const order: string[] = [];
+    const runtime = {
+      opfs: { closeAll: () => undefined },
+      rebuild: async () => Promise.reject(new Error("store terminal")),
+      runner: { subscribeEvents: () => () => undefined },
+      stops: new Map(),
+      store: { close: async () => undefined },
+    } as unknown as WorkerState;
+    const leader = new LeaderRuntime({
+      epoch: "leader",
+      identity: { storageId: "documents" } as never,
+      runtime,
+      scope: "scope",
+      storagePath: "documents.db",
+    });
+    leader.addLocalClient({
+      activeMutations: 0,
+      id: "client",
+      post: (response) => {
+        if (response.op === WorkerEvent.Event && response.event.type === "runtime") {
+          order.push(`runtime:${response.event.degradation ?? response.event.phase}`);
+        }
+      },
+      remoteConfigured: true,
+      watches: new Map(),
+      workerId: "worker",
+    });
+    const recovery = leader.enableRecovery({
+      ...idleHooks,
+      onDeadInstance: () => order.push("page-dispose"),
+    });
+
+    recovery.reportThreadError();
+    await drainMicrotasks();
+
+    expect(order.at(-1)).toBe("page-dispose");
+    expect(order.slice(0, -1)).toContain("runtime:failed");
+    await leader.close();
+  });
+
   test("rejects a fresh query promptly with the sticky root error, never running it", async () => {
     const { leader, ran, runtime } = deadLeader();
     await drainMicrotasks();
@@ -673,7 +759,7 @@ describe("dead-instance fast-fail", () => {
     const result = responses.find(
       (response) => response.op === WorkerEvent.Result && response.id === 1,
     ) as Extract<WorkerResponse, { op: typeof WorkerEvent.Result }> | undefined;
-    expect(result?.error?.message).toBe("emnapi pthread pool crashed");
+    expect(result?.error?.message).toBe("embedded store instance wedged on wal-write lane");
     expect(ran).not.toContain("query");
     await leader.close();
   });
@@ -704,7 +790,7 @@ describe("dead-instance fast-fail", () => {
     const result = responses.find(
       (response) => response.op === WorkerEvent.Result && response.id === 2,
     ) as Extract<WorkerResponse, { op: typeof WorkerEvent.Result }> | undefined;
-    expect(result?.error?.message).toBe("emnapi pthread pool crashed");
+    expect(result?.error?.message).toBe("embedded store instance wedged on wal-write lane");
     expect(ran).not.toContain("mutation");
     await leader.close();
   });

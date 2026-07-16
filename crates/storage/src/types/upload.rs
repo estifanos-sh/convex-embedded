@@ -32,21 +32,17 @@ pub struct PendingUpload {
     pub updated_time: i64,
 }
 
-/// Exact commands for the upload-lease lifecycle write.
+/// Exact target states for an upload-lease lifecycle write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UploadLeaseWrite {
-    Claim {
+    Claimed {
+        /// `None` selects the next pending or expired upload; `Some` rewrites that owned lease.
+        local_storage_id: Option<String>,
         owner: String,
         now_ms: i64,
         lease_until: i64,
     },
-    Renew {
-        local_storage_id: String,
-        owner: String,
-        now_ms: i64,
-        lease_until: i64,
-    },
-    Release {
+    Pending {
         local_storage_id: String,
         owner: String,
         now_ms: i64,

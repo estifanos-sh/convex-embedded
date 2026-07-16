@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::invariant::{check_id_mappings, check_rev_set};
 use crate::{
-    ColValue, ColumnDef, CommitOptions, CommitResult, CountSpec, EmbeddedStore, IndexDef, Page,
-    ReadSpec, RevKey, RevState, RowKey, StorageError, StoreSchema, TableDef, UpsertIn, WriteBatch,
+    ColValue, ColumnDef, CommitOptions, CommitResult, CountSpec, DocWrite, EmbeddedStore, IndexDef,
+    Page, ReadSpec, RevKey, RevState, RowKey, StorageError, StoreSchema, TableDef, WriteBatch,
 };
 
 /// Run the structural rev-graph + id-mapping oracle over the whole store: every row's rev set is
@@ -223,9 +223,9 @@ pub fn commit(store: &EmbeddedStore, batch: WriteBatch) -> CommitResult {
     store.commit(batch, &CommitOptions::default()).unwrap()
 }
 
-/// A `users` upsert carrying a profile email.
-pub fn user(store: &EmbeddedStore, id: &str, email: &str) -> UpsertIn {
-    UpsertIn {
+/// A `users` doc_write carrying a profile email.
+pub fn user(store: &EmbeddedStore, id: &str, email: &str) -> DocWrite {
+    DocWrite {
         table: "users".into(),
         id: id.into(),
         data: format!(r#"{{"profile":{{"email":"{email}"}}}}"#),
@@ -234,9 +234,9 @@ pub fn user(store: &EmbeddedStore, id: &str, email: &str) -> UpsertIn {
     }
 }
 
-/// A `users` upsert with no email column.
-pub fn user_without_email(store: &EmbeddedStore, id: &str) -> UpsertIn {
-    UpsertIn {
+/// A `users` doc_write with no email column.
+pub fn user_without_email(store: &EmbeddedStore, id: &str) -> DocWrite {
+    DocWrite {
         table: "users".into(),
         id: id.into(),
         data: r#"{"profile":{}}"#.into(),
@@ -245,9 +245,9 @@ pub fn user_without_email(store: &EmbeddedStore, id: &str) -> UpsertIn {
     }
 }
 
-/// An `issues` upsert with a fresh monotonic creation time.
-pub fn issue(store: &EmbeddedStore, id: &str, title: &str, status: &str) -> UpsertIn {
-    UpsertIn {
+/// An `issues` doc_write with a fresh monotonic creation time.
+pub fn issue(store: &EmbeddedStore, id: &str, title: &str, status: &str) -> DocWrite {
+    DocWrite {
         table: "issues".into(),
         id: id.into(),
         data: format!(r#"{{"title":"{title}"}}"#),
@@ -256,9 +256,9 @@ pub fn issue(store: &EmbeddedStore, id: &str, title: &str, status: &str) -> Upse
     }
 }
 
-/// A `flags` upsert with the given boolean column value.
-pub fn flag(store: &EmbeddedStore, id: &str, active: ColValue) -> UpsertIn {
-    UpsertIn {
+/// A `flags` doc_write with the given boolean column value.
+pub fn flag(store: &EmbeddedStore, id: &str, active: ColValue) -> DocWrite {
+    DocWrite {
         table: "flags".into(),
         id: id.into(),
         data: r#"{"active":true}"#.into(),
@@ -267,10 +267,10 @@ pub fn flag(store: &EmbeddedStore, id: &str, active: ColValue) -> UpsertIn {
     }
 }
 
-/// A write batch of upserts only.
-pub fn upserts(rows: Vec<UpsertIn>) -> WriteBatch {
+/// A write batch of doc_writes only.
+pub fn doc_writes(rows: Vec<DocWrite>) -> WriteBatch {
     WriteBatch {
-        upserts: rows,
+        doc_writes: rows,
         crdt_ops: vec![],
         crdt_restores: vec![],
         deletes: vec![],

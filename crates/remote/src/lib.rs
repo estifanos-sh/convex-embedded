@@ -29,7 +29,7 @@ pub use error::RemoteError;
 #[cfg(not(target_arch = "wasm32"))]
 pub use store::SystemRemoteClock;
 pub use store::{RemoteClock, RemoteStore, RemoteStoreFuture};
-pub use tick::RemoteTick;
+pub use tick::{RemotePending, RemoteTick};
 pub use transport::{
     ConnectRequest, RemoteTransport, SendRemoteTransport, ServerMessage, TransportEvent,
 };

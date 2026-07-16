@@ -55,7 +55,7 @@ export async function runBrowserStartupBenchmark(
       opfsRegisterMs: summarize(samples.map((sample) => sample.phaseMs.opfsRegisterMs ?? 0)),
       openSetupMs: summarize(samples.map((sample) => sample.phaseMs.openSetupMs)),
       readyQueryMs: summarize(samples.map((sample) => sample.readyQueryMs)),
-      storeCheckpointMs: summarize(samples.map((sample) => sample.phaseMs.storeCheckpointMs ?? 0)),
+      storeWalWriteMs: summarize(samples.map((sample) => sample.phaseMs.storeWalWriteMs ?? 0)),
       storeOpenMs: summarize(samples.map((sample) => sample.phaseMs.storeOpenMs ?? 0)),
       storeSetupMs: summarize(samples.map((sample) => sample.phaseMs.storeSetupMs ?? 0)),
       totalMs: summarize(samples.map((sample) => sample.totalMs)),
@@ -123,7 +123,7 @@ export async function runBrowserStartupBenchmark(
           const phaseMs: BrowserStartupPhaseTimings = {
             openSetupMs: 0,
             opfsRegisterMs: durations.get("worker:opfs:register"),
-            storeCheckpointMs: durations.get("worker:store:checkpoint"),
+            storeWalWriteMs: durations.get("worker:store:wal-write"),
             storeOpenMs: durations.get("worker:store:open"),
             storeSetupMs: durations.get("worker:store:setup"),
             wasmBeforeInitMs: durations.get("worker:wasm:before-init"),
@@ -136,7 +136,7 @@ export async function runBrowserStartupBenchmark(
             (phaseMs.wasmLoadMs ?? 0) +
             (phaseMs.storeOpenMs ?? 0) +
             (phaseMs.storeSetupMs ?? 0) +
-            (phaseMs.storeCheckpointMs ?? 0);
+            (phaseMs.storeWalWriteMs ?? 0);
           return phaseMs;
         };
         let module: BrowserClientModule;
@@ -238,7 +238,7 @@ export async function runBrowserStartupBenchmark(
           const phaseMs: BrowserStartupPhaseTimings = {
             openSetupMs: 0,
             opfsRegisterMs: durations.get("worker:opfs:register"),
-            storeCheckpointMs: durations.get("worker:store:checkpoint"),
+            storeWalWriteMs: durations.get("worker:store:wal-write"),
             storeOpenMs: durations.get("worker:store:open"),
             storeSetupMs: durations.get("worker:store:setup"),
             wasmBeforeInitMs: durations.get("worker:wasm:before-init"),
@@ -251,7 +251,7 @@ export async function runBrowserStartupBenchmark(
             (phaseMs.wasmLoadMs ?? 0) +
             (phaseMs.storeOpenMs ?? 0) +
             (phaseMs.storeSetupMs ?? 0) +
-            (phaseMs.storeCheckpointMs ?? 0);
+            (phaseMs.storeWalWriteMs ?? 0);
           return phaseMs;
         };
         const module = await importClient(`attach-${token}`);
@@ -382,7 +382,7 @@ export async function runBrowserStartupBenchmark(
         "attach keeps one leader client alive in the same page while measuring follower client construction/readiness",
         "readyQueryMs includes worker init/coordination and first query response for that client",
         "firstQueryMs is currently the same measured call as readyQueryMs; it is reported separately so future startup work can split queueing from query execution",
-        "phaseMs is derived from worker debug start/done events: OPFS registration, WASM load/fetch/instantiate, store open/setup, and checkpoint",
+        "phaseMs is derived from worker debug start/done events: OPFS registration, WASM load/fetch/instantiate, store open/setup, and wal write",
       ],
       results: result.results,
       version: 2,

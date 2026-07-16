@@ -433,7 +433,7 @@ export async function runMetalScaleBenchmark(
     const settlementMs = summarizeMetalRemotePhase(
       statuses,
       baselineEventCounts,
-      (event) => (event.tick?.settlementsAcknowledged ?? 0) > 0,
+      (event) => (event.tick?.receiptsPushed ?? 0) > 0,
     );
     const remoteTicks = subtractMetalRemoteTicks(
       summarizeMetalRemoteTicks(statuses),
@@ -977,7 +977,7 @@ async function waitForMetalAcknowledgments(
     return {
       detail: metalWaitDetail(label, status),
       done:
-        status.remoteTickTotals.settlementsAcknowledged >=
+        status.remoteTickTotals.receiptsPushed >=
         status.remoteTickTotals.pushAccepted +
           status.remoteTickTotals.pushConflicts +
           status.remoteTickTotals.pushFailed,
@@ -1031,7 +1031,7 @@ function summarizeMetalRemoteTicks(
     retainedRevisions: 0,
     rowsApplied: 0,
     sent: 0,
-    settlementsAcknowledged: 0,
+    receiptsPushed: 0,
     storeJobs: 0,
   };
   for (const status of statuses) {
@@ -1045,7 +1045,7 @@ function summarizeMetalRemoteTicks(
     totals.retainedRevisions += status.remoteTickTotals.retainedRevisions;
     totals.rowsApplied += status.remoteTickTotals.rowsApplied;
     totals.sent += status.remoteTickTotals.sent;
-    totals.settlementsAcknowledged += status.remoteTickTotals.settlementsAcknowledged;
+    totals.receiptsPushed += status.remoteTickTotals.receiptsPushed;
     totals.storeJobs += status.remoteTickTotals.storeJobs;
   }
   return totals;
@@ -1066,10 +1066,7 @@ function subtractMetalRemoteTicks(
     retainedRevisions: Math.max(0, total.retainedRevisions - baseline.retainedRevisions),
     rowsApplied: Math.max(0, total.rowsApplied - baseline.rowsApplied),
     sent: Math.max(0, total.sent - baseline.sent),
-    settlementsAcknowledged: Math.max(
-      0,
-      total.settlementsAcknowledged - baseline.settlementsAcknowledged,
-    ),
+    receiptsPushed: Math.max(0, total.receiptsPushed - baseline.receiptsPushed),
     storeJobs: Math.max(0, total.storeJobs - baseline.storeJobs),
   };
 }

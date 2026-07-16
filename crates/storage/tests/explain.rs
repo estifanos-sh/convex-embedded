@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use storage::testkit;
 use storage::{
-    Bound, ColValue, ColumnDef, CommitOptions, CountSpec, EmbeddedStore, IndexDef, StoreSchema,
-    TableDef, UpsertIn, WriteBatch,
+    Bound, ColValue, ColumnDef, CommitOptions, CountSpec, DocWrite, EmbeddedStore, IndexDef,
+    StoreSchema, TableDef, WriteBatch,
 };
 use turso_core::{
     Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult, Value, IO,
@@ -56,8 +56,8 @@ fn db_path(tag: &str) -> std::path::PathBuf {
 fn seeded(path: &std::path::Path, rows: usize) -> EmbeddedStore {
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    let upserts: Vec<UpsertIn> = (0..rows)
-        .map(|i| UpsertIn {
+    let doc_writes: Vec<DocWrite> = (0..rows)
+        .map(|i| DocWrite {
             table: "vals".into(),
             id: format!("r{i:08}"),
             data: r#"{"v":0}"#.into(),
@@ -70,7 +70,7 @@ fn seeded(path: &std::path::Path, rows: usize) -> EmbeddedStore {
             WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
-                upserts,
+                doc_writes,
                 deletes: vec![],
                 fresh_ids: vec![],
                 data_only_ids: vec![],

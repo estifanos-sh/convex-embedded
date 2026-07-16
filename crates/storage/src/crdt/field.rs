@@ -122,7 +122,7 @@ pub(crate) const SEED_PEER: u64 = u64::MAX - 1;
 /// Loro state yet (`prev` is None) but the row carries a `seed` plain value, the base is seeded
 /// deterministically under [`SEED_PEER`] before the client op, and the exported delta carries
 /// seed+op so a receiver that never seeded still materializes the base.
-pub(crate) fn crdt_field_apply(
+pub(crate) fn crdt_field_intent_write(
     prev: Option<&CrdtFieldState>,
     kind: CrdtFieldKind,
     op: &CrdtOperation,
@@ -190,7 +190,7 @@ fn apply_seed(doc: &LoroDoc, kind: CrdtFieldKind, seed: &JsonValue) -> Result<()
 
 /// Merge a remote CRDT update (one pulled `crdt` `RowChange`, §3) into a field, returning the new
 /// durable state. Commutative and order-independent — never a conflict.
-pub(crate) fn crdt_field_merge(
+pub(crate) fn crdt_field_update_write(
     prev: Option<&CrdtFieldState>,
     update: &[u8],
 ) -> Result<CrdtFieldState, StorageError> {
@@ -245,7 +245,7 @@ pub fn crdt_checkpoint_response(
     }
     let mut state = crdt_field_restore(checkpoint, checkpoint_seq, String::new())?;
     for update in &updates[..count] {
-        state = crdt_field_merge(Some(&state), update)?;
+        state = crdt_field_update_write(Some(&state), update)?;
     }
     let projection_hash = crdt_field_projection_hash(&state, kind)?;
     if projection_hash != request.projection_hash {
@@ -318,7 +318,7 @@ pub(crate) fn crdt_field_accept(
 ) -> Result<CrdtFieldState, StorageError> {
     let mut remote = crdt_field_restore(checkpoint, 0, String::new())?;
     for update in updates {
-        remote = crdt_field_merge(Some(&remote), update)?;
+        remote = crdt_field_update_write(Some(&remote), update)?;
     }
     if crdt_field_projection_hash(&remote, kind)? != projection_hash {
         return Err(StorageError::Unsatisfiable(
@@ -327,7 +327,7 @@ pub(crate) fn crdt_field_accept(
     }
     let remote_accepted = CrdtAcceptedState::read(&remote);
     let snapshot = crdt_field_snapshot(&remote)?;
-    let mut accepted = crdt_field_merge(accepted, &snapshot)?;
+    let mut accepted = crdt_field_update_write(accepted, &snapshot)?;
     accepted.server_epoch = epoch;
     accepted.server_seq = head_seq;
     accepted.server_projection_hash = projection_hash;
@@ -355,7 +355,7 @@ pub(crate) fn crdt_field_accept_incremental(
             "incremental CRDT pull requires an accepted causal base".to_owned(),
         )
     })?;
-    let remote = crdt_field_merge(Some(&base), update)?;
+    let remote = crdt_field_update_write(Some(&base), update)?;
     if crdt_field_projection_hash(&remote, kind)? != projection_hash {
         return Err(StorageError::Unsatisfiable(
             "incremental CRDT pull projection does not match its payload".to_owned(),
@@ -363,7 +363,7 @@ pub(crate) fn crdt_field_accept_incremental(
     }
     let remote_accepted = CrdtAcceptedState::read(&remote);
     let snapshot = crdt_field_snapshot(&remote)?;
-    let mut merged = crdt_field_merge(Some(current), &snapshot)?;
+    let mut merged = crdt_field_update_write(Some(current), &snapshot)?;
     merged.server_epoch = epoch;
     merged.server_seq = head_seq;
     merged.server_projection_hash = projection_hash;
@@ -399,9 +399,9 @@ pub(crate) fn crdt_field_remote_effect(
 ) -> Result<crate::types::CrdtRemoteEffect, StorageError> {
     let mut base = accepted_state(state)?;
     for prior in prior_payloads {
-        base = Some(crdt_field_merge(base.as_ref(), prior)?);
+        base = Some(crdt_field_update_write(base.as_ref(), prior)?);
     }
-    let next = crdt_field_merge(base.as_ref(), payload)?;
+    let next = crdt_field_update_write(base.as_ref(), payload)?;
     let prefix_len = i64::try_from(prior_payloads.len()).map_err(|_| {
         StorageError::Unsatisfiable("CRDT speculative prefix is too large".to_owned())
     })?;
@@ -447,7 +447,7 @@ pub(crate) fn crdt_field_settle(
         )));
     }
     let base = accepted_state(state)?;
-    let next = crdt_field_merge(base.as_ref(), payload)?;
+    let next = crdt_field_update_write(base.as_ref(), payload)?;
     if crdt_field_projection_hash(&next, kind)? != projection_hash {
         return Err(StorageError::Unsatisfiable(
             "CRDT settlement projection does not match its payload".to_owned(),
@@ -592,7 +592,8 @@ mod field_tests {
     #[test]
     fn text_apply_then_materialize() {
         let (mut state, _) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "hello"), 1, None).unwrap();
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "hello"), 1, None)
+                .unwrap();
         state.server_projection_hash = "hosted-before-local-edit".to_owned();
         assert_eq!(
             crdt_field_value(&state, CrdtFieldKind::Text).unwrap(),
@@ -607,10 +608,11 @@ mod field_tests {
     #[test]
     fn concurrent_text_edits_converge_by_merge() {
         let (_, base_update) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "ab"), 1, None).unwrap();
-        let peer_a = crdt_field_merge(None, &base_update).unwrap();
-        let peer_b = crdt_field_merge(None, &base_update).unwrap();
-        let (a_state, a_update) = crdt_field_apply(
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "ab"), 1, None)
+                .unwrap();
+        let peer_a = crdt_field_update_write(None, &base_update).unwrap();
+        let peer_b = crdt_field_update_write(None, &base_update).unwrap();
+        let (a_state, a_update) = crdt_field_intent_write(
             Some(&peer_a),
             CrdtFieldKind::Text,
             &splice(1, 0, "X"),
@@ -618,7 +620,7 @@ mod field_tests {
             None,
         )
         .unwrap();
-        let (b_state, b_update) = crdt_field_apply(
+        let (b_state, b_update) = crdt_field_intent_write(
             Some(&peer_b),
             CrdtFieldKind::Text,
             &splice(2, 0, "Y"),
@@ -626,8 +628,8 @@ mod field_tests {
             None,
         )
         .unwrap();
-        let a_final = crdt_field_merge(Some(&a_state), &b_update).unwrap();
-        let b_final = crdt_field_merge(Some(&b_state), &a_update).unwrap();
+        let a_final = crdt_field_update_write(Some(&a_state), &b_update).unwrap();
+        let b_final = crdt_field_update_write(Some(&b_state), &a_update).unwrap();
         assert_eq!(
             crdt_field_value(&a_final, CrdtFieldKind::Text).unwrap(),
             crdt_field_value(&b_final, CrdtFieldKind::Text).unwrap(),
@@ -638,7 +640,7 @@ mod field_tests {
     #[test]
     fn concurrent_seed_from_plain_converges_without_base_duplication() {
         let seed = JsonValue::String("MID".to_owned());
-        let (a_state, a_update) = crdt_field_apply(
+        let (a_state, a_update) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Text,
             &splice(0, 0, "A-"),
@@ -646,7 +648,7 @@ mod field_tests {
             Some(&seed),
         )
         .unwrap();
-        let (b_state, b_update) = crdt_field_apply(
+        let (b_state, b_update) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Text,
             &splice(3, 0, "-B"),
@@ -662,8 +664,8 @@ mod field_tests {
             crdt_field_value(&b_state, CrdtFieldKind::Text).unwrap(),
             JsonValue::String("MID-B".to_owned())
         );
-        let a_final = crdt_field_merge(Some(&a_state), &b_update).unwrap();
-        let b_final = crdt_field_merge(Some(&b_state), &a_update).unwrap();
+        let a_final = crdt_field_update_write(Some(&a_state), &b_update).unwrap();
+        let b_final = crdt_field_update_write(Some(&b_state), &a_update).unwrap();
         assert_eq!(
             crdt_field_value(&a_final, CrdtFieldKind::Text).unwrap(),
             JsonValue::String("A-MID-B".to_owned()),
@@ -683,7 +685,7 @@ mod field_tests {
     #[test]
     fn self_echo_merge_is_idempotent() {
         let seed = JsonValue::String("MID".to_owned());
-        let (state, update) = crdt_field_apply(
+        let (state, update) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Text,
             &splice(3, 0, "-B"),
@@ -695,13 +697,13 @@ mod field_tests {
             crdt_field_value(&state, CrdtFieldKind::Text).unwrap(),
             JsonValue::String("MID-B".to_owned())
         );
-        let echoed = crdt_field_merge(Some(&state), &update).unwrap();
+        let echoed = crdt_field_update_write(Some(&state), &update).unwrap();
         assert_eq!(
             crdt_field_value(&echoed, CrdtFieldKind::Text).unwrap(),
             JsonValue::String("MID-B".to_owned()),
             "pulling back one's own pushed update must be an idempotent no-op"
         );
-        let twice = crdt_field_merge(Some(&echoed), &update).unwrap();
+        let twice = crdt_field_update_write(Some(&echoed), &update).unwrap();
         assert_eq!(
             crdt_field_value(&twice, CrdtFieldKind::Text).unwrap(),
             JsonValue::String("MID-B".to_owned())
@@ -711,8 +713,9 @@ mod field_tests {
     #[test]
     fn checkpoint_covered_tail_keeps_the_accepted_causal_base() {
         let (accepted, _) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "abcA"), 1, None).unwrap();
-        let (_, dependent_update) = crdt_field_apply(
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "abcA"), 1, None)
+                .unwrap();
+        let (_, dependent_update) = crdt_field_intent_write(
             Some(&accepted),
             CrdtFieldKind::Text,
             &splice(4, 0, "B"),
@@ -723,7 +726,7 @@ mod field_tests {
 
         let checkpoint = crdt_field_snapshot(&accepted).unwrap();
         let mut remote = crdt_field_restore(&checkpoint, 0, String::new()).unwrap();
-        remote = crdt_field_merge(Some(&remote), &dependent_update).unwrap();
+        remote = crdt_field_update_write(Some(&remote), &dependent_update).unwrap();
         let projection_hash = crdt_field_projection_hash(&remote, CrdtFieldKind::Text).unwrap();
         let merged = crdt_field_accept(
             Some(&accepted),
@@ -746,13 +749,14 @@ mod field_tests {
     #[test]
     fn incremental_head_preserves_optimistic_local_state() {
         let (seed, _) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None).unwrap();
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None)
+                .unwrap();
         let checkpoint = crdt_field_snapshot(&seed).unwrap();
         let seed_hash = crdt_field_projection_hash(&seed, CrdtFieldKind::Text).unwrap();
         let accepted =
             crdt_field_accept(None, CrdtFieldKind::Text, &checkpoint, &[], 3, 1, seed_hash)
                 .unwrap();
-        let (optimistic, _) = crdt_field_apply(
+        let (optimistic, _) = crdt_field_intent_write(
             Some(&accepted),
             CrdtFieldKind::Text,
             &splice(1, 0, "L"),
@@ -760,7 +764,7 @@ mod field_tests {
             None,
         )
         .unwrap();
-        let (remote, remote_payload) = crdt_field_apply(
+        let (remote, remote_payload) = crdt_field_intent_write(
             Some(&accepted),
             CrdtFieldKind::Text,
             &splice(1, 0, "R"),
@@ -797,8 +801,9 @@ mod field_tests {
     #[test]
     fn queued_effects_advance_only_their_exact_accepted_prefix() {
         let (first, first_payload) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None).unwrap();
-        let (mut optimistic, second_payload) = crdt_field_apply(
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None)
+                .unwrap();
+        let (mut optimistic, second_payload) = crdt_field_intent_write(
             Some(&first),
             CrdtFieldKind::Text,
             &splice(1, 0, "b"),
@@ -853,8 +858,9 @@ mod field_tests {
     #[test]
     fn speculative_effects_advance_without_mutating_the_accepted_prefix() {
         let (first, first_payload) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None).unwrap();
-        let (_, second_payload) = crdt_field_apply(
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None)
+                .unwrap();
+        let (_, second_payload) = crdt_field_intent_write(
             Some(&first),
             CrdtFieldKind::Text,
             &splice(1, 0, "b"),
@@ -880,7 +886,7 @@ mod field_tests {
 
     #[test]
     fn counter_and_set_materialize() {
-        let (count, _) = crdt_field_apply(
+        let (count, _) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Count,
             &CrdtOperation::CountAdd { delta: 3.0 },
@@ -893,7 +899,7 @@ mod field_tests {
             JsonValue::Number(serde_json::Number::from_f64(3.0).unwrap())
         );
 
-        let (set, _) = crdt_field_apply(
+        let (set, _) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Set,
             &CrdtOperation::SetAdd {
@@ -912,7 +918,7 @@ mod field_tests {
     #[test]
     fn counter_rejects_non_finite_delta() {
         for delta in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let error = crdt_field_apply(
+            let error = crdt_field_intent_write(
                 None,
                 CrdtFieldKind::Count,
                 &CrdtOperation::CountAdd { delta },
@@ -929,7 +935,7 @@ mod field_tests {
 
     #[test]
     fn counter_rejects_overflow_to_non_finite() {
-        let (base, _) = crdt_field_apply(
+        let (base, _) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Count,
             &CrdtOperation::CountAdd { delta: f64::MAX },
@@ -941,7 +947,7 @@ mod field_tests {
             crdt_field_value(&base, CrdtFieldKind::Count).unwrap(),
             JsonValue::Number(serde_json::Number::from_f64(f64::MAX).unwrap())
         );
-        let error = crdt_field_apply(
+        let error = crdt_field_intent_write(
             Some(&base),
             CrdtFieldKind::Count,
             &CrdtOperation::CountAdd { delta: f64::MAX },
@@ -957,7 +963,7 @@ mod field_tests {
 
     #[test]
     fn counter_and_set_seed_from_plain() {
-        let (count, _) = crdt_field_apply(
+        let (count, _) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Count,
             &CrdtOperation::CountAdd { delta: 2.0 },
@@ -973,7 +979,7 @@ mod field_tests {
         );
 
         let seed = JsonValue::Array(vec![JsonValue::String("a".to_owned())]);
-        let (set, _) = crdt_field_apply(
+        let (set, _) = crdt_field_intent_write(
             None,
             CrdtFieldKind::Set,
             &CrdtOperation::SetAdd {
@@ -994,8 +1000,9 @@ mod field_tests {
     #[test]
     fn checkpoint_covered_history_promotes_directly() {
         let (first, _first_update) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None).unwrap();
-        let (_, second_update) = crdt_field_apply(
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None)
+                .unwrap();
+        let (_, second_update) = crdt_field_intent_write(
             Some(&first),
             CrdtFieldKind::Text,
             &splice(1, 0, "b"),
@@ -1005,7 +1012,7 @@ mod field_tests {
         .unwrap();
         let checkpoint = crdt_field_snapshot(&first).unwrap();
         let mut remote = crdt_field_restore(&checkpoint, 0, String::new()).unwrap();
-        remote = crdt_field_merge(Some(&remote), &second_update).unwrap();
+        remote = crdt_field_update_write(Some(&remote), &second_update).unwrap();
         let projection_hash = crdt_field_projection_hash(&remote, CrdtFieldKind::Text).unwrap();
         let accepted = crdt_field_accept(
             None,
@@ -1028,8 +1035,9 @@ mod field_tests {
     #[test]
     fn checkpoint_response_rebuilds_only_the_requested_prefix() {
         let (first, _) =
-            crdt_field_apply(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None).unwrap();
-        let (second, second_update) = crdt_field_apply(
+            crdt_field_intent_write(None, CrdtFieldKind::Text, &splice(0, 0, "a"), 1, None)
+                .unwrap();
+        let (second, second_update) = crdt_field_intent_write(
             Some(&first),
             CrdtFieldKind::Text,
             &splice(1, 0, "b"),
@@ -1037,7 +1045,7 @@ mod field_tests {
             None,
         )
         .unwrap();
-        let (_, third_update) = crdt_field_apply(
+        let (_, third_update) = crdt_field_intent_write(
             Some(&second),
             CrdtFieldKind::Text,
             &splice(2, 0, "c"),

@@ -14,10 +14,10 @@ use crate::sql::Projection;
 #[cfg(any(debug_assertions, test, feature = "testkit"))]
 use crate::types::RevFrontier;
 use crate::types::{
-    AuthoritativeRow, ColValue, CommitOptions, FileMetadata, IdMapping, IdMappingContent,
+    AuthoritativeRow, ColValue, CommitOptions, DocWrite, FileMetadata, IdMapping, IdMappingContent,
     MutationRecord, MutationStatus, PendingUpload, RevKey, RevState, RowChange, RowChangeOp,
     RowHead, RowKey, ScheduledFunctionKind, ScheduledJob, ScheduledState, StoreSchema, TableDef,
-    UploadLease, UpsertIn, WriteBatch,
+    UploadLease, WriteBatch,
 };
 
 use super::{DirtyHead, TableRuntime, PATH_LOCKS};
@@ -163,18 +163,18 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(crate) fn changed_tables(batch: &WriteBatch) -> Vec<String> {
-    if batch.deletes.is_empty() && batch.upserts.len() == 1 {
-        return vec![batch.upserts[0].table.clone()];
+    if batch.deletes.is_empty() && batch.doc_writes.len() == 1 {
+        return vec![batch.doc_writes[0].table.clone()];
     }
-    if batch.upserts.is_empty() && batch.deletes.len() == 1 {
+    if batch.doc_writes.is_empty() && batch.deletes.len() == 1 {
         return vec![batch.deletes[0].table.clone()];
     }
     let mut seen = FxHashSet::default();
     let mut tables = Vec::new();
     for table in batch
-        .upserts
+        .doc_writes
         .iter()
-        .map(|upsert| &upsert.table)
+        .map(|doc_write| &doc_write.table)
         .chain(batch.deletes.iter().map(|delete| &delete.table))
     {
         if seen.insert(table.as_str()) {
@@ -190,19 +190,19 @@ pub(crate) fn require_terminal_mutation_call(
 ) -> Result<(String, String), StorageError> {
     let call = options.terminal_call().ok_or_else(|| {
         StorageError::Unsatisfiable(format!(
-            "mutation id {mutation_id} was committed before mutation_begin"
+            "mutation id {mutation_id} was committed before mutation_write"
         ))
     })?;
     Ok((call.name.clone(), call.args.clone()))
 }
 
-pub(crate) fn cols_are_in_table_order(upsert: &UpsertIn, table: &TableRuntime) -> bool {
-    upsert.cols.len() == table.def.columns.len()
+pub(crate) fn cols_are_in_table_order(doc_write: &DocWrite, table: &TableRuntime) -> bool {
+    doc_write.cols.len() == table.def.columns.len()
         && table
             .def
             .columns
             .iter()
-            .zip(&upsert.cols)
+            .zip(&doc_write.cols)
             .all(|(column, (name, _))| column.name == *name)
 }
 
@@ -238,13 +238,13 @@ pub(crate) fn create_peer_id() -> u64 {
 }
 
 pub(crate) fn row_changes(batch: &WriteBatch) -> Result<Vec<RowChange>, StorageError> {
-    let mut changes = Vec::with_capacity(batch.upserts.len() + batch.deletes.len());
-    for upsert in &batch.upserts {
+    let mut changes = Vec::with_capacity(batch.doc_writes.len() + batch.deletes.len());
+    for doc_write in &batch.doc_writes {
         changes.push(RowChange {
-            op: RowChangeOp::Upsert,
-            table: upsert.table.clone(),
-            id: upsert.id.clone(),
-            row: Some(materialized_upsert(upsert)?),
+            op: RowChangeOp::Write,
+            table: doc_write.table.clone(),
+            id: doc_write.id.clone(),
+            row: Some(doc_write_row(doc_write)?),
         });
     }
     for delete in &batch.deletes {
@@ -258,8 +258,8 @@ pub(crate) fn row_changes(batch: &WriteBatch) -> Result<Vec<RowChange>, StorageE
     Ok(changes)
 }
 
-pub(crate) fn materialized_upsert(upsert: &crate::types::UpsertIn) -> Result<String, StorageError> {
-    materialized_row(&upsert.id, upsert.creation_time, &upsert.data)
+pub(crate) fn doc_write_row(doc_write: &crate::types::DocWrite) -> Result<String, StorageError> {
+    materialized_row(&doc_write.id, doc_write.creation_time, &doc_write.data)
 }
 
 pub(crate) fn materialized_row(
@@ -286,12 +286,12 @@ pub(crate) fn materialized_row(
     Ok(out)
 }
 
-pub(crate) fn remote_projection_upsert(
+pub(crate) fn remote_doc_encode(
     table: &TableDef,
     local_id: &str,
     row: &str,
     now_ms: i64,
-) -> Result<crate::types::UpsertIn, StorageError> {
+) -> Result<crate::types::DocWrite, StorageError> {
     let value: serde_json::Value = serde_json::from_str(row).map_err(|e| StorageError::Decode {
         expected: "remote projection json",
         index: 0,
@@ -317,7 +317,7 @@ pub(crate) fn remote_projection_upsert(
             got: e.to_string(),
         }
     })?;
-    Ok(crate::types::UpsertIn {
+    Ok(crate::types::DocWrite {
         cols,
         creation_time,
         data,
@@ -326,7 +326,7 @@ pub(crate) fn remote_projection_upsert(
     })
 }
 
-pub(crate) fn projection_local_id(table: &str, server_document_id: &str) -> String {
+pub(crate) fn remote_doc_id_encode(table: &str, server_document_id: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(b"embedded:projection-local-id:v1");
     hash.update([0]);
@@ -432,7 +432,7 @@ pub(crate) fn text_value(value: String) -> Value {
 
 /// Splice one materialized document object onto `buf` straight from the row: `{"_id":<id>,
 /// "_creationTime":<ct>,<data body>`. The stored `data` column is trusted compact JSON object
-/// text (see `UpsertIn::data`), so it is sliced past its leading `{` — never parsed.
+/// text (see `DocWrite::data`), so it is sliced past its leading `{` — never parsed.
 pub(crate) fn append_doc(buf: &mut String, row: &Row) -> Result<(), StorageError> {
     let id = text_ref_at(row, 0)?;
     let creation_time = real_at(row, 1)?;
@@ -612,10 +612,9 @@ pub(crate) fn row_to_dirty_head(row: &Row) -> Result<DirtyHead, StorageError> {
     let table = text_at(row, 0)?;
     let document_id = text_at(row, 1)?;
     let op_text = text_at(row, 2)?;
-    let op = match op_text.as_str() {
-        "upsert" => RowChangeOp::Upsert,
-        "delete" => RowChangeOp::Delete,
-        _ => {
+    let op = match RowChangeOp::parse(&op_text) {
+        Some(op) => op,
+        None => {
             return Err(StorageError::Decode {
                 expected: "dirty head operation",
                 index: 2,
@@ -646,10 +645,10 @@ pub(crate) fn row_to_dirty_head(row: &Row) -> Result<DirtyHead, StorageError> {
     })
 }
 
-/// Bind values for `read_due_schedules`, matching its predicate placeholder order: `identity_key`,
+/// Bind values for `schedule_lease_read`, matching its predicate placeholder order: `identity_key`,
 /// then the Pending-due branch (state, `due_time`) and the Running-expired branch (state,
 /// `lease_until`). Both time comparisons use the same `now_ms`.
-pub(crate) fn schedule_claimable_params(identity_key: &str, now_ms: i64) -> Vec<Value> {
+pub(crate) fn schedule_lease_params(identity_key: &str, now_ms: i64) -> Vec<Value> {
     vec![
         text_value(identity_key.to_owned()),
         text_value(ScheduledState::PENDING.to_owned()),

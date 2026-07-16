@@ -40,6 +40,7 @@ import { canonicalJson, hashDocument, hashValue } from "../hash";
 import { validatorIdReferences, validatorIdValues } from "../id/path";
 import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../protocol";
 import { withEntropy } from "../entropy";
+import { read as readTime } from "../component/time";
 import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "../schema";
 import { normalizeMutationResult } from "../result";
 import { buildQueryBuilder, completeQueryRows, invokeQueryCapture } from "./query";
@@ -287,9 +288,30 @@ export function defineEmbedded<Schema extends GenericSchema>(
       crdtFields,
       storageIdPaths,
     ) as EmbeddedMutationBuilder<DataModel, "internal">,
+    upload: buildUpload(),
     pull: buildPull(options.component),
     push: buildPush(options.component, tableNames, crdtFields),
   };
+}
+
+function buildUpload() {
+  return mutationGeneric({
+    args: {
+      contentType: v.optional(v.string()),
+      localStorageId: v.string(),
+      sha256: v.string(),
+      size: v.number(),
+    },
+    returns: v.object({ uploadUrl: v.string() }),
+    handler: async (ctx, args) => {
+      if (args.localStorageId.length === 0) throw new Error("localStorageId must not be empty.");
+      if (!/^[0-9a-f]{64}$/.test(args.sha256)) throw new Error("sha256 must be lowercase hex.");
+      if (!Number.isSafeInteger(args.size) || args.size < 0) {
+        throw new Error("size must be a non-negative safe integer.");
+      }
+      return { uploadUrl: await ctx.storage.generateUploadUrl() };
+    },
+  });
 }
 
 function buildMutationBuilder(
@@ -745,7 +767,7 @@ class RevisionCapture {
       await this.stage("retain", revisionExpectation(args));
       return await this.invoke(ref, args);
     }
-    if (operation !== "set") return await this.invoke(ref, args);
+    if (operation !== "restore") return await this.invoke(ref, args);
 
     const displaced = await this.current(args);
     const selected = await this.inspect(this.get, args);
@@ -770,8 +792,8 @@ class RevisionCapture {
       if (!sameRevisionValue(current, expectation)) {
         throw new Error(
           expectation.deleted
-            ? "rev.set must be followed by the matching document delete."
-            : "rev.set must be followed by the matching document replace.",
+            ? "rev.restore must be followed by the matching document delete."
+            : "rev.restore must be followed by the matching document replace.",
         );
       }
     }
@@ -895,7 +917,7 @@ const pullRequestValidator = v.union(
     runtime: runtimeRequestValidator,
   }),
   v.object({
-    kind: v.literal("bootstrap"),
+    kind: v.literal("checkpoint"),
     functionName: v.string(),
     args: v.any(),
     runtime: runtimeRequestValidator,
@@ -1005,6 +1027,7 @@ function buildPull(component: EmbeddedComponent) {
         continueCursor: v.union(v.string(), v.null()),
         isDone: v.boolean(),
       }),
+      v.object({ kind: v.literal("stale") }),
       v.object({
         found: v.boolean(),
         cursor: v.union(v.string(), v.null()),
@@ -1046,11 +1069,11 @@ function buildPull(component: EmbeddedComponent) {
         args.functionName,
         args.args,
       );
-      if (args.kind === "bootstrap") {
+      if (args.kind === "checkpoint") {
         if (!rows.some((row) => row.table === args.table && row.rowId === args.rowId)) {
-          throw new Error("Embedded bootstrap row is no longer authorized by the app query.");
+          throw new Error("Embedded checkpoint row is no longer authorized by the app query.");
         }
-        return await ctx.runQuery(component.protocol.bootstrap, {
+        return await ctx.runQuery(component.protocol.checkpointRead, {
           table: args.table,
           rowId: args.rowId,
           field: args.field,
@@ -1151,9 +1174,11 @@ function buildPush(
     returns: v.union(settlementValidator, v.null()),
     handler: async (ctx, { request: args }): Promise<Settlement | null> => {
       if (args.kind === "acknowledge") {
+        const identity = await identityAttributeOf(ctx);
         await ctx.runMutation(component.protocol.acknowledge, {
           clientId: args.clientId,
           mutationId: args.mutationId,
+          ...(identity === null ? {} : { identity }),
         });
         return null;
       }
@@ -1180,6 +1205,7 @@ function buildPush(
           tokenHash: await hashValue({ requestId, functionName: args.functionName }),
           kind: "push",
           clientId: args.clientId,
+          ...(identity === null ? {} : { identity }),
           requestId,
           functionName: args.functionName,
           mutationId: args.mutationId,
@@ -1195,7 +1221,7 @@ function buildPush(
           revisionCheckpoints: args.revisionCheckpoints,
           runtime: args.runtime,
           acknowledgeMutationId: args.acknowledgeMutationId,
-          expiresAt: Date.now() + REPLAY_TTL_MS,
+          expiresAt: readTime() + REPLAY_TTL_MS,
         })) as Settlement | null;
         if (prior) return prior;
 
@@ -1233,8 +1259,12 @@ function buildPush(
           const revisions: RevisionCandidate[] =
             outcome === "rebase"
               ? []
-              : args.afterImages.filter((candidate) =>
-                  targetKeys.has(`${candidate.table}\u0000${candidate.rowId}`),
+              : await divergentRevisionCandidates(
+                  args.afterImages.filter((candidate) =>
+                    targetKeys.has(`${candidate.table}\u0000${candidate.rowId}`),
+                  ),
+                  changes,
+                  crdtFields,
                 );
           const settlement: FailureSettlementInput = {
             mutationId: args.mutationId,
@@ -2161,6 +2191,33 @@ async function authoritativeChanges(
     }
   }
   return changes;
+}
+
+/** A stale witness is a conflict only in ordering; retain an after-image only when content differs. */
+async function divergentRevisionCandidates(
+  candidates: RevisionCandidate[],
+  authoritative: Awaited<ReturnType<typeof authoritativeChanges>>,
+  crdtFields: Map<string, Map<string, CrdtKind>>,
+): Promise<RevisionCandidate[]> {
+  const current = new Map(
+    authoritative.map((change) => [`${change.table}\u0000${change.rowId}`, change]),
+  );
+  const divergent: RevisionCandidate[] = [];
+  for (const candidate of candidates) {
+    const change = current.get(`${candidate.table}\u0000${candidate.rowId}`);
+    if (candidate.content === "deleted") {
+      if (change?.op !== "del") divergent.push(candidate);
+      continue;
+    }
+    if (
+      change?.op !== "put" ||
+      (await hashDocument(candidate.value, crdtFields.get(candidate.table)?.keys())) !==
+        change.contentHash
+    ) {
+      divergent.push(candidate);
+    }
+  }
+  return divergent;
 }
 
 function replayFailureMessage(

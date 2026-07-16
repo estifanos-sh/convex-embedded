@@ -3,10 +3,7 @@ import { v } from "convex/values";
 import { components } from "./_generated/api";
 import { mutation, query } from "./_generated/server";
 
-const deleteProgressValidator = v.union(
-  v.object({ progress: v.literal("continue"), deleted: v.number() }),
-  v.object({ progress: v.literal("complete"), deleted: v.number() }),
-);
+const deleteResultValidator = v.object({ deleted: v.number(), isDone: v.boolean() });
 
 export const field = query({
   args: { rowId: v.id("documents"), field: v.string() },
@@ -41,7 +38,7 @@ export const checkpoint = mutation({
 
 export const payloadDelete = mutation({
   args: { checkpointId: v.string(), numItems: v.number() },
-  returns: deleteProgressValidator,
+  returns: deleteResultValidator,
   handler: async (ctx, args) => {
     return await ctx.runMutation(components.embedded.crdt.payload.delete, args);
   },
@@ -49,7 +46,7 @@ export const payloadDelete = mutation({
 
 export const clear = mutation({
   args: { fieldId: v.string(), expectedEpoch: v.number(), numItems: v.number() },
-  returns: deleteProgressValidator,
+  returns: deleteResultValidator,
   handler: async (ctx, args) => {
     return await ctx.runMutation(components.embedded.crdt.clear, args);
   },
@@ -57,7 +54,7 @@ export const clear = mutation({
 
 export const revisionDelete = mutation({
   args: { rowId: v.id("documents"), revId: v.string(), numItems: v.number() },
-  returns: deleteProgressValidator,
+  returns: deleteResultValidator,
   handler: async (ctx, args) => {
     return await ctx.runMutation(components.embedded.rev.delete, {
       table: "documents",

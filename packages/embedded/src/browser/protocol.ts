@@ -56,6 +56,8 @@ export const WorkerCommand = {
   IdentityRead: 13,
   IdentityWrite: 14,
   RemoteIdentityRead: 15,
+  RemoteNetworkWrite: 16,
+  StorageOwnerWrite: 17,
 } as const;
 
 export type WorkerCommandCode = (typeof WorkerCommand)[keyof typeof WorkerCommand];
@@ -69,6 +71,8 @@ export const WorkerEvent = {
   Event: 6,
   AuthTokenRequest: 7,
   WatchPatched: 8,
+  /** The worker-owned store is terminal; the page must dispose its runner and storage lease. */
+  Terminal: 9,
 } as const;
 
 export type WorkerRequest =
@@ -89,6 +93,7 @@ export type WorkerRequest =
         url: string;
       };
       storagePath: string;
+      storageOwner?: boolean;
     }
   | {
       authRequestId: number;
@@ -116,7 +121,7 @@ export type WorkerRequest =
        * replays after a leader change reuse the same key and the store dedups across epochs.
        */
       mutationId: string;
-      mutationFresh?: boolean;
+      mutationIsFresh?: boolean;
       name: string;
       op: typeof WorkerCommand.Mutation;
       /** Stable random source for deterministic hosted replay across leader changes. */
@@ -145,6 +150,17 @@ export type WorkerRequest =
       clientId?: string;
       id: number;
       op: typeof WorkerCommand.RemoteIdentityRead;
+    }
+  | {
+      clientId?: string;
+      id: number;
+      online: boolean;
+      op: typeof WorkerCommand.RemoteNetworkWrite;
+    }
+  | {
+      clientId?: string;
+      id: number;
+      op: typeof WorkerCommand.StorageOwnerWrite;
     }
   | {
       bytes: Uint8Array;
@@ -222,6 +238,10 @@ export type WorkerResponse =
       authRequestId: number;
       forceRefreshToken: boolean;
       op: typeof WorkerEvent.AuthTokenRequest;
+    }
+  | {
+      error: SerializedError;
+      op: typeof WorkerEvent.Terminal;
     };
 
 export interface SerializedError {

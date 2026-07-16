@@ -45,7 +45,7 @@ fn read_page_by_index_bound_and_counts() {
     store.setup(&schema()).unwrap();
     commit(
         &store,
-        upserts(vec![
+        doc_writes(vec![
             issue(&store, "a", "A", "open"),
             issue(&store, "b", "B", "closed"),
             issue(&store, "c", "C", "open"),
@@ -94,15 +94,15 @@ fn read_page_boolean_index_values() {
     store.setup(&bool_schema()).unwrap();
     commit(
         &store,
-        upserts(vec![
-            UpsertIn {
+        doc_writes(vec![
+            DocWrite {
                 table: "flags".into(),
                 id: "yes".into(),
                 data: r#"{"active":true}"#.into(),
                 cols: vec![("active".into(), ColValue::Bool(true))],
                 creation_time: store.clock_read().unwrap(),
             },
-            UpsertIn {
+            DocWrite {
                 table: "flags".into(),
                 id: "no".into(),
                 data: r#"{"active":false}"#.into(),
@@ -134,7 +134,7 @@ fn plans_convex_fields_through_storage_columns() {
     let first_creation_time = first.creation_time;
     commit(
         &store,
-        upserts(vec![first, user(&store, "users|b", "b@example.com")]),
+        doc_writes(vec![first, user(&store, "users|b", "b@example.com")]),
     );
 
     let by_email = store
@@ -184,14 +184,14 @@ fn plans_convex_fields_through_storage_columns() {
 fn read_page_total_with_exact_null_and_undefined() {
     let store = EmbeddedStore::open(tmp_path("rs_total.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    let missing = UpsertIn {
+    let missing = DocWrite {
         table: "issues".into(),
         id: "missing".into(),
         data: r#"{"title":"M"}"#.into(),
         cols: vec![],
         creation_time: store.clock_read().unwrap(),
     };
-    let explicit_null = UpsertIn {
+    let explicit_null = DocWrite {
         table: "issues".into(),
         id: "null".into(),
         data: r#"{"title":"N","status":null}"#.into(),
@@ -200,7 +200,7 @@ fn read_page_total_with_exact_null_and_undefined() {
     };
     commit(
         &store,
-        upserts(vec![
+        doc_writes(vec![
             issue(&store, "open", "O", "open"),
             missing,
             explicit_null,
@@ -265,7 +265,7 @@ fn read_page_total_with_exact_null_and_undefined() {
 fn paged_scans_walk_the_cursor_chain() {
     let store = EmbeddedStore::open(tmp_path("rs_paging.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    let rows: Vec<UpsertIn> = (0..10)
+    let rows: Vec<DocWrite> = (0..10)
         .map(|i| {
             issue(
                 &store,
@@ -275,7 +275,7 @@ fn paged_scans_walk_the_cursor_chain() {
             )
         })
         .collect();
-    commit(&store, upserts(rows));
+    commit(&store, doc_writes(rows));
 
     let full = |order: Order| {
         doc_ids(
@@ -326,7 +326,7 @@ fn paged_scans_handle_null_key_columns() {
     for i in 0..4 {
         rows.push(user(&store, &format!("users|e{i}"), &format!("u{i}@x.com")));
     }
-    commit(&store, upserts(rows));
+    commit(&store, doc_writes(rows));
 
     for order in [Order::Asc, Order::Desc] {
         let spec = ReadSpec {
@@ -349,7 +349,7 @@ fn cursors_reject_a_different_scan_shape_and_resume_after_key_works() {
     store.setup(&schema()).unwrap();
     commit(
         &store,
-        upserts(vec![
+        doc_writes(vec![
             issue(&store, "a", "A", "open"),
             issue(&store, "b", "B", "open"),
             issue(&store, "c", "C", "open"),
@@ -430,10 +430,10 @@ fn order_key_matches_convex_total_order() {
         ("11_text_a", Some(ColValue::Text("a".into()))),
         ("12_text_b", Some(ColValue::Text("b".into()))),
     ];
-    let rows: Vec<UpsertIn> = ordered
+    let rows: Vec<DocWrite> = ordered
         .iter()
         .rev()
-        .map(|(id, v)| UpsertIn {
+        .map(|(id, v)| DocWrite {
             table: "vals".into(),
             id: (*id).to_owned(),
             data: "{}".into(),
@@ -444,7 +444,7 @@ fn order_key_matches_convex_total_order() {
             creation_time: store.clock_read().unwrap(),
         })
         .collect();
-    commit(&store, upserts(rows));
+    commit(&store, doc_writes(rows));
 
     let asc = store
         .doc_page_read(&ReadSpec {
@@ -475,7 +475,7 @@ fn order_key_matches_convex_total_order() {
 fn cursor_rejects_a_different_bound_value() {
     let store = EmbeddedStore::open(tmp_path("rs_cursor_value.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
-    let rows: Vec<UpsertIn> = (0..6)
+    let rows: Vec<DocWrite> = (0..6)
         .map(|i| {
             issue(
                 &store,
@@ -485,7 +485,7 @@ fn cursor_rejects_a_different_bound_value() {
             )
         })
         .collect();
-    commit(&store, upserts(rows));
+    commit(&store, doc_writes(rows));
 
     let open = ReadSpec {
         table: "issues".into(),
@@ -542,8 +542,8 @@ fn seeded_vals(rows: usize) -> EmbeddedStore {
     let store =
         EmbeddedStore::open(tmp_path(&format!("rs_alloc_{rows}.db")).to_str().unwrap()).unwrap();
     store.setup(&vals_schema()).unwrap();
-    let upserts: Vec<UpsertIn> = (0..rows)
-        .map(|i| UpsertIn {
+    let doc_writes: Vec<DocWrite> = (0..rows)
+        .map(|i| DocWrite {
             table: "vals".into(),
             id: format!("r{i:06}"),
             data: r#"{"v":0}"#.into(),
@@ -556,7 +556,7 @@ fn seeded_vals(rows: usize) -> EmbeddedStore {
             WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
-                upserts,
+                doc_writes,
                 deletes: vec![],
                 fresh_ids: vec![],
                 data_only_ids: vec![],

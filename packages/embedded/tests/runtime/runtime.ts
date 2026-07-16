@@ -20,7 +20,7 @@ import type {
   EmbeddedEvent,
   EmbeddedSchedulerEvent,
   EmbeddedStorageEvent,
-  EmbeddedDataUpsert,
+  EmbeddedDataWrite,
 } from "../../src/events";
 import type {
   CommitOptions,
@@ -45,6 +45,7 @@ import { createRunner, type Runner } from "../../src/runtime/runner";
 import { toRuntimeStoreSchema, toStoreSchema } from "../../src/schema";
 import { NativeStore } from "../../src/node/native";
 import { getTimerTime } from "../../src/time";
+import { read as readTime } from "../testkit/time";
 import { count, set, text } from "../../src/values";
 import { nativeModule } from "../testkit/native";
 
@@ -754,7 +755,7 @@ class FakeStorage implements RuntimeStorage {
   private readonly docs = new Map<string, StoredDoc>();
   private readonly ids = new Map<string, IdMapping>();
   private readonly mutations = new Map<string, MutationRecord & { args: string; name: string }>();
-  mutationBeginCalls = 0;
+  mutationWriteCalls = 0;
   readonly pushEnvelopes: Array<{
     afterImages: unknown[];
     crdt: unknown[];
@@ -807,8 +808,8 @@ class FakeStorage implements RuntimeStorage {
   };
 
   readonly mutation = {
-    begin: (call: MutationCall): Promise<MutationRecord> => {
-      this.mutationBeginCalls += 1;
+    write: (call: MutationCall): Promise<MutationRecord> => {
+      this.mutationWriteCalls += 1;
       const existing = this.mutations.get(call.mutationId);
       if (existing) {
         if (existing.args !== call.args || existing.name !== call.name) {
@@ -923,15 +924,15 @@ class FakeStorage implements RuntimeStorage {
       }
     }
     const changes = [
-      ...batch.upserts.map((upsert) => ({
-        id: upsert.id,
-        op: "upsert" as const,
+      ...batch.docWrites.map((docWrite) => ({
+        id: docWrite.id,
+        op: "write" as const,
         row: {
-          ...upsert.data,
-          _id: upsert.id,
-          _creationTime: upsert.creationTime,
+          ...docWrite.data,
+          _id: docWrite.id,
+          _creationTime: docWrite.creationTime,
         },
-        table: upsert.table,
+        table: docWrite.table,
       })),
       ...batch.deletes.map((deleted) => ({
         id: deleted.id,
@@ -939,11 +940,11 @@ class FakeStorage implements RuntimeStorage {
         table: deleted.table,
       })),
     ];
-    for (const upsert of batch.upserts) {
-      this.docs.set(upsert.id, {
-        ...upsert.data,
-        _id: upsert.id,
-        _creationTime: upsert.creationTime,
+    for (const docWrite of batch.docWrites) {
+      this.docs.set(docWrite.id, {
+        ...docWrite.data,
+        _id: docWrite.id,
+        _creationTime: docWrite.creationTime,
       });
     }
     for (const del of batch.deletes) this.docs.delete(del.id);
@@ -959,7 +960,9 @@ class FakeStorage implements RuntimeStorage {
       record.status = "committed";
     }
     return Promise.resolve({
-      changedTables: [...new Set([...batch.upserts, ...batch.deletes].map((write) => write.table))],
+      changedTables: [
+        ...new Set([...batch.docWrites, ...batch.deletes].map((write) => write.table)),
+      ],
       changes,
       commitSeq: this.seq,
     });
@@ -1011,12 +1014,12 @@ describe("runtime", () => {
     const id = (await runner.runMutation("docs:seed", {})) as string;
     const push = async (name: "body" | "title" | "mixed", ordinal: number) => {
       const mutationId = `mutation:crdt-contract:${ordinal}`;
-      await store.mutation.begin({ args: "test", mutationId, name: `docs:${name}` });
+      await store.mutation.write({ args: "test", mutationId, name: `docs:${name}` });
       await runner.runMutation(
         `docs:${name}`,
         { id },
         {
-          mutationFresh: true,
+          mutationIsFresh: true,
           mutationId,
           pushCall: { fn: `documents:${name}`, rngSeed: mutationId },
         },
@@ -1066,11 +1069,11 @@ describe("runtime", () => {
     const runner = createRunner({ notes }, store, toStoreSchema(entropySchema));
     const id = (await runner.runMutation("notes:seed", {})) as string;
     const seed = "shared-entropy-seed";
-    await store.mutation.begin({ args: "test", mutationId: seed, name: "notes:mix" });
+    await store.mutation.write({ args: "test", mutationId: seed, name: "notes:mix" });
     await runner.runMutation(
       "notes:mix",
       { id },
-      { mutationFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
+      { mutationIsFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
     );
 
     const stream = seedEntropy(seed);
@@ -1106,18 +1109,18 @@ describe("runtime", () => {
           return null;
         },
       }),
-      now: query({ args: {}, handler: () => Date.now() }),
+      now: query({ args: {}, handler: () => readTime() }),
     };
     const store = new FakeStorage();
     const runner = createRunner({ notes }, store, toStoreSchema(schema));
     const id = (await runner.runMutation("notes:seed", {})) as string;
     const seed = "gate-clock-seed";
-    await store.mutation.begin({ args: "test", mutationId: seed, name: "notes:mix" });
-    const realBaseline = Date.now();
+    await store.mutation.write({ args: "test", mutationId: seed, name: "notes:mix" });
+    const realBaseline = readTime();
     const mutationRun = runner.runMutation(
       "notes:mix",
       { id },
-      { mutationFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
+      { mutationIsFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
     );
     await paused;
     const queryRun = runner.runQuery("notes:now", {});
@@ -1155,11 +1158,11 @@ describe("runtime", () => {
       const runner = createRunner({ notes }, store, toStoreSchema(schema));
       const id = (await runner.runMutation("notes:seed", {})) as string;
       const seed = "gate-stream-seed";
-      await store.mutation.begin({ args: "test", mutationId: seed, name: "notes:mix" });
+      await store.mutation.write({ args: "test", mutationId: seed, name: "notes:mix" });
       const mutationRun = runner.runMutation(
         "notes:mix",
         { id },
-        { mutationFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
+        { mutationIsFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
       );
       await paused;
       const queryRun = concurrentQuery ? runner.runQuery("notes:noise", {}) : undefined;
@@ -1205,11 +1208,11 @@ describe("runtime", () => {
     const runner = createRunner({ notes }, store, toStoreSchema(schema));
     const id = (await runner.runMutation("notes:seed", {})) as string;
     const seed = "gate-liveness-seed";
-    await store.mutation.begin({ args: "test", mutationId: seed, name: "notes:mix" });
+    await store.mutation.write({ args: "test", mutationId: seed, name: "notes:mix" });
     const mutationRun = runner.runMutation(
       "notes:mix",
       { id },
-      { mutationFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
+      { mutationIsFresh: true, mutationId: seed, pushCall: { fn: "notes:mix", rngSeed: seed } },
     );
     await paused;
     const queryRun = runner.runQuery("notes:count", {});
@@ -1551,7 +1554,7 @@ describe("runtime", () => {
           { index: 0, delete: 0, insert: "Z" },
         ],
       },
-      { mutationFresh: true, mutationId: "mutation:multi-splice" },
+      { mutationIsFresh: true, mutationId: "mutation:multi-splice" },
     );
     expect(await r.runQuery("docs:get", { id })).toMatchObject({ body: "ZaCDbE" });
 
@@ -1645,17 +1648,17 @@ describe("runtime", () => {
     expect(await r.runQuery("messages:list", { channel: "new" })).toHaveLength(2);
   });
 
-  test("native direct one-upsert path preserves mutation id replay", async () => {
-    const r = await runner("rt_one_upsert_mutation_id.db");
+  test("native direct one-docWrite path preserves mutation id replay", async () => {
+    const r = await runner("rt_one_doc_write_mutation_id.db");
     const first = (await r.runMutation(
       "messages:send",
       { channel: "direct", body: "hi" },
-      { mutationFresh: true, mutationId: "mutation:direct-one-upsert" },
+      { mutationIsFresh: true, mutationId: "mutation:direct-one-docWrite" },
     )) as string;
     const second = (await r.runMutation(
       "messages:send",
       { channel: "direct", body: "hi" },
-      { mutationId: "mutation:direct-one-upsert" },
+      { mutationId: "mutation:direct-one-docWrite" },
     )) as string;
 
     expect(second).toBe(first);
@@ -1740,7 +1743,7 @@ describe("runtime", () => {
         rev: {
           create: unknown;
           list: unknown;
-          set: unknown;
+          restore: unknown;
         };
       };
     };
@@ -1777,7 +1780,7 @@ describe("runtime", () => {
       restore: mutation({
         args: { id: v.id("messages"), revId: v.string(), write: v.boolean() },
         handler: async (ctx, args) => {
-          const revision = (await ctx.runMutation(components.embedded.rev.set as never, {
+          const revision = (await ctx.runMutation(components.embedded.rev.restore as never, {
             table: "messages",
             rowId: args.id,
             revId: args.revId,
@@ -1828,7 +1831,7 @@ describe("runtime", () => {
     const { mutation: revisionMutation, query: revisionQuery } =
       defineFunctions<RevisionDataModel>();
     const components = componentsGeneric() as unknown as {
-      embedded: { rev: { create: unknown; set: unknown } };
+      embedded: { rev: { create: unknown; restore: unknown } };
     };
     const docs = {
       seed: revisionMutation({
@@ -1878,7 +1881,7 @@ describe("runtime", () => {
       restore: revisionMutation({
         args: { id: v.id("docs"), revId: v.string() },
         handler: async (ctx, args) => {
-          const revision = (await ctx.runMutation(components.embedded.rev.set as never, {
+          const revision = (await ctx.runMutation(components.embedded.rev.restore as never, {
             table: "docs",
             rowId: args.id,
             revId: args.revId,
@@ -2128,7 +2131,7 @@ describe("runtime", () => {
         event.type === "storage" &&
         event.deletes.some((row) => row.table === "_storage" && row.id === deleted),
     );
-    expect(deleteEvent?.upserts).toContainEqual(
+    expect(deleteEvent?.docWrites).toContainEqual(
       expect.objectContaining({
         id: `_storage|${deleted}`,
         row: expect.objectContaining({ localId: deleted, mapping: "deleted" }),
@@ -2154,13 +2157,15 @@ describe("runtime", () => {
         events.some(
           (event) =>
             event.type === "scheduler" &&
-            event.upserts.some((upsert) => upsert.id === jobId && upsert.row.state === "complete"),
+            event.docWrites.some(
+              (docWrite) => docWrite.id === jobId && docWrite.row.state === "complete",
+            ),
         ),
       "timed out waiting for scheduler completion event",
     );
 
-    const schedulerRows = events.flatMap((event): EmbeddedDataUpsert[] =>
-      event.type === "scheduler" ? event.upserts : [],
+    const schedulerRows = events.flatMap((event): EmbeddedDataWrite[] =>
+      event.type === "scheduler" ? event.docWrites : [],
     );
     expect(schedulerRows).toEqual(
       expect.arrayContaining([
@@ -2241,7 +2246,7 @@ describe("runtime", () => {
     await store.close();
   });
 
-  test("scheduler cancel emits a canceled upsert", async () => {
+  test("scheduler cancel emits a canceled docWrite", async () => {
     const store = await NativeStore.openWith(nativeModule().Store, tmp("rt_scheduler_cancel.db"));
     await store.setup(storeSchema);
     const r = createRunner({ messages }, store, storeSchema);
@@ -2256,7 +2261,9 @@ describe("runtime", () => {
     const schedulerEvent = events.find(
       (event): event is EmbeddedSchedulerEvent =>
         event.type === "scheduler" &&
-        event.upserts.some((upsert) => upsert.id === jobId && upsert.row.state === "canceled"),
+        event.docWrites.some(
+          (docWrite) => docWrite.id === jobId && docWrite.row.state === "canceled",
+        ),
     );
     expect(schedulerEvent?.deletes).toEqual([]);
     expect(await store.schedule.read()).toMatchObject([{ jobId, state: "canceled" }]);
@@ -2680,10 +2687,10 @@ describe("runtime", () => {
     const first = (await r.runMutation(
       "messages:send",
       { channel: "fresh-dedupe", body: "a" },
-      { mutationFresh: true, mutationId: "mutation:fresh-success" },
+      { mutationIsFresh: true, mutationId: "mutation:fresh-success" },
     )) as string;
 
-    expect(store.mutationBeginCalls).toBe(0);
+    expect(store.mutationWriteCalls).toBe(0);
 
     const second = (await r.runMutation(
       "messages:send",
@@ -2692,7 +2699,7 @@ describe("runtime", () => {
     )) as string;
 
     expect(second).toBe(first);
-    expect(store.mutationBeginCalls).toBe(1);
+    expect(store.mutationWriteCalls).toBe(1);
     const seen = (await r.runQuery("messages:list", { channel: "fresh-dedupe" })) as {
       body: string;
     }[];
@@ -2724,19 +2731,19 @@ describe("runtime", () => {
         "messages:failFresh",
         {},
         {
-          mutationFresh: true,
+          mutationIsFresh: true,
           mutationId: "mutation:fresh-failed",
         },
       ),
     ).rejects.toThrow("fresh failed");
     expect(calls).toBe(1);
-    expect(store.mutationBeginCalls).toBe(1);
+    expect(store.mutationWriteCalls).toBe(1);
 
     await expect(
       r.runMutation("messages:failFresh", {}, { mutationId: "mutation:fresh-failed" }),
     ).rejects.toThrow("fresh failed");
     expect(calls).toBe(1);
-    expect(store.mutationBeginCalls).toBe(2);
+    expect(store.mutationWriteCalls).toBe(2);
   });
 
   test("runner replays a committed void mutation with the same normalized result", async () => {
@@ -2876,7 +2883,7 @@ describe("runtime", () => {
     await store.setup(storeSchema);
     await store.commit({
       deletes: [],
-      upserts: [
+      docWrites: [
         {
           cols: { channel: "general" },
           creationTime: 1,
@@ -3236,7 +3243,7 @@ describe("runtime", () => {
             updatedTime: 101,
           },
         ],
-        upserts: [
+        docWrites: [
           {
             cols: { channel: "live" },
             creationTime: 100,

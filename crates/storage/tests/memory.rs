@@ -81,8 +81,8 @@ fn crdt_schema() -> StoreSchema {
 }
 
 fn seed_crdt_docs(store: &EmbeddedStore, count: usize) {
-    let upserts = (0..count)
-        .map(|i| UpsertIn {
+    let doc_writes = (0..count)
+        .map(|i| DocWrite {
             table: "issues".into(),
             id: format!("doc{i:05}"),
             data: r#"{"body":"","title":"t"}"#.into(),
@@ -107,7 +107,7 @@ fn seed_crdt_docs(store: &EmbeddedStore, count: usize) {
     store
         .commit(
             WriteBatch {
-                upserts,
+                doc_writes,
                 crdt_ops,
                 ..WriteBatch::default()
             },
@@ -117,8 +117,8 @@ fn seed_crdt_docs(store: &EmbeddedStore, count: usize) {
 }
 
 fn seed_plain_rows(store: &EmbeddedStore, count: usize) {
-    let upserts = (0..count)
-        .map(|i| UpsertIn {
+    let doc_writes = (0..count)
+        .map(|i| DocWrite {
             table: "vals".into(),
             id: format!("r{i:06}"),
             data: r#"{"v":0}"#.into(),
@@ -129,7 +129,7 @@ fn seed_plain_rows(store: &EmbeddedStore, count: usize) {
     store
         .commit(
             WriteBatch {
-                upserts,
+                doc_writes,
                 ..WriteBatch::default()
             },
             &CommitOptions::remote(),
@@ -170,7 +170,7 @@ fn scenario_boot_reopen_existing_store() {
         let store = EmbeddedStore::open(path_str).unwrap();
         store.setup(&crdt_schema()).unwrap();
         seed_crdt_docs(&store, 100);
-        store.checkpoint().unwrap();
+        store.wal_write().unwrap();
     }
     let (net, peak, store) = measure(|| {
         let store = EmbeddedStore::open(path_str).unwrap();

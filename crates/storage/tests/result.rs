@@ -1,5 +1,5 @@
 //! Retained authored-result cache storage (Cut 7 §3/§6/§10): atomic pull-page write, zero-write
-//! fast path, point delete, orphan + stale-runtime sweep, and the membership edge range descriptor.
+//! fast path, point delete, orphan and stale-runtime deletion, and the membership edge range descriptor.
 #![cfg(feature = "testkit")]
 
 use rustc_hash::FxHashSet;
@@ -111,7 +111,7 @@ fn result_delete_removes_one_entry() {
 
 #[test]
 fn result_delete_stale_deletes_orphaned_and_stale_runtime_entries() {
-    let store = open("result_delete_stale.db");
+    let store = open("result_stale_delete.db");
 
     let live = entry("key-live", "hash-live", 1.0);
     store.result_write(&live).unwrap();
@@ -133,7 +133,7 @@ fn result_delete_stale_deletes_orphaned_and_stale_runtime_entries() {
     keep.insert("key-stale-module".to_owned());
 
     let deleted = store
-        .result_delete_stale(&keep, "schema-v1", "module-v1")
+        .result_stale_delete(&keep, "schema-v1", "module-v1")
         .unwrap();
     assert_eq!(deleted, 3);
 
@@ -164,7 +164,7 @@ fn projection(server_id: &str) -> AuthoritativeRow {
 fn membership_edge_range_descriptor_defaults_null_until_populated() {
     let store = open("result_membership_range.db");
     store
-        .remote_pull_page(&RemotePull {
+        .remote_page_write(&RemotePageWrite {
             subscription: "issues:list".into(),
             members: vec![RemoteMember {
                 table: "issues".into(),

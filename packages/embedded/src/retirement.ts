@@ -28,12 +28,12 @@ export class RotationBreaker {
   ) {}
 
   record(now: number): boolean {
-    this.prune(now);
+    this.expiredDelete(now);
     this.events.push(now);
     return this.events.length > this.max;
   }
 
-  private prune(now: number): void {
+  private expiredDelete(now: number): void {
     const cutoff = now - this.windowMs;
     while (this.events.length > 0 && this.events[0]! <= cutoff) this.events.shift();
   }
