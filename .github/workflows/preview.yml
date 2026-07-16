@@ -45,6 +45,9 @@ jobs:
       - name: Expose local binaries
         run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
 
+      - name: Build embedded TypeScript
+        run: vp run @convex-dev/embedded#build:ts
+
       - name: Check
         run: vp check
 

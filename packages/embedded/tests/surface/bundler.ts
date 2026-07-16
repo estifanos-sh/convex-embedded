@@ -290,7 +290,7 @@ describe("embedded unplugin adapter", () => {
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
-      }) as {
+      }) as unknown as {
         load(id: string): Promise<string | null>;
         resolveId(id: string): Promise<string | null>;
       };
@@ -316,7 +316,7 @@ describe("embedded unplugin adapter", () => {
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
-      }) as {
+      }) as unknown as {
         resolveId(id: string): Promise<string | null>;
       };
 
@@ -334,7 +334,7 @@ describe("embedded unplugin adapter", () => {
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
-      }) as {
+      }) as unknown as {
         resolveId(id: string): Promise<string | null>;
       };
 
@@ -351,7 +351,7 @@ describe("embedded unplugin adapter", () => {
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
-      }) as {
+      }) as unknown as {
         resolveId(id: string, importer?: string): Promise<string | null>;
       };
 
@@ -365,7 +365,7 @@ describe("embedded unplugin adapter", () => {
     await withFixture(async ({ root }) => {
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir: path.join(root, "missing-convex"),
-      }) as {
+      }) as unknown as {
         load(id: string): Promise<string | null>;
       };
 
