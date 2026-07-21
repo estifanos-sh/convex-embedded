@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -46,6 +46,19 @@ try {
   if (platform === "ios") {
     const ios = resolve(work, "ios");
     run("pod", ["install"], ios, { ...process.env, RCT_NEW_ARCH_ENABLED: "1" });
+    const provider = resolve(
+      ios,
+      "Pods/Target Support Files",
+      `Pods-${name}`,
+      "ExpoModulesProvider.swift",
+    );
+    const providerSource = readFileSync(provider, "utf8");
+    for (const expected of ["import ConvexEmbeddedNative", "ConvexEmbeddedNativeModule.self"]) {
+      if (!providerSource.includes(expected)) {
+        throw new Error(`Expo autolinking provider is missing ${expected}.`);
+      }
+    }
+    const derived = resolve(work, "derived");
     run(
       "xcodebuild",
       [
@@ -59,12 +72,24 @@ try {
         "iphoneos",
         "-destination",
         "generic/platform=iOS",
+        "-derivedDataPath",
+        derived,
         "CODE_SIGNING_ALLOWED=NO",
         "ONLY_ACTIVE_ARCH=NO",
         "build",
       ],
       ios,
     );
+    const app = resolve(derived, `Build/Products/Debug-iphoneos/${name}.app`);
+    const binaries = [resolve(app, name), resolve(app, `${name}.debug.dylib`)].filter(existsSync);
+    const symbols = binaries.flatMap((binary) =>
+      read("xcrun", ["nm", "-gUj", binary], ios)
+        .split("\n")
+        .map((symbol) => symbol.trim().replace(/^_/, "")),
+    );
+    if (!symbols.includes("cem_api_version")) {
+      throw new Error("Compiled Expo app is missing the Convex Embedded native storage symbols.");
+    }
   } else {
     run(resolve(work, "android", "gradlew"), [":app:assembleDebug", "--no-daemon"], work);
   }
@@ -78,4 +103,13 @@ function writeJson(path: string, value: unknown): void {
 
 function run(command: string, args: string[], cwd: string, env = process.env): void {
   execFileSync(command, args, { cwd, env, stdio: "inherit" });
+}
+
+function read(command: string, args: string[], cwd: string, env = process.env): string {
+  return execFileSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    env,
+    maxBuffer: 64 * 1024 * 1024,
+  });
 }

@@ -26,6 +26,7 @@ const command = process.argv[2] ?? "verify";
 const androidAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] as const;
 const cargoNdkVersion = "3.5.4";
 const ndkVersion = "28.1.13356709";
+const iosDeploymentTarget = "15.1";
 const cSymbols = [
   "cem_api_version",
   "cem_open_path",
@@ -244,10 +245,63 @@ function verifyAppleSymbols(library: string, expectedArchitectures: readonly str
         symbols += execText("xcrun", ["nm", "-gUj", resolve(directory, member)], directory);
       }
       assertSymbols(symbols, cSymbols, `${library} (${architecture})`);
+      verifyAppleDeploymentTargets(archive);
     }
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+function verifyAppleDeploymentTargets(library: string): void {
+  const work = mkdtempSync(resolve(tmpdir(), "convex-embedded-deployment-"));
+  try {
+    execText("xcrun", ["ar", "-x", library], work);
+    const objects = readdirSync(work)
+      .filter((entry) => entry.endsWith(".o"))
+      .map((entry) => resolve(work, entry));
+    if (objects.length === 0) throw new Error(`${library} has no object files.`);
+    for (let index = 0; index < objects.length; index += 64) {
+      verifyAppleObjectTargets(
+        execText("xcrun", ["otool", "-l", ...objects.slice(index, index + 64)]),
+      );
+    }
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+function verifyAppleObjectTargets(output: string): void {
+  let object = "unknown object";
+  let deploymentCommand = false;
+  for (const line of output.split("\n")) {
+    if (line.endsWith(":")) {
+      object = line.slice(0, -1);
+      deploymentCommand = false;
+      continue;
+    }
+    const command = line.match(/^\s*cmd (LC_[A-Z0-9_]+)/)?.[1];
+    if (command) {
+      deploymentCommand = command === "LC_BUILD_VERSION" || command === "LC_VERSION_MIN_IPHONEOS";
+      continue;
+    }
+    if (!deploymentCommand) continue;
+    const version = line.match(/^\s*(?:minos|version) ([0-9]+(?:\.[0-9]+)*)$/)?.[1];
+    if (version && compareVersion(version, iosDeploymentTarget) > 0) {
+      throw new Error(
+        `${object} targets iOS ${version}, newer than package minimum ${iosDeploymentTarget}.`,
+      );
+    }
+  }
+}
+
+function compareVersion(left: string, right: string): number {
+  const leftParts = left.split(".").map(Number);
+  const rightParts = right.split(".").map(Number);
+  for (let index = 0; index < Math.max(leftParts.length, rightParts.length); index += 1) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
 }
 
 function verifyAndroid(): void {
@@ -331,7 +385,9 @@ function assertSymbols(output: string, symbols: readonly string[], artifactName:
 }
 
 function cargoBuild(triple: string): void {
-  exec("cargo", ["build", "--package", "mobile", "--release", "--locked", "--target", triple]);
+  exec("cargo", ["build", "--package", "mobile", "--release", "--locked", "--target", triple], {
+    IPHONEOS_DEPLOYMENT_TARGET: iosDeploymentTarget,
+  });
 }
 
 function artifact(triple: string, extension: "a"): string {
@@ -346,10 +402,14 @@ function assertArtifact(path: string): void {
   }
 }
 
-function exec(command: string, args: string[]): void {
+function exec(
+  command: string,
+  args: string[],
+  environment: Record<string, string | undefined> = {},
+): void {
   execFileSync(command, args, {
     cwd: repoRoot,
-    env: { ...process.env, CARGO_TARGET_DIR: targetDir },
+    env: { ...process.env, ...environment, CARGO_TARGET_DIR: targetDir },
     stdio: "inherit",
   });
 }

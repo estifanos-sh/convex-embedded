@@ -17,7 +17,7 @@ describe("Expo package surface", () => {
       readFileSync(join(root, "expo-module.config.json"), "utf8"),
     ) as {
       android: { modules: string[] };
-      apple: { modules: string[] };
+      apple: { modules: string[]; podspecPath: string };
     };
 
     expect(packageJson.exports["./expo"]).toEqual({
@@ -37,7 +37,10 @@ describe("Expo package surface", () => {
     expect(packageJson.peerDependenciesMeta["react-native"]?.optional).toBe(true);
     expect(moduleConfig).toEqual({
       platforms: ["apple", "android"],
-      apple: { modules: ["ConvexEmbeddedNativeModule"] },
+      apple: {
+        modules: ["ConvexEmbeddedNativeModule"],
+        podspecPath: "ConvexEmbeddedNative.podspec",
+      },
       android: { modules: ["expo.modules.convexembedded.ConvexEmbeddedNativeModule"] },
     });
   });
@@ -45,8 +48,12 @@ describe("Expo package surface", () => {
   test("packages prebuilts rather than compiling Rust in consumer projects", () => {
     const podspec = readFileSync(join(root, "ConvexEmbeddedNative.podspec"), "utf8");
     const gradle = readFileSync(join(root, "android/build.gradle"), "utf8");
+    const mobile = readFileSync(join(root, "scripts/mobile.ts"), "utf8");
 
     expect(podspec).toContain('s.vendored_frameworks = "native/apple/ConvexEmbedded.xcframework"');
+    expect(podspec).toContain('s.platforms = { :ios => "15.1" }');
+    expect(mobile).toContain('const iosDeploymentTarget = "15.1"');
+    expect(mobile).toContain("IPHONEOS_DEPLOYMENT_TARGET: iosDeploymentTarget");
     expect(gradle).toContain('jniLibs.srcDirs = ["../native/android"]');
     expect(gradle).not.toMatch(/cargo|externalNativeBuild|cmake/i);
   });
