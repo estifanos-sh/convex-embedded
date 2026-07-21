@@ -40,6 +40,8 @@ catalog:
   convex-helpers: ^0.1.120
   "@convex-dev/migrations": ^0.3.5
   pkg-pr-new: 0.0.75
+  react-test-renderer: 19.1.0
+  "@types/react-test-renderer": 19.1.0
 overrides:
   vite: "catalog:"
   vitest: "catalog:"

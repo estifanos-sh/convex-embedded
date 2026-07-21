@@ -45,6 +45,9 @@ catalogs:
     '@types/node':
       specifier: ^25.9.1
       version: 25.9.1
+    '@types/react-test-renderer':
+      specifier: 19.1.0
+      version: 19.1.0
     '@typescript/native-preview':
       specifier: latest
       version: 7.0.0-dev.20260707.2
@@ -78,6 +81,9 @@ catalogs:
     react-native:
       specifier: 0.81.5
       version: 0.81.5
+    react-test-renderer:
+      specifier: 19.1.0
+      version: 19.1.0
     solid-js:
       specifier: ^1.9.13
       version: 1.9.13
@@ -261,6 +267,12 @@ importers:
       '@types/react':
         specifier: ~19.1.0
         version: 19.1.17
+      '@types/react-test-renderer':
+        specifier: 'catalog:'
+        version: 19.1.0
+      react-test-renderer:
+        specifier: 'catalog:'
+        version: 19.1.0(react@19.1.0)
       tsx:
         specifier: ^4.20.6
         version: 4.23.1
@@ -3146,6 +3158,9 @@ packages:
     peerDependencies:
       '@types/react': ^19.2.0
 
+  '@types/react-test-renderer@19.1.0':
+    resolution: {integrity: sha512-XD0WZrHqjNrxA/MaR9O22w/RNidWR9YZmBdRGI7wcnWGrv/3dA8wKCJ8m63Sn+tLJhcjmuhOi629N66W6kgWzQ==}
+
   '@types/react@19.1.17':
     resolution: {integrity: sha512-Qec1E3mhALmaspIrhWt9jkQMNdw6bReVu64mjvhbhq2NFPftLPVr+l1SZgmw/66WwBNpDh7ao5AT6gF5v41PFA==}
 
@@ -5523,6 +5538,11 @@ packages:
     peerDependenciesMeta:
       '@types/react':
         optional: true
+
+  react-test-renderer@19.1.0:
+    resolution: {integrity: sha512-jXkSl3CpvPYEF+p/eGDLB4sPoDX8pKkYvRl9+rR8HxLY0X04vW7hCm1/0zHoUSjPZ3bDa+wXWNTDVIw/R8aDVw==}
+    peerDependencies:
+      react: ^19.1.0
 
   react@19.1.0:
     resolution: {integrity: sha512-FS+XFBNvn3GTAWq26joslQgWNoFu08F4kl0J4CgdNKADkdSGXQyTCnKteIAJy96Br6YbpEU1LSzV5dYtjMkMDg==}
@@ -9740,6 +9760,10 @@ snapshots:
     dependencies:
       '@types/react': 19.2.17
 
+  '@types/react-test-renderer@19.1.0':
+    dependencies:
+      '@types/react': 19.2.17
+
   '@types/react@19.1.17':
     dependencies:
       csstype: 3.2.3
@@ -12861,6 +12885,12 @@ snapshots:
     optionalDependencies:
       '@types/react': 19.2.17
     optional: true
+
+  react-test-renderer@19.1.0(react@19.1.0):
+    dependencies:
+      react: 19.1.0
+      react-is: 19.2.7
+      scheduler: 0.26.0
 
   react@19.1.0: {}
 
