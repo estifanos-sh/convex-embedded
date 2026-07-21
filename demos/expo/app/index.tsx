@@ -36,19 +36,43 @@ export default function DocumentsScreen() {
     linkedDocumentId ?? null,
   );
   const [editorVisible, setEditorVisible] = React.useState(linkedDocumentId !== undefined);
+  const selectedDocumentIdRef = React.useRef<string | null>(linkedDocumentId ?? null);
+  const readyDocumentIdRef = React.useRef<string | null>(null);
+  const requestedDocumentIdRef = React.useRef<string | null>(linkedDocumentId ?? null);
+  const previousLinkedDocumentIdRef = React.useRef<string | undefined>(linkedDocumentId);
 
   const openDocument = React.useCallback((id: string) => {
+    const alreadyReady = selectedDocumentIdRef.current === id && readyDocumentIdRef.current === id;
+    selectedDocumentIdRef.current = id;
     setSelectedDocumentId(id);
+    if (alreadyReady) {
+      requestedDocumentIdRef.current = null;
+      setEditorVisible(true);
+      return;
+    }
+    readyDocumentIdRef.current = null;
+    requestedDocumentIdRef.current = id;
+    setEditorVisible(false);
+  }, []);
+  const showReadyDocument = React.useCallback((id: string) => {
+    if (selectedDocumentIdRef.current !== id) return;
+    readyDocumentIdRef.current = id;
+    if (requestedDocumentIdRef.current !== id) return;
+    requestedDocumentIdRef.current = null;
     setEditorVisible(true);
   }, []);
   const closeDocument = React.useCallback(() => {
     Keyboard.dismiss();
+    requestedDocumentIdRef.current = null;
     setEditorVisible(false);
     if (linkedDocumentId !== undefined) router.setParams({ document: undefined });
   }, [linkedDocumentId]);
 
   React.useEffect(() => {
-    if (linkedDocumentId !== undefined) openDocument(linkedDocumentId);
+    const previous = previousLinkedDocumentIdRef.current;
+    previousLinkedDocumentIdRef.current = linkedDocumentId;
+    if (linkedDocumentId !== undefined && linkedDocumentId !== previous)
+      openDocument(linkedDocumentId);
   }, [linkedDocumentId, openDocument]);
 
   const createDocument = React.useCallback(async () => {
@@ -81,6 +105,8 @@ export default function DocumentsScreen() {
 
   React.useEffect(() => {
     if (selectedDocumentId !== null || documents.length === 0) return;
+    selectedDocumentIdRef.current = documents[0]._id;
+    readyDocumentIdRef.current = null;
     setSelectedDocumentId(documents[0]._id);
   }, [documents, selectedDocumentId]);
 
@@ -140,7 +166,11 @@ export default function DocumentsScreen() {
               pointerEvents={editorVisible ? "auto" : "none"}
               style={styles.editorLayer}
             >
-              <DocumentScreen active={editorVisible} documentId={selectedDocumentId} />
+              <DocumentScreen
+                active={editorVisible}
+                documentId={selectedDocumentId}
+                onReady={showReadyDocument}
+              />
             </View>
           ) : null}
           <View

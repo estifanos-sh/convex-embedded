@@ -32,10 +32,10 @@ type DocumentEditorProps = EditorProps & {
 };
 
 export default function DocumentEditor(props: DocumentEditorProps) {
-  return <DocumentSession {...props} key={props.editorToken} />;
+  return <InteractiveDocument {...props} key={props.editorToken} />;
 }
 
-function DocumentSession({
+function InteractiveDocument({
   active,
   document,
   documentWrite,

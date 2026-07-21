@@ -3,15 +3,7 @@ import type { Id } from "$convex/_generated/dataModel";
 import type { DOMProps } from "expo/dom";
 import { Redirect, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  AccessibilityInfo,
-  Animated,
-  AppState,
-  Pressable,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import { AppState, Pressable, StyleSheet, Text, View } from "react-native";
 
 import DocumentEditor from "@/src/editor";
 import { client } from "@/src/client";
@@ -47,30 +39,31 @@ export default function DocumentRoute() {
 export function DocumentScreen({
   active = true,
   documentId: id,
+  onReady,
 }: {
   active?: boolean;
   documentId?: string;
+  onReady?: (id: string) => void;
 }) {
   const [document, setDocument] = useState<EditorDocument | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editorToken, setEditorToken] = useState("");
   const [loading, setLoading] = useState(true);
-  const [editorPainted, setEditorPainted] = useState(false);
+  const [readyEditorToken, setReadyEditorToken] = useState("");
   const [applicationActive, setApplicationActive] = useState(AppState.currentState === "active");
   const [placeholderVisible, setPlaceholderVisible] = useState(true);
-  const [reduceMotion, setReduceMotion] = useState(false);
   const [webViewCrash, setWebViewCrash] = useState<string | null>(null);
   const activeEditorTokenRef = useRef("");
+  const editorHasPaintedRef = useRef(false);
   const readGenerationRef = useRef(0);
-  const placeholderOpacity = useRef(new Animated.Value(1)).current;
 
   const read = useCallback(() => {
     const generation = readGenerationRef.current + 1;
     readGenerationRef.current = generation;
     activeEditorTokenRef.current = "";
-    setEditorPainted(false);
-    setPlaceholderVisible(true);
-    placeholderOpacity.setValue(1);
+    if (!editorHasPaintedRef.current) {
+      setPlaceholderVisible(true);
+    }
     setWebViewCrash(null);
     if (!id) {
       setDocument(null);
@@ -99,7 +92,7 @@ export function DocumentScreen({
       .finally(() => {
         if (readGenerationRef.current === generation) setLoading(false);
       });
-  }, [id, placeholderOpacity]);
+  }, [id]);
 
   useEffect(() => {
     read();
@@ -116,35 +109,6 @@ export function DocumentScreen({
     return () => subscription.remove();
   }, []);
 
-  useEffect(() => {
-    let active = true;
-    let eventReceived = false;
-    void AccessibilityInfo.isReduceMotionEnabled().then((value) => {
-      if (active && !eventReceived) setReduceMotion(value);
-    });
-    const subscription = AccessibilityInfo.addEventListener("reduceMotionChanged", (value) => {
-      eventReceived = true;
-      if (active) setReduceMotion(value);
-    });
-    return () => {
-      active = false;
-      subscription.remove();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!editorPainted) return;
-    const animation = Animated.timing(placeholderOpacity, {
-      duration: reduceMotion ? 0 : 150,
-      toValue: 0,
-      useNativeDriver: true,
-    });
-    animation.start(({ finished }) => {
-      if (finished) setPlaceholderVisible(false);
-    });
-    return () => animation.stop();
-  }, [editorPainted, placeholderOpacity, reduceMotion]);
-
   const editorFailed = useCallback((token: string, message: string) => {
     if (activeEditorTokenRef.current === token) setWebViewCrash(message);
   }, []);
@@ -155,12 +119,20 @@ export function DocumentScreen({
     },
     [editorFailed],
   );
-  const editorReady = useCallback(async (token: string) => {
-    if (activeEditorTokenRef.current === token) setEditorPainted(true);
-  }, []);
+  const editorReady = useCallback(
+    async (token: string) => {
+      if (activeEditorTokenRef.current === token) {
+        editorHasPaintedRef.current = true;
+        setReadyEditorToken(token);
+        setPlaceholderVisible(false);
+        if (id) onReady?.(id);
+      }
+    },
+    [id, onReady],
+  );
 
   useEffect(() => {
-    if (!document || !editorToken || editorPainted || webViewCrash) return;
+    if (!document || !editorToken || readyEditorToken === editorToken || webViewCrash) return;
     const timeout = setTimeout(() => {
       editorFailed(
         editorToken,
@@ -168,7 +140,7 @@ export function DocumentScreen({
       );
     }, 30_000);
     return () => clearTimeout(timeout);
-  }, [document, editorFailed, editorPainted, editorToken, webViewCrash]);
+  }, [document, editorFailed, editorToken, readyEditorToken, webViewCrash]);
 
   const dom = useMemo<DOMProps>(
     () => ({
@@ -200,7 +172,7 @@ export function DocumentScreen({
   );
 
   const switchingDocument = document !== null && document.id !== id;
-  const showPlaceholder = placeholderVisible || switchingDocument;
+  const showPlaceholder = placeholderVisible;
   const visibleError = switchingDocument ? null : (webViewCrash ?? error);
   const preview = useMemo(
     () => (document && !switchingDocument ? documentPreview(document.body) : ""),
@@ -248,13 +220,13 @@ export function DocumentScreen({
             </View>
           ) : null}
           {showPlaceholder ? (
-            <Animated.View
+            <View
               accessibilityLabel="Opening the local document"
               accessibilityRole="progressbar"
               accessibilityViewIsModal
               importantForAccessibility="yes"
               pointerEvents="box-only"
-              style={[styles.placeholder, { opacity: placeholderOpacity }]}
+              style={styles.placeholder}
             >
               <View style={styles.placeholderHeader}>
                 {document && !switchingDocument ? (
@@ -266,7 +238,7 @@ export function DocumentScreen({
                 )}
                 <View style={styles.placeholderSave}>
                   <View style={styles.placeholderDot} />
-                  <Text style={styles.placeholderSaveLabel}>Opening</Text>
+                  <Text style={styles.placeholderSaveLabel}>Saved</Text>
                 </View>
               </View>
               <View style={styles.placeholderBody}>
@@ -281,7 +253,7 @@ export function DocumentScreen({
                   </>
                 )}
               </View>
-            </Animated.View>
+            </View>
           ) : null}
         </View>
       )}
@@ -316,25 +288,27 @@ const styles = StyleSheet.create({
     paddingTop: 14,
   },
   placeholderHeader: {
-    minHeight: 40,
-    marginBottom: 8,
+    minHeight: 42,
+    marginBottom: 4,
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     gap: 14,
   },
   placeholderSave: {
-    minHeight: 30,
-    paddingHorizontal: 10,
+    minHeight: 28,
+    marginTop: 2,
+    paddingHorizontal: 9,
     flexDirection: "row",
     alignItems: "center",
     gap: 7,
     backgroundColor: colors.background.tertiary,
     borderRadius: 999,
+    transform: [{ translateY: 8 }],
   },
   placeholderDot: {
     width: 7,
     height: 7,
-    backgroundColor: "#63a8f8",
+    backgroundColor: "#b4ec92",
     borderRadius: 999,
   },
   placeholderSaveLabel: {
@@ -348,7 +322,8 @@ const styles = StyleSheet.create({
     fontSize: 30,
     fontWeight: "600",
     letterSpacing: -1,
-    lineHeight: 36,
+    lineHeight: 32,
+    transform: [{ translateY: 10 }],
   },
   placeholderTitleBar: {
     flex: 1,
@@ -358,12 +333,12 @@ const styles = StyleSheet.create({
   },
   placeholderBody: {
     gap: 12,
-    paddingTop: 14,
+    paddingTop: 0,
   },
   placeholderCopy: {
     color: colors.content.primary,
-    fontSize: 17,
-    lineHeight: 29,
+    fontSize: 16,
+    lineHeight: 27.5,
   },
   placeholderLine: {
     width: "82%",
