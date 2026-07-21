@@ -7,7 +7,6 @@
 import { makeFunctionReference } from "convex/server";
 
 import { initRuntime, transferRemoteUpload, type WorkerState } from "../../src/browser/runtime";
-import { analyzeEmbeddedSchema } from "../../src/schema";
 import type { RemoteTransportHost } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
@@ -48,8 +47,7 @@ self.onmessage = (event: MessageEvent<{ storageId: string }>) => {
 };
 
 async function run(storageId: string): Promise<AutoDrainResult> {
-  const { schema, modules } = await import("virtual:convex-embedded");
-  const schemaAnalysis = analyzeEmbeddedSchema(schema);
+  const { embeddedSchema, modules } = await import("virtual:convex-embedded");
   const wasmResponse = await fetch(wasmUrl);
   if (!wasmResponse.ok) {
     throw new Error(`failed to load packaged WASM artifact: ${wasmResponse.status}`);
@@ -57,9 +55,9 @@ async function run(storageId: string): Promise<AutoDrainResult> {
   const wasmBytes = await wasmResponse.arrayBuffer();
   const state = await initRuntime({
     modules,
-    setupSchema: schemaAnalysis.storeSchema,
+    setupSchema: embeddedSchema.runtimeStoreSchema,
     storagePath: `convex-embedded-${storageId}.db`,
-    storeSchema: schemaAnalysis.storeSchema,
+    storeSchema: embeddedSchema.runtimeStoreSchema,
     wasm: {
       bytes: wasmBytes,
       worker: () => new Worker(new URL(napiWorkerUrl, import.meta.url), { type: "module" }),

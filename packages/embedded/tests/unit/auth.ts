@@ -132,7 +132,7 @@ function fakeRunner(options: {
       read: options.cachedRead ?? (async () => undefined),
       write: options.write ?? (async () => undefined),
     },
-    route: async () => ({ execution: "local" }),
+    route: async () => ({ execution: "local", placement: "replicated" }),
     runQuery: async (_ref, _args, runOptions = {}) => options.runQuery?.(runOptions),
     runMutation: async () => undefined,
     runAction: async () => undefined,

@@ -314,6 +314,7 @@ export class QueryBuilder<
     private readonly overlay?: () => QueryOverlay,
     private readonly tracker?: ReadTracker,
     plan: QueryPlan = {},
+    private readonly view: "replicated" | "device" = "replicated",
   ) {
     this.bounds = plan.bounds;
     this.indexName = plan.indexName;
@@ -630,7 +631,8 @@ export class QueryBuilder<
         this.indexName !== undefined,
       );
       await this.captureRange(bounds, page.docs, page.versions);
-      if (page.docs.length) yield page.docs;
+      const docs = this.deviceDocs(page.docs, page.deviceFields);
+      if (docs.length) yield docs;
       if (page.cursor === null) return;
       cursor = page.cursor;
       pageSize = Math.min(pageSize * 2, DEFAULT_READ_PAGE);
@@ -657,7 +659,7 @@ export class QueryBuilder<
         this.indexName !== undefined,
       );
       await this.captureRange(bounds, page.docs, page.versions);
-      return page.docs;
+      return this.deviceDocs(page.docs, page.deviceFields);
     }
     const docs: RawDoc[] = [];
     let cursor: string | undefined;
@@ -678,7 +680,7 @@ export class QueryBuilder<
         this.indexName !== undefined,
       );
       await this.captureRange(bounds, page.docs, page.versions);
-      docs.push(...page.docs);
+      docs.push(...this.deviceDocs(page.docs, page.deviceFields));
       cursor = page.cursor ?? undefined;
     } while (cursor !== undefined);
     freezeNormalizedTree(docs);
@@ -695,6 +697,14 @@ export class QueryBuilder<
       !this.predicates.length &&
       boundsAreExact(bounds)
     );
+  }
+
+  private deviceDocs(
+    docs: RawDoc[],
+    fields: Record<string, Record<string, unknown>> | undefined,
+  ): RawDoc[] {
+    if (this.view !== "device" || this.def.placement !== "replicated" || !fields) return docs;
+    return docs.map((doc) => ({ ...doc, ...fields[doc._id] }));
   }
 
   private activeOverlay(): QueryOverlay | undefined {
@@ -899,15 +909,22 @@ export class QueryBuilder<
   }
 
   private withPlan(plan: QueryPlan): QueryBuilder<DM, T> {
-    return new QueryBuilder(this.store, this.def, this.overlay, this.tracker, {
-      bounds: Object.hasOwn(plan, "bounds") ? plan.bounds : this.bounds,
-      indexName: plan.indexName ?? this.indexName,
-      initializer: plan.initializer ?? false,
-      limit: Object.hasOwn(plan, "limit") ? plan.limit : this.limitCount,
-      orderDir: plan.orderDir ?? this.orderDir,
-      orderSet: plan.orderSet ?? this.orderSet,
-      predicates: plan.predicates ?? this.predicates,
-    });
+    return new QueryBuilder(
+      this.store,
+      this.def,
+      this.overlay,
+      this.tracker,
+      {
+        bounds: Object.hasOwn(plan, "bounds") ? plan.bounds : this.bounds,
+        indexName: plan.indexName ?? this.indexName,
+        initializer: plan.initializer ?? false,
+        limit: Object.hasOwn(plan, "limit") ? plan.limit : this.limitCount,
+        orderDir: plan.orderDir ?? this.orderDir,
+        orderSet: plan.orderSet ?? this.orderSet,
+        predicates: plan.predicates ?? this.predicates,
+      },
+      this.view,
+    );
   }
 
   private consumeForUse(): QueryBuilder<DM, T> {

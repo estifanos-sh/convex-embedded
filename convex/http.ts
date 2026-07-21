@@ -94,7 +94,7 @@ const serveAttachment = httpAction(async (ctx, request) => {
     });
   }
 
-  const attachment = await ctx.runQuery(internal.files.serve, { token });
+  const attachment = await ctx.runQuery(internal.remote.serve, { token });
   if (!attachment) {
     return response("Attachment not found", 404, {
       "Content-Type": "text/plain",

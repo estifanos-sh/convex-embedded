@@ -22,8 +22,8 @@ use crate::types::{
     MutationRecord, MutationStatus, Page, PendingUpload, ReadSpec, RemoteMember, RemotePageWrite,
     RemotePageWriteResult, RemotePending, RemoteSettlementOutcome, RemoteSettlementWrite,
     RemoteSettlementWriteResult, ResultEntry, RevKey, RevState, RevWriteResult, RowChange,
-    RowChangeOp, RowHead, RowKey, ScheduledJob, ScheduledState, StoreSchema, TableDef, UploadLease,
-    UploadLeaseWrite, WriteBatch,
+    RowChangeOp, RowHead, RowKey, ScheduledJob, ScheduledState, StoreSchema, TableDef,
+    TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch,
 };
 
 static PATH_LOCKS: LazyLock<Mutex<FxHashMap<String, Weak<Mutex<()>>>>> =
@@ -463,6 +463,7 @@ impl EmbeddedStore {
             sql::create_dirty_heads_seq_index(),
             sql::create_crdt_ops(),
             sql::create_crdt_field(),
+            sql::create_local_fields(),
             sql::create_projections(),
             sql::create_projections_server_index(),
             sql::create_memberships(),
@@ -536,6 +537,10 @@ impl EmbeddedStore {
                     .any(|table| table.name == previous_table.name)
                 {
                     self.delete_doc_indexes_unlocked(previous_table, None)?;
+                    self.driver.execute(
+                        sql::delete_local_fields_table(),
+                        vec![text_value(previous_table.name.clone())],
+                    )?;
                 }
             }
             for table in &current.tables {
@@ -551,6 +556,20 @@ impl EmbeddedStore {
                             table.name
                         ))
                     })?;
+                    for field in previous_table.local_fields.iter().filter(|field| {
+                        !table
+                            .local_fields
+                            .iter()
+                            .any(|candidate| candidate.field == field.field)
+                    }) {
+                        self.driver.execute(
+                            sql::delete_local_fields_definition(),
+                            vec![
+                                text_value(table.name.clone()),
+                                text_value(field.field.clone()),
+                            ],
+                        )?;
+                    }
                     let columns = self.read_doc_columns_unlocked(&table.name)?;
                     require_doc_base_columns(&table.name, &columns)?;
                     self.delete_doc_indexes_unlocked(previous_table, Some(table))?;
@@ -944,6 +963,7 @@ impl EmbeddedStore {
                 sql::clear_dirty_heads(),
                 sql::clear_crdt_ops(),
                 sql::clear_crdt_field(),
+                sql::clear_local_fields(),
                 sql::clear_projections(),
                 sql::clear_peers(),
                 sql::clear_files(),
@@ -1140,11 +1160,77 @@ impl EmbeddedStore {
             None
         };
         let versions = self.page_versions(&spec.table, &page_local_ids)?;
+        let local_fields = self.page_local_fields(&spec.table, &page_local_ids)?;
         Ok(Page {
             text,
             cursor,
             versions,
+            local_fields,
         })
+    }
+
+    fn page_local_fields(
+        &self,
+        table: &str,
+        local_ids: &[String],
+    ) -> Result<
+        std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+        StorageError,
+    > {
+        let mut fields = std::collections::BTreeMap::new();
+        let _guard = lock(&self.operation_lock);
+        for local_id in local_ids {
+            let row = self.local_fields_read_unlocked(table, local_id)?;
+            if !row.is_empty() {
+                fields.insert(local_id.clone(), row);
+            }
+        }
+        Ok(fields)
+    }
+
+    /// Read the device-only overlay for one replicated row. The base document is deliberately not
+    /// merged here so replicated execution cannot accidentally observe device state.
+    pub fn local_fields_read(
+        &self,
+        table: &str,
+        id: &str,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.local_fields_read_unlocked(table, id)
+    }
+
+    fn local_fields_read_unlocked(
+        &self,
+        table: &str,
+        id: &str,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, StorageError> {
+        validate_ident(table)?;
+        let definition = self.def(table)?;
+        if definition.placement != TablePlacement::Replicated {
+            return Ok(serde_json::Map::new());
+        }
+        let mut fields = serde_json::Map::new();
+        self.driver.run_rows(
+            sql::read_local_fields(),
+            vec![
+                text_value(self.identity_key.clone()),
+                text_value(table.to_owned()),
+                text_value(id.to_owned()),
+            ],
+            |row| {
+                let field = text_at(row, 0)?;
+                let value = serde_json::from_str(&text_at(row, 1)?).map_err(|error| {
+                    StorageError::Decode {
+                        expected: "device field JSON",
+                        index: 1,
+                        got: error.to_string(),
+                    }
+                })?;
+                fields.insert(field, value);
+                Ok(())
+            },
+        )?;
+        Ok(fields)
     }
 
     /// The per-row adoption version sidecar (§11 D1): `localId -> pull seq`, read from the
@@ -1287,6 +1373,7 @@ impl EmbeddedStore {
         data_only: bool,
     ) -> Result<CommitResult, StorageError> {
         let table = self.runtime(&doc_write.table)?;
+        validate_table_commit_source(&table.def, options)?;
         self.doc_write_unlocked(doc_write, &table, data_only)?;
         let changes = if options.includes_changes() {
             vec![RowChange {
@@ -1330,6 +1417,7 @@ impl EmbeddedStore {
         data_only: bool,
     ) -> Result<CommitResult, StorageError> {
         let table = self.runtime(table_name)?;
+        validate_table_commit_source(&table.def, options)?;
         self.doc_write_encoded_unlocked(
             table_name,
             id,
@@ -1376,6 +1464,7 @@ impl EmbeddedStore {
         batch: &WriteBatch,
         options: &CommitOptions,
     ) -> Result<CommitResult, StorageError> {
+        self.validate_batch_placement(batch, options)?;
         let changed_tables = changed_tables(batch);
         let changes = if options.includes_changes() {
             row_changes(batch)?
@@ -1430,6 +1519,41 @@ impl EmbeddedStore {
         }
         for mapping in &batch.id_mappings {
             self.id_write_unlocked(mapping)?;
+        }
+        let logical_clock = if batch.local_field_writes.is_empty() {
+            0.0
+        } else {
+            lock(&self.clock).now(wall_ms()?)
+        };
+        for write in &batch.local_field_writes {
+            let value_json =
+                serde_json::to_string(&write.value).map_err(|error| StorageError::Decode {
+                    expected: "device field JSON value",
+                    index: 0,
+                    got: error.to_string(),
+                })?;
+            self.driver.execute(
+                sql::write_local_field(),
+                vec![
+                    text_value(self.identity_key.clone()),
+                    text_value(write.table.clone()),
+                    text_value(write.id.clone()),
+                    text_value(write.field.clone()),
+                    text_value(value_json),
+                    Value::from_f64(logical_clock),
+                ],
+            )?;
+        }
+        for delete in &batch.local_field_deletes {
+            self.driver.execute(
+                sql::delete_local_field(),
+                vec![
+                    text_value(self.identity_key.clone()),
+                    text_value(delete.table.clone()),
+                    text_value(delete.id.clone()),
+                    text_value(delete.field.clone()),
+                ],
+            )?;
         }
         for job in &batch.schedules {
             self.schedule_write_unlocked(job)?;
@@ -1503,6 +1627,68 @@ impl EmbeddedStore {
         #[cfg(debug_assertions)]
         self.debug_assert_rev_invariants();
         Ok(result)
+    }
+
+    fn validate_batch_placement(
+        &self,
+        batch: &WriteBatch,
+        options: &CommitOptions,
+    ) -> Result<(), StorageError> {
+        if options.is_device()
+            && (!batch.crdt_ops.is_empty()
+                || !batch.crdt_restores.is_empty()
+                || !batch.fresh_ids.is_empty()
+                || !batch.data_only_ids.is_empty()
+                || !batch.id_mappings.is_empty()
+                || !batch.schedules.is_empty())
+        {
+            return Err(StorageError::Unsatisfiable(
+                "device commits cannot contain replication metadata".to_owned(),
+            ));
+        }
+        if !options.is_device()
+            && (!batch.local_field_writes.is_empty() || !batch.local_field_deletes.is_empty())
+        {
+            return Err(StorageError::Unsatisfiable(
+                "device field writes require a device commit".to_owned(),
+            ));
+        }
+        for mapping in &batch.id_mappings {
+            self.validate_id_mapping_table(&mapping.table)?;
+        }
+        for table_name in batch
+            .doc_writes
+            .iter()
+            .map(|write| write.table.as_str())
+            .chain(batch.deletes.iter().map(|delete| delete.table.as_str()))
+        {
+            let definition = self.def(table_name)?;
+            validate_table_commit_source(&definition, options)?;
+        }
+        for (table_name, field) in batch
+            .local_field_writes
+            .iter()
+            .map(|write| (write.table.as_str(), write.field.as_str()))
+            .chain(
+                batch
+                    .local_field_deletes
+                    .iter()
+                    .map(|delete| (delete.table.as_str(), delete.field.as_str())),
+            )
+        {
+            let definition = self.def(table_name)?;
+            if definition.placement != TablePlacement::Replicated
+                || !definition
+                    .local_fields
+                    .iter()
+                    .any(|candidate| candidate.field == field)
+            {
+                return Err(StorageError::Unsatisfiable(format!(
+                    "device field write targets undeclared field {table_name}.{field}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn write_push_envelope_unlocked(
@@ -1610,6 +1796,7 @@ impl EmbeddedStore {
         table: &TableRuntime,
         data_only: bool,
     ) -> Result<(), StorageError> {
+        validate_replicated_doc_data(&table.def, &doc_write.data)?;
         if data_only {
             self.driver.execute(
                 &table.update_data_sql,
@@ -1661,6 +1848,7 @@ impl EmbeddedStore {
         table: &TableRuntime,
         data_only: bool,
     ) -> Result<(), StorageError> {
+        validate_replicated_doc_data(&table.def, data)?;
         if data_only {
             self.driver.execute(
                 &table.update_data_sql,
@@ -2081,6 +2269,33 @@ impl EmbeddedStore {
                 Some(&mapping.local_document_id),
                 settlement.now_ms,
             )?;
+        }
+        for projection in projections
+            .iter()
+            .filter(|projection| projection.row.is_none())
+        {
+            let mapping = self.projection_map_remote_id_unlocked(
+                &projection.table,
+                &projection.server_document_id,
+                projection.local_document_id.as_deref(),
+                settlement.now_ms,
+            )?;
+            let confirmed_own_delete = self
+                .read_dirty_head_unlocked(&projection.table, &mapping.local_id)?
+                .is_some_and(|head| {
+                    head.updated_commit_seq == settlement.expected_commit_seq
+                        && head.change.op == RowChangeOp::Delete
+                });
+            if confirmed_own_delete {
+                self.driver.execute(
+                    sql::delete_local_fields_row(),
+                    vec![
+                        text_value(self.identity_key.clone()),
+                        text_value(projection.table.clone()),
+                        text_value(mapping.local_id),
+                    ],
+                )?;
+            }
         }
         let projection =
             self.remote_settle_applied_unlocked(projections, settlement.expected_commit_seq)?;
@@ -3080,6 +3295,8 @@ impl EmbeddedStore {
                         row,
                         record.received_time,
                     )?],
+                    local_field_writes: vec![],
+                    local_field_deletes: vec![],
                     crdt_ops: vec![],
                     crdt_restores: vec![],
                     fresh_ids: vec![],
@@ -3104,6 +3321,8 @@ impl EmbeddedStore {
                 },
                 None => WriteBatch {
                     doc_writes: Vec::new(),
+                    local_field_writes: vec![],
+                    local_field_deletes: vec![],
                     crdt_ops: vec![],
                     crdt_restores: vec![],
                     fresh_ids: vec![],
@@ -3366,7 +3585,7 @@ impl EmbeddedStore {
     fn validate_remote_pull_unlocked(&self, pull: &RemotePageWrite) -> Result<(), StorageError> {
         let mut members = FxHashSet::default();
         for member in &pull.members {
-            self.def(&member.table)?;
+            self.replicated_def(&member.table)?;
             if !members.insert((member.table.clone(), member.server_document_id.clone())) {
                 return Err(StorageError::Unsatisfiable(
                     "remote pull membership contains a duplicate row".to_owned(),
@@ -3376,7 +3595,7 @@ impl EmbeddedStore {
 
         let mut projections = FxHashSet::default();
         for projection in &pull.projections {
-            self.def(&projection.table)?;
+            self.replicated_def(&projection.table)?;
             if projection.row.is_none() {
                 return Err(StorageError::Unsatisfiable(
                     "complete remote pull pages cannot contain projection tombstones".to_owned(),
@@ -3485,7 +3704,7 @@ impl EmbeddedStore {
         let mut local_ids = FxHashSet::default();
         let mut server_ids = FxHashSet::default();
         for mapping in ids {
-            self.def(&mapping.table)?;
+            self.replicated_def(&mapping.table)?;
             if mapping.local_document_id.is_empty()
                 || mapping.server_document_id.is_empty()
                 || !local_ids.insert((mapping.table.clone(), mapping.local_document_id.clone()))
@@ -3498,11 +3717,11 @@ impl EmbeddedStore {
         }
         Self::validate_remote_schedule_mappings(schedules)?;
         for projection in projections {
-            self.def(&projection.table)?;
+            self.replicated_def(&projection.table)?;
         }
         let mut crdt_fields = FxHashSet::default();
         for write in crdt {
-            self.def(&write.table)?;
+            self.replicated_def(&write.table)?;
             if write.id.is_empty()
                 || write.field.is_empty()
                 || write.head_seq < 0
@@ -3553,7 +3772,7 @@ impl EmbeddedStore {
         let mut row_ids = FxHashSet::default();
         let mut server_rev_ids = FxHashSet::default();
         for target in targets {
-            self.def(&target.table)?;
+            self.replicated_def(&target.table)?;
             if target.local_document_id.is_empty()
                 || !row_ids.insert((target.table.clone(), target.local_document_id.clone()))
                 || target.server_rev_id.as_ref().is_some_and(|rev_id| {
@@ -3566,7 +3785,7 @@ impl EmbeddedStore {
             }
         }
         for projection in projections {
-            self.def(&projection.table)?;
+            self.replicated_def(&projection.table)?;
         }
         Ok(())
     }
@@ -4541,6 +4760,7 @@ impl EmbeddedStore {
             }
         }
         for stale_document_id in &stale_document_ids {
+            self.rekey_local_fields_unlocked(table, stale_document_id, &local_id)?;
             self.driver.execute(
                 sql::delete_id_mapping(),
                 vec![
@@ -4569,6 +4789,34 @@ impl EmbeddedStore {
             local_id,
             stale_document_ids,
         })
+    }
+
+    fn rekey_local_fields_unlocked(
+        &self,
+        table: &str,
+        from_id: &str,
+        to_id: &str,
+    ) -> Result<(), StorageError> {
+        if from_id == to_id {
+            return Ok(());
+        }
+        self.driver.execute(
+            sql::rekey_local_fields(),
+            vec![
+                text_value(to_id.to_owned()),
+                text_value(self.identity_key.clone()),
+                text_value(table.to_owned()),
+                text_value(from_id.to_owned()),
+            ],
+        )?;
+        self.driver.execute(
+            sql::delete_local_fields_row(),
+            vec![
+                text_value(self.identity_key.clone()),
+                text_value(table.to_owned()),
+                text_value(from_id.to_owned()),
+            ],
+        )
     }
 
     fn deleted_local_id_for_server_unlocked(
@@ -5174,6 +5422,7 @@ impl EmbeddedStore {
     pub fn id_write(&self, mapping: &IdMapping) -> Result<(), StorageError> {
         validate_ident(&mapping.table)?;
         let _guard = lock(&self.operation_lock);
+        self.validate_id_mapping_table(&mapping.table)?;
         self.id_write_unlocked(mapping)
     }
 
@@ -5197,6 +5446,7 @@ impl EmbeddedStore {
     pub fn id_read(&self, table: &str, local_id: &str) -> Result<Option<IdMapping>, StorageError> {
         validate_ident(table)?;
         let _guard = lock(&self.operation_lock);
+        self.validate_id_mapping_table(table)?;
         self.id_read_unlocked(table, local_id)
     }
 
@@ -5207,6 +5457,7 @@ impl EmbeddedStore {
     ) -> Result<Option<String>, StorageError> {
         validate_ident(table)?;
         let _guard = lock(&self.operation_lock);
+        self.validate_id_mapping_table(table)?;
         self.local_id_for_server_unlocked(table, server_document_id)
     }
 
@@ -5230,6 +5481,7 @@ impl EmbeddedStore {
         validate_ident(table)?;
         let mut out = Vec::new();
         let _guard = lock(&self.operation_lock);
+        self.validate_id_mapping_table(table)?;
         self.driver.run_rows(
             sql::read_id_mappings(),
             vec![
@@ -5247,6 +5499,7 @@ impl EmbeddedStore {
     pub fn id_delete(&self, table: &str, local_id: &str) -> Result<(), StorageError> {
         validate_ident(table)?;
         let _guard = lock(&self.operation_lock);
+        self.validate_id_mapping_table(table)?;
         self.driver.execute(
             sql::delete_id_mapping(),
             vec![
@@ -6037,7 +6290,14 @@ impl EmbeddedStore {
                 [
                     text_value(self.identity_key.clone()),
                     Value::from_i64(commit_seq),
-                    text_value("remote".to_owned()),
+                    text_value(
+                        match options.source {
+                            CommitSource::Remote => "remote",
+                            CommitSource::Device => "device",
+                            CommitSource::Local => "local",
+                        }
+                        .to_owned(),
+                    ),
                     options
                         .mutation_id()
                         .map_or(Value::Null, |value| text_value(value.to_owned())),
@@ -6215,6 +6475,23 @@ impl EmbeddedStore {
         self.runtime(table).map(|table| table.def.clone())
     }
 
+    fn replicated_def(&self, table: &str) -> Result<Arc<TableDef>, StorageError> {
+        let definition = self.def(table)?;
+        if definition.placement != TablePlacement::Replicated {
+            return Err(StorageError::Unsatisfiable(format!(
+                "remote operation targets device table {table}"
+            )));
+        }
+        Ok(definition)
+    }
+
+    fn validate_id_mapping_table(&self, table: &str) -> Result<(), StorageError> {
+        if matches!(table, "_storage" | "_scheduled_functions") {
+            return Ok(());
+        }
+        self.replicated_def(table).map(|_| ())
+    }
+
     fn runtime(&self, table: &str) -> Result<Arc<TableRuntime>, StorageError> {
         lock(&self.tables)
             .get(table)
@@ -6329,6 +6606,24 @@ fn validate_schema_transition(
         else {
             continue;
         };
+        if previous_table.placement != table.placement {
+            return Err(StorageError::IncompatibleStore(format!(
+                "table {} changed placement in place",
+                table.name
+            )));
+        }
+        for field in &table.local_fields {
+            if !previous_table
+                .local_fields
+                .iter()
+                .any(|previous| previous.field == field.field)
+            {
+                return Err(StorageError::IncompatibleStore(format!(
+                    "field {}.{} changed to device-only placement in place",
+                    table.name, field.field
+                )));
+            }
+        }
         for column in &table.columns {
             let Some(previous_column) = previous_table
                 .columns
@@ -6368,6 +6663,48 @@ fn validate_schema_transition(
     Ok(())
 }
 
+fn validate_table_commit_source(
+    table: &TableDef,
+    options: &CommitOptions,
+) -> Result<(), StorageError> {
+    let valid = match table.placement {
+        TablePlacement::Replicated => !options.is_device(),
+        TablePlacement::Device => options.is_device(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(StorageError::Unsatisfiable(format!(
+            "{:?} commit cannot write {:?} table {}",
+            options.source, table.placement, table.name
+        )))
+    }
+}
+
+fn validate_replicated_doc_data(table: &TableDef, data: &str) -> Result<(), StorageError> {
+    if table.placement != TablePlacement::Replicated || table.local_fields.is_empty() {
+        return Ok(());
+    }
+    let data = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(data).map_err(
+        |error| StorageError::Decode {
+            expected: "replicated document JSON object",
+            index: 0,
+            got: error.to_string(),
+        },
+    )?;
+    if let Some(field) = table
+        .local_fields
+        .iter()
+        .find(|field| data.contains_key(&field.field))
+    {
+        return Err(StorageError::Unsatisfiable(format!(
+            "replicated document write contains device-only field {}.{}",
+            table.name, field.field
+        )));
+    }
+    Ok(())
+}
+
 fn validate_store_schema(schema: &StoreSchema) -> Result<(), StorageError> {
     let mut tables = FxHashSet::default();
     for table in &schema.tables {
@@ -6399,6 +6736,27 @@ fn validate_store_schema(schema: &StoreSchema) -> Result<(), StorageError> {
                     table.name, field.field
                 )));
             }
+        }
+        let mut local_fields = FxHashSet::default();
+        for field in &table.local_fields {
+            if table.placement != TablePlacement::Replicated
+                || field.field.is_empty()
+                || !local_fields.insert(field.field.as_str())
+                || crdt_fields.contains(field.field.as_str())
+            {
+                return Err(StorageError::Unsatisfiable(format!(
+                    "invalid, duplicate, or conflicting device field definition {}.{}",
+                    table.name, field.field
+                )));
+            }
+        }
+        if table.placement == TablePlacement::Device
+            && (!table.crdt_fields.is_empty() || !table.local_fields.is_empty())
+        {
+            return Err(StorageError::Unsatisfiable(format!(
+                "device table {} cannot declare replicated CRDT or overlay fields",
+                table.name
+            )));
         }
         let mut indexes = FxHashSet::default();
         for index in &table.indexes {

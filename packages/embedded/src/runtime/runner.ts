@@ -71,7 +71,7 @@ import {
   ROOT_INSTANCE,
   type ComponentInstancePath,
 } from "./components";
-import type { FunctionReference, RegisteredFunction } from "./functions";
+import type { FunctionPlacement, FunctionReference, RegisteredFunction } from "./functions";
 import type { BaseVersion, ReadBound, ReadTracker } from "./query";
 import { validateFields, validateJson, validateValue } from "./validate";
 import { emitCommit, emitDeletes } from "./emit";
@@ -140,6 +140,8 @@ export type StopOnUpdate = () => void;
 export interface RunMutationOptions {
   allowInternal?: boolean;
   auth?: UserIdentity | null;
+  /** Placement of the currently executing parent function. @internal */
+  callerPlacement?: FunctionPlacement;
   mutationIsFresh?: boolean;
   mutationId?: string;
   onAccepted?(this: void, mutationId: string): void;
@@ -184,6 +186,8 @@ export type RunMutationTiming = EmbeddedMutationTiming;
 export interface RunOptions {
   allowInternal?: boolean;
   auth?: UserIdentity | null;
+  /** Placement of the currently executing parent function. @internal */
+  callerPlacement?: FunctionPlacement;
   remoteScope?: boolean | (() => boolean);
 }
 
@@ -193,8 +197,23 @@ export interface RunnerOptions {
   emit?: EmbeddedInternalEventListener;
   hasEventListeners?(): boolean;
   moduleGraphHash?: string;
+  /** Trusted build-time placement metadata, including hosted-only functions. */
+  manifest?: RuntimeFunctionManifest;
   remote?: boolean;
 }
+
+/** Build-time function metadata used to route functions omitted from the device bundle. @internal */
+export type RuntimeFunctionManifest = Record<
+  string,
+  Record<
+    string,
+    {
+      kind: "query" | "mutation";
+      placement: FunctionPlacement;
+      visibility: "public" | "internal";
+    }
+  >
+>;
 
 /** Runtime table summary exposed to devtools. @internal */
 export interface RunnerDevtoolsTable {
@@ -281,7 +300,7 @@ export type RunnerDevtoolsRequest =
 
 /** Execution route and hosted arguments resolved before a public client operation starts. */
 export type RunnerRoute =
-  | { execution: "local" }
+  | { execution: "local"; placement: "replicated" | "local" }
   | { execution: "hosted"; args: Record<string, unknown> }
   | { execution: "blocked" };
 
@@ -667,16 +686,6 @@ export function createRunner(
     while (tx === undefined && entropySpan) await entropySpan;
     const resolved = resolveFunctionAddress(ref, scope);
     const scopeStore = namespaceStore(store, resolved.scope.instancePath);
-    const txDb = tx?.writer(resolved.scope).db;
-    const activeDb =
-      txDb ??
-      (db && resolved.scope.instancePath === scope.instancePath
-        ? db
-        : createReader<GenericDataModel>(
-            scopeStore,
-            resolved.scope.schema,
-            scopedTracker(resolved.scope, tracker),
-          ));
     const fn = await loadFunction(
       resolved.scope.modules,
       moduleCache,
@@ -686,6 +695,18 @@ export function createRunner(
     );
     if (fn.kind !== "query") throw new Error(`${describeRef(ref)} is not a query`);
     ensureVisible(fn, ref, options);
+    ensureSamePlacement(fn, ref, options.callerPlacement);
+    const txDb = tx?.writer(resolved.scope).db;
+    const activeDb =
+      txDb ??
+      (db && resolved.scope.instancePath === scope.instancePath
+        ? db
+        : createReader<GenericDataModel>(
+            scopeStore,
+            resolved.scope.schema,
+            scopedTracker(resolved.scope, tracker),
+            fn.placement === "local" ? "device" : "replicated",
+          ));
     const checked = await resolveQueryArgs(scopeStore, fn, args);
     const result = await fn.handler(
       {
@@ -696,6 +717,7 @@ export function createRunner(
           runQuery(childRef, childArgs, resolved.scope, tracker, activeDb, tx, {
             ...options,
             allowInternal: true,
+            callerPlacement: fn.placement,
           }),
         storage: createStorageService(
           namespaceStore(store, resolved.scope.instancePath),
@@ -710,7 +732,10 @@ export function createRunner(
     return validateReturn(fn, result);
   };
 
-  const createMutationTransaction = (readSetTracker?: ReadTracker): ScopedMutationTransaction => {
+  const createMutationTransaction = (
+    placement: "replicated" | "local",
+    readSetTracker?: ReadTracker,
+  ): ScopedMutationTransaction => {
     const writers = new Map<ComponentInstancePath, ReturnType<typeof createWriter>>();
     const revisionRestores: RevisionRestoreExpectation[] = [];
     const writer = (scope: RuntimeScope): ReturnType<typeof createWriter> => {
@@ -720,6 +745,7 @@ export function createRunner(
           namespaceStore(store, scope.instancePath),
           scope.schema,
           scope.instancePath === ROOT_INSTANCE ? readSetTracker : undefined,
+          placement === "local" ? "device" : "replicated",
         );
         writers.set(scope.instancePath, existing);
       }
@@ -770,6 +796,8 @@ export function createRunner(
         const freshIds: NonNullable<WriteBatch["freshIds"]> = [];
         const dataOnlyIds: NonNullable<WriteBatch["dataOnlyIds"]> = [];
         const idMappings: NonNullable<WriteBatch["idMappings"]> = [];
+        const localFieldWrites: NonNullable<WriteBatch["localFieldWrites"]> = [];
+        const localFieldDeletes: NonNullable<WriteBatch["localFieldDeletes"]> = [];
         let rootBatch: WriteBatch = { deletes: [], docWrites: [] };
         for (const [instancePath, w] of writers) {
           const batch = w.toBatch();
@@ -786,6 +814,8 @@ export function createRunner(
           freshIds.push(...(namespaced.freshIds ?? []));
           dataOnlyIds.push(...(namespaced.dataOnlyIds ?? []));
           idMappings.push(...(namespaced.idMappings ?? []));
+          localFieldWrites.push(...(namespaced.localFieldWrites ?? []));
+          localFieldDeletes.push(...(namespaced.localFieldDeletes ?? []));
         }
         return {
           batch: {
@@ -796,6 +826,8 @@ export function createRunner(
             deletes,
             freshIds,
             idMappings,
+            localFieldWrites,
+            localFieldDeletes,
             docWrites,
           },
           rootBatch,
@@ -866,8 +898,29 @@ export function createRunner(
         : undefined;
     const timingStartedAt = timing ? getTimerTime() : 0;
     let timingPhaseStartedAt = timingStartedAt;
+    const resolved = resolveFunctionAddress(ref, scope);
+    const fn = await loadFunction(
+      resolved.scope.modules,
+      moduleCache,
+      functionCache,
+      resolved.scope.instancePath,
+      resolved.name,
+    );
+    if (fn.kind !== "mutation") throw new Error(`${describeRef(ref)} is not a mutation`);
+    ensureVisible(fn, ref, options);
+    ensureSamePlacement(fn, ref, options.callerPlacement);
+    if (fn.placement === "remote") {
+      throw new Error(
+        `${describeRef(ref)} is remote-only and cannot execute in the local runtime.`,
+      );
+    }
     const readSetCollector = !tx && options.pushCall ? createReadSetCollector() : undefined;
-    const root = tx ?? createMutationTransaction(readSetCollector?.tracker);
+    const root =
+      tx ??
+      createMutationTransaction(
+        fn.placement === "local" ? "local" : "replicated",
+        readSetCollector?.tracker,
+      );
     const snapshot = tx?.snapshot();
     const revisionReplaySnapshot = options.revisionReplay
       ? {
@@ -876,7 +929,6 @@ export function createRunner(
           nextOrdinal: options.revisionReplay.nextOrdinal,
         }
       : undefined;
-    const resolved = resolveFunctionAddress(ref, scope);
     const resolvedWriter = root.writer(resolved.scope);
     const componentRevision =
       resolved.scope.instancePath === "embedded" && resolved.name.startsWith("rev:")
@@ -918,15 +970,6 @@ export function createRunner(
         argsAreNormalized,
       );
     }
-    const fn = await loadFunction(
-      resolved.scope.modules,
-      moduleCache,
-      functionCache,
-      resolved.scope.instancePath,
-      resolved.name,
-    );
-    if (fn.kind !== "mutation") throw new Error(`${describeRef(ref)} is not a mutation`);
-    ensureVisible(fn, ref, options);
     const checked = await resolveMutationArgs(
       namespaceStore(store, resolved.scope.instancePath),
       fn,
@@ -1057,6 +1100,7 @@ export function createRunner(
               runQuery(childRef, childArgs, resolved.scope, undefined, resolvedWriter.db, root, {
                 ...options,
                 allowInternal: true,
+                callerPlacement: fn.placement,
               }),
             runSnapshotQuery: (
               childRef: FunctionReference,
@@ -1065,16 +1109,32 @@ export function createRunner(
               runQuery(childRef, childArgs, resolved.scope, undefined, undefined, root, {
                 ...options,
                 allowInternal: true,
+                callerPlacement: fn.placement,
               }),
             runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-              runMutationDirect(
-                childRef,
-                childArgs,
-                resolved.scope,
-                { ...options, allowInternal: true, revisionReplay },
-                root,
-              ),
+              fn.placement === "replicated" && extractReferencePath(childRef) === null
+                ? Promise.reject(
+                    new Error(
+                      "Embedded replicated mutations cannot call nested app mutations until their writes can join the parent replay capture.",
+                    ),
+                  )
+                : runMutationDirect(
+                    childRef,
+                    childArgs,
+                    resolved.scope,
+                    {
+                      ...options,
+                      allowInternal: true,
+                      callerPlacement: fn.placement,
+                      revisionReplay,
+                    },
+                    // Same-placement is checked by the child before its handler runs.
+                    root,
+                  ),
             get scheduler(): SchedulerService {
+              if (fn.placement === "local") {
+                throw new Error("Local functions cannot schedule functions.");
+              }
               return (schedulerService ??= createSchedulerService(
                 store,
                 emit,
@@ -1085,6 +1145,7 @@ export function createRunner(
                       runMutationDirect(childRef, childArgs, resolved.scope, {
                         ...options,
                         allowInternal: true,
+                        callerPlacement: fn.placement,
                       }),
                     ),
                   runQuery: (childRef, childArgs = {}) =>
@@ -1098,6 +1159,7 @@ export function createRunner(
                       {
                         ...options,
                         allowInternal: true,
+                        callerPlacement: fn.placement,
                       },
                     ),
                 },
@@ -1109,6 +1171,9 @@ export function createRunner(
               ));
             },
             get storage(): StorageWriterService {
+              if (fn.placement === "local") {
+                throw new Error("Local functions cannot access file storage.");
+              }
               return (storageService ??= createStorageService(
                 namespaceStore(store, resolved.scope.instancePath),
                 uploadUrls,
@@ -1275,31 +1340,33 @@ export function createRunner(
         });
       }
       const commitOptions: CommitOptions =
-        options.mutationId === undefined
-          ? { changes: "omit", mutation: "none", source: "local" }
-          : options.mutationIsFresh &&
-              pushEnvelopeJson !== undefined &&
-              pushEnvelopeNowMs !== undefined
-            ? {
-                changes: "omit",
-                mutation: "push",
-                mutationId: options.mutationId,
-                push: { json: pushEnvelopeJson, nowMs: pushEnvelopeNowMs },
-                source: "local",
-              }
-            : {
-                changes: "omit",
-                mutation: "terminal",
-                mutationArgs: encodedMutationArgs!,
-                mutationIsFresh: options.mutationIsFresh === true,
-                mutationId: options.mutationId,
-                mutationName: resolved.name,
-                mutationResult: encodedMutationResult!,
-                ...(pushEnvelopeJson === undefined || pushEnvelopeNowMs === undefined
-                  ? {}
-                  : { push: { json: pushEnvelopeJson, nowMs: pushEnvelopeNowMs } }),
-                source: "local",
-              };
+        fn.placement === "local"
+          ? { changes: "omit", source: "device" }
+          : options.mutationId === undefined
+            ? { changes: "omit", mutation: "none", source: "local" }
+            : options.mutationIsFresh &&
+                pushEnvelopeJson !== undefined &&
+                pushEnvelopeNowMs !== undefined
+              ? {
+                  changes: "omit",
+                  mutation: "push",
+                  mutationId: options.mutationId,
+                  push: { json: pushEnvelopeJson, nowMs: pushEnvelopeNowMs },
+                  source: "local",
+                }
+              : {
+                  changes: "omit",
+                  mutation: "terminal",
+                  mutationArgs: encodedMutationArgs!,
+                  mutationIsFresh: options.mutationIsFresh === true,
+                  mutationId: options.mutationId,
+                  mutationName: resolved.name,
+                  mutationResult: encodedMutationResult!,
+                  ...(pushEnvelopeJson === undefined || pushEnvelopeNowMs === undefined
+                    ? {}
+                    : { push: { json: pushEnvelopeJson, nowMs: pushEnvelopeNowMs } }),
+                  source: "local",
+                };
       if (localSchedules) batchInfo!.batch.schedules = pendingScheduleRows;
       const commit = oneDocWrite
         ? await store.commitOneDocWrite!(oneDocWrite, commitOptions)
@@ -1358,6 +1425,7 @@ export function createRunner(
     );
     if (fn.kind !== "action") throw new Error(`${describeRef(ref)} is not an action`);
     ensureVisible(fn, ref, options);
+    ensureSamePlacement(fn, ref, options.callerPlacement);
     const checked = validateArgs(fn, args);
     const result = await fn.handler(
       {
@@ -1706,6 +1774,27 @@ export function createRunner(
       const detached = normalizeCopy(args) as Record<string, unknown>;
       if (kind !== "action") {
         const resolved = resolveFunctionAddress(ref, rootScope);
+        const declared =
+          resolved.scope.instancePath === ROOT_INSTANCE
+            ? manifestFunction(options.manifest, resolved.name)
+            : undefined;
+        if (options.manifest && resolved.scope.instancePath === ROOT_INSTANCE && !declared) {
+          throw new Error(`unknown embedded function: ${resolved.name}`);
+        }
+        if (declared) {
+          if (declared.kind !== kind) throw new Error(`${describeRef(ref)} is not a ${kind}`);
+          if (declared.visibility !== "public") {
+            throw new Error(
+              `${describeRef(ref)} is internal and cannot be called from the public client.`,
+            );
+          }
+          if (declared.placement === "remote") {
+            const hosted = await mapHostedArguments(store, detached);
+            return hosted === undefined
+              ? { execution: "blocked" }
+              : { execution: "hosted", args: hosted };
+          }
+        }
         const fn = await loadFunction(
           resolved.scope.modules,
           moduleCache,
@@ -1717,7 +1806,9 @@ export function createRunner(
         ensureVisible(fn, ref, {});
         if (kind === "query") await resolveQueryArgs(store, fn, detached);
         else validateArgs(fn, detached, true);
-        if (fn.local) return { execution: "local" };
+        if (fn.placement === "replicated" || fn.placement === "local") {
+          return { execution: "local", placement: fn.placement };
+        }
       }
       const hosted = await mapHostedArguments(store, detached);
       return hosted === undefined
@@ -2139,6 +2230,17 @@ export function createRunner(
     }
     return { crdtHeads, dirtyHeads, files, idMappings, projections, uploads };
   }
+}
+
+function manifestFunction(
+  manifest: RuntimeFunctionManifest | undefined,
+  fullName: string,
+): RuntimeFunctionManifest[string][string] | undefined {
+  if (!manifest) return undefined;
+  const separator = fullName.indexOf(":");
+  const moduleId = separator < 0 ? fullName : fullName.slice(0, separator);
+  const exportName = separator < 0 ? "default" : fullName.slice(separator + 1);
+  return manifest[moduleId]?.[exportName];
 }
 
 function clampPageSize(limit: number | undefined): number {
@@ -2627,13 +2729,24 @@ function callSafely(call: () => void): void {
 
 interface RunnableFunction {
   kind: "query" | "mutation" | "action";
-  local: boolean;
+  placement: FunctionPlacement;
   args?: PropertyValidators;
   returns?: GenericValidator;
   argsJson?: ValidatorJSON;
   returnsJson?: ValidatorJSON | null;
   visibility: "public" | "internal";
   handler: (ctx: unknown, args: Record<string, unknown>) => unknown;
+}
+
+function ensureSamePlacement(
+  fn: RunnableFunction,
+  ref: FunctionReference,
+  callerPlacement: FunctionPlacement | undefined,
+): void {
+  if (callerPlacement === undefined || callerPlacement === fn.placement) return;
+  throw new Error(
+    `Embedded ${callerPlacement} functions cannot call ${fn.placement} function ${describeRef(ref)}.`,
+  );
 }
 
 function ensureVisible(fn: RunnableFunction, ref: FunctionReference, options: RunOptions): void {
@@ -2681,7 +2794,7 @@ async function loadFunctionUncached(
   const name = sep < 0 ? "default" : fullName.slice(sep + 1);
   const module = await loadModule(modules, moduleCache, instancePath, file);
   const fn = module[name];
-  const registered = toRunnable(fn);
+  const registered = toRunnable(fn, instancePath === "embedded" ? "replicated" : undefined);
   if (!registered) throw new Error(`not a registered function: ${fullName}`);
   return registered;
 }
@@ -2804,7 +2917,10 @@ function isSystemModuleId(moduleId: string): boolean {
   );
 }
 
-function toRunnable(value: unknown): RunnableFunction | undefined {
+function toRunnable(
+  value: unknown,
+  builtInPlacement?: FunctionPlacement,
+): RunnableFunction | undefined {
   if (typeof value === "object" && value !== null && "kind" in value) {
     const candidate = value as RegisteredFunction;
     if (
@@ -2814,7 +2930,7 @@ function toRunnable(value: unknown): RunnableFunction | undefined {
     ) {
       return {
         kind: candidate.kind,
-        local: candidate.local !== false,
+        placement: candidate.placement,
         args: candidate.args,
         returns: candidate.returns,
         visibility: candidate.visibility ?? "public",
@@ -2837,12 +2953,24 @@ function toRunnable(value: unknown): RunnableFunction | undefined {
   if (!kind) return undefined;
   return {
     kind,
-    local: record.__embeddedLocal !== false,
+    placement: embeddedPlacement(record, builtInPlacement),
     handler: handler as RunnableFunction["handler"],
     visibility: record.isInternal === true ? "internal" : "public",
     argsJson: exportedValidator(record.exportArgs),
     returnsJson: exportedReturns(record.exportReturns),
   };
+}
+
+function embeddedPlacement(
+  record: Record<string, unknown>,
+  builtInPlacement?: FunctionPlacement,
+): FunctionPlacement {
+  const placement = record.__embeddedPlacement;
+  if (placement === "replicated" || placement === "remote" || placement === "local") {
+    return placement;
+  }
+  if (builtInPlacement !== undefined) return builtInPlacement;
+  throw new Error("Embedded function registration is missing explicit placement metadata.");
 }
 
 async function mapHostedArguments(

@@ -377,6 +377,7 @@ pub struct ReadRange {
 pub enum CommitSource {
     Local,
     Remote,
+    Device,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,6 +444,7 @@ impl CommitOptions {
         let source = match source.unwrap_or("local") {
             "local" => CommitSource::Local,
             "remote" => CommitSource::Remote,
+            "device" => CommitSource::Device,
             _ => return None,
         };
         let push = match (push_json, push_now_ms, mutation_id.as_ref()) {
@@ -482,7 +484,7 @@ impl CommitOptions {
             }
             _ => return None,
         };
-        if source == CommitSource::Remote && (mutation != CommitMutation::None || push.is_some()) {
+        if source != CommitSource::Local && (mutation != CommitMutation::None || push.is_some()) {
             return None;
         }
         Some(Self {
@@ -543,6 +545,11 @@ impl CommitOptions {
     #[must_use]
     pub fn is_local(&self) -> bool {
         self.source == CommitSource::Local
+    }
+
+    #[must_use]
+    pub fn is_device(&self) -> bool {
+        self.source == CommitSource::Device
     }
 
     #[must_use]

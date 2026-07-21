@@ -15,6 +15,7 @@ import {
   metalConvexDir,
 } from "../tests/bench/harness/paths.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
+import schema from "../tests/metal/convex/schema.js";
 
 export const metalProject = {
   test: {
@@ -57,7 +58,7 @@ export const metalProject = {
       Math.min(300_000, readNumberEnvValue("EMBEDDED_METAL_BENCH_TIMEOUT_MS", 120_000)),
     ),
   },
-  plugins: [convexEmbedded({ convexDir: metalConvexDir }), browserRuntimeLog()],
+  plugins: [convexEmbedded({ convexDir: metalConvexDir, schema }), browserRuntimeLog()],
   resolve: {
     alias: [
       { find: "@convex-dev/embedded/browser", replacement: browserDistPath },

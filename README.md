@@ -30,7 +30,7 @@ app.use(embedded);
 export default app;
 ```
 
-Create one Embedded server definition and export its function builders and protocol functions:
+Create one Embedded server definition and export its protocol functions:
 
 ```ts
 // convex/embedded.ts
@@ -39,22 +39,24 @@ import { defineEmbedded } from "@convex-dev/embedded/server";
 import { components } from "./_generated/api";
 import schema from "./schema";
 
-export const { query, mutation, internalQuery, internalMutation, upload, pull, push } =
-  defineEmbedded({
-    component: components.embedded,
-    schema,
-  });
+export const embedded = defineEmbedded({
+  component: components.embedded,
+  schema,
+});
+
+export const { upload, pull, push } = embedded;
 ```
 
-Application functions import those builders and use normal Convex authorization and database APIs:
+Application functions select an explicit placement and use normal Convex authorization and
+database APIs:
 
 ```ts
 // convex/documents.ts
 import { ConvexError, v } from "convex/values";
 
-import { mutation, query } from "./embedded";
+import { embedded } from "./embedded";
 
-export const list = query({
+export const list = embedded.replicated.query({
   args: {},
   handler: async (ctx) => {
     const identity = await ctx.auth.getUserIdentity();
@@ -66,7 +68,7 @@ export const list = query({
   },
 });
 
-export const create = mutation({
+export const create = embedded.replicated.mutation({
   args: { body: v.string() },
   handler: async (ctx, args) => {
     const identity = await ctx.auth.getUserIdentity();
@@ -79,8 +81,66 @@ export const create = mutation({
 });
 ```
 
-There are no table capability declarations, protocol validators, generated engine tables, or raw
-function-builder parameters in app code.
+Use `embedded.remote` for hosted-only queries and mutations and `embedded.local` for device-only
+operations. Replicated functions see only replicated fields, remote functions see the hosted
+document, and local functions see replicated fields plus device overlays.
+
+### Placement model
+
+Tables, fields, indexes, and functions use the same three placements:
+
+| Schema declaration                                       | Hosted server | Replication wire | Device                  |
+| -------------------------------------------------------- | ------------- | ---------------- | ----------------------- |
+| `embeddedTable({...})`                                   | Yes           | Yes              | Yes                     |
+| Plain `defineTable({...})` inside `defineEmbeddedSchema` | Yes           | No               | No                      |
+| `localTable({...})`                                      | No            | No               | Yes                     |
+| Unannotated field in an `embeddedTable`                  | Yes           | Yes              | Yes                     |
+| `e.omit(validator)`                                      | Yes           | No               | No                      |
+| `e.local(validator)`                                     | No            | No               | Optional device overlay |
+
+An `e.local` field is stored separately from its replicated document. Pull, membership exit, and a
+server deletion do not erase the overlay; if the row returns, the overlay is visible again. A local
+mutation clears it by patching the field to `undefined`. Local overlays are scoped to the current
+device identity and validated by the validator passed to `e.local`. Local functions may patch these
+fields, but cannot insert, replace, or delete the replicated row.
+
+A `localTable` owns complete device-only documents. Those rows are durable local state and change
+only through local functions (or when the table is removed from the schema); they are never pushed,
+pulled, or deployed to Convex.
+
+Index placement follows its fields. A normal index containing only replicated fields exists on both
+the server and device. If any indexed field uses `e.omit`, the index is hosted-only. An index may not
+contain an `e.local` field. Search, vector, and staged indexes are supported on an `embeddedTable`
+only when they are hosted-only; the embedded store does not implement those index kinds.
+
+Device-only functions live in a `*.local.ts` module and are referenced through the generated local
+API rather than Convex's hosted `_generated/api`:
+
+```ts
+// convex/preferences.local.ts
+import { v } from "convex/values";
+import { embedded } from "./embedded";
+
+export const setCompact = embedded.local.mutation({
+  args: { compact: v.boolean() },
+  handler: async (ctx, { compact }) => {
+    const current = await ctx.db.query("preferences").first();
+    if (current) await ctx.db.patch("preferences", current._id, { compact });
+    else await ctx.db.insert("preferences", { compact });
+  },
+});
+```
+
+```ts
+// application code
+import { localApi } from "./convex/_generated/embedded";
+
+await client.mutation(localApi["preferences.local"].setCompact, { compact: true });
+```
+
+The build plugin regenerates `_generated/embedded.ts` from the schema and function graph. Treat it
+like other generated Convex output: do not edit it by hand, and always pass the imported schema to
+the plugin so stale placement metadata cannot enter a device build.
 
 ## 2. Configure the browser build
 
@@ -101,13 +161,14 @@ Vite configuration:
 // vite.config.ts
 import { convexEmbedded } from "@convex-dev/embedded/vite";
 import { defineConfig } from "vite";
+import schema from "./convex/schema";
 
 export default defineConfig({
-  plugins: [convexEmbedded()],
+  plugins: [convexEmbedded({ schema })],
 });
 ```
 
-`convexEmbedded()` supplies the virtual function registry to both the page and worker builds,
+`convexEmbedded({ schema })` supplies the virtual function registry to both the page and worker builds,
 configures dependency optimization, enables browser function references before the application
 loads, and adds these headers to Vite's development and preview servers:
 
@@ -124,12 +185,14 @@ The plugin options are relative to the Vite project root:
 ```ts
 convexEmbedded({
   convexDir: "convex",
-  schemaPath: "convex/schema.ts",
+  schema,
+  schemaPath: "schema.ts",
 });
 ```
 
-Both values above are the defaults. Files in `convex/` with a top-level `"use node"` directive are
-hosted-only and are intentionally excluded from the local registry.
+The paths above are the defaults; `schema` is required so every build regenerates and verifies the
+device contract. Files in `convex/` with a top-level `"use node"` directive are hosted-only and are
+intentionally excluded from the local registry.
 
 ### Rollup, Rolldown, Webpack, Rspack, and esbuild
 
@@ -137,20 +200,21 @@ The package exposes Unplugin adapters for projects that do not use Vite:
 
 ```ts
 import { convexEmbeddedUnplugin } from "@convex-dev/embedded/unplugin";
+import schema from "./convex/schema";
 
 // Rollup
 export default {
-  plugins: [convexEmbeddedUnplugin.rollup()],
+  plugins: [convexEmbeddedUnplugin.rollup({ schema })],
 };
 ```
 
 Use the matching adapter in other configurations:
 
 ```ts
-convexEmbeddedUnplugin.rolldown();
-convexEmbeddedUnplugin.webpack();
-convexEmbeddedUnplugin.rspack();
-convexEmbeddedUnplugin.esbuild();
+convexEmbeddedUnplugin.rolldown({ schema });
+convexEmbeddedUnplugin.webpack({ schema });
+convexEmbeddedUnplugin.rspack({ schema });
+convexEmbeddedUnplugin.esbuild({ schema });
 ```
 
 These adapters provide function discovery and the virtual registry. They do **not** reproduce all
@@ -346,12 +410,17 @@ materialized values.
 
 ```ts
 // convex/schema.ts
-import { text } from "@convex-dev/embedded/values";
-import { defineSchema, defineTable } from "convex/server";
+import { defineEmbeddedSchema, embeddedTable } from "@convex-dev/embedded/schema";
+import { e } from "@convex-dev/embedded/values";
 import { v } from "convex/values";
 
-export default defineSchema({
-  documents: defineTable({ owner: v.string(), body: text() }).index("by_owner", ["owner"]),
+export default defineEmbeddedSchema({
+  documents: embeddedTable({
+    owner: v.string(),
+    body: e.text(),
+    serverLabel: e.omit(v.optional(v.string())),
+    expanded: e.local(v.boolean()),
+  }).index("by_owner", ["owner"]),
 });
 ```
 
@@ -359,9 +428,9 @@ export default defineSchema({
 // convex/documents.ts
 import { v } from "convex/values";
 
-import { mutation } from "./embedded";
+import { embedded } from "./embedded";
 
-export const insertText = mutation({
+export const insertText = embedded.replicated.mutation({
   args: { id: v.id("documents"), index: v.number(), value: v.string() },
   handler: async (ctx, { id, index, value }) => {
     await ctx.db.text.splice("documents", id, "body", {

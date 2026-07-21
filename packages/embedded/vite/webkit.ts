@@ -13,6 +13,7 @@ import {
 } from "../tests/bench/harness/paths.js";
 import { browserCommands } from "../tests/browser/harness/commands.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
+import schema from "../tests/fixture/convex/schema.js";
 
 export const webkitProject = {
   define: {
@@ -21,7 +22,7 @@ export const webkitProject = {
   optimizeDeps: {
     include: ["convex-helpers/server/pagination", "convex/browser", "convex/server"],
   },
-  plugins: [convexEmbedded({ convexDir: browserConvexDir }), browserRuntimeLog()],
+  plugins: [convexEmbedded({ convexDir: browserConvexDir, schema }), browserRuntimeLog()],
   resolve: {
     dedupe: ["solid-js"],
     alias: [

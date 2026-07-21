@@ -96,11 +96,7 @@ describe("public package surface", () => {
       const code = declarations.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
       const names = exportedNames(declarations).join("\n");
       const relativePath = path.slice(packageRoot.length + 1);
-      for (const pattern of [
-        /embedded\.generated/i,
-        /manifest/i,
-        new RegExp("sync" + "able", "i"),
-      ]) {
+      for (const pattern of [/embedded\.generated/i, new RegExp("sync" + "able", "i")]) {
         if (pattern.test(code) || pattern.test(names) || pattern.test(relativePath)) {
           leaked.push(`${relativePath}: ${pattern}`);
         }

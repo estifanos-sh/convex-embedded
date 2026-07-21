@@ -33,9 +33,10 @@ export function renderEmbeddedBundle(bundle: EmbeddedBundleResult): string {
     )
     .join("\n");
 
-  return `import schema from ${JSON.stringify(toVirtualSourceId(bundle.schemaPath))};
+  return `import { embeddedSchema } from ${JSON.stringify(toVirtualSourceId(bundle.generatedPath))};
 
-export { schema };
+export { embeddedSchema };
+export const embeddedManifest = ${JSON.stringify(bundle.manifest)};
 export const modules = {
 ${moduleEntries}
 };
@@ -43,17 +44,11 @@ ${moduleEntries}
 }
 
 export async function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): Promise<string> {
-  const schemaHash = await fileHash(bundle.schemaPath);
-  const moduleGraphHash = await hashJson(
-    Object.fromEntries(
-      await Promise.all(
-        Object.entries(bundle.modules).map(async ([moduleId, filePath]) => [
-          moduleId,
-          await fileHash(filePath),
-        ]),
-      ),
-    ),
-  );
+  const schemaHash = bundle.schemaHash;
+  const moduleGraphHash = await hashJson({
+    manifest: bundle.manifest,
+    sources: await Promise.all(bundle.sourceFiles.map(fileHash)),
+  });
 
   return `export const embeddedIdentity = ${JSON.stringify({
     moduleGraphHash,

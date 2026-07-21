@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { compareValues, v } from "convex/values";
 import type { Value } from "convex/values";
-import { type DataModelFromSchemaDefinition, defineSchema, defineTable } from "convex/server";
+import { type DataModelFromSchemaDefinition } from "convex/server";
 
 import type {
   BindingColValue,
@@ -35,10 +35,15 @@ import { encode } from "../../src/runtime/codec";
 import { defineFunctions } from "../../src/runtime/functions";
 import { getTimerTime } from "../../src/time";
 import { createRunner, type Runner } from "../../src/runtime/runner";
-import { toRuntimeStoreSchema, toStoreSchema } from "../../src/schema";
+import {
+  defineEmbeddedSchema,
+  embeddedTable,
+  toRuntimeStoreSchema,
+  toStoreSchema,
+} from "../../src/schema";
 
-export const benchSchema = defineSchema({
-  messages: defineTable({
+export const benchSchema = defineEmbeddedSchema({
+  messages: embeddedTable({
     channel: v.string(),
     body: v.string(),
     sequence: v.number(),
@@ -50,7 +55,7 @@ export const benchSchema = defineSchema({
 
 type BenchDataModel = DataModelFromSchemaDefinition<typeof benchSchema>;
 
-const { mutation, query } = defineFunctions<BenchDataModel>();
+const { mutation, query } = defineFunctions<BenchDataModel>().replicated;
 
 export const benchModules = {
   seed: mutation({

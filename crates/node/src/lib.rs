@@ -53,13 +53,13 @@ use storage::{
     Bound, ColValue, ColumnDef, CommitOptions, CommitResult, CountSpec, CrdtFieldDef,
     CrdtFieldKind, CrdtOp, CrdtOperation, CrdtRestore, CrdtSnapshot, CrdtWireOp, DeleteIn,
     DeleteResult, DirtyHeadDebug, DocWrite, EmbeddedStore, FileMetadata, FileStore, IdMapping,
-    IdMappingContent, IndexDef, MutationCall, MutationRecord, MutationStatus, Order, Page,
-    PendingUpload, ReadSpec, ResultEntry, RowChange, RowHead, RowKey, ScheduledFunctionKind,
-    ScheduledJob, ScheduledState, StorageError, StoreSchema, TableDef, UploadLease,
-    UploadLeaseWrite, WriteBatch,
+    IdMappingContent, IndexDef, LocalFieldDef, LocalFieldDelete, LocalFieldWrite, MutationCall,
+    MutationRecord, MutationStatus, Order, Page, PendingUpload, ReadSpec, ResultEntry, RowChange,
+    RowHead, RowKey, ScheduledFunctionKind, ScheduledJob, ScheduledState, StorageError,
+    StoreSchema, TableDef, TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch,
 };
 
-const API_VERSION: u32 = 20;
+const API_VERSION: u32 = 21;
 
 #[napi(js_name = "apiVersion")]
 #[must_use]
@@ -91,9 +91,16 @@ pub struct JsIndex {
 #[napi(object)]
 pub struct JsTable {
     pub name: String,
+    pub placement: String,
     pub columns: Vec<JsColumn>,
     pub crdt_fields: Option<Vec<JsCrdtField>>,
+    pub local_fields: Option<Vec<JsLocalField>>,
     pub indexes: Vec<JsIndex>,
+}
+
+#[napi(object)]
+pub struct JsLocalField {
+    pub field: String,
 }
 
 #[napi(object)]
@@ -182,12 +189,29 @@ pub struct JsDelete {
 pub struct JsWriteBatch {
     pub doc_writes: Vec<JsDocWrite>,
     pub deletes: Vec<JsDelete>,
+    pub local_field_writes: Option<Vec<JsLocalFieldWrite>>,
+    pub local_field_deletes: Option<Vec<JsLocalFieldDelete>>,
     pub crdt_ops: Option<Vec<JsCrdtOp>>,
     pub crdt_restores: Option<Vec<JsCrdtRestore>>,
     pub fresh_ids: Option<Vec<JsDelete>>,
     pub data_only_ids: Option<Vec<JsDelete>>,
     pub id_mappings: Option<Vec<JsIdMapping>>,
     pub schedules: Option<Vec<JsScheduledJob>>,
+}
+
+#[napi(object)]
+pub struct JsLocalFieldWrite {
+    pub table: String,
+    pub id: String,
+    pub field: String,
+    pub value_json: String,
+}
+
+#[napi(object)]
+pub struct JsLocalFieldDelete {
+    pub table: String,
+    pub id: String,
+    pub field: String,
 }
 
 #[napi(object)]
@@ -321,6 +345,8 @@ pub struct JsPage {
     /// Sidecar per-row adoption version (`localId -> pull seq`) for §11 D1 read-set capture; empty
     /// for key pages. Absent id => version `0`.
     pub versions: std::collections::HashMap<String, i64>,
+    /// JSON object keyed by local row id, then local field name.
+    pub local_fields_json: Option<String>,
 }
 
 #[napi(object)]
@@ -916,6 +942,20 @@ impl Store {
     #[napi]
     pub async fn doc_read(&self, table: String, id: String) -> napi::Result<Option<String>> {
         self.run(move |store| store.doc_read(&table, &id)).await
+    }
+
+    #[napi]
+    pub async fn local_fields_read(&self, table: String, id: String) -> napi::Result<String> {
+        self.run(move |store| {
+            serde_json::to_string(&store.local_fields_read(&table, &id)?).map_err(|error| {
+                StorageError::Decode {
+                    expected: "device fields JSON",
+                    index: 0,
+                    got: error.to_string(),
+                }
+            })
+        })
+        .await
     }
 
     #[napi]
@@ -1539,6 +1579,19 @@ impl Store {
     #[napi]
     pub fn doc_read(&self, table: String, id: String) -> napi::Result<Option<String>> {
         self.run(|store| store.doc_read(&table, &id))
+    }
+
+    #[napi]
+    pub fn local_fields_read(&self, table: String, id: String) -> napi::Result<String> {
+        self.run(|store| {
+            serde_json::to_string(&store.local_fields_read(&table, &id)?).map_err(|error| {
+                StorageError::Decode {
+                    expected: "device fields JSON",
+                    index: 0,
+                    got: error.to_string(),
+                }
+            })
+        })
     }
 
     #[napi]
@@ -3050,6 +3103,15 @@ fn to_schema(schema: JsSchema) -> napi::Result<StoreSchema> {
         }
         tables.push(TableDef {
             name: t.name,
+            placement: match t.placement.as_str() {
+                "replicated" => TablePlacement::Replicated,
+                "device" => TablePlacement::Device,
+                other => {
+                    return Err(napi::Error::from_reason(format!(
+                        "unknown embedded table placement {other}"
+                    )))
+                }
+            },
             columns,
             crdt_fields: t
                 .crdt_fields
@@ -3057,6 +3119,12 @@ fn to_schema(schema: JsSchema) -> napi::Result<StoreSchema> {
                 .into_iter()
                 .map(to_crdt_field)
                 .collect::<napi::Result<Vec<_>>>()?,
+            local_fields: t
+                .local_fields
+                .unwrap_or_default()
+                .into_iter()
+                .map(|field| LocalFieldDef { field: field.field })
+                .collect(),
             indexes: t
                 .indexes
                 .into_iter()
@@ -3164,6 +3232,8 @@ fn to_write_batch(batch: JsWriteBatch) -> napi::Result<WriteBatch> {
         crdt_restores,
         data_only_ids,
         deletes,
+        local_field_writes,
+        local_field_deletes,
         fresh_ids,
         id_mappings,
         schedules,
@@ -3180,6 +3250,29 @@ fn to_write_batch(batch: JsWriteBatch) -> napi::Result<WriteBatch> {
             .map(|delete| DeleteIn {
                 id: delete.id,
                 table: delete.table,
+            })
+            .collect(),
+        local_field_writes: local_field_writes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|write| {
+                Ok(LocalFieldWrite {
+                    table: write.table,
+                    id: write.id,
+                    field: write.field,
+                    value: serde_json::from_str(&write.value_json).map_err(|error| {
+                        napi::Error::from_reason(format!("invalid device field JSON: {error}"))
+                    })?,
+                })
+            })
+            .collect::<napi::Result<Vec<_>>>()?,
+        local_field_deletes: local_field_deletes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|delete| LocalFieldDelete {
+                table: delete.table,
+                id: delete.id,
+                field: delete.field,
             })
             .collect(),
         crdt_ops: crdt_ops
@@ -3440,6 +3533,10 @@ fn js_page(page: Page) -> JsPage {
         text: page.text,
         cursor: page.cursor,
         versions: page.versions.into_iter().collect(),
+        local_fields_json: (!page.local_fields.is_empty())
+            .then(|| serde_json::to_string(&page.local_fields))
+            .transpose()
+            .expect("device field values were decoded from JSON"),
     }
 }
 
@@ -3819,13 +3916,15 @@ fn parse_remote_scope(scope_json: &str) -> napi::Result<RemoteScope> {
 mod tests {
     use storage::{
         AuthoritativeRow, ColValue, ColumnDef, CommitOptions, DocWrite, EmbeddedStore, IndexDef,
-        Order, ReadSpec, RevLifecycle, RowKey, StoreSchema, TableDef, WriteBatch,
+        Order, ReadSpec, RevLifecycle, RowKey, StoreSchema, TableDef, TablePlacement, WriteBatch,
     };
 
     fn reroot_schema() -> StoreSchema {
         StoreSchema {
             tables: vec![TableDef {
                 name: "issues".into(),
+                placement: TablePlacement::Replicated,
+                local_fields: vec![],
                 columns: vec![ColumnDef {
                     name: "status".into(),
                     field: None,

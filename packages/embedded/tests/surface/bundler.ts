@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,12 +6,15 @@ import { fileURLToPath } from "node:url";
 import fc from "fast-check";
 import { build } from "vite";
 import { describe, expect, test } from "vite-plus/test";
+import { v } from "convex/values";
 
-import { createEmbeddedBundle, toModuleId } from "../../src/bundler";
+import { createEmbeddedBundle, generateEmbedded, toModuleId } from "../../src/bundler";
+import { analyzeEmbeddedSchema, defineEmbeddedSchema, embeddedTable } from "../../src/schema";
 import { convexEmbeddedUnplugin } from "../../src/unplugin";
 import {
   fromVirtualSourceId,
   renderEmbeddedBundle,
+  renderEmbeddedIdentity,
   toVirtualSourceId,
   VIRTUAL_MODULE_ID,
   VIRTUAL_SOURCE_MODULE_PREFIX,
@@ -21,25 +24,31 @@ import { convexEmbedded } from "../../src/vite";
 const convexServerPath = fileURLToPath(import.meta.resolve("convex/server"));
 const convexValuesPath = fileURLToPath(import.meta.resolve("convex/values"));
 const embeddedServerPath = fileURLToPath(new URL("../../src/server/index.ts", import.meta.url));
+const fixtureSchema = defineEmbeddedSchema({});
 
 describe("embedded bundler core", () => {
   test("discovers Convex modules and renders a lazy virtual registry", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(convexDir, "messages.ts", "export const list = null;\n");
-      await file(convexDir, "admin/users.tsx", "export const list = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
+      await file(convexDir, "admin/users.tsx", canonical("replicated", "query", "list"));
       await file(convexDir, "_generated/api.ts", "export const api = {};\n");
       await file(convexDir, "ignored.d.ts", "export {};\n");
 
-      const bundle = await createEmbeddedBundle({ root });
+      const bundle = await createFixtureBundle(root);
 
       expect(bundle.schemaPath).toBe(path.join(convexDir, "schema.ts"));
       expect(bundle.modules).toEqual({
         "admin/users": path.join(convexDir, "admin/users.tsx"),
         messages: path.join(convexDir, "messages.ts"),
       });
-      expect(JSON.stringify(bundle)).not.toContain("_generated");
+      expect(bundle.manifest.messages?.list).toEqual({
+        kind: "query",
+        placement: "replicated",
+        visibility: "public",
+      });
+      expect(JSON.stringify(bundle.modules)).not.toContain("_generated");
       expect(JSON.stringify(bundle)).not.toContain("ignored.d.ts");
     });
   });
@@ -89,10 +98,10 @@ describe("embedded bundler core", () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(convexDir, "messages.ts", "export const list = null;\n");
-      await file(convexDir, "messages.tsx", "export const other = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
+      await file(convexDir, "messages.tsx", canonical("replicated", "query", "other"));
 
-      await expect(createEmbeddedBundle({ root })).rejects.toThrow(
+      await expect(createFixtureBundle(root)).rejects.toThrow(
         'Duplicate Convex module id "messages"',
       );
     });
@@ -114,6 +123,53 @@ describe("embedded bundler core", () => {
     });
   });
 
+  test("fails closed when the generated contract is missing", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await file(convexDir, "embedded.ts", "export const pull = null;\n");
+
+      await expect(createEmbeddedBundle({ root })).rejects.toThrow(
+        "Could not find generated Embedded contract",
+      );
+    });
+  });
+
+  test("rejects generated contracts stale for schema source or function manifest", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
+      await createFixtureBundle(root);
+
+      await file(convexDir, "schema.ts", "export default { changed: true };\n");
+      await expect(createEmbeddedBundle({ root })).rejects.toThrow("stale for the current schema");
+
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await file(convexDir, "messages.ts", canonical("remote", "query", "list"));
+      await expect(createEmbeddedBundle({ root })).rejects.toThrow(
+        "stale for the current function manifest",
+      );
+    });
+  });
+
+  test("rejects generated contracts with unsupported format versions", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
+      await createFixtureBundle(root);
+      const generatedPath = path.join(convexDir, "_generated/embedded.ts");
+      const generated = await readFile(generatedPath, "utf8");
+      await writeFile(
+        generatedPath,
+        generated.replace('"formatVersion":1', '"formatVersion":999'),
+        "utf8",
+      );
+
+      await expect(createEmbeddedBundle({ root })).rejects.toThrow("format 999 is unsupported");
+    });
+  });
+
   test("ignores declaration files for all TypeScript module extensions", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
@@ -121,7 +177,7 @@ describe("embedded bundler core", () => {
       await file(convexDir, "helpers.d.mts", "export {};\n");
       await file(convexDir, "helpers.d.cts", "export {};\n");
 
-      await expect(createEmbeddedBundle({ root })).resolves.toMatchObject({
+      await expect(createFixtureBundle(root)).resolves.toMatchObject({
         modules: {},
       });
     });
@@ -135,9 +191,9 @@ describe("embedded bundler core", () => {
       await file(convexDir, "auth.config.ts", "export default {};\n");
       await file(convexDir, "crons.ts", "export default {};\n");
       await file(convexDir, "http.ts", "export default {};\n");
-      await file(convexDir, "messages.ts", "export const list = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
 
-      const bundle = await createEmbeddedBundle({ root });
+      const bundle = await createFixtureBundle(root);
 
       expect(bundle.modules).toEqual({
         messages: path.join(convexDir, "messages.ts"),
@@ -154,13 +210,155 @@ describe("embedded bundler core", () => {
         "hosted.ts",
         `/* hosted only */\n"use strict";\n"use node";\nexport const run = null;\n`,
       );
-      await file(convexDir, "local.ts", `export const read = null;\n`);
+      await file(convexDir, "device.local.ts", canonical("local", "query", "read"));
 
-      const bundle = await createEmbeddedBundle({ root });
+      const bundle = await createFixtureBundle(root);
 
       expect(bundle.modules).toEqual({
-        local: path.join(convexDir, "local.ts"),
+        "device.local": path.join(convexDir, "device.local.ts"),
       });
+    });
+  });
+
+  test("keeps remote registrations in the manifest but out of the device graph", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "feed.ts", canonical("replicated", "query", "list"));
+      await file(convexDir, "admin.ts", canonical("remote", "mutation", "remove"));
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.modules).toEqual({ feed: path.join(convexDir, "feed.ts") });
+      expect(bundle.manifest.admin?.remove).toMatchObject({
+        kind: "mutation",
+        placement: "remote",
+      });
+      expect(JSON.stringify(bundle.modules)).not.toContain("admin.ts");
+    });
+  });
+
+  test("rejects device dependency paths that reach remote modules", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.ts",
+        `import "./admin";\n${canonical("replicated", "query", "list")}`,
+      );
+      await file(convexDir, "admin.ts", canonical("remote", "query", "audit"));
+
+      await expect(createFixtureBundle(root)).rejects.toThrow("imports a remote module");
+    });
+  });
+
+  test("rejects explicit-extension imports that reach remote modules", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.ts",
+        `import "./admin.ts";\n${canonical("replicated", "query", "list")}`,
+      );
+      await file(convexDir, "admin.ts", canonical("remote", "query", "audit"));
+
+      await expect(createFixtureBundle(root)).rejects.toThrow("imports a remote module");
+    });
+  });
+
+  test("rejects path aliases that reach remote or Node-only modules", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        root,
+        "tsconfig.json",
+        JSON.stringify({
+          compilerOptions: { baseUrl: ".", paths: { "@convex/*": ["convex/*"] } },
+        }),
+      );
+      await file(
+        convexDir,
+        "feed.ts",
+        `import "@convex/admin";\n${canonical("replicated", "query", "list")}`,
+      );
+      await file(convexDir, "admin.ts", canonical("remote", "query", "audit"));
+
+      await expect(createFixtureBundle(root)).rejects.toThrow("imports a remote module");
+
+      await file(convexDir, "admin.ts", `"use node";\nexport const audit = null;\n`);
+      await expect(createFixtureBundle(root)).rejects.toThrow("imports a Node-only module");
+    });
+  });
+
+  test("hashes all transitive project helpers in the module graph identity", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.ts",
+        `import { value } from "./helper.ts";\nvoid value;\n${canonical(
+          "replicated",
+          "query",
+          "list",
+        )}`,
+      );
+      await file(convexDir, "helper.ts", "export const value = 1;\n");
+
+      const beforeBundle = await createFixtureBundle(root);
+      const before = await renderEmbeddedIdentity(beforeBundle);
+      expect(beforeBundle.sourceFiles).toContain(path.join(convexDir, "helper.ts"));
+
+      await file(convexDir, "helper.ts", "export const value = 2;\n");
+      const afterBundle = await createFixtureBundle(root);
+      const after = await renderEmbeddedIdentity(afterBundle);
+
+      expect(after).not.toBe(before);
+    });
+  });
+
+  test("rejects non-canonical embedded registrations", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "legacy.ts",
+        "declare const embedded: any; export const list = embedded.query({});\n",
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow("canonical embedded");
+    });
+  });
+
+  test("rejects typed or parenthesized registrations that evade the canonical form", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "typed.ts",
+        "declare const embedded: any; export const list: unknown = embedded.replicated.query({});\n",
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow("canonical embedded");
+
+      await file(
+        convexDir,
+        "typed.ts",
+        "declare const embedded: any; export const list = (embedded.replicated.query)({});\n",
+      );
+      await expect(createFixtureBundle(root)).rejects.toThrow("canonical embedded");
+
+      await file(
+        convexDir,
+        "typed.ts",
+        "declare const embedded: any; const localQuery = embedded.local.query; export const list = localQuery({});\n",
+      );
+      await expect(createFixtureBundle(root)).rejects.toThrow("directly from its exported");
     });
   });
 
@@ -244,7 +442,7 @@ export default defineComponent("defaultChild");
         "export const pong = null;\n",
       );
 
-      const bundle = await createEmbeddedBundle({ root });
+      const bundle = await createFixtureBundle(root);
 
       expect(bundle.modules).toEqual({});
       expect(JSON.stringify(bundle)).not.toContain("test-component");
@@ -254,8 +452,18 @@ export default defineComponent("defaultChild");
 
   test("renders quoted keys for module ids that are not identifiers", () => {
     const source = renderEmbeddedBundle({
+      generatedPath: "/repo/convex/_generated/embedded.ts",
+      manifest: {
+        "admin/users": {
+          list: { kind: "query", placement: "replicated", visibility: "public" },
+        },
+      },
       modules: { "admin/users": "/repo/convex/admin/users.ts" },
+      schemaHash: "schema",
+      sourceFiles: ["/repo/convex/admin/users.ts"],
       schemaPath: "/repo/convex/schema.ts",
+      schemaSourceHash: "schema",
+      manifestHash: "manifest",
     });
 
     expect(source).toContain('"admin/users": () => import(');
@@ -286,10 +494,11 @@ describe("embedded unplugin adapter", () => {
     await withFixture(async ({ convexDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(convexDir, "messages.ts", "export const list = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
+        schema: fixtureSchema,
       }) as unknown as {
         load(id: string): Promise<string | null>;
         resolveId(id: string): Promise<string | null>;
@@ -306,16 +515,40 @@ describe("embedded unplugin adapter", () => {
     });
   });
 
+  test("regenerates the literal contract from a schema supplied to the plugin", async () => {
+    await withFixture(async ({ convexDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await file(convexDir, "embedded.ts", "export const pull = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
+      const schema = defineEmbeddedSchema({ messages: embeddedTable({ body: v.string() }) });
+      const plugin = convexEmbeddedUnplugin.rollup({ convexDir, schema }) as unknown as {
+        load(id: string): Promise<string | null>;
+        resolveId(id: string): Promise<string | null>;
+      };
+
+      const resolved = await plugin.resolveId(VIRTUAL_MODULE_ID);
+      const source = await plugin.load(resolved!);
+
+      expect(source).toContain("embeddedSchema");
+      await expect(
+        import("node:fs/promises").then(({ readFile }) =>
+          readFile(path.join(convexDir, "_generated/embedded.ts"), "utf8"),
+        ),
+      ).resolves.toContain("runtimeStoreSchema");
+    });
+  });
+
   test("resolves virtual source ids to real Convex files", async () => {
     await withFixture(async ({ convexDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(convexDir, "messages.ts", "export const list = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
       const modulePath = path.join(convexDir, "messages.ts");
       const sourceId = toVirtualSourceId(modulePath);
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
+        schema: fixtureSchema,
       }) as unknown as {
         resolveId(id: string): Promise<string | null>;
       };
@@ -329,11 +562,12 @@ describe("embedded unplugin adapter", () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(convexDir, "messages.ts", "export const list = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
       await file(root, "secret.ts", "export const secret = true;\n");
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
+        schema: fixtureSchema,
       }) as unknown as {
         resolveId(id: string): Promise<string | null>;
       };
@@ -351,6 +585,7 @@ describe("embedded unplugin adapter", () => {
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
+        schema: fixtureSchema,
       }) as unknown as {
         resolveId(id: string, importer?: string): Promise<string | null>;
       };
@@ -365,6 +600,7 @@ describe("embedded unplugin adapter", () => {
     await withFixture(async ({ root }) => {
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir: path.join(root, "missing-convex"),
+        schema: fixtureSchema,
       }) as unknown as {
         load(id: string): Promise<string | null>;
       };
@@ -373,26 +609,26 @@ describe("embedded unplugin adapter", () => {
     });
   });
 
-  test("does not write a generated embedded registry file", async () => {
+  test("requires the generated embedded contract without rewriting it", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(convexDir, "messages.ts", "export const list = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
 
-      await createEmbeddedBundle({ root });
+      await createFixtureBundle(root);
 
       await expect(
-        import("node:fs/promises").then(({ stat }) =>
-          stat(path.join(convexDir, "_generated/embedded.ts")),
+        import("node:fs/promises").then(({ readFile }) =>
+          readFile(path.join(convexDir, "_generated/embedded.ts"), "utf8"),
         ),
-      ).rejects.toThrow();
+      ).resolves.toContain("embeddedSchema");
     });
   });
 });
 
 describe("embedded Vite adapter", () => {
   test("installs cross-origin isolation headers for dev and preview", () => {
-    const [configPlugin] = convexEmbedded();
+    const [configPlugin] = convexEmbedded({ schema: fixtureSchema });
     const config = (configPlugin as unknown as { config(): Record<string, unknown> }).config();
 
     expect(config).toMatchObject({
@@ -427,10 +663,10 @@ export const query = queryGeneric;
       await file(
         convexDir,
         "messages.ts",
-        `import { query } from "./_generated/server";
+        `import { embedded } from "./embedded";
 import { v } from "convex/values";
 
-export const list = query({
+export const list = embedded.replicated.query({
   args: { channel: v.string() },
   handler: () => [],
 });
@@ -439,9 +675,9 @@ export const list = query({
       await file(
         root,
         "src/main.ts",
-        `import { modules, schema } from "virtual:convex-embedded";
+        `import { embeddedSchema, modules } from "virtual:convex-embedded";
 
-void schema;
+void embeddedSchema;
 void modules.messages;
 `,
       );
@@ -452,7 +688,7 @@ void modules.messages;
           write: false,
         },
         logLevel: "silent",
-        plugins: [convexEmbedded()],
+        plugins: [convexEmbedded({ schema: fixtureSchema })],
         resolve: {
           alias: {
             "convex/server": convexServerPath,
@@ -480,7 +716,7 @@ export const query = queryGeneric;
       );
       await file(convexDir, "_generated/api.ts", "export const components = { embedded: {} };\n");
       await embeddedEntrypoint(convexDir);
-      await file(convexDir, "messages.ts", "export const list = null;\n");
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
 
       const output = await build({
         build: {
@@ -490,7 +726,7 @@ export const query = queryGeneric;
           write: false,
         },
         logLevel: "silent",
-        plugins: [convexEmbedded()],
+        plugins: [convexEmbedded({ schema: fixtureSchema })],
         root,
         resolve: {
           alias: {
@@ -534,6 +770,11 @@ async function withFixture(
   }
 }
 
+async function createFixtureBundle(root: string) {
+  await generateEmbedded({ analysis: analyzeEmbeddedSchema(fixtureSchema), root });
+  return createEmbeddedBundle({ root });
+}
+
 async function file(root: string, relative: string, contents: string): Promise<void> {
   const fullPath = path.join(root, relative);
   await mkdir(path.dirname(fullPath), { recursive: true });
@@ -549,7 +790,7 @@ import { components } from "./_generated/api";
 import schema from "./schema";
 import { mutation, query } from "./_generated/server";
 
-const embedded = defineEmbedded({
+export const embedded = defineEmbedded({
   component: components.embedded,
   schema,
 });
@@ -557,4 +798,12 @@ const embedded = defineEmbedded({
 export const { pull, push } = embedded;
 `,
   );
+}
+
+function canonical(
+  placement: "replicated" | "remote" | "local",
+  builder: "query" | "mutation" | "internalQuery" | "internalMutation",
+  name: string,
+): string {
+  return `declare const embedded: any;\nexport const ${name} = embedded.${placement}.${builder}({});\n`;
 }

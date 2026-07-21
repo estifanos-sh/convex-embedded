@@ -26,7 +26,6 @@ import {
   REMOTE_PULL_DIAGNOSTIC_ERROR,
   remoteTickHasWork,
 } from "../rev";
-import { toRuntimeStoreSchema } from "../schema";
 import type {
   RemoteStartOptions,
   RemoteScope,
@@ -235,7 +234,6 @@ export async function initFromMessage(
 ): Promise<WorkerState> {
   postDebug(request.debug, "worker:bundle:import:start", undefined, postResponse);
   const embedded = await importEmbeddedBundle();
-  const schema = embedded.schema;
   postDebug(
     request.debug,
     "worker:bundle:import:done",
@@ -244,7 +242,7 @@ export async function initFromMessage(
     },
     postResponse,
   );
-  const runtimeStoreSchema = toRuntimeStoreSchema(schema);
+  const runtimeStoreSchema = embedded.embeddedSchema.runtimeStoreSchema;
   const state = await initRuntime({
     debug: request.debug,
     emit:
@@ -252,6 +250,7 @@ export async function initFromMessage(
         ? undefined
         : (event) => postResponse({ event, op: WorkerEvent.Event }),
     modules: embedded.modules,
+    manifest: embedded.embeddedManifest,
     moduleGraphHash: request.identity?.moduleGraphHash,
     onRuntimeEvent: (event) => postResponse({ event, op: WorkerEvent.Event }),
     setupSchema: runtimeStoreSchema,
@@ -1410,6 +1409,7 @@ export async function initRuntime(options: {
   debug?: boolean;
   emit?: EmbeddedEventListener;
   modules: ConvexModules;
+  manifest?: import("../runtime/runner").RuntimeFunctionManifest;
   moduleGraphHash?: string;
   onDebug?: (phase: string, detail?: unknown) => void;
   onRuntimeEvent?: RuntimeEventSink;
@@ -1462,6 +1462,7 @@ export async function initRuntime(options: {
       },
       emit: options.emit,
       moduleGraphHash: options.moduleGraphHash,
+      manifest: options.manifest,
       remote: options.remote,
     });
     if (slowOpenTimer !== undefined) clearTimeout(slowOpenTimer);
@@ -1496,6 +1497,7 @@ export async function initRuntime(options: {
         },
         emit: options.emit,
         moduleGraphHash: options.moduleGraphHash,
+        manifest: options.manifest,
         remote: options.remote,
       });
     };

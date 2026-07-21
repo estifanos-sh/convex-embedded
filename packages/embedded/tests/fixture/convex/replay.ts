@@ -1,10 +1,8 @@
 import { v } from "convex/values";
 
-import { mutation } from "./embedded";
-import { read as readTime } from "./time";
-import { mutation as rawMutation } from "./_generated/server";
+import { embedded } from "./embedded";
 
-export const updatePair = mutation({
+export const updatePair = embedded.replicated.mutation({
   args: {
     first: v.id("documents"),
     second: v.id("documents"),
@@ -24,7 +22,7 @@ export const updatePair = mutation({
   },
 });
 
-export const insertNull = mutation({
+export const insertNull = embedded.replicated.mutation({
   args: { slug: v.string(), title: v.string(), updatedAt: v.number() },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -33,21 +31,6 @@ export const insertNull = mutation({
       slug: args.slug,
       title: args.title,
       updatedAt: args.updatedAt,
-    });
-    return null;
-  },
-});
-
-/** Deliberately bypasses Embedded so rollback can be verified against an invalid target. */
-export const rawMutationTarget = rawMutation({
-  args: { slug: v.string() },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    await ctx.db.insert("documents", {
-      body: "",
-      slug: args.slug,
-      title: args.slug,
-      updatedAt: readTime(),
     });
     return null;
   },

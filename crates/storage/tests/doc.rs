@@ -14,6 +14,8 @@ fn legacy_document_schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "documents".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![
                 ColumnDef {
                     name: "idx_slug".into(),
@@ -129,6 +131,8 @@ fn commit_reports_row_changes_for_observability() {
         WriteBatch {
             crdt_ops: Vec::new(),
             crdt_restores: vec![],
+            local_field_writes: vec![],
+            local_field_deletes: vec![],
             doc_writes: vec![],
             deletes: vec![DeleteIn {
                 table: "issues".into(),
@@ -161,6 +165,8 @@ fn data_only_update_changes_body_without_rewriting_index_columns() {
         WriteBatch {
             crdt_ops: Vec::new(),
             crdt_restores: vec![],
+            local_field_writes: vec![],
+            local_field_deletes: vec![],
             doc_writes: vec![DocWrite {
                 table: "issues".into(),
                 id: "i1".into(),
@@ -201,6 +207,8 @@ fn supports_camel_case_indexed_fields() {
     let schema = StoreSchema {
         tables: vec![TableDef {
             name: "documents".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "idx_updatedat".into(),
                 field: Some("updatedAt".into()),
@@ -316,6 +324,8 @@ fn setup_reconciles_schema_changes_without_deleting_existing_rows() {
     let mut changed = schema();
     changed.tables.push(TableDef {
         name: "notes".into(),
+        placement: TablePlacement::Replicated,
+        local_fields: vec![],
         columns: vec![],
         crdt_fields: vec![],
         indexes: vec![],
@@ -379,6 +389,8 @@ fn setup_repairs_missing_index_columns_without_deleting_existing_rows() {
     let schema = StoreSchema {
         tables: vec![TableDef {
             name: "documents".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "idx_slug".into(),
                 field: Some("slug".into()),
@@ -532,6 +544,8 @@ fn setup_rejects_invalid_and_reserved_schema_names() {
         let bad = StoreSchema {
             tables: vec![TableDef {
                 name: name.into(),
+                placement: TablePlacement::Replicated,
+                local_fields: vec![],
                 columns: vec![],
                 crdt_fields: vec![],
                 indexes: vec![],
@@ -545,6 +559,8 @@ fn setup_rejects_invalid_and_reserved_schema_names() {
     let reserved = StoreSchema {
         tables: vec![TableDef {
             name: "issues".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "data".into(),
                 field: None,
@@ -575,6 +591,8 @@ fn commit_applies_mixed_batch_and_rolls_back_failed_writes() {
         WriteBatch {
             crdt_ops: Vec::new(),
             crdt_restores: vec![],
+            local_field_writes: vec![],
+            local_field_deletes: vec![],
             doc_writes: vec![flag(&store, "new", ColValue::Bool(true))],
             deletes: vec![DeleteIn {
                 table: "flags".into(),

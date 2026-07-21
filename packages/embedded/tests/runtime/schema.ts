@@ -4,7 +4,7 @@ import fc from "fast-check";
 import { describe, expect, test } from "vite-plus/test";
 
 import { analyzeEmbeddedSchema, toRuntimeStoreSchema, toStoreSchema } from "../../src/schema";
-import { count, set, text } from "../../src/values";
+import { e } from "../../src/values";
 
 describe("Convex schema storage conversion", () => {
   test("preserves Convex index fields while aliasing storage columns", () => {
@@ -22,6 +22,7 @@ describe("Convex schema storage conversion", () => {
       tables: [
         {
           name: "users",
+          placement: "replicated",
           columns: [
             { name: "idx_profile_email", field: "profile.email" },
             { name: "idx_status", field: "status" },
@@ -101,6 +102,17 @@ describe("Convex schema storage conversion", () => {
       "by_field_epoch_state_retain_seq",
     );
     expect(checkpoints?.columns.map((column) => column.name)).not.toContain("idx_retain_until");
+  });
+
+  test("keeps locally executed component revision indexes in browser storage", () => {
+    const schema = defineSchema({ documents: defineTable({ value: v.string() }) });
+    const revisions = toRuntimeStoreSchema(schema).tables.find(
+      (table) => table.name === "__e_revisions",
+    );
+
+    expect(revisions).toBeDefined();
+    expect(revisions?.indexes.map((index) => index.name)).toContain("by_revid");
+    expect(revisions?.columns).toContainEqual({ field: "revId", name: "idx_rev_id" });
   });
 
   test("aliases indexed user fields that collide with storage internals", () => {
@@ -183,9 +195,9 @@ describe("Convex schema storage conversion", () => {
     const schema = defineSchema({
       docs: defineTable({
         title: v.string(),
-        body: text(),
-        stats: v.object({ votes: count() }),
-        tags: set(v.string()),
+        body: e.text(),
+        stats: v.object({ votes: e.count() }),
+        tags: e.set(v.string()),
       }),
     });
 
@@ -273,7 +285,7 @@ describe("Convex schema storage conversion", () => {
   test("analyzes store schema and storage id paths from one schema pass", () => {
     const schema = defineSchema({
       docs: defineTable({
-        body: text(),
+        body: e.text(),
         file: v.id("_storage"),
         slug: v.string(),
       }).index("by_slug", ["slug"]),

@@ -556,6 +556,8 @@ fn seeded_vals(rows: usize) -> EmbeddedStore {
             WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
+                local_field_writes: vec![],
+                local_field_deletes: vec![],
                 doc_writes,
                 deletes: vec![],
                 fresh_ids: vec![],

@@ -7,6 +7,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { embeddedDevtools } from "@convex-dev/embedded/devtools/vite";
 import { convexEmbedded } from "@convex-dev/embedded/vite";
+import schema from "../../../convex/schema";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const convexDir = fileURLToPath(new URL("../../../convex", import.meta.url));
@@ -110,7 +111,7 @@ export default defineConfig(({ command, mode }) => {
     plugins: [
       react(),
       tailwindcss(),
-      convexEmbedded({ convexDir }),
+      convexEmbedded({ convexDir, schema }),
       embeddedDevtools(),
       preloadRuntimeAssets(),
       precompressAssets(),

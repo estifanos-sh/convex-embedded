@@ -19,6 +19,8 @@
     "dist/node.mjs",
     "dist/server.d.mts",
     "dist/server.mjs",
+    "dist/schema.d.mts",
+    "dist/schema.mjs",
     "dist/thread",
     "dist/unplugin.d.mts",
     "dist/unplugin.mjs",
@@ -55,6 +57,10 @@
     "./values": {
       "types": "./dist/values.d.mts",
       "import": "./dist/values.mjs"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.mts",
+      "import": "./dist/schema.mjs"
     },
     "./convex.config": {
       "@convex-dev/component-source": "./src/component/convex.config.ts",

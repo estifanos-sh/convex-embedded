@@ -2,11 +2,11 @@ import { paginationOptsValidator } from "convex/server";
 import { v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { mutation, query } from "./_generated/server";
+import { embedded } from "./embedded";
 
 const deleteResultValidator = v.object({ deleted: v.number(), isDone: v.boolean() });
 
-export const list = query({
+export const list = embedded.remote.query({
   args: {
     identityKey: v.optional(v.string()),
     acknowledged: v.optional(v.boolean()),
@@ -23,7 +23,7 @@ export const list = query({
     }),
 });
 
-export const settlement = query({
+export const settlement = embedded.remote.query({
   args: {
     clientId: v.string(),
     mutationId: v.string(),
@@ -33,7 +33,7 @@ export const settlement = query({
     await ctx.runQuery(components.embedded.protocol.settlementRead, { clientId, mutationId }),
 });
 
-export const remove = mutation({
+export const remove = embedded.remote.mutation({
   args: {
     clientId: v.optional(v.string()),
     identityKey: v.optional(v.string()),

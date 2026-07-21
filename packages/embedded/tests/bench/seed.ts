@@ -1,7 +1,6 @@
-import { modules, schema as appSchema } from "virtual:convex-embedded";
+import { embeddedSchema, modules } from "virtual:convex-embedded";
 
 import { initRuntime } from "../../src/browser/runtime";
-import { toRuntimeStoreSchema } from "../../src/schema";
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
 import wasmUrl from "../../dist/wasm/index.wasm?url";
 
@@ -29,7 +28,7 @@ export async function seedBrowserVolume(options: {
 }): Promise<void> {
   const response = await fetch(wasmUrl);
   if (!response.ok) throw new Error(`Failed to load benchmark WASM: ${response.status}.`);
-  const schema = toRuntimeStoreSchema(appSchema);
+  const schema = embeddedSchema.runtimeStoreSchema;
   const storagePath = `convex-embedded-${options.storageId}.db`;
   const state = await initRuntime({
     modules,

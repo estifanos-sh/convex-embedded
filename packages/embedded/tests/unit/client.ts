@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vite-plus/test";
+import { makeFunctionReference } from "convex/server";
 
 import { EMBEDDED_STORE_FORMAT_VERSION } from "../../src/abi";
 import { EmbeddedClient } from "../../src/client";
@@ -451,6 +452,30 @@ describe("browser network lifecycle", () => {
 });
 
 describe("connection invariants", () => {
+  test("local mutations do not allocate replication metadata", async () => {
+    let runOptions: Parameters<Runner["runMutation"]>[2];
+    const runner = {
+      identity: { read: async () => undefined, write: async () => undefined },
+      route: async () => ({ execution: "local", placement: "local" }),
+      runMutation: async (_ref: unknown, _args: unknown, options: typeof runOptions) => {
+        runOptions = options;
+        return "saved";
+      },
+      subscribeEvents: () => () => undefined,
+    } as unknown as Runner;
+    const client = new EmbeddedClient({ eagerRunner: runner, runner });
+    try {
+      const mutation = makeFunctionReference<"mutation", Record<string, never>, string>(
+        "preferences:save",
+      );
+      await expect(client.mutation(mutation, {})).resolves.toBe("saved");
+      expect(runOptions).not.toHaveProperty("mutationId");
+      expect(runOptions).not.toHaveProperty("pushCall");
+    } finally {
+      await client.close();
+    }
+  });
+
   test("local readiness never implies remote readiness", async () => {
     let emit: ((event: EmbeddedEvent) => void) | undefined;
     const runner = {

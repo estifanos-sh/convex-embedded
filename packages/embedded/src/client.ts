@@ -373,7 +373,7 @@ export class EmbeddedClient {
   private clientId = randomId("client");
   private closePromise: Promise<void> | undefined;
   private nextMutationId = 1;
-  private readonly localRoutes = new Set<string>();
+  private readonly localRoutes = new Map<string, "replicated" | "local">();
   private readonly queries = new Map<string, QueryState>();
   private readonly state: Promise<ClientState>;
   private readonly auth: EmbeddedAuthState;
@@ -484,8 +484,9 @@ export class EmbeddedClient {
     // watcher loop is the sole producer of `baseValue`/`baseError`, so a concurrent watched read
     // cannot tear against this result. Mirrors Convex's `client.query()`.
     return (await this.recordOperation("query", getFunctionName(query), normalized, async () => {
-      const route = this.hasLocalRoute(query, "query")
-        ? ({ execution: "local" } as const)
+      const cachedPlacement = this.cachedLocalRoute(query, "query");
+      const route = cachedPlacement
+        ? ({ execution: "local", placement: cachedPlacement } as const)
         : await this.resolveRoute(runner, query, normalized, "query");
       if (route.execution === "hosted") {
         return this.runHosted("query", query, route.args);
@@ -548,8 +549,9 @@ export class EmbeddedClient {
       getFunctionName(mutation),
       normalized,
       async () => {
-        const route = this.hasLocalRoute(mutation, "mutation")
-          ? ({ execution: "local" } as const)
+        const cachedPlacement = this.cachedLocalRoute(mutation, "mutation");
+        const route = cachedPlacement
+          ? ({ execution: "local", placement: cachedPlacement } as const)
           : await this.resolveRoute(runner, mutation, normalized, "mutation");
         if (route.execution === "hosted") {
           return this.runHosted("mutation", mutation, route.args);
@@ -562,6 +564,19 @@ export class EmbeddedClient {
         if (clientTiming) {
           clientTiming.authMs += getTimerTime() - timingPhaseStartedAt;
           timingPhaseStartedAt = getTimerTime();
+        }
+        if (route.placement === "local") {
+          const value = await runner.runMutation(mutation, normalized, {
+            auth,
+            onTiming: (value) => {
+              runnerTiming = value;
+            },
+          });
+          if (clientTiming) {
+            clientTiming.runnerMs += getTimerTime() - timingPhaseStartedAt;
+            timingPhaseStartedAt = getTimerTime();
+          }
+          return value;
         }
         const mutationId = this.allocateMutationId();
         if (clientTiming) {
@@ -994,8 +1009,9 @@ export class EmbeddedClient {
       if (state.stop) return;
       const { runner } = await this.state;
       if (this.closed || state.stop || !state.callbacks.size) return;
-      const route = this.hasLocalRoute(query, "query")
-        ? ({ execution: "local" } as const)
+      const cachedPlacement = this.cachedLocalRoute(query, "query");
+      const route = cachedPlacement
+        ? ({ execution: "local", placement: cachedPlacement } as const)
         : await this.resolveRoute(runner, query, args, "query");
       if (
         this.closed ||
@@ -1244,7 +1260,7 @@ export class EmbeddedClient {
       if (route.execution !== "blocked") {
         unsubscribe?.();
         if (route.execution === "local") {
-          this.localRoutes.add(this.routeKey(ref, kind));
+          this.localRoutes.set(this.routeKey(ref, kind), route.placement);
         }
         return route;
       }
@@ -1270,11 +1286,11 @@ export class EmbeddedClient {
     }
   }
 
-  private hasLocalRoute(
+  private cachedLocalRoute(
     ref: FunctionReference<"query" | "mutation" | "action">,
     kind: "query" | "mutation" | "action",
-  ): boolean {
-    return this.localRoutes.has(this.routeKey(ref, kind));
+  ): "replicated" | "local" | undefined {
+    return this.localRoutes.get(this.routeKey(ref, kind));
   }
 
   private routeKey(

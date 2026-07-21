@@ -109,6 +109,8 @@ fn seed(rows: &[(&str, ColValue)]) -> EmbeddedStore {
             WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
+                local_field_writes: vec![],
+                local_field_deletes: vec![],
                 doc_writes,
                 deletes: vec![],
                 fresh_ids: vec![],
@@ -187,8 +189,10 @@ proptest! {
         store
             .commit(
                 WriteBatch {
-                crdt_ops: Vec::new(),
-                crdt_restores: vec![],
+                    crdt_ops: Vec::new(),
+                    crdt_restores: vec![],
+                    local_field_writes: vec![],
+                    local_field_deletes: vec![],
                     doc_writes,
                     deletes: vec![],
                     fresh_ids: vec![],
@@ -249,8 +253,10 @@ proptest! {
         store
             .commit(
                 WriteBatch {
-                crdt_ops: Vec::new(),
-                crdt_restores: vec![],
+                    crdt_ops: Vec::new(),
+                    crdt_restores: vec![],
+                    local_field_writes: vec![],
+                    local_field_deletes: vec![],
                     doc_writes: rows,
                     deletes: vec![],
                     fresh_ids: vec![],

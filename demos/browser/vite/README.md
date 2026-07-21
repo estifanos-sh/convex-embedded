@@ -25,6 +25,6 @@ pnpm dev:browser:vite
 
 - `src/app.tsx` — BlockNote editor, local draft writes, revision history, and restore controls.
 - `src/lib/client.ts` — `ConvexEmbeddedClient` setup and optional remote configuration.
-- `vite.config.ts` — React, Tailwind, `convexEmbedded({ convexDir })`, and embedded devtools.
+- `vite.config.ts` — React, Tailwind, `convexEmbedded({ convexDir, schema })`, and embedded devtools.
 
 The schema and functions live at the workspace root in `convex/`. The Vite plugin bundles those functions into the browser worker and emits a stable identity hash so compatible tabs attach to the same local runtime.

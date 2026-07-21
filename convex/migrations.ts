@@ -1,10 +1,13 @@
 import { Migrations } from "@convex-dev/migrations";
 
 import { components, internal } from "./_generated/api";
-import { internalMutation } from "./embedded";
+import { embedded } from "./embedded";
 import schema from "./schema";
 
-const migrations = new Migrations(components.migrations, { internalMutation, schema });
+const migrations = new Migrations(components.migrations, {
+  internalMutation: embedded.remote.internalMutation,
+  schema,
+});
 
 export const normalizeUpdatedAt = migrations.define({
   table: "documents",

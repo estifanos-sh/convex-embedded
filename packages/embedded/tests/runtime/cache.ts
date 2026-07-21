@@ -41,7 +41,7 @@ const appSchema = defineSchema({
 });
 type DataModel = DataModelFromSchemaDefinition<typeof appSchema>;
 const storeSchema = toRuntimeStoreSchema(appSchema);
-const { mutation, query } = defineFunctions<DataModel>();
+const { mutation, query } = defineFunctions<DataModel>().replicated;
 
 const mutationProbe: { id?: string } = {};
 
@@ -740,6 +740,7 @@ describe("hosted ids in typed v.id arguments", () => {
     const r = runner(store);
     await expect(r.route("cache:point", { id: "hostedR" }, "query")).resolves.toEqual({
       execution: "local",
+      placement: "replicated",
     });
   });
 

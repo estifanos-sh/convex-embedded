@@ -1,7 +1,6 @@
 /** Dedicated worker for release-WASM linear-memory measurements. */
 import type { WasmSource } from "../../src/browser/artifact";
 import { initRuntime, type WorkerState } from "../../src/browser/runtime";
-import { toRuntimeStoreSchema } from "../../src/schema";
 import type { StoreSchema } from "../../src/storage/types";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
@@ -89,8 +88,7 @@ async function measure(request: MemoryRequest): Promise<{
 }
 
 async function open(storageId: string): Promise<WorkerState> {
-  const { modules, schema, wasm } = await loadModules();
-  const storeSchema = toRuntimeStoreSchema(schema);
+  const { modules, storeSchema, wasm } = await loadModules();
   return await openWithSchema(storageId, storeSchema, modules, wasm);
 }
 
@@ -117,15 +115,15 @@ async function close(state: WorkerState): Promise<void> {
 
 async function loadModules(): Promise<{
   modules: Awaited<typeof import("virtual:convex-embedded")>["modules"];
-  schema: Awaited<typeof import("virtual:convex-embedded")>["schema"];
+  storeSchema: StoreSchema;
   wasm: WasmSource;
 }> {
-  const { modules, schema } = await import("virtual:convex-embedded");
+  const { embeddedSchema, modules } = await import("virtual:convex-embedded");
   const response = await fetch(wasmUrl);
   if (!response.ok) throw new Error(`failed to load packaged WASM artifact: ${response.status}`);
   return {
     modules,
-    schema,
+    storeSchema: embeddedSchema.runtimeStoreSchema,
     wasm: {
       bytes: await response.arrayBuffer(),
       worker: () => new Worker(new URL(napiWorkerUrl, import.meta.url), { type: "module" }),

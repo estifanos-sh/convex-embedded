@@ -1,9 +1,9 @@
-import { defineSchema, defineTable } from "convex/server";
+import { defineEmbeddedSchema, embeddedTable } from "@convex-dev/embedded/schema";
 import { v } from "convex/values";
-import { text } from "@convex-dev/embedded/values";
+import { e } from "@convex-dev/embedded/values";
 
-export default defineSchema({
-  attachments: defineTable({
+export default defineEmbeddedSchema({
+  attachments: embeddedTable({
     contentType: v.string(),
     documentId: v.id("documents"),
     name: v.string(),
@@ -14,8 +14,8 @@ export default defineSchema({
     .index("by_documentId", ["documentId"])
     .index("by_storageId", ["storageId"])
     .index("by_token", ["token"]),
-  documents: defineTable({
-    body: text(),
+  documents: embeddedTable({
+    body: e.text(),
     slug: v.string(),
     title: v.string(),
     updatedAt: v.number(),

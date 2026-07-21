@@ -21,6 +21,7 @@ const schema: StoreSchema = {
   tables: [
     {
       name: "issues",
+      placement: "replicated",
       columns: [{ name: "status" }],
       indexes: [{ name: "by_status", fields: ["status"] }],
     },
@@ -31,6 +32,7 @@ const aliasSchema: StoreSchema = {
   tables: [
     {
       name: "users",
+      placement: "replicated",
       columns: [{ name: "idx_profile_email", field: "profile.email" }],
       indexes: [
         {
@@ -49,11 +51,13 @@ const cacheSchema: StoreSchema = {
   tables: [
     {
       name: "issues",
+      placement: "replicated",
       columns: [{ name: "status" }],
       indexes: [{ name: "by_status", fields: ["status"] }],
     },
     {
       name: "notes",
+      placement: "replicated",
       columns: [{ name: "kind" }],
       indexes: [{ name: "by_kind", fields: ["kind"] }],
     },

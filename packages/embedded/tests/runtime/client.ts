@@ -2,30 +2,25 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import {
-  type DataModelFromSchemaDefinition,
-  defineSchema,
-  defineTable,
-  makeFunctionReference,
-} from "convex/server";
+import { type DataModelFromSchemaDefinition, makeFunctionReference } from "convex/server";
 import { v } from "convex/values";
 import { describe, expect, test } from "vite-plus/test";
 
 import { createConvexEmbeddedClientForTest } from "../../src/node/client";
 import { defineFunctions } from "../../src/runtime/functions";
 import type { StoreBinding } from "../../src/storage/binding";
-import { toRuntimeStoreSchema } from "../../src/schema";
+import { defineEmbeddedSchema, embeddedTable, toRuntimeStoreSchema } from "../../src/schema";
 import { hashValue } from "../../src/hash";
 import { nativeModule } from "../testkit/native";
 
-const schema = defineSchema({
-  messages: defineTable({
+const schema = defineEmbeddedSchema({
+  messages: embeddedTable({
     channel: v.string(),
     body: v.string(),
   }).index("by_channel", ["channel"]),
 });
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
-const { query, mutation } = defineFunctions<DataModel>();
+const { query, mutation } = defineFunctions<DataModel>().replicated;
 
 const modules = {
   send: mutation({
