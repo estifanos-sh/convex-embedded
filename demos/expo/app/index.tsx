@@ -1,23 +1,54 @@
 import { api } from "$convex/_generated/api";
 import type { FunctionReturnType } from "convex/server";
 import * as Haptics from "expo-haptics";
-import { Link, router } from "expo-router";
+import { router, useLocalSearchParams } from "expo-router";
 import { Stack } from "expo-router/stack";
 import * as React from "react";
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from "react-native";
+import {
+  ActivityIndicator,
+  BackHandler,
+  FlatList,
+  Keyboard,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 
 import { client } from "@/src/client";
 import { useEmbeddedQuery } from "@/src/query";
 import { colors, fontSize, radius, spacing } from "@/src/theme";
+import { DocumentScreen } from "./document/[id]";
 
-const summaryArgs = Object.freeze({ limit: 40 });
+const summaryArgs = { limit: 40 } as const;
 
 type DocumentSummary = FunctionReturnType<typeof api.documents.summaries>[number];
 
 export default function DocumentsScreen() {
+  const params = useLocalSearchParams<{ document?: string | string[] }>();
+  const linkedDocumentId = Array.isArray(params.document) ? params.document[0] : params.document;
   const query = useEmbeddedQuery(api.documents.summaries, summaryArgs);
   const [creating, setCreating] = React.useState(false);
   const [createError, setCreateError] = React.useState<string | null>(null);
+  const [selectedDocumentId, setSelectedDocumentId] = React.useState<string | null>(
+    linkedDocumentId ?? null,
+  );
+  const [editorVisible, setEditorVisible] = React.useState(linkedDocumentId !== undefined);
+
+  const openDocument = React.useCallback((id: string) => {
+    setSelectedDocumentId(id);
+    setEditorVisible(true);
+  }, []);
+  const closeDocument = React.useCallback(() => {
+    Keyboard.dismiss();
+    setEditorVisible(false);
+    if (linkedDocumentId !== undefined) router.setParams({ document: undefined });
+  }, [linkedDocumentId]);
+
+  React.useEffect(() => {
+    if (linkedDocumentId !== undefined) openDocument(linkedDocumentId);
+  }, [linkedDocumentId, openDocument]);
 
   const createDocument = React.useCallback(async () => {
     if (creating) return;
@@ -28,13 +59,22 @@ export default function DocumentsScreen() {
     }
     try {
       const document = await client.mutation(api.documents.create, {});
-      router.push({ pathname: "/document/[id]", params: { id: document._id } });
+      openDocument(document._id);
     } catch (error: unknown) {
       setCreateError(error instanceof Error ? error.message : "The document could not be created.");
     } finally {
       setCreating(false);
     }
-  }, [creating]);
+  }, [creating, openDocument]);
+
+  React.useEffect(() => {
+    if (!editorVisible) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      closeDocument();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [closeDocument, editorVisible]);
 
   const documents: DocumentSummary[] = query.status === "ready" ? query.value : [];
 
@@ -42,75 +82,139 @@ export default function DocumentsScreen() {
     <>
       <Stack.Screen
         options={{
-          headerRight: () => (
-            <Pressable
-              accessibilityLabel="Create document"
-              accessibilityRole="button"
-              disabled={creating}
-              hitSlop={12}
-              onPress={() => void createDocument()}
-              style={({ pressed }) => [styles.headerButton, pressed && styles.buttonPressed]}
-            >
-              {creating ? (
-                <ActivityIndicator color={colors.content.primary} size="small" />
-              ) : (
-                <Text style={styles.headerButtonLabel}>New</Text>
-              )}
-            </Pressable>
-          ),
+          headerLeft: editorVisible
+            ? () => (
+                <Pressable
+                  accessibilityLabel="Back to documents"
+                  accessibilityRole="button"
+                  hitSlop={12}
+                  onPress={closeDocument}
+                  style={({ pressed }) => [
+                    styles.headerBack,
+                    pressed && styles.headerButtonPressed,
+                  ]}
+                >
+                  <Text style={styles.headerBackLabel}>‹</Text>
+                </Pressable>
+              )
+            : () => null,
+          headerRight: editorVisible
+            ? () => null
+            : () => (
+                <Pressable
+                  accessibilityLabel="Create document"
+                  accessibilityRole="button"
+                  disabled={creating}
+                  hitSlop={12}
+                  onPress={() => void createDocument()}
+                  style={({ pressed }) => [
+                    styles.headerButton,
+                    Platform.OS !== "ios" && styles.headerButtonSurface,
+                    pressed &&
+                      (Platform.OS === "ios" ? styles.headerButtonPressed : styles.buttonPressed),
+                  ]}
+                >
+                  {creating ? (
+                    <ActivityIndicator color={colors.content.primary} size="small" />
+                  ) : (
+                    <Text style={styles.headerButtonLabel}>+</Text>
+                  )}
+                </Pressable>
+              ),
+          headerTitle: editorVisible ? "" : "Documents",
         }}
       />
-      <FlatList
-        contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={documents.length === 0 ? styles.emptyContent : styles.content}
-        data={documents}
-        keyExtractor={(document) => document._id}
-        ListHeaderComponent={
-          createError ? (
-            <View accessibilityRole="alert" style={styles.errorBanner}>
-              <Text selectable style={styles.errorText}>
-                {createError}
-              </Text>
-            </View>
-          ) : null
-        }
-        ListEmptyComponent={
-          <QueryState
-            creating={creating}
-            onCreate={createDocument}
-            onRetry={query.retry}
-            state={query}
+      <View style={styles.screen}>
+        {selectedDocumentId ? (
+          <View
+            accessibilityElementsHidden={!editorVisible}
+            importantForAccessibility={editorVisible ? "auto" : "no-hide-descendants"}
+            onAccessibilityEscape={() => {
+              closeDocument();
+            }}
+            pointerEvents={editorVisible ? "auto" : "none"}
+            style={styles.editorLayer}
+          >
+            <DocumentScreen
+              active={editorVisible}
+              documentId={selectedDocumentId}
+              key={selectedDocumentId}
+            />
+          </View>
+        ) : null}
+        <View
+          accessibilityElementsHidden={editorVisible}
+          importantForAccessibility={editorVisible ? "no-hide-descendants" : "auto"}
+          pointerEvents={editorVisible ? "none" : "auto"}
+          style={[styles.listLayer, editorVisible && styles.listLayerHidden]}
+        >
+          <FlatList
+            contentInsetAdjustmentBehavior="automatic"
+            contentContainerStyle={documents.length === 0 ? styles.emptyContent : styles.content}
+            data={documents}
+            keyExtractor={(document) => document._id}
+            ListHeaderComponent={
+              createError ? (
+                <View accessibilityRole="alert" style={styles.errorBanner}>
+                  <Text selectable style={styles.errorText}>
+                    {createError}
+                  </Text>
+                </View>
+              ) : null
+            }
+            ListEmptyComponent={
+              <QueryState
+                creating={creating}
+                onCreate={createDocument}
+                onRetry={query.retry}
+                state={query}
+              />
+            }
+            renderItem={({ item }) => (
+              <DocumentRow document={item} onOpen={() => openDocument(item._id)} />
+            )}
+            style={styles.list}
           />
-        }
-        renderItem={({ item }) => <DocumentRow document={item} />}
-        style={styles.screen}
-      />
+        </View>
+      </View>
     </>
   );
 }
 
-function DocumentRow({ document }: { document: DocumentSummary }) {
+function DocumentRow({ document, onOpen }: { document: DocumentSummary; onOpen: () => void }) {
   return (
-    <Link href={{ pathname: "/document/[id]", params: { id: document._id } }} asChild>
-      <Pressable
-        accessibilityHint="Opens this document"
-        onPressIn={() => {
-          if (process.env.EXPO_OS === "ios") void Haptics.selectionAsync();
-        }}
-        style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+    <Pressable
+      accessibilityHint="Opens this document"
+      accessibilityRole="button"
+      onPress={onOpen}
+      onPressIn={() => {
+        if (process.env.EXPO_OS === "ios") void Haptics.selectionAsync();
+      }}
+      style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+    >
+      <View
+        accessibilityElementsHidden
+        importantForAccessibility="no-hide-descendants"
+        style={styles.documentIcon}
       >
-        <View style={styles.documentMark} />
-        <View style={styles.rowCopy}>
-          <Text numberOfLines={1} selectable style={styles.rowTitle}>
-            {document.title || "Untitled"}
-          </Text>
-          <Text selectable style={styles.rowMeta}>
-            Created {formatDate(document.updatedAt)}
-          </Text>
-        </View>
-        <Text style={styles.chevron}>›</Text>
-      </Pressable>
-    </Link>
+        <View style={styles.documentIconFold} />
+        <View style={styles.documentIconLine} />
+        <View style={[styles.documentIconLine, styles.documentIconLineShort]} />
+      </View>
+      <View style={styles.rowCopy}>
+        <Text numberOfLines={1} style={styles.rowTitle}>
+          {document.title || "Untitled"}
+        </Text>
+        <Text style={styles.rowMeta}>{formatDate(document.updatedAt)}</Text>
+      </View>
+      <Text
+        accessibilityElementsHidden
+        importantForAccessibility="no-hide-descendants"
+        style={styles.chevron}
+      >
+        ›
+      </Text>
+    </Pressable>
   );
 }
 
@@ -193,37 +297,73 @@ function ActionButton({
 
 function formatDate(value: number): string {
   return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    month: "short",
   }).format(value);
 }
 
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: colors.background.primary,
+    backgroundColor: colors.background.secondary,
+  },
+  list: {
+    flex: 1,
+    backgroundColor: colors.background.secondary,
+  },
+  editorLayer: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: colors.background.secondary,
+  },
+  listLayer: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: colors.background.secondary,
+  },
+  listLayerHidden: {
+    opacity: 0,
   },
   content: {
-    padding: spacing.lg,
-    gap: spacing.sm,
+    paddingBottom: spacing.lg,
   },
   emptyContent: {
     flexGrow: 1,
     padding: spacing.lg,
   },
   headerButton: {
-    minWidth: 48,
-    minHeight: 36,
-    paddingHorizontal: spacing.md,
+    width: 44,
+    height: 44,
     alignItems: "center",
     justifyContent: "center",
+  },
+  headerButtonSurface: {
     backgroundColor: colors.accent,
-    borderRadius: radius.full,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.18)",
+    borderRadius: radius.md,
+  },
+  headerButtonPressed: {
+    opacity: 0.58,
+  },
+  headerBack: {
+    width: 44,
+    height: 44,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  headerBackLabel: {
+    marginTop: -3,
+    color: colors.content.primary,
+    fontSize: 42,
+    fontWeight: "300",
+    lineHeight: 44,
   },
   headerButtonLabel: {
     color: colors.content.primary,
-    fontSize: fontSize.body,
-    fontWeight: "700",
+    fontSize: 26,
+    fontWeight: "400",
+    lineHeight: 28,
   },
   buttonPressed: {
     backgroundColor: colors.accentPressed,
@@ -244,26 +384,48 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   row: {
-    minHeight: 72,
+    minHeight: 68,
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.md,
-    backgroundColor: colors.background.secondary,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.lg,
+    backgroundColor: "transparent",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
   },
   rowPressed: {
     backgroundColor: colors.background.tertiary,
-    transform: [{ scale: 0.99 }],
   },
-  documentMark: {
-    width: 10,
-    height: 36,
-    backgroundColor: colors.accent,
-    borderRadius: radius.full,
+  documentIcon: {
+    width: 18,
+    height: 22,
+    borderWidth: 1.5,
+    borderColor: colors.content.tertiary,
+    borderRadius: 2,
+    paddingHorizontal: 3,
+    paddingTop: 8,
+    gap: 3,
+  },
+  documentIconFold: {
+    position: "absolute",
+    top: -1,
+    right: -1,
+    width: 7,
+    height: 7,
+    borderLeftWidth: 1.5,
+    borderBottomWidth: 1.5,
+    borderColor: colors.content.tertiary,
+    backgroundColor: colors.background.secondary,
+  },
+  documentIconLine: {
+    width: 9,
+    height: 1.5,
+    backgroundColor: colors.content.tertiary,
+    borderRadius: 1,
+  },
+  documentIconLineShort: {
+    width: 6,
   },
   rowCopy: {
     flex: 1,
@@ -280,7 +442,7 @@ const styles = StyleSheet.create({
   },
   chevron: {
     color: colors.content.tertiary,
-    fontSize: 28,
+    fontSize: 24,
     fontWeight: "300",
   },
   state: {

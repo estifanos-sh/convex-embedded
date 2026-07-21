@@ -21,6 +21,9 @@ export type DocumentWrite = {
 export type DocumentWriteAction = (write: DocumentWrite) => Promise<void>;
 
 export type EditorProps = {
+  active: boolean;
   document: EditorDocument;
   documentWrite: DocumentWriteAction;
+  editorReady: (token: string) => Promise<void>;
+  editorToken: string;
 };

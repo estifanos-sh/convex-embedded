@@ -31,7 +31,13 @@ type DocumentEditorProps = EditorProps & {
   dom?: import("expo/dom").DOMProps;
 };
 
-export default function DocumentEditor({ document, documentWrite }: DocumentEditorProps) {
+export default function DocumentEditor({
+  active,
+  document,
+  documentWrite,
+  editorReady,
+  editorToken,
+}: DocumentEditorProps) {
   const [initial] = useState(() => {
     const recovered = readRecovery(document);
     const draft = normalizeDocumentDraft(recovered.draft);
@@ -53,6 +59,7 @@ export default function DocumentEditor({ document, documentWrite }: DocumentEdit
   const persistedRef = useRef<EditorDraft>({ body: document.body, title: document.title });
   const persistedFingerprintRef = useRef(initialPersistedFingerprint);
   const actionRef = useRef(documentWrite);
+  const editorReadyRef = useRef(editorReady);
   const trailingTimerRef = useRef<number | undefined>(undefined);
   const maxTimerRef = useRef<number | undefined>(undefined);
   const editorCancelRef = useRef<(() => void) | undefined>(undefined);
@@ -64,6 +71,22 @@ export default function DocumentEditor({ document, documentWrite }: DocumentEdit
   const flushRecoveryRef = useRef<() => void>(() => undefined);
   const flushEditorRef = useRef<() => void>(() => undefined);
   actionRef.current = documentWrite;
+  editorReadyRef.current = editorReady;
+
+  useEffect(() => {
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        void editorReadyRef.current(editorToken).catch((error: unknown) => {
+          console.error("The native editor-ready action failed.", error);
+        });
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [editorToken]);
 
   const clearTimers = useCallback(() => {
     if (trailingTimerRef.current !== undefined) window.clearTimeout(trailingTimerRef.current);
@@ -232,6 +255,16 @@ export default function DocumentEditor({ document, documentWrite }: DocumentEdit
     };
   }, []);
 
+  useEffect(() => {
+    if (active) return;
+    if (globalThis.document.activeElement instanceof HTMLElement) {
+      globalThis.document.activeElement.blur();
+    }
+    flushEditorRef.current();
+    flushRecoveryRef.current();
+    flushRef.current();
+  }, [active]);
+
   const writeTitle = useCallback(
     (value: string) => {
       setTitle(value);
@@ -250,7 +283,6 @@ export default function DocumentEditor({ document, documentWrite }: DocumentEdit
     <main className="editorPage">
       <article className="documentSheet">
         <div className="documentStatus">
-          <span>Convex embedded · Local document</span>
           {saveState === "error" ? (
             <button
               className={`saveState saveState--${saveState}`}
@@ -365,7 +397,7 @@ function saveLabel(state: SaveState): string {
   if (state === "error") return "Retry save";
   if (state === "recovered") return "Recovered";
   if (state === "saving") return "Saving";
-  return "Saved locally";
+  return "Saved";
 }
 
 function errorMessage(error: unknown): string {

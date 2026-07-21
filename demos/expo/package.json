@@ -16,6 +16,7 @@
     "native:dry-run": "node scripts/native.ts eas --dry-run",
     "native:ios": "node scripts/native.ts ios --prepare",
     "start": "vp run build:package && expo start --dev-client",
+    "start:optimized": "vp run build:package && expo start --dev-client --no-dev --minify",
     "test": "tsx --test tests/*.ts",
     "typecheck": "tsc --noEmit"
   },

@@ -90,16 +90,26 @@ export const summaries = embedded.replicated.query({
   returns: v.array(summaryValidator),
   handler: async (ctx, args) => {
     const limit = documentLimit(args.limit);
-    const documents = await ctx.db.query("documents").collect();
-    const matched =
-      args.prefix === undefined
-        ? documents
-        : documents.filter(
-            (document) =>
-              document.title >= (args.prefix as string) && document.title < `${args.prefix}\uffff`,
-          );
-    matched.sort((left, right) => right.updatedAt - left.updatedAt);
-    return matched.slice(0, limit).map((document) => ({
+    const prefix = args.prefix;
+    const documents =
+      prefix === undefined
+        ? await ctx.db.query("documents").withIndex("by_updatedAt").order("desc").take(limit)
+        : await (async () => {
+            const matches = await ctx.db
+              .query("documents")
+              .withIndex("by_title", (query) =>
+                query.gte("title", prefix).lt("title", `${prefix}\uffff`),
+              )
+              .take(MAX_DOCUMENTS + 1);
+            if (matches.length > MAX_DOCUMENTS) {
+              throw new Error("The document prefix is too broad; use a more specific prefix.");
+            }
+            return matches
+              .slice()
+              .sort((left, right) => right.updatedAt - left.updatedAt)
+              .slice(0, limit);
+          })();
+    return documents.map((document) => ({
       _id: document._id,
       title: document.title,
       updatedAt: document.updatedAt,
@@ -183,15 +193,17 @@ export const writeBody = embedded.replicated.mutation({
   },
   returns: documentValidator,
   handler: async (ctx, args) => {
+    const existing = await ctx.db.get(args.id);
+    if (!existing) throw new Error("Document not found.");
     for (const splice of args.splices) {
       await ctx.db.text.splice("documents", args.id, "body", splice);
     }
-    if (args.title !== undefined) {
-      const document = await ctx.db.get(args.id);
-      if (!document) throw new Error("Document not found.");
-      if (document.title !== args.title) {
-        await ctx.db.patch(args.id, { title: args.title });
-      }
+    const titleChanged = args.title !== undefined && existing.title !== args.title;
+    if (titleChanged) {
+      await ctx.db.patch(args.id, {
+        title: args.title,
+        updatedAt: readTime(),
+      });
     }
     const updated = await ctx.db.get(args.id);
     if (!updated) throw new Error("Document not found.");

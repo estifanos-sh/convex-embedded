@@ -1,13 +1,7 @@
 :root {
   color-scheme: dark;
-  font-family:
-    Inter,
-    ui-sans-serif,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
-  background: #1e1c1a;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", ui-sans-serif, sans-serif;
+  background: #2a2825;
   color: #ffffff;
 }
 
@@ -20,11 +14,12 @@ body,
 #root {
   min-height: 100%;
   margin: 0;
+  background: #2a2825;
 }
 
 body {
   min-width: 0;
-  background: radial-gradient(circle at 90% 0%, rgb(63 82 149 / 20%), transparent 38rem), #1e1c1a;
+  background: #2a2825;
   overscroll-behavior-y: contain;
   -webkit-tap-highlight-color: transparent;
 }
@@ -36,24 +31,16 @@ input {
 
 .editorPage {
   min-height: 100dvh;
+  background: #2a2825;
   padding-bottom: max(48px, env(safe-area-inset-bottom));
 }
 
 .documentStatus {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
-  margin-bottom: 28px;
-}
-
-.documentStatus > span:first-child {
-  color: #97908a;
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  line-height: 1.4;
-  text-transform: uppercase;
+  margin-bottom: 18px;
 }
 
 .saveState {
@@ -62,9 +49,9 @@ input {
   flex: 0 0 auto;
   align-items: center;
   gap: 7px;
-  border: 1px solid rgb(163 156 148 / 30%);
+  border: 0;
   border-radius: 999px;
-  background: #2a2825;
+  background: #3c3a37;
   color: #b9b1aa;
   padding: 6px 10px;
   font-size: 11px;
@@ -102,19 +89,19 @@ input {
 }
 
 .documentSheet {
-  width: min(100%, 820px);
+  width: min(100%, 760px);
   margin: 0 auto;
-  padding: clamp(32px, 7vw, 64px) clamp(20px, 7vw, 64px) 80px;
+  padding: 22px 20px 80px;
 }
 
 .titleLabel {
-  display: block;
-  margin-bottom: 7px;
-  color: #97908a;
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .titleInput {
@@ -126,8 +113,8 @@ input {
   outline: 0;
   background: transparent;
   color: #ffffff;
-  padding: 0 0 18px;
-  font-size: clamp(28px, 8vw, 44px);
+  padding: 0 0 16px;
+  font-size: clamp(30px, 8vw, 38px);
   font-weight: 650;
   letter-spacing: -0.035em;
   line-height: 1.08;
@@ -170,7 +157,7 @@ input {
 }
 
 .editorCanvas {
-  margin: 18px -54px 0;
+  margin: 12px -20px 0;
 }
 
 .editorCanvas .bn-container {
@@ -192,7 +179,7 @@ input {
 .editorCanvas .bn-editor {
   min-height: 62dvh;
   background: transparent !important;
-  padding: 18px 54px 80px;
+  padding: 18px 20px 80px;
 }
 
 .editorCanvas .bn-editor > .bn-block-group > .bn-block-outer:first-child {
@@ -215,20 +202,6 @@ input {
   }
   to {
     opacity: 1;
-  }
-}
-
-@media (max-width: 520px) {
-  .documentSheet {
-    padding-inline: 20px;
-  }
-
-  .editorCanvas {
-    margin-inline: -28px;
-  }
-
-  .editorCanvas .bn-editor {
-    padding-inline: 28px;
   }
 }
 

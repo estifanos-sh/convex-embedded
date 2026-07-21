@@ -8,15 +8,15 @@ export default function RootLayout() {
     <>
       <Stack
         screenOptions={{
-          contentStyle: { backgroundColor: colors.background.primary },
+          contentStyle: { backgroundColor: colors.background.secondary },
           headerBackButtonDisplayMode: "minimal",
           headerShadowVisible: false,
-          headerStyle: { backgroundColor: colors.background.primary },
+          headerStyle: { backgroundColor: colors.background.secondary },
           headerTintColor: colors.content.primary,
         }}
       >
         <Stack.Screen name="index" options={{ title: "Documents" }} />
-        <Stack.Screen name="document/[id]" options={{ title: "Document" }} />
+        <Stack.Screen name="document/[id]" options={{ headerShown: false }} />
       </Stack>
       <StatusBar style="light" />
     </>

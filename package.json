@@ -40,6 +40,7 @@
     "upload:demo": "vp run upload:browser:vite",
     "dev:convex": "vpx convex dev",
     "dev:expo": "pnpm --filter @convex-dev/embedded-demo-expo start",
+    "dev:expo:optimized": "pnpm --filter @convex-dev/embedded-demo-expo start:optimized",
     "ios:expo": "pnpm --filter @convex-dev/embedded-demo-expo ios",
     "android:expo": "pnpm --filter @convex-dev/embedded-demo-expo android",
     "dev:browser:vite": "pnpm --filter @convex-dev/embedded-demo-browser-vite dev",
