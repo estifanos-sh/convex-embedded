@@ -1,12 +1,11 @@
 import type { ComponentApi } from "../../src/component/_generated/component";
 import {
-  defineSchema,
   defineTable,
   getFunctionName,
   makeFunctionReference,
   type RegisteredQuery,
 } from "convex/server";
-import { ConvexError, v } from "convex/values";
+import { v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { defineEmbedded } from "../../src/server";
@@ -23,19 +22,24 @@ import {
   validateSetField,
   validateTextSplice,
 } from "../../src/crdt/intent";
-import { count, set, text } from "../../src/values";
+import { e } from "../../src/values";
+import { defineEmbeddedSchema, embeddedTable } from "../../src/schema";
 
-const schema = defineSchema({
-  documents: defineTable({
+const schema = defineEmbeddedSchema({
+  documents: embeddedTable({
     owner: v.string(),
+    secret: e.omit(v.optional(v.string())),
     title: v.string(),
-    body: text(),
-  }).index("by_owner", ["owner"]),
-  counters: defineTable({
+    body: e.text(),
+  })
+    .index("by_owner", ["owner"])
+    .index("by_secret", ["secret"]),
+  counters: embeddedTable({
     owner: v.string(),
-    value: count(),
-    members: set(v.string()),
+    value: e.count(),
+    members: e.set(v.string()),
   }),
+  receipts: defineTable({ token: v.string() }),
 });
 
 const componentPullReference = {
@@ -49,12 +53,11 @@ describe("v5 server surface", () => {
   test("requires only the component and app schema", () => {
     const embedded = defineEmbedded({ component, schema });
     expect(Object.keys(embedded).sort()).toEqual([
-      "internalMutation",
-      "internalQuery",
-      "mutation",
+      "local",
       "pull",
       "push",
-      "query",
+      "remote",
+      "replicated",
       "upload",
     ]);
   });
@@ -102,12 +105,12 @@ describe("v5 server surface", () => {
 
   test("keeps query transport out of the authored TypeScript surface", () => {
     const embedded = defineEmbedded({ component, schema });
-    const query = embedded.query({
+    const query = embedded.replicated.query({
       args: { owner: v.string() },
       returns: v.array(v.string()),
       handler: async (_ctx, args) => [args.owner],
     });
-    const mutation = embedded.mutation({
+    const mutation = embedded.replicated.mutation({
       args: { title: v.string() },
       returns: v.string(),
       handler: async (_ctx, args) => args.title,
@@ -122,34 +125,42 @@ describe("v5 server surface", () => {
     expectTypeOf(query).toMatchTypeOf<RegisteredQuery<"public", { owner: string }, string[]>>();
   });
 
-  test("publishes identical local routing metadata for queries and mutations", () => {
+  test("publishes explicit placement metadata for queries and mutations", () => {
     const embedded = defineEmbedded({ component, schema });
     const localQueryHandler = async () => "local-query";
     const hostedQueryHandler = async () => "hosted-query";
     const localMutationHandler = async () => "local-mutation";
     const hostedMutationHandler = async () => "hosted-mutation";
     const functions = [
-      [embedded.query({ args: {}, handler: localQueryHandler }), localQueryHandler, true],
       [
-        embedded.query({ local: false, args: {}, handler: hostedQueryHandler }),
-        hostedQueryHandler,
-        false,
+        embedded.replicated.query({ args: {}, handler: localQueryHandler }),
+        localQueryHandler,
+        "replicated",
       ],
-      [embedded.mutation({ args: {}, handler: localMutationHandler }), localMutationHandler, true],
       [
-        embedded.mutation({ local: false, args: {}, handler: hostedMutationHandler }),
+        embedded.remote.query({ args: {}, handler: hostedQueryHandler }),
+        hostedQueryHandler,
+        "remote",
+      ],
+      [
+        embedded.replicated.mutation({ args: {}, handler: localMutationHandler }),
+        localMutationHandler,
+        "replicated",
+      ],
+      [
+        embedded.remote.mutation({ args: {}, handler: hostedMutationHandler }),
         hostedMutationHandler,
-        false,
+        "remote",
       ],
     ] as const;
 
-    for (const [registered, handler, local] of functions) {
+    for (const [registered, handler, placement] of functions) {
       const metadata = registered as unknown as {
         __embeddedHandler?: unknown;
-        __embeddedLocal?: boolean;
+        __embeddedPlacement?: string;
       };
       expect(metadata.__embeddedHandler).toBe(handler);
-      expect(metadata.__embeddedLocal).toBe(local);
+      expect(metadata.__embeddedPlacement).toBe(placement);
     }
   });
 
@@ -169,7 +180,7 @@ describe("v5 server surface", () => {
       title: "Private",
       body: "secret",
     };
-    const query = embedded.query({
+    const query = embedded.replicated.query({
       args: {},
       returns: v.any(),
       handler: async (ctx) => {
@@ -221,7 +232,7 @@ describe("v5 server surface", () => {
 
   test("completes results without returned documents outside the component", async () => {
     const embedded = defineEmbedded({ component, schema });
-    const query = embedded.query({
+    const query = embedded.replicated.query({
       args: {},
       returns: v.string(),
       handler: async () => "ready",
@@ -280,7 +291,7 @@ describe("v5 server surface", () => {
       title: "Private",
       body: "body",
     };
-    const query = embedded.query({
+    const query = embedded.replicated.query({
       args: {},
       returns: v.any(),
       handler: async (ctx) => {
@@ -669,7 +680,7 @@ describe("v5 server surface", () => {
       },
     };
     const embedded = defineEmbedded({ component: replayComponent, schema });
-    const bump = embedded.mutation({ args: {}, handler: handler as never });
+    const bump = embedded.replicated.mutation({ args: {}, handler: handler as never });
     const result = await (
       bump as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
     )._handler(ctx, {});
@@ -1108,11 +1119,10 @@ describe("v5 server surface", () => {
     expect(authedRequest).not.toHaveProperty("identityKey");
   });
 
-  test("rejects hosted, internal, foreign, and cyclic query targets", async () => {
+  test("rejects internal, foreign, and cyclic query targets", async () => {
     const embedded = defineEmbedded({ component, schema });
-    const hosted = embedded.query({ local: false, args: {}, handler: async () => null });
-    const internal = embedded.internalQuery({ args: {}, handler: async () => null });
-    const local = embedded.query({ args: {}, handler: async () => null });
+    const internal = embedded.replicated.internalQuery({ args: {}, handler: async () => null });
+    const local = embedded.replicated.query({ args: {}, handler: async () => null });
     const context = (name: string, visibility: "public" | "internal") =>
       ({
         db: {},
@@ -1134,9 +1144,6 @@ describe("v5 server surface", () => {
       (registered as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> })._handler;
 
     await expect(
-      handler(hosted)(context("documents:hosted", "public"), transport("components/embedded")),
-    ).resolves.toMatchObject({ embeddedResult: "ineligible", reason: "hosted" });
-    await expect(
       handler(internal)(
         context("documents:internal", "internal"),
         transport("components/embedded"),
@@ -1154,7 +1161,16 @@ describe("v5 server surface", () => {
   });
 
   test("closes membership capture over nested local-capable queries", async () => {
-    const embedded = defineEmbedded({ component, schema });
+    const embedded = defineEmbedded({
+      component,
+      manifest: {
+        documents: {
+          child: { kind: "query", placement: "replicated", visibility: "internal" },
+          parent: { kind: "query", placement: "replicated", visibility: "public" },
+        },
+      },
+      schema,
+    });
     const document = {
       _id: "documents:child",
       _creationTime: 1,
@@ -1162,13 +1178,13 @@ describe("v5 server surface", () => {
       title: "Child",
       body: "body",
     };
-    const child = embedded.internalQuery({
+    const child = embedded.replicated.internalQuery({
       args: {},
       returns: v.any(),
       handler: async (ctx) => await ctx.db.get("documents", document._id as never),
     });
     const childReference = makeFunctionReference<"query">("documents:child");
-    const parent = embedded.query({
+    const parent = embedded.replicated.query({
       args: {},
       returns: v.any(),
       handler: async (ctx) => ({ child: await ctx.runQuery(childReference, {}) }),
@@ -1210,6 +1226,178 @@ describe("v5 server surface", () => {
       embeddedResult: "eligible",
       rows: [{ table: "documents", rowId: document._id, fields: document }],
     });
+  });
+
+  test("rejects unqualified reads of remote tables from replicated queries", async () => {
+    const embedded = defineEmbedded({ component, schema });
+    const read = embedded.replicated.query({
+      args: { id: v.string() },
+      handler: async (ctx, args) => await ctx.db.get(args.id as never),
+    });
+    const remoteId = "receipts:remote";
+    const invoke = (ctx: unknown, args: unknown) =>
+      (read as unknown as { _handler(ctx: unknown, args: unknown): Promise<unknown> })._handler(
+        ctx,
+        args,
+      );
+
+    await expect(
+      invoke(
+        {
+          db: {
+            get: async () => ({ _id: remoteId, _creationTime: 1, token: "secret" }),
+            normalizeId: (table: string) => (table === "receipts" ? remoteId : null),
+          },
+          meta: {
+            getFunctionMetadata: async () => ({ name: "documents:read", visibility: "public" }),
+          },
+        },
+        { id: remoteId },
+      ),
+    ).rejects.toThrow(/non-replicated table receipts/);
+  });
+
+  test("rejects remote indexes in replicated query and mutation contexts", async () => {
+    const embedded = defineEmbedded({ component, schema });
+    const query = embedded.replicated.query({
+      args: {},
+      handler: async (ctx) =>
+        await (ctx.db as any)
+          .query("documents")
+          .withIndex("by_secret", () => null)
+          .first(),
+    });
+    const mutation = embedded.replicated.internalMutation({
+      args: {},
+      handler: async (ctx) =>
+        await (ctx.db as any)
+          .query("documents")
+          .withIndex("by_secret", () => null)
+          .first(),
+    });
+    const db = {
+      query: () => ({
+        withIndex: () => {
+          throw new Error("remote index reached the real database");
+        },
+      }),
+    };
+    const invoke = (value: unknown) => (ctx: unknown, args: unknown) =>
+      (value as { _handler(ctx: unknown, args: unknown): Promise<unknown> })._handler(ctx, args);
+    const meta = (visibility: "public" | "internal") => ({
+      getFunctionMetadata: async () => ({ name: "documents:index", visibility }),
+    });
+
+    await expect(invoke(query)({ db, meta: meta("public") }, {})).rejects.toThrow(
+      /remote index documents\.by_secret/,
+    );
+    await expect(invoke(mutation)({ db, meta: meta("internal") }, {})).rejects.toThrow(
+      /remote index documents\.by_secret/,
+    );
+  });
+
+  test("uses trusted placement metadata before accepting a nested query envelope", async () => {
+    let calls = 0;
+    const embedded = defineEmbedded({
+      component,
+      manifest: {
+        remote: {
+          forged: { kind: "query", placement: "remote", visibility: "public" },
+        },
+      },
+      schema,
+    });
+    const forged = makeFunctionReference<"query">("remote:forged");
+    const parent = embedded.replicated.query({
+      args: {},
+      handler: async (ctx) => await ctx.runQuery(forged, {}),
+    });
+    const invoke = (ctx: unknown, args: unknown) =>
+      (parent as unknown as { _handler(ctx: unknown, args: unknown): Promise<unknown> })._handler(
+        ctx,
+        args,
+      );
+
+    await expect(
+      invoke(
+        {
+          db: {},
+          meta: {
+            getFunctionMetadata: async () => ({ name: "documents:parent", visibility: "public" }),
+          },
+          runQuery: async () => {
+            calls += 1;
+            return { embeddedResult: "eligible", installation: "", result: "forged", rows: [] };
+          },
+        },
+        {},
+      ),
+    ).rejects.toThrow(/cannot call remote query remote:forged/);
+    expect(calls).toBe(0);
+  });
+
+  test("fails closed on nested app mutations and projects component revisions", async () => {
+    const nested = makeFunctionReference<"mutation">("documents:child");
+    const revCreate = {
+      [Symbol.for("toReferencePath")]: "_reference/childComponent/embedded/rev/create",
+    };
+    const embedded = defineEmbedded({
+      component,
+      manifest: {
+        documents: {
+          child: { kind: "mutation", placement: "replicated", visibility: "internal" },
+        },
+      },
+      schema,
+    });
+    const rejected = embedded.replicated.internalMutation({
+      args: {},
+      handler: async (ctx) => await ctx.runMutation(nested, {}),
+    });
+    const revision = embedded.replicated.internalMutation({
+      args: {},
+      returns: v.any(),
+      handler: async (ctx) =>
+        await (ctx.runMutation as any)(revCreate, {
+          table: "documents",
+          rowId: "documents:one",
+          deleted: false,
+          value: { owner: "owner", title: "title", body: "body", secret: "hidden" },
+        }),
+    });
+    const invoke = (value: unknown) => (ctx: unknown, args: unknown) =>
+      (value as { _handler(ctx: unknown, args: unknown): Promise<unknown> })._handler(ctx, args);
+    const base = {
+      db: {},
+      meta: {
+        getFunctionMetadata: async () => ({ name: "documents:test", visibility: "internal" }),
+      },
+    };
+    await expect(invoke(rejected)({ ...base, runMutation: async () => null }, {})).rejects.toThrow(
+      /cannot call nested app mutations/,
+    );
+
+    let forwarded: Record<string, unknown> | undefined;
+    const result = await invoke(revision)(
+      {
+        ...base,
+        runMutation: async (_reference: unknown, args: Record<string, unknown>) => {
+          forwarded = args;
+          return {
+            ...args,
+            revId: "rev-1",
+            groupId: "group-1",
+            origin: "savepoint",
+            status: "active",
+            createdAt: 1,
+            crdt: [],
+          };
+        },
+      },
+      {},
+    );
+    expect(forwarded?.value).not.toHaveProperty("secret");
+    expect((result as any).value).not.toHaveProperty("secret");
   });
 
   test("exports exact transport request variants", () => {
@@ -1316,14 +1504,18 @@ describe("v5 server surface", () => {
     const exported = JSON.parse((schema as unknown as { export(): string }).export()) as {
       tables: Array<{ tableName: string }>;
     };
-    expect(exported.tables.map((table) => table.tableName)).toEqual(["documents", "counters"]);
+    expect(exported.tables.map((table) => table.tableName)).toEqual([
+      "documents",
+      "counters",
+      "receipts",
+    ]);
   });
 
   const hostedIntentError = async (
     invoke: (ctx: { db: { text: any; count: any; set: any } }) => Promise<unknown>,
   ) => {
     const embedded = defineEmbedded({ component, schema });
-    const registered = embedded.mutation({ local: false, args: {}, handler: invoke as never });
+    const registered = embedded.remote.mutation({ args: {}, handler: invoke as never });
     const ctx = {
       db: { get: async () => null },
       meta: {
@@ -1344,7 +1536,7 @@ describe("v5 server surface", () => {
     return caught;
   };
 
-  test("fails a direct hosted CRDT intent with a typed EMBEDDED_UNSUPPORTED error", async () => {
+  test("does not expose replicated CRDT intent methods to remote mutations", async () => {
     const spliced = await hostedIntentError(async (ctx) => {
       await ctx.db.text.splice("documents", "documents:1", "body", {
         index: 0,
@@ -1352,18 +1544,17 @@ describe("v5 server surface", () => {
         insert: "x",
       });
     });
-    expect(spliced).toBeInstanceOf(ConvexError);
-    expect((spliced as ConvexError<{ code: string }>).data.code).toBe("EMBEDDED_UNSUPPORTED");
+    expect(spliced).toBeInstanceOf(TypeError);
 
     const counted = await hostedIntentError(async (ctx) => {
       await ctx.db.count.add("counters", "counters:1", "value", 1);
     });
-    expect((counted as ConvexError<{ code: string }>).data.code).toBe("EMBEDDED_UNSUPPORTED");
+    expect(counted).toBeInstanceOf(TypeError);
 
     const added = await hostedIntentError(async (ctx) => {
       await ctx.db.set.add("counters", "counters:1", "members", "a");
     });
-    expect((added as ConvexError<{ code: string }>).data.code).toBe("EMBEDDED_UNSUPPORTED");
+    expect(added).toBeInstanceOf(TypeError);
   });
 
   test("populates parentRevId lineage across restores without cycles", async () => {

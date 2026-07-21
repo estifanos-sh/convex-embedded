@@ -84,6 +84,8 @@ fn crdt_schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "issues".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "status".into(),
                 field: None,

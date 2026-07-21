@@ -39,6 +39,7 @@ const main = defineConfig({
     "internal/client": "src/client.ts",
     "internal/storage": "src/storage/binding.ts",
     node: "src/node/index.ts",
+    schema: "src/tables.ts",
     server: "src/server/index.ts",
     unplugin: "src/unplugin.ts",
     values: "src/values.ts",
@@ -156,6 +157,19 @@ const metro = defineConfig({
   deps: { neverBundle: ["unplugin"] },
 });
 
+// Config files commonly execute through CommonJS even in ESM applications. Keep the public ESM
+// entries in `main`, and emit matching require targets for schemas imported by those configs.
+const config = defineConfig({
+  clean: false,
+  dts: true,
+  entry: {
+    schema: "src/tables.ts",
+    values: "src/values.ts",
+  },
+  format: "cjs",
+  target: "node20.19",
+});
+
 const thread = defineConfig({
   clean: true,
   deps: {
@@ -168,4 +182,4 @@ const thread = defineConfig({
   outDir: "dist/thread",
 });
 
-export default defineConfig([main, metro, thread]);
+export default defineConfig([main, config, metro, thread]);

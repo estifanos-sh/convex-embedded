@@ -6,7 +6,7 @@ import type {
   QueryBuilder,
   RegisteredQuery,
 } from "convex/server";
-import { makeFunctionReference } from "convex/server";
+import { getFunctionName, makeFunctionReference } from "convex/server";
 import {
   asObjectValidator,
   ConvexError,
@@ -20,6 +20,7 @@ import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../c
 import { canonicalJson, hashDocument } from "../hash";
 import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../protocol";
 import { pointerPart } from "../id/path";
+import { projectWireDoc, type EmbeddedSchemaPlacements } from "../schema";
 
 const TRANSPORT_FIELD = "embeddedTransport";
 const MAX_CAPTURED_ROWS = 1_024;
@@ -30,6 +31,17 @@ const NESTED_TRANSACTION_LIMITS = {
 };
 
 type EmbeddedComponent = ComponentApi<string | undefined>;
+export type FunctionManifest = Record<
+  string,
+  Record<
+    string,
+    {
+      kind: "query" | "mutation";
+      placement: "replicated" | "remote" | "local";
+      visibility: "public" | "internal";
+    }
+  >
+>;
 export type QueryRow = {
   table: string;
   rowId: string;
@@ -38,6 +50,11 @@ export type QueryRow = {
 };
 
 type QueryTransport =
+  | {
+      kind: "direct";
+      stack: string[];
+      topLevel: false;
+    }
   | {
       kind: "capture";
       installation: string;
@@ -65,7 +82,6 @@ type QueryTransportResult =
     };
 
 type QueryDefinition = {
-  local?: false;
   args?: PropertyValidators | GenericValidator;
   returns?: PropertyValidators | GenericValidator;
   handler: (ctx: GenericQueryCtx<any>, args: Record<string, unknown>) => unknown;
@@ -73,7 +89,7 @@ type QueryDefinition = {
 
 type EmbeddedRegisteredQuery = RegisteredQuery<any, any, any> & {
   __embeddedHandler?: QueryDefinition["handler"];
-  __embeddedLocal?: boolean;
+  __embeddedPlacement?: "replicated";
 };
 
 const runtimeValidator = v.object({
@@ -83,6 +99,11 @@ const runtimeValidator = v.object({
 });
 
 const transportValidator = v.union(
+  v.object({
+    kind: v.literal("direct"),
+    stack: v.array(v.string()),
+    topLevel: v.literal(false),
+  }),
   v.object({
     kind: v.literal("capture"),
     installation: v.string(),
@@ -136,6 +157,8 @@ export function buildQueryBuilder(
   component: EmbeddedComponent,
   tableNames: string[],
   crdtFields: ReadonlyMap<string, ReadonlyMap<string, unknown>>,
+  placements: EmbeddedSchemaPlacements,
+  manifest?: FunctionManifest,
 ) {
   return (definition: QueryDefinition) => {
     const args = asObjectValidator(definition.args ?? {}) as VObject<
@@ -158,26 +181,61 @@ export function buildQueryBuilder(
           }),
       handler: async (ctx: GenericQueryCtx<any>, received: Record<string, unknown>) => {
         const transport = received[TRANSPORT_FIELD] as QueryTransport | undefined;
-        if (transport === undefined) return await definition.handler(ctx, received);
+        if (transport === undefined) {
+          const capture = new QueryCapture(ctx.db, tableNames, crdtFields, placements);
+          const appCtx = {
+            ...ctx,
+            db: capture.reader(),
+            runQuery: async (
+              reference: FunctionReference<"query", "public" | "internal">,
+              args: unknown,
+            ) => {
+              if (isEmbeddedComponentReference(reference)) {
+                return projectComponentQueryResult(
+                  placements,
+                  tableNames,
+                  reference,
+                  await runQuery(ctx, reference, args as Record<string, unknown>),
+                );
+              }
+              assertReplicatedReference(manifest, reference, "query");
+              const nested = await runQuery(
+                ctx,
+                reference,
+                withTransport(args, { kind: "direct", stack: [], topLevel: false }),
+              );
+              if (!isTransportResult(nested) || nested.embeddedResult === "ineligible") {
+                throw new Error(
+                  "EMBEDDED_QUERY_INELIGIBLE: replicated queries may only call replicated queries.",
+                );
+              }
+              return nested.result;
+            },
+          } as GenericQueryCtx<any>;
+          return await definition.handler(appCtx, received);
+        }
 
         const metadata = await ctx.meta.getFunctionMetadata();
         if (transport.topLevel && metadata.visibility !== "public") {
           return ineligible("internal");
         }
-        if (definition.local === false) return ineligible("hosted");
         if (transport.stack.includes(metadata.name)) return ineligible("cycle");
 
         const componentId = transport.kind === "live" ? componentIdentity(component) : "";
         if (transport.kind === "capture") {
           const installation = await installationRead(ctx, component);
           if (installation !== transport.installation) return ineligible("foreign");
-        } else if (!transport.topLevel && componentId !== transport.component) {
+        } else if (
+          transport.kind === "live" &&
+          !transport.topLevel &&
+          componentId !== transport.component
+        ) {
           return ineligible("foreign");
         }
 
         const authoredArgs = { ...received };
         delete authoredArgs[TRANSPORT_FIELD];
-        const capture = new QueryCapture(ctx.db, tableNames, crdtFields);
+        const capture = new QueryCapture(ctx.db, tableNames, crdtFields, placements);
         const stack = [...transport.stack, metadata.name];
         const appCtx = {
           ...ctx,
@@ -186,24 +244,44 @@ export function buildQueryBuilder(
             reference: FunctionReference<"query", "public" | "internal">,
             args: unknown,
           ) => {
+            if (isEmbeddedComponentReference(reference)) {
+              return projectComponentQueryResult(
+                placements,
+                tableNames,
+                reference,
+                await runQuery(ctx, reference, args as Record<string, unknown>),
+              );
+            }
+            assertReplicatedReference(manifest, reference, "query");
             const nestedTransport: QueryTransport =
-              transport.kind === "capture"
-                ? {
-                    kind: "capture",
-                    installation: transport.installation,
-                    stack,
-                    topLevel: false,
-                  }
-                : {
-                    kind: "live",
-                    component: componentId,
-                    runtime: transport.runtime,
-                    stack,
-                    topLevel: false,
-                  };
+              transport.kind === "direct"
+                ? { kind: "direct", stack, topLevel: false }
+                : transport.kind === "capture"
+                  ? {
+                      kind: "capture",
+                      installation: transport.installation,
+                      stack,
+                      topLevel: false,
+                    }
+                  : {
+                      kind: "live",
+                      component: componentId,
+                      runtime: transport.runtime,
+                      stack,
+                      topLevel: false,
+                    };
             const nested = await runQuery(ctx, reference, withTransport(args, nestedTransport));
             if (!isTransportResult(nested) || nested.embeddedResult === "ineligible") {
               throw new Error("EMBEDDED_QUERY_INELIGIBLE: nested query is not local-capable.");
+            }
+            const expectedInstallation =
+              transport.kind === "capture"
+                ? transport.installation
+                : transport.kind === "live"
+                  ? componentId
+                  : "";
+            if (nested.installation !== expectedInstallation) {
+              throw new Error("EMBEDDED_QUERY_INELIGIBLE: nested query has foreign provenance.");
             }
             capture.add(nested.rows);
             return nested.result;
@@ -216,14 +294,19 @@ export function buildQueryBuilder(
         }
         return {
           embeddedResult: "eligible" as const,
-          installation: transport.kind === "capture" ? transport.installation : componentId,
+          installation:
+            transport.kind === "capture"
+              ? transport.installation
+              : transport.kind === "live"
+                ? componentId
+                : "",
           result,
           rows,
         };
       },
     } as never) as EmbeddedRegisteredQuery;
     registered.__embeddedHandler = definition.handler;
-    registered.__embeddedLocal = definition.local !== false;
+    registered.__embeddedPlacement = "replicated";
     return registered;
   };
 }
@@ -316,6 +399,86 @@ function isTransportResult(value: unknown): value is QueryTransportResult {
   return kind === "eligible" || kind === "ineligible";
 }
 
+export function assertReplicatedReference(
+  manifest: FunctionManifest | undefined,
+  reference: FunctionReference<"query" | "mutation", "public" | "internal">,
+  kind: "query" | "mutation",
+): void {
+  const name = getFunctionName(reference);
+  const separator = name.indexOf(":");
+  const moduleId = separator < 0 ? name : name.slice(0, separator);
+  const exportName = separator < 0 ? "default" : name.slice(separator + 1);
+  const declared = manifest?.[moduleId]?.[exportName];
+  if (!declared) {
+    throw new Error(
+      `Embedded replicated functions cannot call app function ${name} without trusted placement metadata.`,
+    );
+  }
+  if (declared.kind !== kind || declared.placement !== "replicated") {
+    throw new Error(
+      `Embedded replicated functions cannot call ${declared.placement} ${declared.kind} ${name}.`,
+    );
+  }
+}
+
+export function isEmbeddedComponentReference(reference: unknown): boolean {
+  if (typeof reference !== "object" || reference === null) return false;
+  const path = (reference as Record<PropertyKey, unknown>)[TO_REFERENCE_PATH];
+  return typeof path === "string" && path.startsWith("_reference/childComponent/embedded/");
+}
+
+export function projectComponentQueryResult(
+  placements: EmbeddedSchemaPlacements,
+  tableNames: string[],
+  reference: unknown,
+  result: unknown,
+): unknown {
+  const path = referencePath(reference);
+  if (path?.endsWith("/rev/get")) return projectRevision(placements, tableNames, result);
+  if (path?.endsWith("/rev/list")) {
+    if (typeof result !== "object" || result === null || !Array.isArray((result as any).page)) {
+      throw new Error("Embedded revision list returned a malformed result.");
+    }
+    return {
+      ...(result as Record<string, unknown>),
+      page: (result as { page: unknown[] }).page.map((revision) =>
+        projectRevision(placements, tableNames, revision),
+      ),
+    };
+  }
+  return result;
+}
+
+export function projectRevision(
+  placements: EmbeddedSchemaPlacements,
+  tableNames: string[],
+  revision: unknown,
+): unknown {
+  if (revision === null) return null;
+  if (typeof revision !== "object" || Array.isArray(revision)) {
+    throw new Error("Embedded revision returned a malformed result.");
+  }
+  const record = revision as Record<string, unknown>;
+  const table = String(record.table);
+  if (!tableNames.includes(table)) {
+    throw new Error(
+      `Replicated functions cannot access revisions for non-replicated table ${table}.`,
+    );
+  }
+  return record.deleted === true || typeof record.value !== "object" || record.value === null
+    ? record
+    : {
+        ...record,
+        value: projectWireDoc(placements, table, record.value as Record<string, unknown>),
+      };
+}
+
+function referencePath(reference: unknown): string | undefined {
+  if (typeof reference !== "object" || reference === null) return undefined;
+  const path = (reference as Record<PropertyKey, unknown>)[TO_REFERENCE_PATH];
+  return typeof path === "string" ? path : undefined;
+}
+
 class QueryCapture {
   private readonly rows = new Map<string, QueryRow>();
 
@@ -323,6 +486,7 @@ class QueryCapture {
     private readonly db: GenericDatabaseReader<any>,
     private readonly tableNames: string[],
     private readonly crdtFields: ReadonlyMap<string, ReadonlyMap<string, unknown>>,
+    private readonly placements: EmbeddedSchemaPlacements,
   ) {}
 
   reader(): GenericDatabaseReader<any> {
@@ -335,8 +499,14 @@ class QueryCapture {
                 ? await (target as any).get(first)
                 : await (target as any).get(first, second);
             const table = second === undefined ? this.tableOf(first) : first;
-            if (table !== null) this.record(table, row);
-            return row;
+            if (table === null) {
+              if (row !== null) {
+                throw new Error("Replicated functions cannot read an unresolved document ID.");
+              }
+              return null;
+            }
+            this.assertReplicatedTable(table);
+            return this.projectAndRecord(table, row);
           };
         }
         if (property === "query") {
@@ -383,13 +553,13 @@ class QueryCapture {
   }
 
   private table(table: string, reader: object): object {
+    this.assertReplicatedTable(table);
     return new Proxy(reader, {
       get: (target, property, receiver) => {
         if (property === "get") {
           return async (id: string) => {
             const row = await (target as any).get(id);
-            this.record(table, row);
-            return row;
+            return this.projectAndRecord(table, row);
           };
         }
         if (property === "query") {
@@ -401,37 +571,38 @@ class QueryCapture {
   }
 
   private query(table: string, query: object): object {
+    this.assertReplicatedTable(table);
     return new Proxy(query, {
       get: (target, property, receiver) => {
         if (property === Symbol.asyncIterator) {
-          const record = (row: unknown) => this.record(table, row);
+          const record = (row: unknown) => this.projectAndRecord(table, row);
           return async function* () {
             for await (const row of target as AsyncIterable<unknown>) {
-              record(row);
-              yield row;
+              yield record(row);
             }
           };
         }
         const value = Reflect.get(target, property, receiver);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
+          if (property === "withIndex") this.assertReplicatedIndex(table, args[0]);
           const next = value.apply(target, args);
           if (property === "collect" || property === "take") {
             return Promise.resolve(next).then((rows: unknown[]) => {
-              for (const row of rows) this.record(table, row);
-              return rows;
+              return rows.map((row) => this.projectAndRecord(table, row));
             });
           }
           if (property === "first" || property === "unique") {
             return Promise.resolve(next).then((row: unknown) => {
-              this.record(table, row);
-              return row;
+              return this.projectAndRecord(table, row);
             });
           }
           if (property === "paginate") {
             return Promise.resolve(next).then((page: { page: unknown[] }) => {
-              for (const row of page.page) this.record(table, row);
-              return page;
+              return {
+                ...page,
+                page: page.page.map((row) => this.projectAndRecord(table, row)),
+              };
             });
           }
           return typeof next === "object" && next !== null ? this.query(table, next) : next;
@@ -440,10 +611,10 @@ class QueryCapture {
     });
   }
 
-  private record(table: string, value: unknown): void {
-    if (typeof value !== "object" || value === null) return;
-    const row = value as Record<string, unknown>;
-    if (typeof row._id !== "string" || typeof row._creationTime !== "number") return;
+  private projectAndRecord(table: string, value: unknown): unknown {
+    if (typeof value !== "object" || value === null) return value;
+    const row = projectWireDoc(this.placements, table, value as Record<string, unknown>);
+    if (typeof row._id !== "string" || typeof row._creationTime !== "number") return row;
     this.rows.set(memberKey(table, row._id), {
       table,
       rowId: row._id,
@@ -451,13 +622,29 @@ class QueryCapture {
       crdtFields: [...(this.crdtFields.get(table)?.keys() ?? [])],
     });
     this.assertBound();
+    return row;
   }
 
   private tableOf(id: string): string | null {
-    for (const table of this.tableNames) {
+    for (const table of [...this.tableNames, ...this.placements.remoteTables]) {
       if ((this.db as any).normalizeId(table, id) !== null) return table;
     }
     return null;
+  }
+
+  private assertReplicatedTable(table: string): void {
+    if (!this.tableNames.includes(table)) {
+      throw new Error(`Replicated functions cannot access non-replicated table ${table}.`);
+    }
+  }
+
+  private assertReplicatedIndex(table: string, index: unknown): void {
+    if (
+      typeof index === "string" &&
+      this.placements.indexes[table]?.remote.includes(index) === true
+    ) {
+      throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
+    }
   }
 
   private assertBound(): void {

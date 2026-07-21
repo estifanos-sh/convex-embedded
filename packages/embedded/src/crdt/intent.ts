@@ -1,4 +1,4 @@
-import type { EmbeddedCrdtKind } from "./meta";
+import type { EmbeddedCrdtKind } from "../meta";
 
 export function fieldValue(document: unknown, field: string): unknown {
   let cursor: unknown = document;

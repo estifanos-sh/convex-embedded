@@ -41,9 +41,12 @@ pub(crate) struct Schema {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Table {
     pub name: String,
+    pub placement: String,
     pub columns: Vec<Column>,
     #[serde(default)]
     pub crdt_fields: Vec<CrdtField>,
+    #[serde(default)]
+    pub local_fields: Vec<LocalField>,
     pub indexes: Vec<Index>,
 }
 
@@ -57,6 +60,11 @@ pub(crate) struct Column {
 pub(crate) struct CrdtField {
     pub field: String,
     pub kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LocalField {
+    pub field: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +121,10 @@ pub(crate) struct WriteBatch {
     pub doc_writes: Vec<DocWrite>,
     pub deletes: Vec<Row>,
     #[serde(default)]
+    pub local_field_writes: Vec<LocalFieldWrite>,
+    #[serde(default)]
+    pub local_field_deletes: Vec<LocalFieldDelete>,
+    #[serde(default)]
     pub crdt_ops: Vec<CrdtOp>,
     #[serde(default)]
     pub crdt_restores: Vec<CrdtRestore>,
@@ -140,6 +152,22 @@ pub(crate) struct DocWrite {
 pub(crate) struct Row {
     pub table: String,
     pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LocalFieldWrite {
+    pub table: String,
+    pub id: String,
+    pub field: String,
+    pub value_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct LocalFieldDelete {
+    pub table: String,
+    pub id: String,
+    pub field: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,4 +318,25 @@ pub(crate) struct Page {
     pub text: String,
     pub cursor: Option<String>,
     pub versions: BTreeMap<String, i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_fields_json: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Page;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn empty_page_overlay_is_omitted_from_the_wire_shape() {
+        let value = serde_json::to_value(Page {
+            text: "[]".to_owned(),
+            cursor: None,
+            versions: BTreeMap::new(),
+            local_fields_json: None,
+        })
+        .expect("page should serialize");
+
+        assert!(value.get("localFieldsJson").is_none());
+    }
 }

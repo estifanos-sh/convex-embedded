@@ -34,6 +34,8 @@ class ExpoStoreBinding implements StoreBinding {
   };
   commit: StoreBinding["commit"] = (batch, options) => this.invoke("commit", [batch, options]);
   docRead: StoreBinding["docRead"] = (table, id) => this.invoke("docRead", [table, id]);
+  localFieldsRead: NonNullable<StoreBinding["localFieldsRead"]> = (table, id) =>
+    this.invoke("localFieldsRead", [table, id]);
   docVersionRead: StoreBinding["docVersionRead"] = (table, id) =>
     this.invoke("docVersionRead", [table, id]);
   crdtHeadRead: StoreBinding["crdtHeadRead"] = (table, id, field) =>

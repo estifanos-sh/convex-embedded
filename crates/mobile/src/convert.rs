@@ -1,7 +1,8 @@
 use storage::{
     Bound, ColValue, ColumnDef, CommitOptions, CountSpec, CrdtFieldDef, CrdtFieldKind, CrdtOp,
-    CrdtOperation, CrdtRestore, DeleteIn, DocWrite, IdMapping, IdMappingContent, IndexDef, Order,
-    ReadSpec, RowKey, ScheduledFunctionKind, ScheduledJob, ScheduledState, StoreSchema, TableDef,
+    CrdtOperation, CrdtRestore, DeleteIn, DocWrite, IdMapping, IdMappingContent, IndexDef,
+    LocalFieldDef, LocalFieldDelete, LocalFieldWrite, Order, ReadSpec, RowKey,
+    ScheduledFunctionKind, ScheduledJob, ScheduledState, StoreSchema, TableDef, TablePlacement,
     UploadLease, UploadLeaseWrite, WriteBatch,
 };
 
@@ -15,6 +16,15 @@ pub(crate) fn schema(value: model::Schema) -> BridgeResult<StoreSchema> {
             .map(|table| {
                 Ok(TableDef {
                     name: table.name,
+                    placement: match table.placement.as_str() {
+                        "replicated" => TablePlacement::Replicated,
+                        "device" => TablePlacement::Device,
+                        other => {
+                            return Err(BridgeError::Protocol(format!(
+                                "unknown embedded table placement {other}"
+                            )))
+                        }
+                    },
                     columns: table
                         .columns
                         .into_iter()
@@ -28,6 +38,11 @@ pub(crate) fn schema(value: model::Schema) -> BridgeResult<StoreSchema> {
                         .into_iter()
                         .map(crdt_field)
                         .collect::<BridgeResult<_>>()?,
+                    local_fields: table
+                        .local_fields
+                        .into_iter()
+                        .map(|field| LocalFieldDef { field: field.field })
+                        .collect(),
                     indexes: table
                         .indexes
                         .into_iter()
@@ -177,6 +192,29 @@ pub(crate) fn write_batch(value: model::WriteBatch) -> BridgeResult<WriteBatch> 
             .map(|row| DeleteIn {
                 table: row.table,
                 id: row.id,
+            })
+            .collect(),
+        local_field_writes: value
+            .local_field_writes
+            .into_iter()
+            .map(|write| {
+                Ok(LocalFieldWrite {
+                    table: write.table,
+                    id: write.id,
+                    field: write.field,
+                    value: serde_json::from_str(&write.value_json).map_err(|error| {
+                        BridgeError::Protocol(format!("invalid device field JSON: {error}"))
+                    })?,
+                })
+            })
+            .collect::<BridgeResult<_>>()?,
+        local_field_deletes: value
+            .local_field_deletes
+            .into_iter()
+            .map(|delete| LocalFieldDelete {
+                table: delete.table,
+                id: delete.id,
+                field: delete.field,
             })
             .collect(),
         crdt_ops: value

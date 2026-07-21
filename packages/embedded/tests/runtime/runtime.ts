@@ -46,7 +46,7 @@ import { toRuntimeStoreSchema, toStoreSchema } from "../../src/schema";
 import { NativeStore } from "../../src/node/native";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
-import { count, set, text } from "../../src/values";
+import { e } from "../../src/values";
 import { nativeModule } from "../testkit/native";
 
 const appSchema = defineSchema({
@@ -63,7 +63,9 @@ const appSchema = defineSchema({
 });
 type DataModel = DataModelFromSchemaDefinition<typeof appSchema>;
 
-const { action, query, mutation } = defineFunctions<DataModel>();
+const functions = defineFunctions<DataModel>();
+const { query, mutation } = functions.replicated;
+const { action } = functions.remote;
 let flakyFails = false;
 let flakyStarted: (() => void) | undefined;
 
@@ -973,12 +975,12 @@ describe("runtime", () => {
   test("separates plain after-images from CRDT effects", async () => {
     const crdtSchema = defineSchema({
       docs: defineTable({
-        body: text(),
+        body: e.text(),
         title: v.string(),
       }),
     });
     type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
-    const { mutation: crdtMutation } = defineFunctions<CrdtDataModel>();
+    const { mutation: crdtMutation } = defineFunctions<CrdtDataModel>().replicated;
     const docs = {
       seed: crdtMutation({
         args: {},
@@ -1044,7 +1046,7 @@ describe("runtime", () => {
   test("seeds every entropy source from one stream on the local push path", async () => {
     const entropySchema = defineSchema({ notes: defineTable({ body: v.string() }) });
     type EntropyModel = DataModelFromSchemaDefinition<typeof entropySchema>;
-    const { mutation: entropyMutation } = defineFunctions<EntropyModel>();
+    const { mutation: entropyMutation } = defineFunctions<EntropyModel>().replicated;
     const draws: unknown[] = [];
     const notes = {
       seed: entropyMutation({
@@ -1093,7 +1095,7 @@ describe("runtime", () => {
   test("a concurrent query does not observe a replaying mutation's shimmed clock", async () => {
     const schema = defineSchema({ notes: defineTable({ body: v.string() }) });
     type Model = DataModelFromSchemaDefinition<typeof schema>;
-    const { mutation, query } = defineFunctions<Model>();
+    const { mutation, query } = defineFunctions<Model>().replicated;
     let signalPaused!: () => void;
     const paused = new Promise<void>((resolve) => (signalPaused = resolve));
     let release!: () => void;
@@ -1133,7 +1135,7 @@ describe("runtime", () => {
     const runOnce = async (concurrentQuery: boolean): Promise<string[]> => {
       const schema = defineSchema({ notes: defineTable({ body: v.string() }) });
       type Model = DataModelFromSchemaDefinition<typeof schema>;
-      const { mutation, query } = defineFunctions<Model>();
+      const { mutation, query } = defineFunctions<Model>().replicated;
       const draws: string[] = [];
       let signalPaused!: () => void;
       const paused = new Promise<void>((resolve) => (signalPaused = resolve));
@@ -1181,7 +1183,7 @@ describe("runtime", () => {
   test("a replaying mutation, a concurrent query, and a second mutation all settle", async () => {
     const schema = defineSchema({ notes: defineTable({ body: v.string() }) });
     type Model = DataModelFromSchemaDefinition<typeof schema>;
-    const { mutation, query } = defineFunctions<Model>();
+    const { mutation, query } = defineFunctions<Model>().replicated;
     let signalPaused!: () => void;
     const paused = new Promise<void>((resolve) => (signalPaused = resolve));
     let release!: () => void;
@@ -1289,13 +1291,14 @@ describe("runtime", () => {
     const crdtSchema = defineSchema({
       docs: defineTable({
         title: v.string(),
-        body: text(),
-        votes: count(),
-        tags: set(v.string()),
+        body: e.text(),
+        votes: e.count(),
+        tags: e.set(v.string()),
       }),
     });
     type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
-    const { mutation: crdtMutation, query: crdtQuery } = defineFunctions<CrdtDataModel>();
+    const { mutation: crdtMutation, query: crdtQuery } =
+      defineFunctions<CrdtDataModel>().replicated;
     const docs = {
       seed: crdtMutation({
         args: {},
@@ -1368,10 +1371,11 @@ describe("runtime", () => {
     { timeout: 30_000 },
     async () => {
       const crdtSchema = defineSchema({
-        docs: defineTable({ title: v.string(), votes: count() }),
+        docs: defineTable({ title: v.string(), votes: e.count() }),
       });
       type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
-      const { mutation: crdtMutation, query: crdtQuery } = defineFunctions<CrdtDataModel>();
+      const { mutation: crdtMutation, query: crdtQuery } =
+        defineFunctions<CrdtDataModel>().replicated;
       const docs = {
         seed: crdtMutation({
           args: { votes: v.number() },
@@ -1434,10 +1438,11 @@ describe("runtime", () => {
     { timeout: 30_000 },
     async () => {
       const crdtSchema = defineSchema({
-        docs: defineTable({ title: v.string(), body: text() }),
+        docs: defineTable({ title: v.string(), body: e.text() }),
       });
       type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
-      const { mutation: crdtMutation, query: crdtQuery } = defineFunctions<CrdtDataModel>();
+      const { mutation: crdtMutation, query: crdtQuery } =
+        defineFunctions<CrdtDataModel>().replicated;
       const docs = {
         seed: crdtMutation({
           args: { body: v.string() },
@@ -1513,10 +1518,11 @@ describe("runtime", () => {
 
   test("applies multiple splices in one mutation using progressive indices and replays idempotently", async () => {
     const crdtSchema = defineSchema({
-      docs: defineTable({ title: v.string(), body: text() }),
+      docs: defineTable({ title: v.string(), body: e.text() }),
     });
     type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
-    const { mutation: crdtMutation, query: crdtQuery } = defineFunctions<CrdtDataModel>();
+    const { mutation: crdtMutation, query: crdtQuery } =
+      defineFunctions<CrdtDataModel>().replicated;
     const docs = {
       seed: crdtMutation({
         args: { body: v.string() },
@@ -1579,12 +1585,12 @@ describe("runtime", () => {
     const conversionSchema = defineSchema({
       docs: defineTable({
         legacyBody: v.string(),
-        body: v.optional(text()),
+        body: v.optional(e.text()),
       }),
     });
     type ConversionDataModel = DataModelFromSchemaDefinition<typeof conversionSchema>;
     const { mutation: conversionMutation, query: conversionQuery } =
-      defineFunctions<ConversionDataModel>();
+      defineFunctions<ConversionDataModel>().replicated;
     const docs = {
       seed: conversionMutation({
         args: { legacyBody: v.string() },
@@ -1825,11 +1831,11 @@ describe("runtime", () => {
 
   test("revision restore replaces the opaque CRDT head atomically", async () => {
     const revisionSchema = defineSchema({
-      docs: defineTable({ body: text(), title: v.string() }),
+      docs: defineTable({ body: e.text(), title: v.string() }),
     });
     type RevisionDataModel = DataModelFromSchemaDefinition<typeof revisionSchema>;
     const { mutation: revisionMutation, query: revisionQuery } =
-      defineFunctions<RevisionDataModel>();
+      defineFunctions<RevisionDataModel>().replicated;
     const components = componentsGeneric() as unknown as {
       embedded: { rev: { create: unknown; restore: unknown } };
     };
@@ -2537,15 +2543,16 @@ describe("runtime", () => {
     ]);
   });
 
-  test("nested runMutation stages into the parent transaction", async () => {
+  test("replicated nested app mutations fail closed before staging writes", async () => {
     const r = await runner("rt_nested_mutation.db");
     await expect(
       r.runMutation("messages:parentCallsChildThenFails", { channel: "nested" }),
-    ).rejects.toThrow("parent failed");
+    ).rejects.toThrow("cannot call nested app mutations");
     expect(await r.runQuery("messages:list", { channel: "nested" })).toEqual([]);
-    expect(
-      await r.runMutation("messages:parentCallsChildThenReads", { channel: "nested" }),
-    ).toEqual(["child"]);
+    await expect(
+      r.runMutation("messages:parentCallsChildThenReads", { channel: "nested" }),
+    ).rejects.toThrow("cannot call nested app mutations");
+    expect(await r.runQuery("messages:list", { channel: "nested" })).toEqual([]);
   });
 
   test("query() hides a staged delete inside a mutation", async () => {
@@ -2832,18 +2839,24 @@ describe("runtime", () => {
     expect(loads).toBe(2);
   });
 
-  test("runner accepts generated-style revs and real Convex registered exports", async () => {
+  test("runner accepts generated-style revs with explicit placement metadata", async () => {
     const r = createRunner(
       {
         real: {
-          list: queryGeneric({
-            args: { channel: v.string() },
-            handler: (_ctx, args) => [{ body: args.channel }],
-          }),
-          send: mutationGeneric({
-            args: { channel: v.string() },
-            handler: (_ctx, args) => args.channel,
-          }),
+          list: Object.assign(
+            queryGeneric({
+              args: { channel: v.string() },
+              handler: (_ctx, args) => [{ body: args.channel }],
+            }),
+            { __embeddedPlacement: "replicated" as const },
+          ),
+          send: Object.assign(
+            mutationGeneric({
+              args: { channel: v.string() },
+              handler: (_ctx, args) => args.channel,
+            }),
+            { __embeddedPlacement: "replicated" as const },
+          ),
         },
       },
       new FakeStorage(),

@@ -20,7 +20,7 @@ const appSchema = defineSchema({
   }).index("by_flag", ["flag"]),
 });
 type DataModel = DataModelFromSchemaDefinition<typeof appSchema>;
-const { query, mutation } = defineFunctions<DataModel>();
+const { query, mutation } = defineFunctions<DataModel>().replicated;
 
 const items = {
   seed: mutation({

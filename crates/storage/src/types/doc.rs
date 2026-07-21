@@ -121,9 +121,22 @@ pub struct IndexDef {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TableDef {
     pub name: String,
+    pub placement: TablePlacement,
     pub columns: Vec<ColumnDef>,
     pub crdt_fields: Vec<CrdtFieldDef>,
+    pub local_fields: Vec<LocalFieldDef>,
     pub indexes: Vec<IndexDef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TablePlacement {
+    Replicated,
+    Device,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LocalFieldDef {
+    pub field: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -157,6 +170,10 @@ pub struct Page {
     /// beside the compact app-row JSON so rows stay clean; the runtime read-set capture reads it,
     /// absent id => version `0`. Empty for key pages.
     pub versions: std::collections::BTreeMap<String, i64>,
+    /// Device-only field overlays keyed by local row id. They never enter `text`, hashes, or wire
+    /// witnesses; a device-facing runtime may merge this sidecar after the replicated read.
+    pub local_fields:
+        std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
 /// An doc_write: the document plus its extracted column values. Mirrors the TS `DocWrite`.
@@ -185,12 +202,29 @@ pub struct DeleteIn {
 pub struct WriteBatch {
     pub doc_writes: Vec<DocWrite>,
     pub deletes: Vec<DeleteIn>,
+    pub local_field_writes: Vec<LocalFieldWrite>,
+    pub local_field_deletes: Vec<LocalFieldDelete>,
     pub crdt_ops: Vec<CrdtOp>,
     pub crdt_restores: Vec<CrdtRestore>,
     pub fresh_ids: Vec<RowKey>,
     pub data_only_ids: Vec<RowKey>,
     pub id_mappings: Vec<IdMapping>,
     pub schedules: Vec<super::ScheduledJob>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalFieldWrite {
+    pub table: String,
+    pub id: String,
+    pub field: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalFieldDelete {
+    pub table: String,
+    pub id: String,
+    pub field: String,
 }
 
 #[derive(Debug, Clone)]

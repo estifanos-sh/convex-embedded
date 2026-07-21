@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Convex Embedded",
+    "slug": "convex-embedded-demo",
+    "scheme": "convex-embedded-demo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "dev.convex.embedded.demo",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "dev.convex.embedded.demo",
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": ["expo-router", "expo-dev-client"],
+    "experiments": {
+      "autolinkingModuleResolution": true,
+      "typedRoutes": true
+    }
+  }
+}

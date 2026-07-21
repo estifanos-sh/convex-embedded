@@ -158,6 +158,11 @@ fn dispatch(host: &host::StoreHost, request: &Request) -> BridgeResult<Response>
             let value = host.run(move |store| store.doc_read(&table, &id))?;
             Response::value(&value)
         }
+        "localFieldsRead" => {
+            let (table, id): (String, String) = wire::payload(request)?;
+            let value = host.run(move |store| store.local_fields_read(&table, &id))?;
+            Response::value(&serde_json::to_string(&value)?)
+        }
         "docVersionRead" => {
             let (table, id): (String, String) = wire::payload(request)?;
             let value = host.run(move |store| store.doc_version_read(&table, &id))?;
@@ -195,6 +200,9 @@ fn dispatch(host: &host::StoreHost, request: &Request) -> BridgeResult<Response>
                 text: page.text,
                 cursor: page.cursor,
                 versions: page.versions.into_iter().collect::<BTreeMap<_, _>>(),
+                local_fields_json: (!page.local_fields.is_empty())
+                    .then(|| serde_json::to_string(&page.local_fields))
+                    .transpose()?,
             })
         }
         "docCountRead" => {
@@ -596,8 +604,10 @@ mod tests {
         let schema = serde_json::json!([{
             "tables": [{
                 "name": "issues",
+                "placement": "replicated",
                 "columns": [{"name": "status", "field": "status"}],
                 "crdtFields": [],
+                "localFields": [{"field": "draft"}],
                 "indexes": [{"name": "by_status", "fields": ["status"], "columns": ["status"]}],
             }],
         }]);
@@ -621,6 +631,48 @@ mod tests {
                 &request(
                     "docRead",
                     &serde_json::json!(["issues", "issues|local"]),
+                    vec![]
+                ),
+            ))
+            .ok
+        );
+        let overlay = serde_json::json!([{
+            "docWrites": [],
+            "deletes": [],
+            "localFieldWrites": [{
+                "table": "issues",
+                "id": "issues|local",
+                "field": "draft",
+                "valueJson": "true",
+            }],
+            "localFieldDeletes": [],
+        }, {"source": "device", "includeChanges": false}]);
+        assert!(response(&request_bytes(handle, &request("commit", &overlay, vec![]))).ok);
+        assert!(
+            response(&request_bytes(
+                handle,
+                &request(
+                    "localFieldsRead",
+                    &serde_json::json!(["issues", "issues|local"]),
+                    vec![]
+                ),
+            ))
+            .ok
+        );
+        assert!(
+            response(&request_bytes(
+                handle,
+                &request(
+                    "docPageRead",
+                    &serde_json::json!([{
+                        "table": "issues",
+                        "index": null,
+                        "bounds": null,
+                        "order": "asc",
+                        "pageSize": 10,
+                        "cursor": null,
+                        "resumeAfterKey": null,
+                    }]),
                     vec![]
                 ),
             ))

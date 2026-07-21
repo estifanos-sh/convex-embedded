@@ -20,7 +20,7 @@ use std::sync::Arc;
 use storage::testkit;
 use storage::{
     Bound, ColValue, ColumnDef, CommitOptions, CountSpec, DocWrite, EmbeddedStore, IndexDef,
-    StoreSchema, TableDef, WriteBatch,
+    StoreSchema, TableDef, TablePlacement, WriteBatch,
 };
 use turso_core::{
     Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult, Value, IO,
@@ -30,6 +30,8 @@ fn schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "vals".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "v".into(),
                 field: None,
@@ -70,6 +72,8 @@ fn seeded(path: &std::path::Path, rows: usize) -> EmbeddedStore {
             WriteBatch {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
+                local_field_writes: vec![],
+                local_field_deletes: vec![],
                 doc_writes,
                 deletes: vec![],
                 fresh_ids: vec![],

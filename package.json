@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "ready": "vp check && vp run @convex-dev/embedded#style && vp run @convex-dev/embedded#build && vp run @convex-dev/embedded#test:node && vp test && vp run @convex-dev/embedded#test:browser && vp run build:browser:vite",
+    "ready": "vp run @convex-dev/embedded#build:ts && vp check && vp run @convex-dev/embedded#style && vp run @convex-dev/embedded#wasm && vp run @convex-dev/embedded#native && vp run @convex-dev/embedded#test:node && vp test && vp run @convex-dev/embedded#test:browser && vp run build:browser:vite",
     "style": "vp run @convex-dev/embedded#style",
     "test:unit": "vp run @convex-dev/embedded#test:unit",
     "test:runtime": "vp run @convex-dev/embedded#test:runtime",
@@ -39,6 +39,9 @@
     "deploy:demo": "vp run @convex-dev/embedded#build:ts && vp run @convex-dev/embedded#wasm && vpx convex deploy --cmd 'vp run build:browser:vite' --cmd-url-env-var-name VITE_CONVEX_URL && vp exec static-hosting deploy --skip-build --skip-convex --dist demos/browser/vite/dist",
     "upload:demo": "vp run upload:browser:vite",
     "dev:convex": "vpx convex dev",
+    "dev:expo": "pnpm --filter @convex-dev/embedded-demo-expo start",
+    "ios:expo": "pnpm --filter @convex-dev/embedded-demo-expo ios",
+    "android:expo": "pnpm --filter @convex-dev/embedded-demo-expo android",
     "dev:browser:vite": "pnpm --filter @convex-dev/embedded-demo-browser-vite dev",
     "build:browser:vite": "pnpm --filter @convex-dev/embedded-demo-browser-vite build",
     "preview:browser:vite": "pnpm --filter @convex-dev/embedded-demo-browser-vite preview",

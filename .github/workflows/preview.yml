@@ -38,11 +38,8 @@ jobs:
           corepack enable
           corepack prepare pnpm@11.5.2 --activate
 
-      - name: Install Apple Rust targets
-        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-
-      - name: Build and verify XCFramework
-        run: node packages/embedded/scripts/mobile.ts ios
+      - name: Prepare Rust and build the XCFramework through the Expo hook
+        run: EAS_BUILD_PLATFORM=ios node demos/expo/scripts/native.ts eas
 
       - name: Compile Expo Apple autolinking smoke app
         run: node packages/embedded/scripts/mobilecompile.ts ios
@@ -58,9 +55,6 @@ jobs:
     name: Build Android mobile artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      ANDROID_NDK_HOME: ${{ github.workspace }}/.android/ndk/28.1.13356709
-
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -77,19 +71,8 @@ jobs:
           corepack enable
           corepack prepare pnpm@11.5.2 --activate
 
-      - name: Install pinned Android NDK
-        run: |
-          mkdir -p "$ANDROID_NDK_HOME"
-          sdkmanager --install "ndk;28.1.13356709"
-          cp -R "$ANDROID_HOME/ndk/28.1.13356709/." "$ANDROID_NDK_HOME"
-
-      - name: Install Android Rust toolchain
-        run: |
-          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
-          cargo install cargo-ndk --version 3.5.4 --locked
-
-      - name: Build and verify Android libraries
-        run: node packages/embedded/scripts/mobile.ts android
+      - name: Prepare Rust and build Android libraries through the Expo hook
+        run: EAS_BUILD_PLATFORM=android node demos/expo/scripts/native.ts eas
 
       - name: Compile Expo Android autolinking smoke app
         run: node packages/embedded/scripts/mobilecompile.ts android
@@ -144,6 +127,18 @@ jobs:
 
       - name: Build embedded TypeScript
         run: vp run @convex-dev/embedded#build:ts
+
+      - name: Typecheck Expo demo
+        run: vp run @convex-dev/embedded-demo-expo#typecheck
+
+      - name: Test Expo editor helpers
+        run: vp run @convex-dev/embedded-demo-expo#test
+
+      - name: Export Expo iOS bundle
+        run: vp run @convex-dev/embedded-demo-expo#export:ios
+
+      - name: Export Expo Android bundle
+        run: vp run @convex-dev/embedded-demo-expo#export:android
 
       - name: Check
         run: vp check

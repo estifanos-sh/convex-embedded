@@ -2,13 +2,11 @@ import type { ComponentApi } from "../component/_generated/component";
 import type {
   ArgsArrayForOptionalValidator,
   ArgsArrayToObject,
-  DataModelFromSchemaDefinition,
   DefaultArgsForOptionalValidator,
   GenericDataModel,
   GenericDatabaseWriter,
   GenericMutationCtx,
   GenericQueryCtx,
-  GenericSchema,
   FunctionReference,
   MutationBuilder,
   QueryBuilder,
@@ -28,7 +26,7 @@ import {
 import { asObjectValidator, ConvexError, v } from "convex/values";
 import type { GenericValidator, PropertyValidators, Validator, VObject } from "convex/values";
 
-import { embeddedCrdtMeta } from "../crdt/meta";
+import { embeddedFieldMeta } from "../meta";
 import {
   assertFiniteDelta,
   assertIntentField,
@@ -41,15 +39,44 @@ import { validatorIdReferences, validatorIdValues } from "../id/path";
 import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../protocol";
 import { withEntropy } from "../entropy";
 import { read as readTime } from "../component/time";
-import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "../schema";
+import {
+  analyzeEmbeddedSchema,
+  embeddedSchemaMeta,
+  fieldPlacements,
+  projectWireDoc,
+  type ConvexEmbeddedSchema,
+  type DeviceDataModel,
+  type EmbeddedSchemaDefinition,
+  type EmbeddedSchemaPlacements,
+  type ReplicatedDataModel,
+  type ServerDataModel,
+} from "../schema";
 import { normalizeMutationResult } from "../result";
-import { buildQueryBuilder, completeQueryRows, invokeQueryCapture } from "./query";
+import {
+  assertReplicatedReference,
+  buildQueryBuilder,
+  completeQueryRows,
+  invokeQueryCapture,
+  isEmbeddedComponentReference,
+  projectComponentQueryResult,
+  projectRevision,
+  type FunctionManifest,
+} from "./query";
 import {
   compileStorageIdPaths,
   diffStorageIds,
   readStorageIds,
   type CompiledStorageIdPaths,
 } from "../storage/id/path";
+import type {
+  MutationCtx as RuntimeMutationCtx,
+  QueryCtx as LocalQueryCtx,
+} from "../runtime/functions";
+
+type LocalMutationCtx<DataModel extends GenericDataModel> = Omit<
+  RuntimeMutationCtx<DataModel>,
+  "scheduler" | "storage"
+>;
 
 const MAX_TRACKED_ROWS = 1_024;
 const MAX_TRACKED_RANGES = 1_024;
@@ -57,7 +84,7 @@ const REPLAY_TTL_MS = 60_000;
 
 type EmbeddedRegisteredFunction = {
   __embeddedHandler?: (ctx: unknown, args: Record<string, unknown>) => unknown;
-  __embeddedLocal?: boolean;
+  __embeddedPlacement?: "replicated" | "remote" | "local";
 };
 
 type EmbeddedComponent = ComponentApi<string | undefined>;
@@ -220,7 +247,6 @@ type EmbeddedQueryBuilder<
   OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
     DefaultArgsForOptionalValidator<ArgsValidator>,
 >(func: {
-  local?: false;
   args?: ArgsValidator;
   returns?: ReturnsValidator;
   handler: (ctx: GenericQueryCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
@@ -237,61 +263,221 @@ type EmbeddedMutationBuilder<
   OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
     DefaultArgsForOptionalValidator<ArgsValidator>,
 >(func: {
-  local?: false;
   args?: ArgsValidator;
   returns?: ReturnsValidator;
   handler: (ctx: EmbeddedMutationCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
 }) => RegisteredMutation<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>) &
   MutationBuilder<DataModel, Visibility>;
 
-export type DefineEmbeddedOptions<Schema extends GenericSchema> = {
+type RemoteMutationBuilder<
+  DataModel extends GenericDataModel,
+  Visibility extends "public" | "internal",
+> = (<
+  ArgsValidator extends PropertyValidators | void | Validator<any, any, any>,
+  ReturnsValidator extends PropertyValidators | GenericValidator | void,
+  ReturnValue extends ReturnValueForOptionalValidator<ReturnsValidator> = any,
+  OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
+    DefaultArgsForOptionalValidator<ArgsValidator>,
+>(func: {
+  args?: ArgsValidator;
+  returns?: ReturnsValidator;
+  handler: (ctx: GenericMutationCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
+}) => RegisteredMutation<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>) &
+  MutationBuilder<DataModel, Visibility>;
+
+type LocalQueryBuilder<
+  DataModel extends GenericDataModel,
+  Visibility extends "public" | "internal",
+> = <
+  ArgsValidator extends PropertyValidators | void | Validator<any, any, any>,
+  ReturnsValidator extends PropertyValidators | GenericValidator | void,
+  ReturnValue extends ReturnValueForOptionalValidator<ReturnsValidator> = any,
+  OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
+    DefaultArgsForOptionalValidator<ArgsValidator>,
+>(func: {
+  args?: ArgsValidator;
+  returns?: ReturnsValidator;
+  handler: (ctx: LocalQueryCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
+}) => RegisteredQuery<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>;
+
+type LocalMutationBuilder<
+  DataModel extends GenericDataModel,
+  Visibility extends "public" | "internal",
+> = <
+  ArgsValidator extends PropertyValidators | void | Validator<any, any, any>,
+  ReturnsValidator extends PropertyValidators | GenericValidator | void,
+  ReturnValue extends ReturnValueForOptionalValidator<ReturnsValidator> = any,
+  OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
+    DefaultArgsForOptionalValidator<ArgsValidator>,
+>(func: {
+  args?: ArgsValidator;
+  returns?: ReturnsValidator;
+  handler: (ctx: LocalMutationCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
+}) => RegisteredMutation<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>;
+
+export type DefineEmbeddedOptions<Schema extends EmbeddedSchemaDefinition> = {
   component: EmbeddedComponent;
-  schema: SchemaDefinition<Schema, boolean>;
+  /** Trusted generated placement metadata used for nested server calls. */
+  manifest?: FunctionManifest;
+  schema: Schema;
 };
 
-export function defineEmbedded<Schema extends GenericSchema>(
+/** Placement-specific function builders and protocol endpoints for an Embedded schema. */
+export type DefinedEmbedded<Schema extends EmbeddedSchemaDefinition> = {
+  replicated: {
+    query: EmbeddedQueryBuilder<ReplicatedDataModel<Schema>, "public">;
+    mutation: EmbeddedMutationBuilder<ReplicatedDataModel<Schema>, "public">;
+    internalQuery: EmbeddedQueryBuilder<ReplicatedDataModel<Schema>, "internal">;
+    internalMutation: EmbeddedMutationBuilder<ReplicatedDataModel<Schema>, "internal">;
+  };
+  remote: {
+    query: EmbeddedQueryBuilder<ServerDataModel<Schema>, "public">;
+    mutation: RemoteMutationBuilder<ServerDataModel<Schema>, "public">;
+    internalQuery: EmbeddedQueryBuilder<ServerDataModel<Schema>, "internal">;
+    internalMutation: RemoteMutationBuilder<ServerDataModel<Schema>, "internal">;
+  };
+  local: {
+    query: LocalQueryBuilder<DeviceDataModel<Schema>, "public">;
+    mutation: LocalMutationBuilder<DeviceDataModel<Schema>, "public">;
+    internalQuery: LocalQueryBuilder<DeviceDataModel<Schema>, "internal">;
+    internalMutation: LocalMutationBuilder<DeviceDataModel<Schema>, "internal">;
+  };
+  upload: ReturnType<typeof buildUpload>;
+  pull: ReturnType<typeof buildPull>;
+  push: ReturnType<typeof buildPush>;
+};
+
+export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
   options: DefineEmbeddedOptions<Schema>,
-) {
-  type DataModel = DataModelFromSchemaDefinition<SchemaDefinition<Schema, boolean>>;
-  const tableNames = schemaTableNames(options.schema);
+): DefinedEmbedded<Schema> {
+  type Replicated = ReplicatedDataModel<Schema>;
+  type Server = ServerDataModel<Schema>;
+  type Device = DeviceDataModel<Schema>;
+  const placements = embeddedSchemaMeta(options.schema as ConvexEmbeddedSchema);
+  const tableNames = placements.replicatedTables;
   const crdtFields = schemaCrdtFields(options.schema);
+  const analysis = analyzeEmbeddedSchema(options.schema as ConvexEmbeddedSchema);
   const storageIdPaths = new Map(
-    Object.entries(
-      analyzeEmbeddedSchema(options.schema as ConvexEmbeddedSchema).storageIdPaths,
-    ).map(([table, paths]) => [table, compileStorageIdPaths(paths)]),
+    Object.entries(analysis.storageIdPaths).map(([table, paths]) => [
+      table,
+      compileStorageIdPaths(paths),
+    ]),
   );
 
   return {
-    query: buildQueryBuilder(
-      queryGeneric,
-      options.component,
-      tableNames,
-      crdtFields,
-    ) as EmbeddedQueryBuilder<DataModel, "public">,
-    mutation: buildMutationBuilder(
-      mutationGeneric,
-      options.component,
-      tableNames,
-      crdtFields,
-      storageIdPaths,
-    ) as EmbeddedMutationBuilder<DataModel, "public">,
-    internalQuery: buildQueryBuilder(
-      internalQueryGeneric,
-      options.component,
-      tableNames,
-      crdtFields,
-    ) as EmbeddedQueryBuilder<DataModel, "internal">,
-    internalMutation: buildMutationBuilder(
-      internalMutationGeneric,
-      options.component,
-      tableNames,
-      crdtFields,
-      storageIdPaths,
-    ) as EmbeddedMutationBuilder<DataModel, "internal">,
+    replicated: {
+      query: buildQueryBuilder(
+        queryGeneric,
+        options.component,
+        tableNames,
+        crdtFields,
+        placements,
+        options.manifest,
+      ) as EmbeddedQueryBuilder<Replicated, "public">,
+      mutation: buildMutationBuilder(
+        mutationGeneric,
+        options.component,
+        tableNames,
+        crdtFields,
+        storageIdPaths,
+        placements,
+        options.manifest,
+      ) as EmbeddedMutationBuilder<Replicated, "public">,
+      internalQuery: buildQueryBuilder(
+        internalQueryGeneric,
+        options.component,
+        tableNames,
+        crdtFields,
+        placements,
+        options.manifest,
+      ) as EmbeddedQueryBuilder<Replicated, "internal">,
+      internalMutation: buildMutationBuilder(
+        internalMutationGeneric,
+        options.component,
+        tableNames,
+        crdtFields,
+        storageIdPaths,
+        placements,
+        options.manifest,
+      ) as EmbeddedMutationBuilder<Replicated, "internal">,
+    },
+    remote: {
+      query: buildRemoteBuilder(queryGeneric, "query", "public") as EmbeddedQueryBuilder<
+        Server,
+        "public"
+      >,
+      mutation: buildRemoteBuilder(mutationGeneric, "mutation", "public") as RemoteMutationBuilder<
+        Server,
+        "public"
+      >,
+      internalQuery: buildRemoteBuilder(
+        internalQueryGeneric,
+        "query",
+        "internal",
+      ) as EmbeddedQueryBuilder<Server, "internal">,
+      internalMutation: buildRemoteBuilder(
+        internalMutationGeneric,
+        "mutation",
+        "internal",
+      ) as RemoteMutationBuilder<Server, "internal">,
+    },
+    local: {
+      query: buildLocalBuilder("query", "public") as unknown as LocalQueryBuilder<Device, "public">,
+      mutation: buildLocalBuilder("mutation", "public") as unknown as LocalMutationBuilder<
+        Device,
+        "public"
+      >,
+      internalQuery: buildLocalBuilder("query", "internal") as unknown as LocalQueryBuilder<
+        Device,
+        "internal"
+      >,
+      internalMutation: buildLocalBuilder(
+        "mutation",
+        "internal",
+      ) as unknown as LocalMutationBuilder<Device, "internal">,
+    },
     upload: buildUpload(),
     pull: buildPull(options.component),
-    push: buildPush(options.component, tableNames, crdtFields),
+    push: buildPush(options.component, tableNames, crdtFields, placements),
   };
+}
+
+function buildRemoteBuilder(
+  base: QueryBuilder<any, any> | MutationBuilder<any, any>,
+  kind: "query" | "mutation",
+  visibility: "public" | "internal",
+) {
+  return (definition: {
+    args?: PropertyValidators | GenericValidator;
+    returns?: PropertyValidators | GenericValidator;
+    handler: (ctx: unknown, args: Record<string, unknown>) => unknown;
+  }) => {
+    const registered = base(definition as never) as unknown as EmbeddedRegisteredFunction;
+    registered.__embeddedHandler = definition.handler;
+    registered.__embeddedPlacement = "remote";
+    Object.assign(registered, {
+      __embeddedKind: kind,
+      __embeddedVisibility: visibility,
+    });
+    return registered;
+  };
+}
+
+function buildLocalBuilder(kind: "query" | "mutation", visibility: "public" | "internal") {
+  return (definition: {
+    args?: PropertyValidators | GenericValidator;
+    returns?: PropertyValidators | GenericValidator;
+    handler: (ctx: unknown, args: Record<string, unknown>) => unknown;
+  }) => ({
+    kind,
+    placement: "local" as const,
+    visibility,
+    args: definition.args,
+    returns: definition.returns,
+    handler: definition.handler,
+    __embeddedHandler: definition.handler,
+    __embeddedPlacement: "local" as const,
+  });
 }
 
 function buildUpload() {
@@ -320,9 +506,10 @@ function buildMutationBuilder(
   tableNames: string[],
   crdtFields: Map<string, Map<string, CrdtKind>>,
   storageIdPaths: Map<string, CompiledStorageIdPaths>,
+  placements: EmbeddedSchemaPlacements,
+  manifest?: FunctionManifest,
 ) {
   return (definition: {
-    local?: false;
     args?: PropertyValidators | GenericValidator;
     returns?: PropertyValidators | GenericValidator;
     handler: (ctx: EmbeddedMutationCtx<any>, args: Record<string, unknown>) => unknown;
@@ -335,10 +522,20 @@ function buildMutationBuilder(
       args,
       returns: mutationReturnsValidator(definition.returns) as never,
       handler: async (ctx: GenericMutationCtx<any>, received: Record<string, unknown>) => {
+        const capture = new WriteCapture(
+          ctx.db,
+          tableNames,
+          crdtFields,
+          storageIdPaths,
+          placements,
+        );
         const metadata = await ctx.meta.getFunctionMetadata();
         const functionName = metadata.name;
-        if (metadata.visibility !== "public" || definition.local === false) {
-          return await definition.handler(hostedIntentCtx(ctx), received);
+        if (metadata.visibility !== "public") {
+          return await definition.handler(
+            hostedIntentCtx(ctx, capture.db, tableNames, placements, manifest),
+            received,
+          );
         }
         const identity = await identityAttributeOf(ctx);
         const { requestId } = await ctx.meta.getRequestMetadata();
@@ -346,15 +543,25 @@ function buildMutationBuilder(
           requestId,
           functionName,
         })) as ReplayEnvelope | null;
-        if (!replay) return await definition.handler(hostedIntentCtx(ctx), received);
+        if (!replay) {
+          return await definition.handler(
+            hostedIntentCtx(ctx, capture.db, tableNames, placements, manifest),
+            received,
+          );
+        }
 
         assertRuntimeVersion(replay.runtime);
         const authoredArgs = received;
         const fingerprint = replay.fingerprint;
-        const witnessState = await inspectWitnesses(ctx, tableNames, crdtFields, replay.reads);
+        const witnessState = await inspectWitnesses(
+          ctx,
+          tableNames,
+          crdtFields,
+          replay.reads,
+          placements,
+        );
         const mutationId = replay.mutationId;
         const clientId = replay.clientId;
-        const capture = new WriteCapture(ctx.db, tableNames, crdtFields, storageIdPaths);
         const effects = new EffectCursor(capture, replay.crdt, crdtFields);
         const schedules = new ScheduleCapture(ctx.scheduler, mutationId, replay.schedules);
         const uploads = new UploadCapture(ctx.storage, mutationId, replay.uploads);
@@ -365,10 +572,14 @@ function buildMutationBuilder(
           ctx.runQuery.bind(ctx) as RevisionRunQuery,
           component,
           replay,
+          tableNames,
+          placements,
+          manifest,
         );
         const appCtx = {
           ...ctx,
           db,
+          runQuery: replicatedMutationQuery(ctx, tableNames, placements, manifest),
           runMutation: revisions.runMutation,
           scheduler: schedules.writer(),
           storage: uploads.writer(),
@@ -461,7 +672,7 @@ function buildMutationBuilder(
     } as never) as RegisteredMutation<any, any, any> & EmbeddedRegisteredFunction;
     registered.__embeddedHandler =
       definition.handler as EmbeddedRegisteredFunction["__embeddedHandler"];
-    registered.__embeddedLocal = definition.local !== false;
+    registered.__embeddedPlacement = "replicated";
     return registered;
   };
 }
@@ -715,6 +926,9 @@ class RevisionCapture {
     private readonly inspect: RevisionRunQuery,
     component: EmbeddedComponent,
     private readonly replay: ReplayEnvelope | null,
+    private readonly tableNames: string[],
+    private readonly placements: EmbeddedSchemaPlacements,
+    private readonly manifest?: FunctionManifest,
   ) {
     const create = component.rev.create as Parameters<RevisionRunMutation>[0];
     const path = referencePath(create);
@@ -744,7 +958,7 @@ class RevisionCapture {
     const operation = this.operation(ref);
     if (operation === "create") {
       const current = await this.current(args);
-      const requested = revisionExpectation(args);
+      const requested = this.project(revisionExpectation(args));
       if (!sameRevisionValue(current, requested)) {
         throw new Error("rev.create must match the document visible in the current transaction.");
       }
@@ -758,30 +972,58 @@ class RevisionCapture {
         : undefined;
       this.nextOrdinal += 1;
       await this.stage("create", requested);
-      return await this.invoke(replay ? this.createReplay : ref, {
-        ...args,
+      const result = await this.invoke(replay ? this.createReplay : ref, {
+        ...revisionArgs(args, requested),
         ...(replay ? { replay } : {}),
       });
+      return this.projectResult(result);
     }
     if (operation === "retain") {
-      await this.stage("retain", revisionExpectation(args));
+      const requested = this.project(revisionExpectation(args));
+      await this.stage("retain", requested);
+      return this.projectResult(await this.invoke(ref, revisionArgs(args, requested)));
+    }
+    if (operation === undefined) {
+      if (!isEmbeddedComponentReference(ref)) {
+        assertReplicatedReference(this.manifest, ref, "mutation");
+        throw new Error(
+          "Embedded replicated mutations cannot call nested app mutations until their writes can join the parent replay capture.",
+        );
+      }
       return await this.invoke(ref, args);
     }
     if (operation !== "restore") return await this.invoke(ref, args);
 
     const displaced = await this.current(args);
-    const selected = await this.inspect(this.get, args);
+    const selected = this.projectResult(await this.inspect(this.get, args));
     if (selected === null) throw new Error("Revision not found.");
     const target = revisionExpectation(selected as Record<string, unknown>);
     if (!sameRevisionValue(displaced, target)) {
       await this.stage("retain", displaced);
       await this.invoke(this.retain, { ...displaced, origin: "displaced" });
     }
-    const result = await this.invoke(ref, args);
+    const result = this.projectResult(await this.invoke(ref, args));
     this.capture.revisionRestore(target);
     this.expectations.push(target);
     return result;
   };
+
+  private project(revision: RevisionExpectation): RevisionExpectation {
+    if (revision.deleted) return revision;
+    if (!this.tableNames.includes(revision.table)) {
+      throw new Error(
+        `Replicated functions cannot access revisions for non-replicated table ${revision.table}.`,
+      );
+    }
+    return {
+      ...revision,
+      value: projectWireDoc(this.placements, revision.table, revision.value ?? {}),
+    };
+  }
+
+  private projectResult(result: unknown): unknown {
+    return projectRevision(this.placements, this.tableNames, result);
+  }
 
   async finish(): Promise<void> {
     if (this.checkpoints.size > 0) {
@@ -877,6 +1119,23 @@ function revisionExpectation(args: Record<string, unknown>): RevisionExpectation
     deleted: args.deleted === true,
     ...(args.deleted === true ? {} : { value: args.value as Record<string, unknown> }),
   };
+}
+
+function revisionArgs(
+  args: Record<string, unknown>,
+  revision: RevisionExpectation,
+): Record<string, unknown> {
+  const projected: Record<string, unknown> = {
+    ...args,
+    table: revision.table,
+    rowId: revision.rowId,
+  };
+  if (revision.deleted) {
+    delete projected.value;
+  } else {
+    projected.value = revision.value;
+  }
+  return projected;
 }
 
 function valueAtPath(value: unknown, path: string): unknown {
@@ -1168,6 +1427,7 @@ function buildPush(
   component: EmbeddedComponent,
   tableNames: string[],
   crdtFields: Map<string, Map<string, CrdtKind>>,
+  placements: EmbeddedSchemaPlacements,
 ) {
   return mutationGeneric({
     args: { request: pushRequestValidator },
@@ -1184,6 +1444,7 @@ function buildPush(
       }
       assertRuntimeVersion(args.runtime);
       if (args.kind === "mutation") {
+        assertWireAfterImages(args.afterImages, placements);
         const identity = await identityAttributeOf(ctx);
         const { requestId } = await ctx.meta.getRequestMetadata();
         const fingerprint = await hashValue({
@@ -1254,7 +1515,13 @@ function buildPush(
                 ? "rebase"
                 : "rejected";
           const targets = outcome === "rejected" ? [] : uniqueTargets(failure.targets);
-          const changes = await authoritativeChanges(ctx, targets, tableNames, crdtFields);
+          const changes = await authoritativeChanges(
+            ctx,
+            targets,
+            tableNames,
+            crdtFields,
+            placements,
+          );
           const targetKeys = new Set(targets.map(({ table, rowId }) => `${table}\u0000${rowId}`));
           const revisions: RevisionCandidate[] =
             outcome === "rebase"
@@ -1316,6 +1583,32 @@ function buildPush(
   });
 }
 
+function assertWireAfterImages(
+  candidates: RevisionCandidate[],
+  placements: EmbeddedSchemaPlacements,
+): void {
+  const replicated = new Set(placements.replicatedTables);
+  for (const candidate of candidates) {
+    if (!replicated.has(candidate.table)) {
+      throw new ConvexError({
+        code: "EMBEDDED_AFTER_IMAGE",
+        message: `After-image addresses non-replicated table ${candidate.table}.`,
+      });
+    }
+    if (
+      candidate.content === "value" &&
+      canonicalJson(
+        projectWireDoc(placements, candidate.table, candidate.value as Record<string, unknown>),
+      ) !== canonicalJson(candidate.value)
+    ) {
+      throw new ConvexError({
+        code: "EMBEDDED_AFTER_IMAGE",
+        message: `After-image contains non-replicated fields for ${candidate.table}.`,
+      });
+    }
+  }
+}
+
 function mutationReturnsValidator(returns: PropertyValidators | GenericValidator | undefined) {
   if (returns === undefined) return undefined;
   return v.union(
@@ -1348,6 +1641,7 @@ class WriteCapture {
     private readonly tableNames: string[],
     private readonly crdtFields: Map<string, Map<string, CrdtKind>>,
     private readonly storageIdPaths: Map<string, CompiledStorageIdPaths>,
+    private readonly placements: EmbeddedSchemaPlacements,
   ) {
     this.db = this.writer();
   }
@@ -1376,12 +1670,13 @@ class WriteCapture {
           contentHash: await hashValue(null),
         });
       } else {
+        const wire = projectWireDoc(this.placements, touched.table, row);
         changes.push({
           op: "put",
           table: touched.table,
           rowId: touched.id,
-          fields: row,
-          contentHash: await hashDocument(row, this.crdtFields.get(touched.table)?.keys()),
+          fields: wire,
+          contentHash: await hashDocument(wire, this.crdtFields.get(touched.table)?.keys()),
         });
       }
     }
@@ -1433,6 +1728,8 @@ class WriteCapture {
       get: (target, property, receiver) => {
         if (property === "insert") {
           return async (table: string, value: unknown) => {
+            this.assertReplicatedTable(table);
+            this.assertReplicatedWrite(table, value);
             const id = await (this.real as any).insert(table, value);
             this.trackInserted(table, id);
             this.insertOrder.push({ table, id });
@@ -1449,7 +1746,14 @@ class WriteCapture {
               target,
               args,
             );
-            return row;
+            const table = args.length === 1 ? await this.tableOf(String(args[0])) : String(args[0]);
+            return this.project(table, row);
+          };
+        }
+        if (property === "query") {
+          return (table: string) => {
+            this.assertReplicatedTable(table);
+            return this.projectQuery(table, (this.real as any).query(table));
           };
         }
         if (property === "table") {
@@ -1462,10 +1766,12 @@ class WriteCapture {
   }
 
   private scoped(table: string, scoped: any): any {
+    this.assertReplicatedTable(table);
     return new Proxy(scoped, {
       get: (target, property, receiver) => {
         if (property === "insert") {
           return async (value: unknown) => {
+            this.assertReplicatedWrite(table, value);
             const id = await target.insert(value);
             this.trackInserted(table, id);
             this.insertOrder.push({ table, id });
@@ -1476,12 +1782,30 @@ class WriteCapture {
           return async (...args: unknown[]) => {
             const id = String(args[0]);
             const restore = this.isRevisionRestore(String(property), table, id, args[1]);
-            if (property !== "delete" && !restore) this.assertPlain(table, args[1]);
+            if (property !== "delete" && !restore) {
+              this.assertPlain(table, args[1]);
+              this.assertReplicatedWrite(table, args[1]);
+            }
             await this.track(table, id, false, true);
+            if (property === "replace" && !restore) {
+              const current = await target.get(id);
+              const preserved = Object.fromEntries(
+                fieldPlacements(this.placements, table).remote.flatMap((field) =>
+                  current && Object.hasOwn(current, field) ? [[field, current[field]]] : [],
+                ),
+              );
+              args[1] = { ...(args[1] as Record<string, unknown>), ...preserved };
+            }
             const result = await target[property](...args);
             if (restore) this.restoreGrants.delete(`${table}\u0000${id}`);
             return result;
           };
+        }
+        if (property === "get") {
+          return async (id: string) => this.project(table, await target.get(id));
+        }
+        if (property === "query") {
+          return () => this.projectQuery(table, target.query());
         }
         const value = Reflect.get(target, property, receiver);
         return typeof value === "function" ? value.bind(target) : value;
@@ -1495,8 +1819,20 @@ class WriteCapture {
     const id = String(args[qualified ? 1 : 0]);
     const value = args[qualified ? 2 : 1];
     const restore = this.isRevisionRestore(kind, table, id, value);
-    if (kind !== "delete" && !restore) this.assertPlain(table, value);
+    if (kind !== "delete" && !restore) {
+      this.assertPlain(table, value);
+      this.assertReplicatedWrite(table, value);
+    }
     await this.track(table, id, false, true);
+    if (kind === "replace" && !restore) {
+      const current = await (this.real as any).get(table, id);
+      const preserved = Object.fromEntries(
+        fieldPlacements(this.placements, table).remote.flatMap((field) =>
+          current && Object.hasOwn(current, field) ? [[field, current[field]]] : [],
+        ),
+      );
+      args[qualified ? 2 : 1] = { ...(value as Record<string, unknown>), ...preserved };
+    }
     const result = await (this.real as any)[kind](...args);
     if (restore) this.restoreGrants.delete(`${table}\u0000${id}`);
     return result;
@@ -1530,6 +1866,72 @@ class WriteCapture {
       if ((this.real as any).normalizeId(table, id) !== null) return table;
     }
     throw new Error("Unable to resolve the table for an unqualified document ID.");
+  }
+
+  private assertReplicatedTable(table: string): void {
+    if (!this.tableNames.includes(table)) {
+      throw new Error(`Replicated functions cannot access non-replicated table ${table}.`);
+    }
+  }
+
+  private assertReplicatedWrite(table: string, value: unknown): void {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const forbidden = new Set([
+      ...fieldPlacements(this.placements, table).remote,
+      ...fieldPlacements(this.placements, table).local,
+    ]);
+    const field = Object.keys(value as Record<string, unknown>).find((name) => forbidden.has(name));
+    if (field !== undefined) {
+      throw new Error(`Replicated functions cannot write non-replicated field ${table}.${field}.`);
+    }
+  }
+
+  private assertReplicatedIndex(table: string, index: unknown): void {
+    if (
+      typeof index === "string" &&
+      this.placements.indexes[table]?.remote.includes(index) === true
+    ) {
+      throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
+    }
+  }
+
+  private project(table: string, value: unknown): unknown {
+    if (typeof value !== "object" || value === null) return value;
+    return projectWireDoc(this.placements, table, value as Record<string, unknown>);
+  }
+
+  private projectQuery(table: string, query: object): object {
+    return new Proxy(query, {
+      get: (target, property, receiver) => {
+        if (property === Symbol.asyncIterator) {
+          const project = (value: unknown) => this.project(table, value);
+          return async function* () {
+            for await (const row of target as AsyncIterable<unknown>) yield project(row);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          if (property === "withIndex") this.assertReplicatedIndex(table, args[0]);
+          const next = value.apply(target, args);
+          if (property === "collect" || property === "take") {
+            return Promise.resolve(next).then((rows: unknown[]) =>
+              rows.map((row) => this.project(table, row)),
+            );
+          }
+          if (property === "first" || property === "unique") {
+            return Promise.resolve(next).then((row) => this.project(table, row));
+          }
+          if (property === "paginate") {
+            return Promise.resolve(next).then((page: { page: unknown[] }) => ({
+              ...page,
+              page: page.page.map((row) => this.project(table, row)),
+            }));
+          }
+          return typeof next === "object" && next !== null ? this.projectQuery(table, next) : next;
+        };
+      },
+    });
   }
 
   private async track(table: string, id: string, inserted: boolean, plain: boolean): Promise<void> {
@@ -1660,6 +2062,10 @@ class UploadCapture {
 
 function hostedIntentCtx<DataModel extends GenericDataModel>(
   ctx: GenericMutationCtx<DataModel>,
+  projectedDb: GenericDatabaseWriter<DataModel>,
+  tableNames: string[],
+  placements: EmbeddedSchemaPlacements,
+  manifest?: FunctionManifest,
 ): EmbeddedMutationCtx<DataModel> {
   const reject = (): never => {
     throw new ConvexError({
@@ -1668,12 +2074,86 @@ function hostedIntentCtx<DataModel extends GenericDataModel>(
         "A direct hosted call to a mutation that executes a CRDT intent method fails unless it carries an Embedded-generated effect.",
     });
   };
-  const db = Object.assign(ctx.db, {
+  const db = Object.assign(projectedDb, {
     count: { add: reject },
     set: { add: reject, delete: reject },
     text: { splice: reject },
   }) as GenericDatabaseWriter<DataModel> & CrdtIntentWriter;
-  return { ...ctx, db } as EmbeddedMutationCtx<DataModel>;
+  return {
+    ...ctx,
+    db,
+    runQuery: replicatedMutationQuery(ctx, tableNames, placements, manifest),
+    runMutation: replicatedMutationCall(ctx, tableNames, placements, manifest),
+  } as EmbeddedMutationCtx<DataModel>;
+}
+
+function replicatedMutationQuery(
+  ctx: GenericMutationCtx<any>,
+  tableNames: string[],
+  placements: EmbeddedSchemaPlacements,
+  manifest?: FunctionManifest,
+): GenericMutationCtx<any>["runQuery"] {
+  return (async (reference: FunctionReference<"query">, args: Record<string, unknown>) => {
+    if (isEmbeddedComponentReference(reference)) {
+      return projectComponentQueryResult(
+        placements,
+        tableNames,
+        reference,
+        await ctx.runQuery(reference as never, args as never),
+      );
+    }
+    assertReplicatedReference(manifest, reference as never, "query");
+    return await ctx.runQuery(reference as never, args as never);
+  }) as GenericMutationCtx<any>["runQuery"];
+}
+
+function replicatedMutationCall(
+  ctx: GenericMutationCtx<any>,
+  tableNames: string[],
+  placements: EmbeddedSchemaPlacements,
+  manifest?: FunctionManifest,
+): GenericMutationCtx<any>["runMutation"] {
+  return (async (reference: FunctionReference<"mutation">, args: Record<string, unknown>) => {
+    if (!isEmbeddedComponentReference(reference)) {
+      assertReplicatedReference(manifest, reference as never, "mutation");
+      throw new Error(
+        "Embedded replicated mutations cannot call nested app mutations until their writes can join the parent replay capture.",
+      );
+    }
+    const path = referencePath(reference);
+    let componentArgs = args;
+    if (path?.endsWith("/rev/create") || path?.endsWith("/rev/retain")) {
+      const revision = projectRevisionExpectation(
+        placements,
+        tableNames,
+        revisionExpectation(args),
+      );
+      componentArgs = revisionArgs(args, revision);
+    }
+    const result = await ctx.runMutation(reference as never, componentArgs as never);
+    return path?.endsWith("/rev/create") ||
+      path?.endsWith("/rev/retain") ||
+      path?.endsWith("/rev/restore")
+      ? projectRevision(placements, tableNames, result)
+      : result;
+  }) as GenericMutationCtx<any>["runMutation"];
+}
+
+function projectRevisionExpectation(
+  placements: EmbeddedSchemaPlacements,
+  tableNames: string[],
+  revision: RevisionExpectation,
+): RevisionExpectation {
+  if (revision.deleted) return revision;
+  if (!tableNames.includes(revision.table)) {
+    throw new Error(
+      `Replicated functions cannot access revisions for non-replicated table ${revision.table}.`,
+    );
+  }
+  return {
+    ...revision,
+    value: projectWireDoc(placements, revision.table, revision.value ?? {}),
+  };
 }
 
 class EffectCursor {
@@ -1763,6 +2243,7 @@ async function inspectWitnesses(
   tableNames: string[],
   crdtFields: Map<string, Map<string, CrdtKind>>,
   witnesses: ReadWitness[],
+  placements: EmbeddedSchemaPlacements,
 ): Promise<{
   conflict: boolean;
   conflicts: Array<{ table: string; rowId: string }>;
@@ -1809,7 +2290,9 @@ async function inspectWitnesses(
         message: "Point witness contains an invalid app-row address.",
       });
     }
-    const current = await (ctx.db as any).get(witness.table, witness.rowId);
+    const serverCurrent = await (ctx.db as any).get(witness.table, witness.rowId);
+    const current =
+      serverCurrent === null ? null : projectWireDoc(placements, witness.table, serverCurrent);
     const currentHash = await hashDocument(current, crdtFields.get(witness.table)?.keys());
     if (witness.plainHash !== currentHash) {
       conflict = true;
@@ -1846,7 +2329,11 @@ async function inspectWitnesses(
   }
   let unsupported = false;
   for (const witness of ranges) {
-    if (!tableNames.includes(witness.table) || witness.index === undefined) {
+    if (
+      !tableNames.includes(witness.table) ||
+      witness.index === undefined ||
+      !placements.indexes[witness.table]?.replicated.includes(witness.index)
+    ) {
       unsupported = true;
       continue;
     }
@@ -1881,10 +2368,13 @@ async function inspectWitnesses(
         unsupported = true;
       } else {
         const members = await Promise.all(
-          rows.map(async (row: any) => ({
-            id: row._id,
-            hash: await hashDocument(row, crdtFields.get(witness.table)?.keys()),
-          })),
+          rows.map(async (row: any) => {
+            const wire = projectWireDoc(placements, witness.table, row);
+            return {
+              id: wire._id,
+              hash: await hashDocument(wire, crdtFields.get(witness.table)?.keys()),
+            };
+          }),
         );
         if ((await hashValue(members)) !== witness.membersHash) {
           conflict = true;
@@ -2021,19 +2511,6 @@ function assertRuntimeVersion(runtime: { protocolVersion: number }): void {
   });
 }
 
-function schemaTableNames(schema: SchemaDefinition<any, boolean>): string[] {
-  try {
-    const exported = JSON.parse((schema as unknown as { export(): string }).export()) as {
-      tables?: Array<{ tableName?: string }>;
-    };
-    return (exported.tables ?? []).flatMap((table) =>
-      typeof table.tableName === "string" ? [table.tableName] : [],
-    );
-  } catch {
-    return [];
-  }
-}
-
 function schemaCrdtFields(
   schema: SchemaDefinition<any, boolean>,
 ): Map<string, Map<string, CrdtKind>> {
@@ -2052,9 +2529,9 @@ function collectCrdtFields(
   prefix: string,
   fields: Map<string, CrdtKind>,
 ): void {
-  const meta = embeddedCrdtMeta(validator);
-  if (meta && prefix !== "") {
-    fields.set(prefix, meta.kind);
+  const meta = embeddedFieldMeta(validator);
+  if (meta?.placement === "replicated" && prefix !== "") {
+    fields.set(prefix, meta.crdt.kind);
     return;
   }
   const object = validator as { kind?: unknown; fields?: Record<string, unknown> };
@@ -2164,6 +2641,7 @@ async function authoritativeChanges(
   targets: Array<{ table: string; rowId: string }>,
   tableNames: string[],
   crdtFields: Map<string, Map<string, CrdtKind>>,
+  placements: EmbeddedSchemaPlacements,
 ) {
   if (targets.length > MAX_TRACKED_ROWS) {
     throw new Error(`Embedded failure settlement accepts at most ${MAX_TRACKED_ROWS} targets.`);
@@ -2181,12 +2659,13 @@ async function authoritativeChanges(
     if (row === null) {
       changes.push({ op: "del", table, rowId, contentHash: await hashValue(null) });
     } else {
+      const wire = projectWireDoc(placements, table, row);
       changes.push({
         op: "put",
         table,
         rowId,
-        fields: row,
-        contentHash: await hashDocument(row, crdtFields.get(table)?.keys()),
+        fields: wire,
+        contentHash: await hashDocument(wire, crdtFields.get(table)?.keys()),
       });
     }
   }

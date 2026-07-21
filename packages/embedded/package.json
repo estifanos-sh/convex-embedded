@@ -3,6 +3,8 @@
   "version": "0.0.0",
   "description": "Embedded runtime and Convex server wrapper for local-first Convex apps.",
   "files": [
+    "dist/*-*.cjs",
+    "dist/*-*.d.cts",
     "dist/*-*.d.mts",
     "dist/*-*.mjs",
     "dist/browser-embedded.d.mts",
@@ -24,9 +26,15 @@
     "dist/metro.mjs",
     "dist/server.d.mts",
     "dist/server.mjs",
+    "dist/schema.cjs",
+    "dist/schema.d.cts",
+    "dist/schema.d.mts",
+    "dist/schema.mjs",
     "dist/thread",
     "dist/unplugin.d.mts",
     "dist/unplugin.mjs",
+    "dist/values.cjs",
+    "dist/values.d.cts",
     "dist/values.d.mts",
     "dist/values.mjs",
     "dist/vite.d.mts",
@@ -76,8 +84,24 @@
       }
     },
     "./values": {
-      "types": "./dist/values.d.mts",
-      "import": "./dist/values.mjs"
+      "import": {
+        "types": "./dist/values.d.mts",
+        "default": "./dist/values.mjs"
+      },
+      "require": {
+        "types": "./dist/values.d.cts",
+        "default": "./dist/values.cjs"
+      }
+    },
+    "./schema": {
+      "import": {
+        "types": "./dist/schema.d.mts",
+        "default": "./dist/schema.mjs"
+      },
+      "require": {
+        "types": "./dist/schema.d.cts",
+        "default": "./dist/schema.cjs"
+      }
     },
     "./convex.config": {
       "@convex-dev/component-source": "./src/component/convex.config.ts",
@@ -128,15 +152,15 @@
     "wasm": "node scripts/wasm.ts",
     "style": "node scripts/style.ts",
     "dev": "vp pack --watch",
-    "test": "vp pack && vp test run --project unit --project storage --project server --project surface && vp test run --project runtime --maxWorkers=1 && vp test run --project remote",
-    "test:unit": "vp test run --project unit",
-    "test:runtime": "vp test run --project runtime --maxWorkers=1",
-    "test:storage": "vp test run --project storage",
-    "test:server": "vp test run --project server",
-    "test:remote": "vp test run --project remote",
+    "test": "vp pack && vp test run --config vite/tests.ts --project unit --project storage --project server --project surface && vp test run --config vite/tests.ts --project runtime --maxWorkers=1 && vp test run --config vite/tests.ts --project remote",
+    "test:unit": "vp test run --config vite/tests.ts --project unit",
+    "test:runtime": "vp test run --config vite/tests.ts --project runtime --maxWorkers=1",
+    "test:storage": "vp test run --config vite/tests.ts --project storage",
+    "test:server": "vp test run --config vite/tests.ts --project server",
+    "test:remote": "vp test run --config vite/tests.ts --project remote",
     "test:browser": "node scripts/browser.ts",
-    "test:metal": "vp pack && node scripts/wasm.ts && vp test run --project metal",
-    "test:surface": "vp test run --project surface",
+    "test:metal": "vp pack && node scripts/wasm.ts && vp test run --config vite/tests.ts --project metal",
+    "test:surface": "vp test run --config vite/tests.ts --project surface",
     "bench": "node scripts/bench.ts",
     "bench:compare": "node scripts/bench.ts --compare tests/bench/baseline.json",
     "bench:browser:startup": "node scripts/bench.ts --browser-startup",

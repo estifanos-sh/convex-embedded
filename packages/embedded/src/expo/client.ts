@@ -3,7 +3,8 @@
  *
  * @packageDocumentation
  */
-import { modules, schema } from "virtual:convex-embedded";
+import { embeddedManifest, embeddedSchema, modules } from "virtual:convex-embedded";
+import { embeddedIdentity } from "virtual:convex-embedded/identity";
 
 import { createEmbeddedAuthState, EmbeddedClient } from "../client";
 import { openExpoStore } from "./store";
@@ -49,8 +50,9 @@ export interface ConvexEmbeddedClientOptions {
  * This entry requires an Expo development or release build. Expo Go cannot
  * load custom native modules. Install `expo-crypto` with Expo's version-aware
  * installer, then configure Metro with
- * `@convex-dev/embedded/metro` so the local schema and Convex modules are
- * generated for the application bundle.
+ * `@convex-dev/embedded/metro` so the generated placement contract and local
+ * Convex modules are included in the application bundle. Expo currently runs
+ * local storage and local functions without native remote replication.
  *
  * @example
  * ```ts
@@ -71,8 +73,10 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
     }
     super({
       authState: createEmbeddedAuthState(),
+      manifest: embeddedManifest,
+      moduleGraphHash: embeddedIdentity.moduleGraphHash,
       modules,
-      schema,
+      storeSchema: embeddedSchema.runtimeStoreSchema,
       store: openExpoStore(path),
     });
   }

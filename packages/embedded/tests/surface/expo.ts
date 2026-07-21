@@ -73,6 +73,7 @@ describe("Expo package surface", () => {
       "mutationFail",
       "commit",
       "docRead",
+      "localFieldsRead",
       "docVersionRead",
       "crdtHeadRead",
       "crdtSnapshotRead",

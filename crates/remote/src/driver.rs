@@ -5868,6 +5868,8 @@ mod tests {
         storage::StoreSchema {
             tables: vec![storage::TableDef {
                 name: "documents".to_owned(),
+                placement: storage::TablePlacement::Replicated,
+                local_fields: Vec::new(),
                 columns: Vec::new(),
                 crdt_fields: vec![storage::CrdtFieldDef {
                     field: "body".to_owned(),

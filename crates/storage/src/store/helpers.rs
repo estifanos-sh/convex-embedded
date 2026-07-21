@@ -112,6 +112,11 @@ pub(crate) fn schema_signature(schema: &StoreSchema) -> String {
     for table in tables {
         hash.update(b"t\0");
         hash.update(table.name.as_bytes());
+        hash.update(b"\0p\0");
+        hash.update(match table.placement {
+            crate::types::TablePlacement::Replicated => b"replicated".as_slice(),
+            crate::types::TablePlacement::Device => b"device".as_slice(),
+        });
         let mut columns = table.columns.iter().collect::<Vec<_>>();
         columns.sort_by(|a, b| a.name.cmp(&b.name));
         for column in columns {
@@ -131,6 +136,12 @@ pub(crate) fn schema_signature(schema: &StoreSchema) -> String {
                 crate::types::CrdtFieldKind::Set => b"set".as_slice(),
                 crate::types::CrdtFieldKind::Text => b"text".as_slice(),
             });
+        }
+        let mut local_fields = table.local_fields.iter().collect::<Vec<_>>();
+        local_fields.sort_by(|a, b| a.field.cmp(&b.field));
+        for field in local_fields {
+            hash.update(b"\0l\0");
+            hash.update(field.field.as_bytes());
         }
         let mut indexes = table.indexes.iter().collect::<Vec<_>>();
         indexes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -163,10 +174,18 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(crate) fn changed_tables(batch: &WriteBatch) -> Vec<String> {
-    if batch.deletes.is_empty() && batch.doc_writes.len() == 1 {
+    if batch.local_field_writes.is_empty()
+        && batch.local_field_deletes.is_empty()
+        && batch.deletes.is_empty()
+        && batch.doc_writes.len() == 1
+    {
         return vec![batch.doc_writes[0].table.clone()];
     }
-    if batch.doc_writes.is_empty() && batch.deletes.len() == 1 {
+    if batch.local_field_writes.is_empty()
+        && batch.local_field_deletes.is_empty()
+        && batch.doc_writes.is_empty()
+        && batch.deletes.len() == 1
+    {
         return vec![batch.deletes[0].table.clone()];
     }
     let mut seen = FxHashSet::default();
@@ -176,6 +195,8 @@ pub(crate) fn changed_tables(batch: &WriteBatch) -> Vec<String> {
         .iter()
         .map(|doc_write| &doc_write.table)
         .chain(batch.deletes.iter().map(|delete| &delete.table))
+        .chain(batch.local_field_writes.iter().map(|write| &write.table))
+        .chain(batch.local_field_deletes.iter().map(|delete| &delete.table))
     {
         if seen.insert(table.as_str()) {
             tables.push(table.clone());

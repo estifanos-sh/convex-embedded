@@ -16,13 +16,14 @@ const schema: StoreSchema = {
   tables: [
     {
       name: "issues",
+      placement: "replicated",
       columns: [{ name: "status" }, { name: "rank" }],
       indexes: [
         { name: "by_status", fields: ["status"] },
         { name: "by_rank", fields: ["rank"] },
       ],
     },
-    { name: "t", columns: [], indexes: [] },
+    { name: "t", placement: "replicated", columns: [], indexes: [] },
   ],
 };
 
@@ -30,6 +31,7 @@ const boolSchema: StoreSchema = {
   tables: [
     {
       name: "flags",
+      placement: "replicated",
       columns: [{ name: "active" }],
       indexes: [{ name: "by_active", fields: ["active"] }],
     },
@@ -107,13 +109,23 @@ export function defineConformance(factory: ConformanceFactory): void {
     test("rejects unsafe schema names before issuing SQL", async () => {
       const store = await factory.open(path("idents"));
       await expect(
-        store.setup({ tables: [{ name: "issues; DROP TABLE x", columns: [], indexes: [] }] }),
+        store.setup({
+          tables: [
+            {
+              name: "issues; DROP TABLE x",
+              placement: "replicated",
+              columns: [],
+              indexes: [],
+            },
+          ],
+        }),
       ).rejects.toThrow("invalid identifier");
       await expect(
         store.setup({
           tables: [
             {
               name: "issues",
+              placement: "replicated",
               columns: [{ name: "data" }],
               indexes: [],
             },

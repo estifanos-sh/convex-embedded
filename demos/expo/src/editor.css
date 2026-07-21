@@ -1,0 +1,239 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    Inter,
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  background: #1e1c1a;
+  color: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 0;
+  background: radial-gradient(circle at 90% 0%, rgb(63 82 149 / 20%), transparent 38rem), #1e1c1a;
+  overscroll-behavior-y: contain;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.editorPage {
+  min-height: 100dvh;
+  padding-bottom: max(48px, env(safe-area-inset-bottom));
+}
+
+.documentStatus {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.documentStatus > span:first-child {
+  color: #97908a;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.saveState {
+  display: inline-flex;
+  min-height: 30px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgb(163 156 148 / 30%);
+  border-radius: 999px;
+  background: #2a2825;
+  color: #b9b1aa;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.saveState > span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #97908a;
+}
+
+.saveState--saved > span {
+  background: #b4ec92;
+}
+
+.saveState--dirty > span,
+.saveState--recovered > span {
+  background: #e6e2a8;
+}
+
+.saveState--saving > span {
+  background: #63a8f8;
+  animation: savePulse 900ms ease-in-out infinite alternate;
+}
+
+.saveState--error {
+  border-color: rgb(238 52 47 / 48%);
+  color: #ffcac1;
+}
+
+.saveState--error > span {
+  background: #ee342f;
+}
+
+.documentSheet {
+  width: min(100%, 820px);
+  margin: 0 auto;
+  padding: clamp(32px, 7vw, 64px) clamp(20px, 7vw, 64px) 80px;
+}
+
+.titleLabel {
+  display: block;
+  margin-bottom: 7px;
+  color: #97908a;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.titleInput {
+  display: block;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  outline: 0;
+  background: transparent;
+  color: #ffffff;
+  padding: 0 0 18px;
+  font-size: clamp(28px, 8vw, 44px);
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  line-height: 1.08;
+}
+
+.titleInput:focus {
+  border-bottom-color: rgb(225 215 205 / 70%);
+}
+
+.titleInput::placeholder {
+  color: #6d6863;
+}
+
+.recoveryNotice {
+  display: grid;
+  width: 100%;
+  gap: 3px;
+  margin: 18px 0 4px;
+  border: 1px solid rgb(238 52 47 / 38%);
+  border-radius: 10px;
+  background: rgb(107 33 31 / 72%);
+  color: #ffcac1;
+  padding: 11px 12px;
+  text-align: left;
+}
+
+.recoveryNotice--calm {
+  border-color: rgb(243 176 28 / 30%);
+  background: rgb(109 82 23 / 42%);
+  color: #e6e2a8;
+}
+
+.recoveryNotice strong {
+  font-size: 12px;
+}
+
+.recoveryNotice span {
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.editorCanvas {
+  margin: 18px -54px 0;
+}
+
+.editorCanvas .bn-container {
+  min-height: 62dvh;
+  background: transparent !important;
+  color: #ffffff;
+  --bn-colors-editor-text: #ffffff !important;
+  --bn-colors-editor-background: transparent !important;
+  --bn-colors-menu-background: #2a2825 !important;
+  --bn-colors-menu-text: #ffffff !important;
+  --bn-colors-tooltip-background: #2a2825 !important;
+  --bn-colors-tooltip-text: #ffffff !important;
+  --bn-colors-hovered-background: #3c3a37 !important;
+  --bn-colors-selected-background: rgb(63 82 149 / 55%) !important;
+  --bn-colors-border: rgb(163 156 148 / 30%) !important;
+  --bn-font-family: inherit !important;
+}
+
+.editorCanvas .bn-editor {
+  min-height: 62dvh;
+  background: transparent !important;
+  padding: 18px 54px 80px;
+}
+
+.editorCanvas .bn-editor > .bn-block-group > .bn-block-outer:first-child {
+  display: none;
+}
+
+.editorCanvas .bn-block-content {
+  line-height: 1.72;
+}
+
+.editorCanvas .bn-toolbar,
+.editorCanvas .bn-menu-dropdown {
+  border: 1px solid rgb(163 156 148 / 30%) !important;
+  box-shadow: 0 14px 40px rgb(0 0 0 / 32%) !important;
+}
+
+@keyframes savePulse {
+  from {
+    opacity: 0.4;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 520px) {
+  .documentSheet {
+    padding-inline: 20px;
+  }
+
+  .editorCanvas {
+    margin-inline: -28px;
+  }
+
+  .editorCanvas .bn-editor {
+    padding-inline: 28px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .saveState--saving > span {
+    animation: none;
+  }
+}

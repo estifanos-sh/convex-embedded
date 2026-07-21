@@ -9,9 +9,10 @@
  * @example
  * ```ts
  * import { convexEmbeddedUnplugin } from "@convex-dev/embedded/unplugin";
+ * import schema from "./convex/schema";
  *
  * export default {
- *   plugins: [convexEmbeddedUnplugin.rollup()],
+ *   plugins: [convexEmbeddedUnplugin.rollup({ schema })],
  * };
  * ```
  *
@@ -22,10 +23,12 @@ import path from "node:path";
 import { createUnplugin, type UnpluginInstance } from "unplugin";
 
 import {
+  generateEmbedded,
   createEmbeddedBundle,
   type EmbeddedBundleInput,
   type EmbeddedBundleResult,
 } from "./bundler";
+import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "./schema";
 import {
   fromVirtualSourceId,
   renderEmbeddedBundle,
@@ -50,6 +53,9 @@ export interface ConvexEmbeddedPluginOptions extends Omit<EmbeddedBundleInput, "
    * @defaultValue `false`
    */
   disabled?: boolean;
+
+  /** Schema value imported by the bundler config to generate the literal device contract. */
+  schema: ConvexEmbeddedSchema;
 }
 
 /**
@@ -58,7 +64,7 @@ export interface ConvexEmbeddedPluginOptions extends Omit<EmbeddedBundleInput, "
  * @public
  */
 export type ConvexEmbeddedUnplugin = Pick<
-  UnpluginInstance<ConvexEmbeddedPluginOptions | undefined>,
+  UnpluginInstance<ConvexEmbeddedPluginOptions>,
   "esbuild" | "rollup" | "rolldown" | "rspack" | "vite" | "webpack"
 >;
 
@@ -67,11 +73,35 @@ const RESOLVED_VIRTUAL_IDENTITY_MODULE_ID = `\0${VIRTUAL_IDENTITY_MODULE_ID}`;
 const DEFAULT_CONVEX_DIR = "convex";
 const TS_EXTENSIONS = /\.(?:ts|tsx|mts|cts)$/;
 
-const unplugin = createUnplugin((rawOptions?: ConvexEmbeddedPluginOptions) => {
-  const options = rawOptions ?? {};
+const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
+  if (options?.schema === undefined) {
+    throw new Error(
+      "convexEmbedded requires the schema option so its generated contract is current",
+    );
+  }
   let root = process.cwd();
+  let generation: Promise<void> | undefined;
+  let watchedSources = new Set<string>();
 
   const convexRoot = (): string => path.resolve(root, options.convexDir ?? DEFAULT_CONVEX_DIR);
+  const bundle = async (): Promise<EmbeddedBundleResult> => {
+    generation ??= generateEmbedded({
+      analysis: analyzeEmbeddedSchema(options.schema),
+      convexDir: options.convexDir,
+      generatedPath: options.generatedPath,
+      root,
+      schemaPath: options.schemaPath,
+    }).then(() => undefined);
+    await generation;
+    const result = await createEmbeddedBundle({
+      convexDir: options.convexDir,
+      generatedPath: options.generatedPath,
+      root,
+      schemaPath: options.schemaPath,
+    });
+    watchedSources = new Set(result.sourceFiles.map((file) => path.normalize(file)));
+    return result;
+  };
 
   return {
     name: "convex-embedded",
@@ -83,11 +113,7 @@ const unplugin = createUnplugin((rawOptions?: ConvexEmbeddedPluginOptions) => {
       if (id === VIRTUAL_IDENTITY_MODULE_ID) return RESOLVED_VIRTUAL_IDENTITY_MODULE_ID;
       const sourcePath = fromVirtualSourceId(id);
       if (sourcePath !== undefined) {
-        const allowed = await sourceFiles({
-          convexDir: options.convexDir,
-          root,
-          schemaPath: options.schemaPath,
-        });
+        const allowed = new Set(watchFiles(await bundle()).map((file) => path.normalize(file)));
         return allowed.has(sourcePath) ? sourcePath : null;
       }
       if (
@@ -105,15 +131,11 @@ const unplugin = createUnplugin((rawOptions?: ConvexEmbeddedPluginOptions) => {
       if (id !== RESOLVED_VIRTUAL_MODULE_ID && id !== RESOLVED_VIRTUAL_IDENTITY_MODULE_ID) {
         return null;
       }
-      const bundle = await createEmbeddedBundle({
-        convexDir: options.convexDir,
-        root,
-        schemaPath: options.schemaPath,
-      });
+      const generated = await bundle();
       this.addWatchFile?.(convexRoot());
-      for (const file of watchFiles(bundle)) this.addWatchFile?.(file);
-      if (id === RESOLVED_VIRTUAL_MODULE_ID) return renderEmbeddedBundle(bundle);
-      if (id === RESOLVED_VIRTUAL_IDENTITY_MODULE_ID) return renderEmbeddedIdentity(bundle);
+      for (const file of watchFiles(generated)) this.addWatchFile?.(file);
+      if (id === RESOLVED_VIRTUAL_MODULE_ID) return renderEmbeddedBundle(generated);
+      if (id === RESOLVED_VIRTUAL_IDENTITY_MODULE_ID) return renderEmbeddedIdentity(generated);
       return null;
     },
 
@@ -125,7 +147,13 @@ const unplugin = createUnplugin((rawOptions?: ConvexEmbeddedPluginOptions) => {
         if (!options.disabled) server.watcher.add(convexRoot());
       },
       handleHotUpdate(ctx) {
-        if (options.disabled || !isConvexSource(ctx.file, convexRoot())) return;
+        if (
+          options.disabled ||
+          (!isConvexSource(ctx.file, convexRoot()) && !watchedSources.has(path.normalize(ctx.file)))
+        ) {
+          return;
+        }
+        generation = undefined;
         const virtualModule = ctx.server.moduleGraph.getModuleById(RESOLVED_VIRTUAL_MODULE_ID);
         const identityModule = ctx.server.moduleGraph.getModuleById(
           RESOLVED_VIRTUAL_IDENTITY_MODULE_ID,
@@ -153,7 +181,8 @@ const unplugin = createUnplugin((rawOptions?: ConvexEmbeddedPluginOptions) => {
  *
  * @remarks
  * Call the adapter method for the bundler you are integrating with, such as
- * `convexEmbeddedUnplugin.rollup()` or `convexEmbeddedUnplugin.webpack()`.
+ * `convexEmbeddedUnplugin.rollup({ schema })` or
+ * `convexEmbeddedUnplugin.webpack({ schema })`.
  *
  * @public
  */
@@ -168,12 +197,7 @@ export const convexEmbedded = convexEmbeddedUnplugin;
 export default convexEmbeddedUnplugin;
 
 function watchFiles(bundle: EmbeddedBundleResult): string[] {
-  return [bundle.schemaPath, ...Object.values(bundle.modules)];
-}
-
-async function sourceFiles(input: EmbeddedBundleInput): Promise<Set<string>> {
-  const bundle = await createEmbeddedBundle(input);
-  return new Set(watchFiles(bundle).map((file) => path.normalize(file)));
+  return [bundle.schemaPath, bundle.generatedPath, ...bundle.sourceFiles];
 }
 
 function isConvexSource(file: string, convexDir: string): boolean {

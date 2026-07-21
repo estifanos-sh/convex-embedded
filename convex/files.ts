@@ -1,13 +1,13 @@
 import { v } from "convex/values";
-import { internalQuery, mutation, query } from "./embedded";
+import { embedded } from "./embedded";
 
-export const generateUploadUrl = mutation({
+export const generateUploadUrl = embedded.replicated.mutation({
   args: {},
   returns: v.string(),
   handler: async (ctx) => await ctx.storage.generateUploadUrl(),
 });
 
-export const attach = mutation({
+export const attach = embedded.replicated.mutation({
   args: {
     contentType: v.string(),
     documentId: v.id("documents"),
@@ -54,7 +54,7 @@ export const attach = mutation({
   },
 });
 
-export const resolve = query({
+export const resolve = embedded.replicated.query({
   args: { token: v.string() },
   returns: v.union(v.string(), v.null()),
   handler: async (ctx, args) => {
@@ -66,41 +66,7 @@ export const resolve = query({
   },
 });
 
-export const hostedUrl = query({
-  local: false,
-  args: { token: v.string() },
-  returns: v.union(v.string(), v.null()),
-  handler: async (ctx, args) => {
-    const attachment = await ctx.db
-      .query("attachments")
-      .withIndex("by_token", (q) => q.eq("token", args.token))
-      .unique();
-    return attachment ? await ctx.storage.getUrl(attachment.storageId) : null;
-  },
-});
-
-export const serve = internalQuery({
-  local: false,
-  args: { token: v.string() },
-  returns: v.union(
-    v.object({
-      contentType: v.string(),
-      storageId: v.id("_storage"),
-    }),
-    v.null(),
-  ),
-  handler: async (ctx, args) => {
-    const attachment = await ctx.db
-      .query("attachments")
-      .withIndex("by_token", (q) => q.eq("token", args.token))
-      .unique();
-    return attachment
-      ? { contentType: attachment.contentType, storageId: attachment.storageId }
-      : null;
-  },
-});
-
-export const metadata = query({
+export const metadata = embedded.replicated.query({
   args: { storageId: v.id("_storage") },
   returns: v.union(v.object({ contentType: v.optional(v.string()), size: v.number() }), v.null()),
   handler: async (ctx, args) => {
@@ -109,7 +75,7 @@ export const metadata = query({
   },
 });
 
-export const url = query({
+export const url = embedded.replicated.query({
   args: { storageId: v.id("_storage") },
   returns: v.union(v.string(), v.null()),
   handler: async (ctx, args) => await ctx.storage.getUrl(args.storageId),

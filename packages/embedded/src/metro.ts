@@ -20,7 +20,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { createEmbeddedBundle, type EmbeddedBundleInput } from "./bundler";
+import { createEmbeddedBundle, generateEmbedded, type EmbeddedBundleInput } from "./bundler";
 import {
   fromVirtualSourceId,
   renderEmbeddedBundle,
@@ -29,6 +29,7 @@ import {
   VIRTUAL_MODULE_ID,
   VIRTUAL_SOURCE_MODULE_PREFIX,
 } from "./bundler/virtual";
+import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "./schema";
 
 /** Options for {@link withConvexEmbedded}. @public */
 export interface ConvexEmbeddedMetroOptions extends Omit<EmbeddedBundleInput, "root"> {
@@ -36,6 +37,8 @@ export interface ConvexEmbeddedMetroOptions extends Omit<EmbeddedBundleInput, "r
   disabled?: boolean;
   /** Project root. Defaults to Metro's `projectRoot`, then `process.cwd()`. */
   root?: string;
+  /** Live schema used to generate and validate the literal device contract. */
+  schema?: ConvexEmbeddedSchema;
 }
 
 interface MetroResolverContext {
@@ -66,8 +69,10 @@ interface MetroConfigShape {
  * @remarks
  * Existing resolver customizations are preserved and receive every unrelated
  * request. Encoded source requests are limited to the files discovered in the
- * Convex module graph. Adding, deleting, or renaming a Convex module requires
- * restarting Metro so its materialized registry is regenerated.
+ * Convex module graph. Passing `schema` regenerates the device contract before
+ * validation; otherwise a current generated contract must already exist. Restart
+ * Metro after changing the schema or any device function source so its registry
+ * and identity are regenerated.
  *
  * @public
  */
@@ -79,8 +84,18 @@ export async function withConvexEmbedded<Config extends object>(
 
   const current = config as Config & MetroConfigShape;
   const root = path.resolve(options.root ?? current.projectRoot ?? process.cwd());
+  if (options.schema !== undefined) {
+    await generateEmbedded({
+      analysis: analyzeEmbeddedSchema(options.schema),
+      convexDir: options.convexDir,
+      generatedPath: options.generatedPath,
+      root,
+      schemaPath: options.schemaPath,
+    });
+  }
   const bundle = await createEmbeddedBundle({
     convexDir: options.convexDir,
+    generatedPath: options.generatedPath,
     root,
     schemaPath: options.schemaPath,
   });
@@ -94,7 +109,12 @@ export async function withConvexEmbedded<Config extends object>(
   ]);
 
   const sourceFiles = new Set(
-    [bundle.schemaPath, ...Object.values(bundle.modules)].map((file) => path.normalize(file)),
+    [
+      bundle.generatedPath,
+      bundle.schemaPath,
+      ...bundle.sourceFiles,
+      ...Object.values(bundle.modules),
+    ].map((file) => path.normalize(file)),
   );
   const generated = new Map([
     [VIRTUAL_MODULE_ID, registryPath],

@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::{RemoteError, RemoteResult};
 
-pub const EMBEDDED_PROTOCOL_VERSION: i64 = 23;
+pub const EMBEDDED_PROTOCOL_VERSION: i64 = 24;
 
 /// Reserved local partition key for unauthenticated data; non-hex so it never collides with a `hashValue` digest.
 pub const EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY: &str = "unauthenticated";

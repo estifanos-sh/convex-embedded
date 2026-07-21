@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::invariant::{check_id_mappings, check_rev_set};
 use crate::{
     ColValue, ColumnDef, CommitOptions, CommitResult, CountSpec, DocWrite, EmbeddedStore, IndexDef,
-    Page, ReadSpec, RevKey, RevState, RowKey, StorageError, StoreSchema, TableDef, WriteBatch,
+    Page, ReadSpec, RevKey, RevState, RowKey, StorageError, StoreSchema, TableDef, TablePlacement,
+    WriteBatch,
 };
 
 /// Run the structural rev-graph + id-mapping oracle over the whole store: every row's rev set is
@@ -73,6 +74,8 @@ pub fn schema() -> StoreSchema {
         tables: vec![
             TableDef {
                 name: "issues".into(),
+                placement: TablePlacement::Replicated,
+                local_fields: vec![],
                 columns: vec![ColumnDef {
                     name: "status".into(),
                     field: None,
@@ -86,6 +89,8 @@ pub fn schema() -> StoreSchema {
             },
             TableDef {
                 name: "t".into(),
+                placement: TablePlacement::Replicated,
+                local_fields: vec![],
                 columns: vec![],
                 crdt_fields: vec![],
                 indexes: vec![],
@@ -99,6 +104,8 @@ pub fn bool_schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "flags".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "active".into(),
                 field: None,
@@ -118,6 +125,8 @@ pub fn alias_schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "users".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "idx_profile_email".into(),
                 field: Some("profile.email".into()),
@@ -148,6 +157,8 @@ pub fn alias_schema() -> StoreSchema {
 pub fn sql_table() -> TableDef {
     TableDef {
         name: "issues".to_owned(),
+        placement: TablePlacement::Replicated,
+        local_fields: vec![],
         columns: vec![
             ColumnDef {
                 field: None,
@@ -172,6 +183,8 @@ pub fn vals_schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "vals".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "v".into(),
                 field: None,
@@ -271,6 +284,8 @@ pub fn flag(store: &EmbeddedStore, id: &str, active: ColValue) -> DocWrite {
 pub fn doc_writes(rows: Vec<DocWrite>) -> WriteBatch {
     WriteBatch {
         doc_writes: rows,
+        local_field_writes: vec![],
+        local_field_deletes: vec![],
         crdt_ops: vec![],
         crdt_restores: vec![],
         deletes: vec![],

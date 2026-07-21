@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { mutation } from "./_generated/server";
+import { embedded } from "./embedded";
 import { read as readTime } from "./time";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../../src/protocol";
 
@@ -15,7 +15,7 @@ const revisionValidator = v.union(
   v.object({ content: v.literal("deleted"), table: v.string(), rowId: v.string() }),
 );
 
-export const commit = mutation({
+export const commit = embedded.remote.mutation({
   args: {
     identityKey: v.string(),
     clientId: v.string(),
@@ -92,7 +92,7 @@ export const commit = mutation({
   },
 });
 
-export const client = mutation({
+export const client = embedded.remote.mutation({
   args: {
     identityKey: v.string(),
     clientId: v.string(),

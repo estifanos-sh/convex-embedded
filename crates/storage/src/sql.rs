@@ -35,7 +35,7 @@ pub(crate) const PRAGMAS: [&str; 5] = [
 /// On-disk storage format version, stamped into the database header via `PRAGMA user_version`.
 /// Bump this whenever the package-owned layout changes incompatibly. Released and deployed formats
 /// advance through the explicit startup migration below; unknown formats fail closed.
-pub(crate) const STORAGE_FORMAT_VERSION: i64 = 41;
+pub(crate) const STORAGE_FORMAT_VERSION: i64 = 42;
 
 /// Reads the database's stored format version (0 on a brand-new database).
 pub(crate) const READ_USER_VERSION: &str = "PRAGMA user_version";
@@ -66,6 +66,7 @@ const REV_LOG: &str = "__embedded_rev_log";
 const DIRTY_HEADS: &str = "__embedded_dirty_heads";
 const CRDT_OPS: &str = "__embedded_crdt_ops";
 const CRDT_FIELD: &str = "__embedded_crdt_field";
+const LOCAL_FIELDS: &str = "__embedded_local_fields";
 const PEERS: &str = "__embedded_peers";
 const FILES: &str = "__embedded_files";
 const ID_MAPPINGS: &str = "__embedded_id_mappings";
@@ -824,6 +825,75 @@ static CREATE_CRDT_FIELD: LazyLock<String> = LazyLock::new(|| {
                     .col(alias(FIELD)),
             )
             .to_string(SqliteQueryBuilder),
+    )
+});
+
+static CREATE_LOCAL_FIELDS: LazyLock<String> = LazyLock::new(|| {
+    strict(
+        &Table::create()
+            .table(alias(LOCAL_FIELDS))
+            .if_not_exists()
+            .col(text_col(IDENTITY_KEY))
+            .col(text_col(TABLE_NAME))
+            .col(text_col(DOCUMENT_ID))
+            .col(text_col(FIELD))
+            .col(text_col(VALUE_JSON))
+            .col(real_col(LOGICAL_CLOCK))
+            .primary_key(
+                Index::create()
+                    .col(alias(IDENTITY_KEY))
+                    .col(alias(TABLE_NAME))
+                    .col(alias(DOCUMENT_ID))
+                    .col(alias(FIELD)),
+            )
+            .to_string(SqliteQueryBuilder),
+    )
+});
+static READ_LOCAL_FIELDS: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        LOCAL_FIELDS,
+        [Expr::col(alias(FIELD)), Expr::col(alias(VALUE_JSON))],
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)],
+    )
+});
+static WRITE_LOCAL_FIELD: LazyLock<String> = LazyLock::new(|| {
+    write(
+        LOCAL_FIELDS,
+        [
+            IDENTITY_KEY,
+            TABLE_NAME,
+            DOCUMENT_ID,
+            FIELD,
+            VALUE_JSON,
+            LOGICAL_CLOCK,
+        ],
+        6,
+        true,
+    )
+});
+static DELETE_LOCAL_FIELD: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        LOCAL_FIELDS,
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID), eq(FIELD)],
+    )
+});
+static DELETE_LOCAL_FIELDS_ROW: LazyLock<String> = LazyLock::new(|| {
+    delete_where(
+        LOCAL_FIELDS,
+        [eq(IDENTITY_KEY), eq(TABLE_NAME), eq(DOCUMENT_ID)],
+    )
+});
+static CLEAR_LOCAL_FIELDS: LazyLock<String> =
+    LazyLock::new(|| delete_where(LOCAL_FIELDS, [eq(IDENTITY_KEY)]));
+static DELETE_LOCAL_FIELDS_TABLE: LazyLock<String> =
+    LazyLock::new(|| delete_where(LOCAL_FIELDS, [eq(TABLE_NAME)]));
+static DELETE_LOCAL_FIELDS_DEFINITION: LazyLock<String> =
+    LazyLock::new(|| delete_where(LOCAL_FIELDS, [eq(TABLE_NAME), eq(FIELD)]));
+static REKEY_LOCAL_FIELDS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "INSERT OR IGNORE INTO {LOCAL_FIELDS} ({IDENTITY_KEY}, {TABLE_NAME}, {DOCUMENT_ID}, {FIELD}, {VALUE_JSON}, {LOGICAL_CLOCK}) \
+         SELECT {IDENTITY_KEY}, {TABLE_NAME}, ?, {FIELD}, {VALUE_JSON}, {LOGICAL_CLOCK} FROM {LOCAL_FIELDS} \
+         WHERE {IDENTITY_KEY} = ? AND {TABLE_NAME} = ? AND {DOCUMENT_ID} = ?"
     )
 });
 static WRITE_CRDT_FIELD: LazyLock<String> = LazyLock::new(|| {
@@ -1878,6 +1948,42 @@ pub(crate) fn clear_peers() -> &'static str {
 
 pub(crate) fn create_crdt_field() -> &'static str {
     &CREATE_CRDT_FIELD
+}
+
+pub(crate) fn create_local_fields() -> &'static str {
+    &CREATE_LOCAL_FIELDS
+}
+
+pub(crate) fn read_local_fields() -> &'static str {
+    &READ_LOCAL_FIELDS
+}
+
+pub(crate) fn write_local_field() -> &'static str {
+    &WRITE_LOCAL_FIELD
+}
+
+pub(crate) fn delete_local_field() -> &'static str {
+    &DELETE_LOCAL_FIELD
+}
+
+pub(crate) fn delete_local_fields_row() -> &'static str {
+    &DELETE_LOCAL_FIELDS_ROW
+}
+
+pub(crate) fn clear_local_fields() -> &'static str {
+    &CLEAR_LOCAL_FIELDS
+}
+
+pub(crate) fn delete_local_fields_table() -> &'static str {
+    &DELETE_LOCAL_FIELDS_TABLE
+}
+
+pub(crate) fn delete_local_fields_definition() -> &'static str {
+    &DELETE_LOCAL_FIELDS_DEFINITION
+}
+
+pub(crate) fn rekey_local_fields() -> &'static str {
+    &REKEY_LOCAL_FIELDS
 }
 
 pub(crate) fn write_crdt_field() -> &'static str {

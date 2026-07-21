@@ -15,6 +15,7 @@ import type * as files from "../files.js";
 import type * as hosted from "../hosted.js";
 import type * as http from "../http.js";
 import type * as migrations from "../migrations.js";
+import type * as remote from "../remote.js";
 import type * as staticHosting from "../staticHosting.js";
 import type * as time from "../time.js";
 
@@ -32,6 +33,7 @@ declare const fullApi: ApiFromModules<{
   hosted: typeof hosted;
   http: typeof http;
   migrations: typeof migrations;
+  remote: typeof remote;
   staticHosting: typeof staticHosting;
   time: typeof time;
 }>;

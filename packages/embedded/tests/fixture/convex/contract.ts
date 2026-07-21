@@ -1,9 +1,9 @@
 import { v } from "convex/values";
 
-import { query } from "./embedded";
+import { embedded } from "./embedded";
 
 /** Versioned sentinel that exists only on the isolated remote-test deployment. */
-export const read = query({
+export const read = embedded.remote.query({
   args: {},
   returns: v.object({
     fixture: v.literal("@convex-dev/embedded/remote-test-fixture"),

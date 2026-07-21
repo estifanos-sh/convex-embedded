@@ -1,7 +1,7 @@
 import type { UserIdentity } from "convex/server";
 import type { JSONValue, ValidatorJSON } from "convex/values";
 
-import type { EmbeddedCrdtMeta } from "../crdt/meta";
+import type { EmbeddedCrdtMeta } from "../meta";
 
 /**
  * Scalar value that can be stored in an extracted indexed column or bound.
@@ -72,10 +72,17 @@ export type CrdtFieldDef = EmbeddedCrdtMeta & { field: string };
  */
 export interface TableDef {
   name: string;
+  placement: "replicated" | "device";
   columns: ColumnDef[];
   crdtFields?: CrdtFieldDef[];
+  localFields?: LocalFieldDef[];
   document?: ValidatorJSON;
   indexes: IndexDef[];
+}
+
+export interface LocalFieldDef {
+  field: string;
+  validator: ValidatorJSON;
 }
 
 /**
@@ -150,6 +157,8 @@ export type CrdtOp =
 export interface WriteBatch {
   docWrites: DocWrite[];
   deletes: DeleteIn[];
+  localFieldWrites?: LocalFieldWrite[];
+  localFieldDeletes?: LocalFieldDelete[];
   crdtOps?: CrdtOp[];
   /** Existing rows whose staged docWrite only materializes {@link crdtOps}. */
   crdtOnlyIds?: DeleteIn[];
@@ -159,6 +168,19 @@ export interface WriteBatch {
   idMappings?: IdMapping[];
   /** Local-only schedule rows folded into the mutation's commit transaction for crash atomicity. */
   schedules?: ScheduledJob[];
+}
+
+export interface LocalFieldWrite {
+  table: string;
+  id: string;
+  field: string;
+  value: unknown;
+}
+
+export interface LocalFieldDelete {
+  table: string;
+  id: string;
+  field: string;
 }
 
 export interface CrdtRestore extends CrdtSnapshot {
@@ -176,6 +198,7 @@ type CommitChanges = { changes: "include" | "omit" };
 export type CommitOptions = CommitChanges &
   (
     | { source: "remote" }
+    | { source: "device" }
     | { source: "local"; mutation: "none" }
     | {
         source: "local";
@@ -344,6 +367,8 @@ export interface DocPage {
    * entries → version 0, so the server conservatively re-reads for conflict detection.
    */
   versions?: Record<string, number>;
+  /** Device-only fields keyed by local document id, kept outside replicated row JSON. */
+  deviceFields?: Record<string, Record<string, unknown>>;
 }
 
 /**
@@ -519,6 +544,7 @@ export interface CountSpec {
 export interface DocSurface {
   /** Read one document by id. */
   read(table: string, id: string): Promise<StoredDoc | undefined>;
+  device?: { read(table: string, id: string): Promise<Record<string, unknown>> };
   /**
    * Read one row's adoption version (the point-read counterpart of the page
    * `versions` sidecar): the remote `seq` the row was last adopted at, or

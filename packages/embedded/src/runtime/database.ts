@@ -155,6 +155,34 @@ function tableDef(schema: Schema, table: string): TableDef {
   return def;
 }
 
+function assertViewTable(def: TableDef, view: "replicated" | "device"): void {
+  if (view === "replicated" && def.placement !== "replicated") {
+    throw new Error(`Replicated functions cannot access device table ${def.name}.`);
+  }
+}
+
+function assertLocalFieldPatch(def: TableDef, partial: Record<string, unknown>): void {
+  const local = new Map((def.localFields ?? []).map((field) => [field.field, field]));
+  const forbidden = Object.keys(partial).find((field) => !local.has(field));
+  if (forbidden !== undefined) {
+    throw new Error(`Local functions cannot write replicated field ${def.name}.${forbidden}.`);
+  }
+  for (const [field, value] of Object.entries(partial)) {
+    if (value === undefined) continue;
+    validateJson(value, local.get(field)!.validator, `${def.name}.${field}`);
+  }
+}
+
+function assertNoLocalFields(def: TableDef, data: Record<string, unknown>): void {
+  if (def.placement !== "replicated") return;
+  const forbidden = (def.localFields ?? []).find(({ field }) => Object.hasOwn(data, field));
+  if (forbidden !== undefined) {
+    throw new Error(
+      `Replicated document write contains device-only field ${def.name}.${forbidden.field}.`,
+    );
+  }
+}
+
 function colsEqual(
   left: readonly [string, unknown][],
   right: readonly [string, unknown][],
@@ -231,6 +259,7 @@ export function createReader<DM extends GenericDataModel>(
   store: RuntimeStorageReader & Partial<{ file: FileSurface }>,
   schema: Schema,
   tracker?: ReadTracker,
+  view: "replicated" | "device" = "replicated",
 ): DatabaseReader<DM> {
   const reader: DatabaseReader<DM> = {
     async get<T extends TableNamesInDataModel<DM>>(
@@ -243,6 +272,7 @@ export function createReader<DM extends GenericDataModel>(
         return null;
       }
       const def = tableDef(schema, table);
+      assertViewTable(def, view);
       tracker?.table(table);
       const readPoint = async (localId: string): Promise<Doc<DM, T> | null> => {
         tracker?.doc?.(localId);
@@ -259,7 +289,12 @@ export function createReader<DM extends GenericDataModel>(
             (def.crdtFields ?? []).map((field) => field.field),
           ),
         });
-        return stored ? (stored as unknown as Doc<DM, T>) : null;
+        if (!stored) return null;
+        const fields =
+          view === "device" && def.placement === "replicated"
+            ? await store.doc.device?.read(table, localId)
+            : undefined;
+        return { ...stored, ...fields } as unknown as Doc<DM, T>;
       };
       if (isLocalIdForTable(table, id)) return readPoint(id);
       if (isLocalIdShape(id)) {
@@ -276,13 +311,15 @@ export function createReader<DM extends GenericDataModel>(
       return isLocalIdForTable(table, id) ? (id as Id<T>) : null;
     },
     query<T extends TableNamesInDataModel<DM>>(table: T): Query<DM, T> {
-      return new QueryBuilder<DM, T>(store, tableDef(schema, table), undefined, tracker);
+      const def = tableDef(schema, table);
+      assertViewTable(def, view);
+      return new QueryBuilder<DM, T>(store, def, undefined, tracker, {}, view);
     },
     get system(): DatabaseReader<DM> {
       return systemReader<DM>(store);
     },
     table<T extends TableNamesInDataModel<DM>>(table: T) {
-      tableDef(schema, table);
+      assertViewTable(tableDef(schema, table), view);
       return {
         get: (id: Id<T>) => reader.get(table, id),
         query: () => reader.query(table),
@@ -301,6 +338,7 @@ export function createWriter<DM extends GenericDataModel>(
   store: RuntimeStorageWriter & Partial<{ file: FileSurface }>,
   schema: Schema,
   tracker?: ReadTracker,
+  view: "replicated" | "device" = "replicated",
 ): {
   db: DatabaseWriter<DM>;
   crdtRestore(restore: CrdtRestore): void;
@@ -331,6 +369,12 @@ export function createWriter<DM extends GenericDataModel>(
   const crdtRestores: CrdtRestore[] = [];
   const freshIds: DeleteIn[] = [];
   const idMappings: IdMapping[] = [];
+  const localFieldWrites = new Map<
+    string,
+    { table: string; id: string; field: string; value: unknown }
+  >();
+  const localFieldDeletes = new Map<string, { table: string; id: string; field: string }>();
+  const deviceViewsByTable = new Map<string, Map<string, RawDoc>>();
   const revisionRestores = new Map<
     string,
     { table: string; rowId: string; deleted: boolean; value?: Record<string, unknown> }
@@ -363,6 +407,7 @@ export function createWriter<DM extends GenericDataModel>(
     creationTime: number,
     options: { cols?: ColEntries; crdtOnly?: boolean; dataOnly?: boolean } = {},
   ): void => {
+    assertNoLocalFields(def, data);
     if (def.document) validateJson(data, def.document, def.name);
     deletesByTable.get(def.name)?.delete(id);
     const docWrites = tableUpserts(def.name);
@@ -383,7 +428,11 @@ export function createWriter<DM extends GenericDataModel>(
 
   const read = async (id: string): Promise<RawDoc | null> => {
     const table = tableFromId(id);
+    const def = tableDef(schema, table);
+    assertViewTable(def, view);
     if (deletesByTable.get(table)?.has(id)) return null;
+    const deviceView = deviceViewsByTable.get(table)?.get(id);
+    if (deviceView) return cloneTree(deviceView);
     const staged = docWritesByTable.get(table)?.get(id);
     if (staged) return cloneTree(materialize(staged.doc));
     tracker?.doc?.(id);
@@ -393,19 +442,27 @@ export function createWriter<DM extends GenericDataModel>(
       table,
       id,
       version,
-      crdt: await crdtReadWitnesses(store, tableDef(schema, table), stored),
+      crdt: await crdtReadWitnesses(store, def, stored),
       contentHash: await hashDocument(
         stored,
-        (tableDef(schema, table).crdtFields ?? []).map((field) => field.field),
+        (def.crdtFields ?? []).map((field) => field.field),
       ),
     });
-    return stored ?? null;
+    if (!stored) return null;
+    const fields =
+      view === "device" && def.placement === "replicated"
+        ? await store.doc.device?.read(table, id)
+        : undefined;
+    return { ...stored, ...fields };
   };
 
   const overlayFor = (table: string): QueryOverlay => ({
-    staged: [...(docWritesByTable.get(table)?.values() ?? [])].map((e) =>
-      cloneTree(materialize(e.doc)),
-    ),
+    staged: [
+      ...[...(docWritesByTable.get(table)?.values() ?? [])].map((e) =>
+        cloneTree(materialize(e.doc)),
+      ),
+      ...[...(deviceViewsByTable.get(table)?.values() ?? [])].map((doc) => cloneTree(doc)),
+    ],
     deleted: deletesByTable.get(table) ?? EMPTY_DELETES,
   });
 
@@ -417,6 +474,8 @@ export function createWriter<DM extends GenericDataModel>(
         field: string,
         delta: number,
       ): Promise<void> {
+        if (view === "device")
+          throw new Error("Local functions cannot write replicated CRDT fields.");
         if (tableFromId(id) !== table) throw new Error(`count.add: id is not in ${table}`);
         const def = tableDef(schema, table);
         assertCrdtField(def, field, "count");
@@ -453,18 +512,15 @@ export function createWriter<DM extends GenericDataModel>(
       return isLocalIdForTable(table, id) ? (id as Id<T>) : null;
     },
     query<T extends TableNamesInDataModel<DM>>(table: T): Query<DM, T> {
-      return new QueryBuilder<DM, T>(
-        store,
-        tableDef(schema, table),
-        () => overlayFor(table),
-        tracker,
-      );
+      const def = tableDef(schema, table);
+      assertViewTable(def, view);
+      return new QueryBuilder<DM, T>(store, def, () => overlayFor(table), tracker, {}, view);
     },
     get system(): DatabaseReader<DM> {
       return systemReader<DM>(store);
     },
     table<T extends TableNamesInDataModel<DM>>(table: T) {
-      tableDef(schema, table);
+      assertViewTable(tableDef(schema, table), view);
       return {
         delete: (id: Id<T>) => db.delete(table, id),
         get: (id: Id<T>) => db.get(table, id),
@@ -483,16 +539,22 @@ export function createWriter<DM extends GenericDataModel>(
       const id = createId(table);
       assertNoSystemFieldConflict("insert", value as Record<string, unknown>);
       const def = tableDef(schema, table);
+      assertViewTable(def, view);
+      if (view === "device" && def.placement !== "device") {
+        throw new Error(`Local functions cannot insert replicated table ${String(table)}.`);
+      }
       assertCrdtInitialValues(def, value as Record<string, unknown>);
       const creationTime = store.clock.read();
-      freshIds.push({ table, id });
-      idMappings.push({
-        table,
-        localId: id,
-        mapping: "local",
-        createdTime: creationTime,
-        updatedTime: creationTime,
-      });
+      if (view === "replicated") {
+        freshIds.push({ table, id });
+        idMappings.push({
+          table,
+          localId: id,
+          mapping: "local",
+          createdTime: creationTime,
+          updatedTime: creationTime,
+        });
+      }
       stage(def, id, dataOf(value as Record<string, unknown>), creationTime);
       return Promise.resolve(id as Id<T>);
     },
@@ -508,6 +570,30 @@ export function createWriter<DM extends GenericDataModel>(
       const partial = (maybePartial ?? idOrPartial) as Record<string, unknown>;
       assertNoSystemFieldConflict("patch", partial, { creationTime: current._creationTime, id });
       const def = tableDef(schema, table);
+      assertViewTable(def, view);
+      if (view === "device" && def.placement === "replicated") {
+        assertLocalFieldPatch(def, partial);
+        const local = new Set((def.localFields ?? []).map(({ field }) => field));
+        for (const [field, value] of Object.entries(partial)) {
+          if (!local.has(field)) continue;
+          const key = `${table}\u0000${id}\u0000${field}`;
+          if (value === undefined) {
+            localFieldWrites.delete(key);
+            localFieldDeletes.set(key, { table, id, field });
+          } else {
+            localFieldDeletes.delete(key);
+            localFieldWrites.set(key, { table, id, field, value: cloneTree(value) });
+          }
+        }
+        const next = { ...current, ...partial };
+        for (const [field, value] of Object.entries(partial)) {
+          if (value === undefined) delete next[field];
+        }
+        let views = deviceViewsByTable.get(table);
+        if (!views) deviceViewsByTable.set(table, (views = new Map()));
+        views.set(id, next);
+        return;
+      }
       assertNoExplicitCrdtWrite(def, "patch", partial);
       const merged = { ...current, ...partial };
       const mergedData = dataOf(merged);
@@ -543,6 +629,10 @@ export function createWriter<DM extends GenericDataModel>(
       const value = (maybeValue ?? idOrValue) as Record<string, unknown>;
       assertNoSystemFieldConflict("replace", value, { creationTime: current._creationTime, id });
       const def = tableDef(schema, table);
+      assertViewTable(def, view);
+      if (view === "device" && def.placement === "replicated") {
+        throw new Error(`Local functions cannot replace replicated table ${table}.`);
+      }
       const restore = revisionRestores.get(`${table}\u0000${id}`);
       const allowedRestore =
         restore !== undefined &&
@@ -559,6 +649,8 @@ export function createWriter<DM extends GenericDataModel>(
         field: string,
         value: unknown,
       ): Promise<void> {
+        if (view === "device")
+          throw new Error("Local functions cannot write replicated CRDT fields.");
         if (tableFromId(id) !== table) throw new Error(`set.add: id is not in ${table}`);
         const def = tableDef(schema, table);
         assertCrdtField(def, field, "set");
@@ -576,6 +668,8 @@ export function createWriter<DM extends GenericDataModel>(
         field: string,
         value: unknown,
       ): Promise<void> {
+        if (view === "device")
+          throw new Error("Local functions cannot write replicated CRDT fields.");
         if (tableFromId(id) !== table) throw new Error(`set.delete: id is not in ${table}`);
         const def = tableDef(schema, table);
         assertCrdtField(def, field, "set");
@@ -596,6 +690,8 @@ export function createWriter<DM extends GenericDataModel>(
         field: string,
         change: { delete: number; index: number; insert: string },
       ): Promise<void> {
+        if (view === "device")
+          throw new Error("Local functions cannot write replicated CRDT fields.");
         if (tableFromId(id) !== table) throw new Error(`text.splice: id is not in ${table}`);
         const def = tableDef(schema, table);
         assertCrdtField(def, field, "text");
@@ -622,12 +718,16 @@ export function createWriter<DM extends GenericDataModel>(
       maybeId?: Id<TableNamesInDataModel<DM>>,
     ): Promise<void> {
       const { table, id } = getArgs(tableOrId as string, maybeId as string | undefined);
-      tableDef(schema, table);
+      const def = tableDef(schema, table);
+      assertViewTable(def, view);
+      if (view === "device" && def.placement === "replicated") {
+        throw new Error(`Local functions cannot delete replicated table ${table}.`);
+      }
       if (tableFromId(id) !== table)
         throw new Error(`delete: id does not belong to table ${table}`);
       const current = await read(id);
       if (!current) throw new Error(`delete: document not found: ${id}`);
-      const existingMapping = await store.id.read(table, id);
+      const existingMapping = view === "replicated" ? await store.id.read(table, id) : undefined;
       const convexId =
         existingMapping?.mapping === "mapped" || existingMapping?.mapping === "deleted"
           ? existingMapping.convexId
@@ -639,14 +739,16 @@ export function createWriter<DM extends GenericDataModel>(
         const op = crdtOps[index]!;
         if (op.table === table && op.id === id) crdtOps.splice(index, 1);
       }
-      idMappings.push({
-        table,
-        localId: id,
-        ...(convexId === undefined ? {} : { convexId }),
-        mapping: "deleted",
-        createdTime: existingMapping?.createdTime ?? current._creationTime,
-        updatedTime: store.clock.read(),
-      });
+      if (view === "replicated") {
+        idMappings.push({
+          table,
+          localId: id,
+          ...(convexId === undefined ? {} : { convexId }),
+          mapping: "deleted",
+          createdTime: existingMapping?.createdTime ?? current._creationTime,
+          updatedTime: store.clock.read(),
+        });
+      }
       if (restore?.deleted) revisionRestores.delete(`${table}\u0000${id}`);
     },
   };
@@ -702,6 +804,8 @@ export function createWriter<DM extends GenericDataModel>(
       deletes,
       freshIds: [...freshIds],
       idMappings: [...idMappings],
+      localFieldDeletes: [...localFieldDeletes.values()],
+      localFieldWrites: [...localFieldWrites.values()],
       docWrites,
     };
   };
@@ -711,6 +815,8 @@ export function createWriter<DM extends GenericDataModel>(
       crdtOps.length > 0 ||
       crdtRestores.length > 0 ||
       idMappings.length > 0 ||
+      localFieldWrites.size > 0 ||
+      localFieldDeletes.size > 0 ||
       deletesByTable.size > 0
     ) {
       return undefined;
@@ -742,6 +848,9 @@ export function createWriter<DM extends GenericDataModel>(
     crdtOps: [...crdtOps],
     crdtRestores: [...crdtRestores],
     idMappings: [...idMappings],
+    localFieldDeletes: new Map(localFieldDeletes),
+    localFieldWrites: new Map(localFieldWrites),
+    deviceViews: new Map([...deviceViewsByTable].map(([table, docs]) => [table, new Map(docs)])),
     revisionRestores: new Map(revisionRestores),
     docWrites: new Map([...docWritesByTable].map(([table, map]) => [table, new Map(map)])),
   });
@@ -759,6 +868,14 @@ export function createWriter<DM extends GenericDataModel>(
     crdtRestores.push(...snapshot.crdtRestores);
     idMappings.length = 0;
     idMappings.push(...snapshot.idMappings);
+    localFieldWrites.clear();
+    for (const [key, value] of snapshot.localFieldWrites) localFieldWrites.set(key, value);
+    localFieldDeletes.clear();
+    for (const [key, value] of snapshot.localFieldDeletes) localFieldDeletes.set(key, value);
+    deviceViewsByTable.clear();
+    for (const [table, docs] of snapshot.deviceViews) {
+      deviceViewsByTable.set(table, new Map(docs));
+    }
     revisionRestores.clear();
     for (const [key, expectation] of snapshot.revisionRestores) {
       revisionRestores.set(key, expectation);
@@ -846,6 +963,9 @@ export interface WriterSnapshot {
   deletes: Map<string, Set<string>>;
   freshIds: DeleteIn[];
   idMappings: IdMapping[];
+  localFieldDeletes: Map<string, { table: string; id: string; field: string }>;
+  localFieldWrites: Map<string, { table: string; id: string; field: string; value: unknown }>;
+  deviceViews: Map<string, Map<string, RawDoc>>;
   revisionRestores: Map<
     string,
     { table: string; rowId: string; deleted: boolean; value?: Record<string, unknown> }

@@ -16,7 +16,6 @@ import { makeFunctionReference } from "convex/server";
 import type { WasmSource } from "../../src/browser/artifact";
 import { initRuntime } from "../../src/browser/runtime";
 import { StoreRecovery, type RecoveryHost } from "../../src/browser/recovery";
-import { analyzeEmbeddedSchema } from "../../src/schema";
 import { getTimerTime } from "../../src/time";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
@@ -69,10 +68,10 @@ self.onmessage = (event: MessageEvent<RecoverRequest>) => {
 
 async function loadModules(): Promise<{
   modules: Awaited<typeof import("virtual:convex-embedded")>["modules"];
-  schema: Awaited<typeof import("virtual:convex-embedded")>["schema"];
+  storeSchema: import("../../src/storage/types").StoreSchema;
   wasm: WasmSource;
 }> {
-  const { schema, modules } = await import("virtual:convex-embedded");
+  const { embeddedSchema, modules } = await import("virtual:convex-embedded");
   const wasmResponse = await fetch(wasmUrl);
   if (!wasmResponse.ok) {
     throw new Error(`failed to load packaged WASM artifact: ${wasmResponse.status}`);
@@ -80,7 +79,7 @@ async function loadModules(): Promise<{
   const wasmBytes = await wasmResponse.arrayBuffer();
   return {
     modules,
-    schema,
+    storeSchema: embeddedSchema.runtimeStoreSchema,
     wasm: {
       bytes: wasmBytes,
       worker: () => new Worker(new URL(napiWorkerUrl, import.meta.url), { type: "module" }),
@@ -89,14 +88,13 @@ async function loadModules(): Promise<{
 }
 
 async function recover(request: RecoverRequest): Promise<RecoverResult> {
-  const { modules, schema, wasm } = await loadModules();
-  const schemaAnalysis = analyzeEmbeddedSchema(schema);
+  const { modules, storeSchema, wasm } = await loadModules();
   const path = `convex-embedded-${request.storageId}.db`;
   const state = await initRuntime({
     modules,
-    setupSchema: schemaAnalysis.storeSchema,
+    setupSchema: storeSchema,
     storagePath: path,
-    storeSchema: schemaAnalysis.storeSchema,
+    storeSchema,
     wasm,
   });
 

@@ -1,0 +1,48 @@
+{
+  "name": "@convex-dev/embedded-demo-expo",
+  "version": "0.0.0",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "android": "vp run build:package && vp run native:android && expo run:android --no-bundler",
+    "build:package": "vp run @convex-dev/embedded#build:ts",
+    "eas-build-post-install": "vp run build:package",
+    "eas-build-pre-install": "node scripts/native.ts eas",
+    "export": "vp run build:package && expo export",
+    "export:android": "vp run build:package && expo export --platform android --output-dir dist/android",
+    "export:ios": "vp run build:package && expo export --platform ios --output-dir dist/ios",
+    "ios": "vp run build:package && vp run native:ios && expo run:ios --no-bundler",
+    "native:android": "node scripts/native.ts android --prepare",
+    "native:dry-run": "node scripts/native.ts eas --dry-run",
+    "native:ios": "node scripts/native.ts ios --prepare",
+    "start": "vp run build:package && expo start --dev-client",
+    "test": "tsx --test tests/*.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@blocknote/ariakit": "^0.47.2",
+    "@blocknote/core": "^0.47.2",
+    "@blocknote/react": "^0.47.2",
+    "@convex-dev/embedded": "workspace:*",
+    "convex": "catalog:",
+    "expo": "catalog:",
+    "expo-crypto": "catalog:",
+    "expo-dev-client": "~6.0.20",
+    "expo-haptics": "~15.0.8",
+    "expo-router": "~6.0.23",
+    "expo-status-bar": "~3.0.9",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-native": "catalog:",
+    "react-native-safe-area-context": "~5.6.0",
+    "react-native-screens": "~4.16.0",
+    "react-native-web": "~0.21.0",
+    "react-native-webview": "~13.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/react": "~19.1.0",
+    "tsx": "^4.20.6",
+    "typescript": "~5.9.2"
+  }
+}

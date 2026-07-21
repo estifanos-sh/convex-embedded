@@ -1,5 +1,5 @@
 /** Native and WASM storage binding ABI required by this JavaScript bundle. @internal */
-export const EMBEDDED_STORAGE_ABI_VERSION = 20;
+export const EMBEDDED_STORAGE_ABI_VERSION = 21;
 
 /**
  * Package-owned SQLite layout version, mirrored from the Rust store's `STORAGE_FORMAT_VERSION`
@@ -9,4 +9,4 @@ export const EMBEDDED_STORAGE_ABI_VERSION = 20;
  *
  * @internal
  */
-export const EMBEDDED_STORE_FORMAT_VERSION = 41;
+export const EMBEDDED_STORE_FORMAT_VERSION = 42;

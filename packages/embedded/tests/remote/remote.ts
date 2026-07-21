@@ -511,7 +511,7 @@ describe("v5 real Convex vertical slice", () => {
         const savepoint = await client.mutation(api.documents.savepoint, { id: document._id });
         savepoints.push(savepoint);
         revisionIds.push({ revId: savepoint.revId, rowId: document._id, table: "documents" });
-        const page = await client.query(api.documents.history, {
+        const page = await client.query(api.remote.history, {
           id: document._id,
           cursor: null,
           numItems: 2,
@@ -519,7 +519,7 @@ describe("v5 real Convex vertical slice", () => {
         expect(page.page).toHaveLength(Math.min(count, 2));
         expect(page.isDone).toBe(count <= 2);
         if (count === 3) {
-          const tail = await client.query(api.documents.history, {
+          const tail = await client.query(api.remote.history, {
             id: document._id,
             cursor: page.continueCursor,
             numItems: 2,
@@ -684,7 +684,7 @@ describe("v5 real Convex vertical slice", () => {
       }
       if (!local) throw new Error("Hosted-watch client did not pull the document.");
 
-      const history = client.watchQuery(api.documents.history, {
+      const history = client.watchQuery(api.remote.history, {
         id: local._id,
         cursor: null,
         numItems: 10,
@@ -906,7 +906,7 @@ describe("v5 real Convex vertical slice", () => {
       expect(acceptedPushes, JSON.stringify(remoteTicks.slice(-20))).toBeGreaterThanOrEqual(3);
       await new Promise((resolve) => setTimeout(resolve, 100));
       await (client as unknown as { __pullRemoteOnce(): Promise<unknown> }).__pullRemoteOnce();
-      await client.mutation(api.documents.restore, { id: local._id, revId: revision.revId });
+      await client.mutation(api.remote.restore, { id: local._id, revId: revision.revId });
       const restoreDeadline = getTimerTime() + 15_000;
       while (acceptedPushes < 4 && getTimerTime() < restoreDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1624,7 +1624,7 @@ describe("v5 real Convex vertical slice", () => {
         client,
         await pushArgs({
           mutationId,
-          functionName: "replay:rawMutationTarget",
+          functionName: "invalid:rawMutationTarget",
           args: { slug },
         }),
       ),
@@ -2095,13 +2095,13 @@ describe("v5 real Convex vertical slice", () => {
       });
       const second = await client.mutation(api.documents.savepoint, { id: document._id });
 
-      const firstPage = await client.query(api.documents.history, {
+      const firstPage = await client.query(api.remote.history, {
         id: document._id,
         cursor: null,
         numItems: 1,
       });
       expect(firstPage).toMatchObject({ isDone: false, page: [{ revId: second.revId }] });
-      const secondPage = await client.query(api.documents.history, {
+      const secondPage = await client.query(api.remote.history, {
         id: document._id,
         cursor: firstPage.continueCursor,
         numItems: 1,
@@ -2109,7 +2109,7 @@ describe("v5 real Convex vertical slice", () => {
       expect(secondPage).toMatchObject({ isDone: true, page: [{ revId: first.revId }] });
 
       expect(
-        await client.mutation(api.documents.restore, { id: document._id, revId: first.revId }),
+        await client.mutation(api.remote.restore, { id: document._id, revId: first.revId }),
       ).toMatchObject({ document: { title } });
       await expect(
         client.mutation(api.revision.remove, {
@@ -2121,7 +2121,7 @@ describe("v5 real Convex vertical slice", () => {
       ).rejects.toThrow(/active revision/i);
 
       expect(
-        await client.mutation(api.documents.restore, { id: document._id, revId: second.revId }),
+        await client.mutation(api.remote.restore, { id: document._id, revId: second.revId }),
       ).toMatchObject({ document: { title: `${title}-two` } });
       expect(
         await client.mutation(api.revision.remove, {
@@ -2133,7 +2133,7 @@ describe("v5 real Convex vertical slice", () => {
       ).toEqual({ deleted: 1, isDone: true });
       expect(
         (
-          await client.query(api.documents.history, {
+          await client.query(api.remote.history, {
             id: document._id,
             cursor: null,
             numItems: 10,

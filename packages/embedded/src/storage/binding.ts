@@ -93,6 +93,8 @@ export interface BindingDocWrite {
 export interface BindingWriteBatch {
   docWrites: BindingDocWrite[];
   deletes: { table: string; id: string }[];
+  localFieldWrites?: { table: string; id: string; field: string; valueJson: string }[];
+  localFieldDeletes?: { table: string; id: string; field: string }[];
   crdtOps?: BindingCrdtOp[];
   crdtRestores?: BindingCrdtRestore[];
   freshIds: { table: string; id: string }[];
@@ -138,7 +140,7 @@ export interface BindingCommitOptions {
   mutationResult?: string;
   pushEnvelopeJson?: string;
   pushEnvelopeNowMs?: number;
-  source?: "local" | "remote";
+  source?: "local" | "remote" | "device";
 }
 
 function bindingCommitMutation(options?: CommitOptions): {
@@ -148,7 +150,7 @@ function bindingCommitMutation(options?: CommitOptions): {
   mutationName?: string;
   mutationResult?: string;
 } {
-  if (!options || options.source === "remote" || options.mutation === "none") return {};
+  if (!options || options.source !== "local" || options.mutation === "none") return {};
   if (options.mutation === "push") return { mutationId: options.mutationId };
   if (options.mutation === "existing") {
     return { mutationId: options.mutationId, mutationResult: options.mutationResult };
@@ -209,6 +211,7 @@ export interface BindingPage {
   cursor?: string | null;
   /** Per-row adoption-version sidecar `{ localId: seq }` (contract §11 D1); absent → version 0. */
   versions?: Record<string, number>;
+  localFieldsJson?: string;
 }
 
 export interface BindingDeleteResult {
@@ -356,7 +359,7 @@ export interface StoreBinding {
     data: string,
     cols: BindingColValue[],
     creationTime: number,
-    source?: "local" | "remote",
+    source?: "local" | "remote" | "device",
     mutationId?: string,
     mutationName?: string,
     mutationArgs?: string,
@@ -372,7 +375,7 @@ export interface StoreBinding {
     data: string,
     encodedCols: Uint8Array,
     creationTime: number,
-    source?: "local" | "remote",
+    source?: "local" | "remote" | "device",
     mutationId?: string,
     mutationName?: string,
     mutationArgs?: string,
@@ -387,7 +390,7 @@ export interface StoreBinding {
     data: string,
     encodedCols: Uint8Array,
     creationTime: number,
-    source?: "local" | "remote",
+    source?: "local" | "remote" | "device",
     mutationId?: string,
     mutationName?: string,
     mutationArgs?: string,
@@ -397,6 +400,7 @@ export interface StoreBinding {
     mutationIsFresh?: boolean,
   ): Promise<bigint | number>;
   docRead(table: string, id: string): Promise<string | undefined | null>;
+  localFieldsRead?(table: string, id: string): Promise<string>;
   docVersionRead(table: string, id: string): Promise<number | bigint | undefined | null>;
   crdtHeadRead(
     table: string,
@@ -600,6 +604,17 @@ export class StoreAdapter implements StorageBackend {
       const doc = text ? parseDoc(text) : undefined;
       return this.readCache.writeDoc(key, doc);
     },
+    device: {
+      read: async (table, id) => {
+        if (!this.inner.localFieldsRead) return {};
+        const fields = JSON.parse(await this.inner.localFieldsRead(table, id)) as Record<
+          string,
+          unknown
+        >;
+        reviveDoc(fields);
+        return fields;
+      },
+    },
     version: {
       read: async (table, id) => {
         const seq = await this.inner.docVersionRead(table, id);
@@ -640,6 +655,11 @@ export class StoreAdapter implements StorageBackend {
           docs,
           cursor: page.cursor ?? null,
           ...(page.versions === undefined ? {} : { versions: page.versions }),
+          ...(page.localFieldsJson === undefined
+            ? {}
+            : {
+                deviceFields: parseDeviceFields(page.localFieldsJson),
+              }),
         });
       },
     },
@@ -816,6 +836,13 @@ export class StoreAdapter implements StorageBackend {
         bytes: new Uint8Array(restore.bytes),
       })),
       deletes: batch.deletes,
+      localFieldWrites: (batch.localFieldWrites ?? []).map((write) => ({
+        table: write.table,
+        id: write.id,
+        field: write.field,
+        valueJson: encode(write.value),
+      })),
+      localFieldDeletes: batch.localFieldDeletes ?? [],
       freshIds: batch.freshIds ?? [],
       dataOnlyIds: batch.dataOnlyIds ?? [],
       idMappings: (batch.idMappings ?? []).map(toBindingIdMapping),
@@ -1049,6 +1076,8 @@ export class StoreAdapter implements StorageBackend {
 }
 
 function isDataOnlyQueryCacheSafe(batch: WriteBatch): boolean {
+  if ((batch.localFieldWrites?.length ?? 0) > 0) return false;
+  if ((batch.localFieldDeletes?.length ?? 0) > 0) return false;
   if (batch.docWrites.length === 0 || batch.deletes.length > 0) return false;
   if ((batch.crdtOps?.length ?? 0) > 0) return false;
   if ((batch.freshIds?.length ?? 0) > 0) return false;
@@ -1390,6 +1419,12 @@ function parseDocs(text: string): StoredDoc[] {
   const docs = JSON.parse(text) as StoredDoc[];
   for (const doc of docs) reviveDoc(doc);
   return docs;
+}
+
+function parseDeviceFields(text: string): Record<string, Record<string, unknown>> {
+  const rows = JSON.parse(text) as Record<string, Record<string, unknown>>;
+  for (const fields of Object.values(rows)) reviveDoc(fields);
+  return rows;
 }
 
 function parseDoc(text: string): StoredDoc {

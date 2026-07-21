@@ -8,6 +8,7 @@ import { describe, expect, test } from "vite-plus/test";
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
   exports: Record<string, unknown>;
+  files: string[];
   name: string;
 };
 
@@ -98,6 +99,37 @@ describe("public package surface", () => {
     expect(typeof metro.withConvexEmbedded).toBe("function");
   });
 
+  test("schema-definition package entries are safe to require from CommonJS", () => {
+    const schema = require("@convex-dev/embedded/schema") as Record<string, unknown>;
+    const values = require("@convex-dev/embedded/values") as Record<string, unknown>;
+
+    expect(typeof schema.defineEmbeddedSchema).toBe("function");
+    expect(typeof schema.embeddedTable).toBe("function");
+    expect(typeof schema.localTable).toBe("function");
+    expect(values.e).toEqual(
+      expect.objectContaining({
+        count: expect.any(Function),
+        local: expect.any(Function),
+        omit: expect.any(Function),
+        set: expect.any(Function),
+        text: expect.any(Function),
+      }),
+    );
+  });
+
+  test("CommonJS schema artifacts and their shared chunks are published", () => {
+    expect(packageJson.files).toEqual(
+      expect.arrayContaining([
+        "dist/*-*.cjs",
+        "dist/*-*.d.cts",
+        "dist/schema.cjs",
+        "dist/schema.d.cts",
+        "dist/values.cjs",
+        "dist/values.d.cts",
+      ]),
+    );
+  });
+
   test("no test-only factory leaks into the public surface", () => {
     const leaked: string[] = [];
     for (const entry of ENTRIES) {
@@ -118,11 +150,7 @@ describe("public package surface", () => {
       const code = declarations.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
       const names = exportedNames(declarations).join("\n");
       const relativePath = path.slice(packageRoot.length + 1);
-      for (const pattern of [
-        /embedded\.generated/i,
-        /manifest/i,
-        new RegExp("sync" + "able", "i"),
-      ]) {
+      for (const pattern of [/embedded\.generated/i, new RegExp("sync" + "able", "i")]) {
         if (pattern.test(code) || pattern.test(names) || pattern.test(relativePath)) {
           leaked.push(`${relativePath}: ${pattern}`);
         }

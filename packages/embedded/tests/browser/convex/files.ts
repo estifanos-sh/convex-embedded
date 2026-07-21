@@ -1,5 +1,6 @@
 import { v } from "convex/values";
-import { mutation, query } from "../../../../../convex/_generated/server";
+
+import { embedded } from "./embedded";
 
 const metadataValidator = v.object({
   contentType: v.optional(v.string()),
@@ -11,7 +12,7 @@ type StorageMetadata = {
   size: number;
 };
 
-export const generateUploadUrl = mutation({
+export const generateUploadUrl = embedded.remote.mutation({
   args: {},
   returns: v.string(),
   handler: async (ctx) => {
@@ -19,7 +20,7 @@ export const generateUploadUrl = mutation({
   },
 });
 
-export const metadata = query({
+export const metadata = embedded.remote.query({
   args: { storageId: v.string() },
   returns: v.union(v.null(), metadataValidator),
   handler: async (ctx, args) => {
@@ -36,7 +37,7 @@ export const metadata = query({
   },
 });
 
-export const url = query({
+export const url = embedded.remote.query({
   args: { storageId: v.string() },
   returns: v.union(v.null(), v.string()),
   handler: async (ctx, args) => {

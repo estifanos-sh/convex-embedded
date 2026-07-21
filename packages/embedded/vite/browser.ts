@@ -14,6 +14,7 @@ import {
 } from "../tests/bench/harness/paths.js";
 import { browserCommands } from "../tests/browser/harness/commands.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
+import schema from "../tests/fixture/convex/schema.js";
 
 export const browserProject = {
   define: {
@@ -57,7 +58,7 @@ export const browserProject = {
     ),
     __CONVEX_EMBEDDED_HOSTED_URL__: JSON.stringify(hostedRemoteUrl ?? null),
   },
-  plugins: [convexEmbedded({ convexDir: browserConvexDir }), browserRuntimeLog()],
+  plugins: [convexEmbedded({ convexDir: browserConvexDir, schema }), browserRuntimeLog()],
   optimizeDeps: {
     include: [
       "@codemirror/lang-json",

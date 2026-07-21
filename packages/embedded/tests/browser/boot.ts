@@ -18,7 +18,7 @@ import type { WasmSource } from "../../src/browser/artifact";
 import type { EmbeddedRuntimeEvent } from "../../src/events";
 import { OpfsDirectory, registerTursoFiles } from "../../src/browser/opfs";
 import { initRuntime, type WorkerState } from "../../src/browser/runtime";
-import { analyzeEmbeddedSchema } from "../../src/schema";
+import type { StoreSchema } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
@@ -211,8 +211,7 @@ async function plantCorruptHeader(path: string): Promise<void> {
 }
 
 async function corruptReset(request: CorruptResetRequest): Promise<CorruptResetResult> {
-  const { modules, schema, wasm } = await loadModules();
-  const schemaAnalysis = analyzeEmbeddedSchema(schema);
+  const { modules, storeSchema, wasm } = await loadModules();
   const path = storagePath(request.storageId);
   await plantCorruptHeader(path);
 
@@ -227,9 +226,9 @@ async function corruptReset(request: CorruptResetRequest): Promise<CorruptResetR
         if (typeof message === "string") resetErrorMessage = message;
       }
     },
-    setupSchema: schemaAnalysis.storeSchema,
+    setupSchema: storeSchema,
     storagePath: path,
-    storeSchema: schemaAnalysis.storeSchema,
+    storeSchema,
     wasm,
   });
 
@@ -263,10 +262,10 @@ async function hold(request: HoldRequest): Promise<{ held: true }> {
 
 async function loadModules(): Promise<{
   modules: Awaited<typeof import("virtual:convex-embedded")>["modules"];
-  schema: Awaited<typeof import("virtual:convex-embedded")>["schema"];
+  storeSchema: StoreSchema;
   wasm: WasmSource;
 }> {
-  const { schema, modules } = await import("virtual:convex-embedded");
+  const { embeddedSchema, modules } = await import("virtual:convex-embedded");
   const wasmResponse = await fetch(wasmUrl);
   if (!wasmResponse.ok) {
     throw new Error(`failed to load packaged WASM artifact: ${wasmResponse.status}`);
@@ -274,7 +273,7 @@ async function loadModules(): Promise<{
   const wasmBytes = await wasmResponse.arrayBuffer();
   return {
     modules,
-    schema,
+    storeSchema: embeddedSchema.runtimeStoreSchema,
     wasm: {
       bytes: wasmBytes,
       worker: () => new Worker(new URL(napiWorkerUrl, import.meta.url), { type: "module" }),
@@ -287,14 +286,13 @@ function storagePath(storageId: string): string {
 }
 
 async function seed(request: SeedRequest): Promise<SeedResult> {
-  const { modules, schema, wasm } = await loadModules();
-  const schemaAnalysis = analyzeEmbeddedSchema(schema);
+  const { modules, storeSchema, wasm } = await loadModules();
   const path = storagePath(request.storageId);
   const state = await initRuntime({
     modules,
-    setupSchema: schemaAnalysis.storeSchema,
+    setupSchema: storeSchema,
     storagePath: path,
-    storeSchema: schemaAnalysis.storeSchema,
+    storeSchema,
     wasm,
   });
   let rows = 0;
@@ -316,8 +314,7 @@ async function seed(request: SeedRequest): Promise<SeedResult> {
 }
 
 async function boot(request: BootRequest): Promise<BootResult> {
-  const { modules, schema, wasm } = await loadModules();
-  const schemaAnalysis = analyzeEmbeddedSchema(schema);
+  const { modules, storeSchema, wasm } = await loadModules();
   const path = storagePath(request.storageId);
   const phases: BootPhaseTimings = {};
   const acquired: BootPhaseTimings = {};
@@ -345,9 +342,9 @@ async function boot(request: BootRequest): Promise<BootResult> {
         acquired[`${phase}:${detailRecord.attempt ?? 0}`] = detailRecord.waitedMs ?? 0;
       }
     },
-    setupSchema: schemaAnalysis.storeSchema,
+    setupSchema: storeSchema,
     storagePath: path,
-    storeSchema: schemaAnalysis.storeSchema,
+    storeSchema,
     wasm,
   });
   let rows = 0;
@@ -367,14 +364,13 @@ async function boot(request: BootRequest): Promise<BootResult> {
 }
 
 async function wound(request: WoundRequest): Promise<never> {
-  const { modules, schema, wasm } = await loadModules();
-  const schemaAnalysis = analyzeEmbeddedSchema(schema);
+  const { modules, storeSchema, wasm } = await loadModules();
   const path = storagePath(request.storageId);
   const state = await initRuntime({
     modules,
-    setupSchema: schemaAnalysis.storeSchema,
+    setupSchema: storeSchema,
     storagePath: path,
-    storeSchema: schemaAnalysis.storeSchema,
+    storeSchema,
     wasm,
   });
   for (let index = 0; index < request.rows; index += 1) {
@@ -386,8 +382,7 @@ async function wound(request: WoundRequest): Promise<never> {
 }
 
 async function woundStage(request: WoundStageRequest): Promise<never> {
-  const { modules, schema, wasm } = await loadModules();
-  const schemaAnalysis = analyzeEmbeddedSchema(schema);
+  const { modules, storeSchema, wasm } = await loadModules();
   const path = storagePath(request.storageId);
   const announce = () => {
     self.postMessage({ ok: true, result: { stage: request.stage, wounding: true } });
@@ -397,9 +392,9 @@ async function woundStage(request: WoundStageRequest): Promise<never> {
     onDebug: (phase) => {
       if (request.stage === "open" && phase === "worker:store:open:start") announce();
     },
-    setupSchema: schemaAnalysis.storeSchema,
+    setupSchema: storeSchema,
     storagePath: path,
-    storeSchema: schemaAnalysis.storeSchema,
+    storeSchema,
     wasm,
   });
   if (request.stage === "commit") {

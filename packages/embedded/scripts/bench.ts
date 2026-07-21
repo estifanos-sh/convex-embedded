@@ -7,6 +7,7 @@ const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
 const args = process.argv.slice(2);
 const env = parseEnv(args);
+const testConfig = ["--config", "vite/tests.ts"];
 
 if (args.includes("--browser-scale-matrix")) {
   runBrowserScaleMatrix(env, args.includes("--manual"));
@@ -46,6 +47,7 @@ if (args.includes("--metal-reconnect-volume")) {
     [
       "test",
       "run",
+      ...testConfig,
       "--project",
       "metal",
       "tests/metal/reconnect.ts",
@@ -69,6 +71,7 @@ if (args.includes("--metal-scale")) {
     [
       "test",
       "run",
+      ...testConfig,
       "--project",
       "metal",
       "tests/metal/scale.ts",
@@ -92,6 +95,7 @@ if (args.includes("--browser-scale")) {
     [
       "test",
       "run",
+      ...testConfig,
       "--project",
       "browser",
       "tests/bench/browser/scale.ts",
@@ -115,6 +119,7 @@ if (args.includes("--browser-startup")) {
     [
       "test",
       "run",
+      ...testConfig,
       "--project",
       "browser",
       "tests/browser/runtime.ts",
@@ -138,6 +143,7 @@ if (args.includes("--browser-remote")) {
     [
       "test",
       "run",
+      ...testConfig,
       "--project",
       "browser",
       "tests/bench/browser/remote.ts",
@@ -161,6 +167,7 @@ if (args.includes("--browser")) {
     [
       "test",
       "run",
+      ...testConfig,
       "--project",
       "browser",
       "tests/browser/runtime.ts",
@@ -199,7 +206,15 @@ if (args.includes("--scale")) {
   }
   const result = spawnSync(
     "vp",
-    ["test", "run", "--project", "bench", "--disableConsoleIntercept", "tests/bench/scale.ts"],
+    [
+      "test",
+      "run",
+      ...testConfig,
+      "--project",
+      "bench",
+      "--disableConsoleIntercept",
+      "tests/bench/scale.ts",
+    ],
     {
       cwd: packageDir,
       env,
@@ -218,7 +233,15 @@ if (usesNativeLayers(args)) {
 
 const result = spawnSync(
   "vp",
-  ["test", "run", "--project", "bench", "--disableConsoleIntercept", "tests/bench/runtime.ts"],
+  [
+    "test",
+    "run",
+    ...testConfig,
+    "--project",
+    "bench",
+    "--disableConsoleIntercept",
+    "tests/bench/runtime.ts",
+  ],
   {
     cwd: packageDir,
     env,

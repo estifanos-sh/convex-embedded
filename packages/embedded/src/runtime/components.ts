@@ -93,6 +93,14 @@ export function namespaceBatch(instancePath: ComponentInstancePath, batch: Write
       ...mapping,
       table: physicalTable(instancePath, mapping.table),
     })),
+    localFieldWrites: batch.localFieldWrites?.map((write) => ({
+      ...write,
+      table: physicalTable(instancePath, write.table),
+    })),
+    localFieldDeletes: batch.localFieldDeletes?.map((deleted) => ({
+      ...deleted,
+      table: physicalTable(instancePath, deleted.table),
+    })),
     docWrites: batch.docWrites.map((docWrite) => ({
       ...docWrite,
       table: physicalTable(instancePath, docWrite.table),
@@ -110,6 +118,10 @@ export function batchInvalidationKeys(
     ...new Set([
       ...batch.docWrites.map((docWrite) => invalidationKey(instancePath, docWrite.table)),
       ...batch.deletes.map((deleted) => invalidationKey(instancePath, deleted.table)),
+      ...(batch.localFieldWrites ?? []).map((write) => invalidationKey(instancePath, write.table)),
+      ...(batch.localFieldDeletes ?? []).map((deleted) =>
+        invalidationKey(instancePath, deleted.table),
+      ),
     ]),
   ];
 }

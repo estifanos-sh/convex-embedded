@@ -41,9 +41,21 @@ exports[`public package surface > browser entry exports only its intended surfac
 
 exports[`public package surface > bundler entry exports only its intended surface 1`] = `
 [
+  "EMBEDDED_GENERATED_FORMAT_VERSION",
   "EmbeddedBundleInput",
   "EmbeddedBundleResult",
+  "EmbeddedFunctionKind",
+  "EmbeddedFunctionManifest",
+  "EmbeddedFunctionManifestEntry",
+  "EmbeddedFunctionVisibility",
+  "EmbeddedGeneratedInput",
+  "EmbeddedGeneratedSchema",
+  "FunctionPlacement",
+  "GenerateEmbeddedInput",
+  "GenerateEmbeddedResult",
   "createEmbeddedBundle",
+  "generateEmbedded",
+  "renderEmbeddedGenerated",
   "toModuleId",
 ]
 `;
@@ -142,9 +154,28 @@ exports[`public package surface > node entry exports only its intended surface 1
 ]
 `;
 
+exports[`public package surface > schema entry exports only its intended surface 1`] = `
+[
+  "DeviceDataModel",
+  "DeviceModel",
+  "EmbeddedSchemaDefinition",
+  "EmbeddedTableDefinition",
+  "EmbeddedTableValidator",
+  "LocalTableDefinition",
+  "ReplicatedDataModel",
+  "ServerDataModel",
+  "ServerModel",
+  "WireModel",
+  "defineEmbeddedSchema",
+  "embeddedTable",
+  "localTable",
+]
+`;
+
 exports[`public package surface > server entry exports only its intended surface 1`] = `
 [
   "DefineEmbeddedOptions",
+  "DefinedEmbedded",
   "defineEmbedded",
 ]
 `;
@@ -161,9 +192,8 @@ exports[`public package surface > unplugin entry exports only its intended surfa
 
 exports[`public package surface > values entry exports only its intended surface 1`] = `
 [
-  "count",
-  "set",
-  "text",
+  "EmbeddedValue",
+  "e",
 ]
 `;
 

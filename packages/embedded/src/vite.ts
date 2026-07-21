@@ -9,9 +9,10 @@
  * ```ts
  * import { defineConfig } from "vite";
  * import convexEmbedded from "@convex-dev/embedded/vite";
+ * import schema from "./convex/schema";
  *
  * export default defineConfig({
- *   plugins: [convexEmbedded()],
+ *   plugins: [convexEmbedded({ schema })],
  * });
  * ```
  *
@@ -38,12 +39,12 @@ type VitePlugin = {
 /**
  * Vite/Vite+ adapter for embedded Convex module discovery.
  *
- * @param options - Optional Convex directory, schema path, and disable flag.
+ * @param options - Embedded schema plus optional Convex paths and disable flag.
  * @returns Vite plugins/config entries for the main build and worker build.
  *
  * @public
  */
-export function convexEmbedded(options?: ConvexEmbeddedPluginOptions): VitePlugin[] {
+export function convexEmbedded(options: ConvexEmbeddedPluginOptions): VitePlugin[] {
   return [
     convexEmbeddedViteConfig(options),
     convexEmbeddedUnplugin.vite(options) as unknown as VitePlugin,
@@ -52,7 +53,7 @@ export function convexEmbedded(options?: ConvexEmbeddedPluginOptions): VitePlugi
 
 export default convexEmbedded;
 
-function convexEmbeddedViteConfig(options?: ConvexEmbeddedPluginOptions): VitePlugin {
+function convexEmbeddedViteConfig(options: ConvexEmbeddedPluginOptions): VitePlugin {
   return {
     name: "convex-embedded:vite-config",
     transformIndexHtml: {

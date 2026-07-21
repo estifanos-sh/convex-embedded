@@ -1,9 +1,9 @@
 import { type GenericId, type Infer, v } from "convex/values";
 import { components, internal } from "./_generated/api";
-import { internalMutation, mutation, query } from "./embedded";
+import { embedded } from "./embedded";
 import { read as readTime } from "./time";
 
-const documentValidator = v.object({
+export const documentValidator = v.object({
   _creationTime: v.number(),
   _id: v.id("documents"),
   body: v.string(),
@@ -18,7 +18,7 @@ const textSpliceValidator = v.object({
   insert: v.string(),
 });
 
-const revisionValidator = v.object({
+export const revisionValidator = v.object({
   revId: v.string(),
   groupId: v.string(),
   table: v.string(),
@@ -57,7 +57,7 @@ const emptyBody = JSON.stringify([
 ]);
 const MAX_DOCUMENTS = 1_024;
 
-export const list = query({
+export const list = embedded.replicated.query({
   args: { limit: v.optional(v.number()), prefix: v.optional(v.string()) },
   returns: v.array(documentValidator),
   handler: async (ctx, args) => {
@@ -85,7 +85,7 @@ const summaryValidator = v.object({
   updatedAt: v.number(),
 });
 
-export const summaries = query({
+export const summaries = embedded.replicated.query({
   args: { limit: v.optional(v.number()), prefix: v.optional(v.string()) },
   returns: v.array(summaryValidator),
   handler: async (ctx, args) => {
@@ -113,7 +113,7 @@ function documentLimit(value: number | undefined): number {
   return Math.min(MAX_DOCUMENTS, Math.max(1, Math.trunc(value)));
 }
 
-export const get = query({
+export const get = embedded.replicated.query({
   args: { id: v.id("documents") },
   returns: v.union(v.null(), documentValidator),
   handler: async (ctx, args) => {
@@ -121,7 +121,7 @@ export const get = query({
   },
 });
 
-export const getBySlug = query({
+export const getBySlug = embedded.replicated.query({
   args: { slug: v.string() },
   returns: v.union(v.null(), documentValidator),
   handler: async (ctx, args) => {
@@ -132,7 +132,7 @@ export const getBySlug = query({
   },
 });
 
-export const create = mutation({
+export const create = embedded.replicated.mutation({
   args: {
     body: v.optional(v.string()),
     slug: v.optional(v.string()),
@@ -155,7 +155,7 @@ export const create = mutation({
   },
 });
 
-export const update = mutation({
+export const update = embedded.replicated.mutation({
   args: {
     id: v.id("documents"),
     title: v.optional(v.string()),
@@ -175,7 +175,7 @@ export const update = mutation({
   },
 });
 
-export const writeBody = mutation({
+export const writeBody = embedded.replicated.mutation({
   args: {
     id: v.id("documents"),
     splices: v.array(textSpliceValidator),
@@ -199,7 +199,7 @@ export const writeBody = mutation({
   },
 });
 
-export const writeSlug = mutation({
+export const writeSlug = embedded.replicated.mutation({
   args: { id: v.id("documents"), slug: v.string() },
   returns: documentValidator,
   handler: async (ctx, args) => {
@@ -212,7 +212,7 @@ export const writeSlug = mutation({
   },
 });
 
-export const savepoint = mutation({
+export const savepoint = embedded.replicated.mutation({
   args: { id: v.id("documents") },
   returns: revisionValidator,
   handler: async (ctx, args) => {
@@ -228,61 +228,7 @@ export const savepoint = mutation({
   },
 });
 
-export const history = query({
-  local: false,
-  args: {
-    id: v.id("documents"),
-    cursor: v.union(v.string(), v.null()),
-    numItems: v.number(),
-  },
-  returns: v.any(),
-  handler: async (ctx, args) => {
-    if (!(await ctx.db.get(args.id))) throw new Error("Document not found.");
-    return await ctx.runQuery(components.embedded.rev.list, {
-      table: "documents",
-      rowId: args.id,
-      paginationOpts: { cursor: args.cursor, numItems: args.numItems },
-    });
-  },
-});
-
-export const revision = query({
-  local: false,
-  args: { id: v.id("documents"), revId: v.string() },
-  returns: v.any(),
-  handler: async (ctx, args) => {
-    if (!(await ctx.db.get(args.id))) throw new Error("Document not found.");
-    return await ctx.runQuery(components.embedded.rev.get, {
-      table: "documents",
-      rowId: args.id,
-      revId: args.revId,
-    });
-  },
-});
-
-export const restore = mutation({
-  local: false,
-  args: { id: v.id("documents"), revId: v.string() },
-  returns: v.object({
-    document: documentValidator,
-    revision: revisionValidator,
-  }),
-  handler: async (ctx, args) => {
-    if (!(await ctx.db.get(args.id))) throw new Error("Document not found.");
-    const revision = await ctx.runMutation(components.embedded.rev.restore, {
-      table: "documents",
-      rowId: args.id,
-      revId: args.revId,
-    });
-    if (revision.deleted) throw new Error("Deleted document revisions are not restorable here.");
-    await ctx.db.replace(args.id, revision.value as never);
-    const document = await ctx.db.get(args.id);
-    if (!document) throw new Error("Document not found after restore.");
-    return { document, revision: revision as Infer<typeof revisionValidator> };
-  },
-});
-
-export const remove = mutation({
+export const remove = embedded.replicated.mutation({
   args: { id: v.id("documents") },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -301,7 +247,7 @@ export const remove = mutation({
   },
 });
 
-export const scheduleAppend = mutation({
+export const scheduleAppend = embedded.replicated.mutation({
   args: { id: v.id("documents") },
   returns: v.id("_scheduled_functions"),
   handler: async (ctx, args): Promise<GenericId<"_scheduled_functions">> => {
@@ -309,7 +255,7 @@ export const scheduleAppend = mutation({
   },
 });
 
-export const scheduleAppendAfter = mutation({
+export const scheduleAppendAfter = embedded.replicated.mutation({
   args: { id: v.id("documents"), delayMs: v.number() },
   returns: v.id("_scheduled_functions"),
   handler: async (ctx, args): Promise<GenericId<"_scheduled_functions">> => {
@@ -319,7 +265,7 @@ export const scheduleAppendAfter = mutation({
   },
 });
 
-export const cancelAppend = mutation({
+export const cancelAppend = embedded.replicated.mutation({
   args: { scheduleId: v.id("_scheduled_functions") },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -328,7 +274,7 @@ export const cancelAppend = mutation({
   },
 });
 
-export const generateUploadUrl = mutation({
+export const generateUploadUrl = embedded.replicated.mutation({
   args: {},
   returns: v.string(),
   handler: async (ctx) => {
@@ -336,7 +282,7 @@ export const generateUploadUrl = mutation({
   },
 });
 
-export const scheduledAppend = internalMutation({
+export const scheduledAppend = embedded.replicated.internalMutation({
   args: { id: v.id("documents") },
   returns: v.null(),
   handler: async (ctx, args) => {
