@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vite-plus/test";
 
 import { NativeStore } from "../../src/node/native";
-import type { StorageBackend, StoreSchema, StoredDoc, DocWrite } from "../../src/storage/types";
+import type { DocWrite, StorageBackend, StoredDoc, StoreSchema } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { defineConformance } from "../testkit/conformance";
 import { nativeModule } from "../testkit/native";
@@ -158,29 +158,36 @@ describe("native storage details", () => {
     await store.close();
   });
 
-  test("invalid one-docWrite encoding fails loudly instead of falling back to generic commit", async () => {
-    let genericCommits = 0;
+  test("one-docWrite uses generic commit when the binding has no fast path", async () => {
+    const genericCommits: Array<{ batch: unknown; options: unknown }> = [];
     const store = NativeStore.wrap({
       clear: async () => undefined,
       clockRead: () => 1,
       close: async () => undefined,
-      commit: async () => {
-        genericCommits += 1;
+      commit: async (batch: unknown, options: unknown) => {
+        genericCommits.push({ batch, options });
         return { changedTables: ["issues"], changes: [], commitSeq: 1 };
       },
       setup: async () => undefined,
     });
 
+    const docWrite = issue("missing-fast-path", "missing", "open");
     await expect(
       store.commitOneDocWrite!(
-        {
-          fresh: true,
-          docWrite: issue("missing-fast-path", "missing", "open"),
-        },
+        { fresh: true, dataOnly: true, docWrite },
         { changes: "omit", mutation: "none", source: "local" },
       ),
-    ).rejects.toThrow("missing commitOneDocWriteEncoded");
-    expect(genericCommits).toBe(0);
+    ).resolves.toEqual({ changedTables: ["issues"], changes: [], commitSeq: 1 });
+    expect(genericCommits).toHaveLength(1);
+    expect(genericCommits[0]).toMatchObject({
+      batch: {
+        docWrites: [{ table: docWrite.table, id: docWrite.id }],
+        deletes: [],
+        freshIds: [{ table: docWrite.table, id: docWrite.id }],
+        dataOnlyIds: [{ table: docWrite.table, id: docWrite.id }],
+      },
+      options: { includeChanges: false, source: "local" },
+    });
   });
 
   test("completes a claimed upload through the atomic mapping path", async () => {

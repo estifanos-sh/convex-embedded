@@ -1,0 +1,28 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'dev.convex'
+version = '0.0.0'
+
+android {
+  namespace 'expo.modules.convexembedded'
+
+  defaultConfig {
+    versionCode 1
+    versionName version
+  }
+
+  sourceSets {
+    main {
+      jniLibs.srcDirs = ["../native/android"]
+    }
+  }
+
+  packagingOptions {
+    jniLibs {
+      useLegacyPackaging = false
+    }
+  }
+}

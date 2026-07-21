@@ -7,6 +7,7 @@ const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 run("vp", ["pack"], packageDir);
 await import("./wasm.ts");
 await import("./native.ts");
+await import("./mobile.ts");
 
 function run(command: string, args: string[], cwd: string, env = process.env): void {
   const result = spawnSync(command, args, { cwd, env, stdio: "inherit" });

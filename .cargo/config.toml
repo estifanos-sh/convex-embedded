@@ -1,6 +1,20 @@
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
 
+# Android 15+ devices may use 16 KiB memory pages. Keep every mobile ELF load segment aligned so
+# one artifact works on both 4 KiB and 16 KiB devices.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
 [alias]
 # Run the integration tests, which live behind the `testkit` feature (white-box test support that
 # never ships). Use with `-p`, e.g. `cargo tk -p storage`.

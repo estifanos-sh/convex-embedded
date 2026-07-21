@@ -1,7 +1,7 @@
 {
   "name": "@convex-dev/embedded",
   "version": "0.0.0",
-  "description": "Embedded browser runtime and Convex server wrapper for local-first Convex apps.",
+  "description": "Embedded runtime and Convex server wrapper for local-first Convex apps.",
   "files": [
     "dist/*-*.d.mts",
     "dist/*-*.mjs",
@@ -13,10 +13,15 @@
     "dist/bundler.mjs",
     "dist/component",
     "dist/devtools",
+    "dist/expo",
     "dist/internal",
     "dist/native",
     "dist/node.d.mts",
     "dist/node.mjs",
+    "dist/metro.cjs",
+    "dist/metro.d.cts",
+    "dist/metro.d.mts",
+    "dist/metro.mjs",
     "dist/server.d.mts",
     "dist/server.mjs",
     "dist/thread",
@@ -28,6 +33,10 @@
     "dist/vite.mjs",
     "dist/wasm",
     "native",
+    "android",
+    "ios",
+    "expo-module.config.json",
+    "ConvexEmbeddedNative.podspec",
     "src"
   ],
   "type": "module",
@@ -51,6 +60,20 @@
     "./node": {
       "types": "./dist/node.d.mts",
       "import": "./dist/node.mjs"
+    },
+    "./expo": {
+      "types": "./dist/expo/index.d.mts",
+      "import": "./dist/expo/index.mjs"
+    },
+    "./metro": {
+      "import": {
+        "types": "./dist/metro.d.mts",
+        "default": "./dist/metro.mjs"
+      },
+      "require": {
+        "types": "./dist/metro.d.cts",
+        "default": "./dist/metro.cjs"
+      }
     },
     "./values": {
       "types": "./dist/values.d.mts",
@@ -93,6 +116,12 @@
     "build": "node scripts/build.ts",
     "build:ts": "vp pack",
     "prepack": "vp run build",
+    "mobile": "node scripts/mobile.ts",
+    "mobile:android": "node scripts/mobile.ts android",
+    "mobile:compile:android": "node scripts/mobilecompile.ts android",
+    "mobile:compile:ios": "node scripts/mobilecompile.ts ios",
+    "mobile:ios": "node scripts/mobile.ts ios",
+    "mobile:verify": "node scripts/mobile.ts verify",
     "native": "node scripts/native.ts",
     "size": "node scripts/size.ts",
     "test:node": "node scripts/node/smoke.ts",
@@ -150,8 +179,11 @@
     "@typescript/native-preview": "catalog:",
     "binaryen": "catalog:",
     "convex": "catalog:",
+    "expo": "catalog:",
+    "expo-crypto": "catalog:",
     "fast-check": "catalog:",
     "playwright": "catalog:",
+    "react-native": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vite-plugin-solid": "catalog:",
@@ -159,7 +191,21 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "convex": "^1.42.1"
+    "convex": "^1.42.1",
+    "expo": ">=54.0.0",
+    "expo-crypto": ">=15.0.0",
+    "react-native": ">=0.81.0"
+  },
+  "peerDependenciesMeta": {
+    "expo": {
+      "optional": true
+    },
+    "expo-crypto": {
+      "optional": true
+    },
+    "react-native": {
+      "optional": true
+    }
   },
   "optionalDependencies": {
     "@codemirror/lang-json": "catalog:",
@@ -170,6 +216,6 @@
     "solid-js": "catalog:"
   },
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=20.19.0"
   }
 }

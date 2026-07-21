@@ -20,6 +20,7 @@ dist-ssr
 /target
 **/*.rs.bk
 *.node
+/packages/embedded/native/
 
 # Editor directories and files
 .vscode/*

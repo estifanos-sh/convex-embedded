@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,7 +13,8 @@ const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "
 
 /** The public entry points from package.json#exports that ship a `.d.mts`. */
 const ENTRIES = typedExportEntries();
-const NODE_SAFE_IMPORTS = new Set(["devtools", "devtools/vite"]);
+const NODE_SAFE_IMPORTS = new Set(["devtools", "devtools/vite", "metro"]);
+const require = createRequire(import.meta.url);
 
 interface ExportEntry {
   dts: string;
@@ -24,13 +26,28 @@ function typedExportEntries(): ExportEntry[] {
   return Object.entries(packageJson.exports).flatMap(([key, value]) => {
     if (typeof value !== "object" || value === null) return [];
     const record = value as Record<string, unknown>;
-    if (typeof record.types !== "string") return [];
-    if (!record.types.startsWith("./dist/") || !record.types.endsWith(".d.mts")) return [];
+    const types = declarationPath(record);
+    if (types === undefined) return [];
     const name = key === "." ? "." : key.replace(/^\.\//, "");
     if (name.startsWith("internal/")) return [];
     const specifier = key === "." ? packageJson.name : `${packageJson.name}${key.slice(1)}`;
-    return [{ dts: record.types.replace(/^\.\//, ""), name, specifier }];
+    return [{ dts: types.replace(/^\.\//, ""), name, specifier }];
   });
+}
+
+function declarationPath(record: Record<string, unknown>): string | undefined {
+  if (typeof record.types === "string") return declarationFile(record.types);
+  for (const condition of ["import", "require", "default"]) {
+    const value = record[condition];
+    if (typeof value !== "object" || value === null) continue;
+    const types = (value as Record<string, unknown>).types;
+    if (typeof types === "string") return declarationFile(types);
+  }
+  return undefined;
+}
+
+function declarationFile(value: string): string | undefined {
+  return value.startsWith("./dist/") && /\.d\.[cm]ts$/.test(value) ? value : undefined;
 }
 
 function distDeclarationFiles(dir = join(packageRoot, "dist")): string[] {
@@ -69,11 +86,16 @@ describe("public package surface", () => {
     });
   }
 
-  test("devtools package entries are safe to import in Node", async () => {
+  test("Node-safe package entries are safe to import", async () => {
     for (const entry of ENTRIES) {
       if (!NODE_SAFE_IMPORTS.has(entry.name)) continue;
       await import(entry.specifier);
     }
+  });
+
+  test("the Metro package entry is safe to require from CommonJS", () => {
+    const metro = require("@convex-dev/embedded/metro") as Record<string, unknown>;
+    expect(typeof metro.withConvexEmbedded).toBe("function");
   });
 
   test("no test-only factory leaks into the public surface", () => {

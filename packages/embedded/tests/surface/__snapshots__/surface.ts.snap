@@ -78,6 +78,39 @@ exports[`public package surface > devtools/vite entry exports only its intended 
 ]
 `;
 
+exports[`public package surface > expo entry exports only its intended surface 1`] = `
+[
+  "AuthTokenFetcher",
+  "ConvexEmbeddedClient",
+  "ConvexEmbeddedClientOptions",
+  "ConvexEmbeddedMutationOptions",
+  "ConvexEmbeddedSchema",
+  "EmbeddedConnectionState",
+  "EmbeddedDataDelete",
+  "EmbeddedDataEvent",
+  "EmbeddedDataWrite",
+  "EmbeddedEvent",
+  "EmbeddedEventListener",
+  "EmbeddedOperationEvent",
+  "EmbeddedOperationKind",
+  "EmbeddedOperationPhase",
+  "EmbeddedRemoteEvent",
+  "EmbeddedRemoteStatus",
+  "EmbeddedSchedulerEvent",
+  "EmbeddedSpanEvent",
+  "EmbeddedSpanPhase",
+  "EmbeddedStorageEvent",
+  "Watch",
+]
+`;
+
+exports[`public package surface > metro entry exports only its intended surface 1`] = `
+[
+  "ConvexEmbeddedMetroOptions",
+  "withConvexEmbedded",
+]
+`;
+
 exports[`public package surface > node entry exports only its intended surface 1`] = `
 [
   "AuthTokenFetcher",

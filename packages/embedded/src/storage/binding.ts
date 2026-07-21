@@ -504,6 +504,10 @@ type ReadCacheKind = "count" | "doc" | "key" | "page";
  *
  * @internal
  */
+function hasMethod(value: object, key: PropertyKey): boolean {
+  return typeof Reflect.get(value, key) === "function";
+}
+
 export class StoreAdapter implements StorageBackend {
   private readonly inner: StoreBinding;
   private readonly readCache = new ReadCache();
@@ -829,6 +833,23 @@ export class StoreAdapter implements StorageBackend {
     options?: CommitOptions,
   ): Promise<CommitResult> {
     const docWrite = commit.docWrite;
+    const hasFastPath =
+      options?.changes === "omit"
+        ? hasMethod(this.inner, "commitOneDocWriteEncodedDeferred") ||
+          hasMethod(this.inner, "commitOneDocWriteEncoded")
+        : hasMethod(this.inner, "commitOneDocWrite");
+    if (!hasFastPath) {
+      const row = { table: docWrite.table, id: docWrite.id };
+      return await this.commit(
+        {
+          docWrites: [docWrite],
+          deletes: [],
+          freshIds: commit.fresh ? [row] : [],
+          dataOnlyIds: commit.dataOnly ? [row] : [],
+        },
+        options,
+      );
+    }
     const data = encodeDocData(docWrite.data);
     const mutation = bindingCommitMutation(options);
     if (options?.changes === "omit") {
@@ -864,9 +885,7 @@ export class StoreAdapter implements StorageBackend {
             commit.dataOnly,
             mutation.mutationIsFresh,
           );
-      if (commitSeq === undefined) {
-        throw new Error("storage artifact is missing commitOneDocWriteEncoded");
-      }
+      if (commitSeq === undefined) throw new Error("storage fast path returned no commit sequence");
       const resultCommit = {
         changedTables: [docWrite.table],
         changes: [],
@@ -875,9 +894,7 @@ export class StoreAdapter implements StorageBackend {
       this.applyOneDocWriteCommitCaches(resultCommit, commit);
       return resultCommit;
     }
-    if (!this.inner.commitOneDocWrite) {
-      throw new Error("storage artifact is missing commitOneDocWrite");
-    }
+    if (!this.inner.commitOneDocWrite) throw new Error("storage fast path is unavailable");
     const cols = toBindingColValues(docWrite.cols);
     const result = await this.inner.commitOneDocWrite(
       docWrite.table,

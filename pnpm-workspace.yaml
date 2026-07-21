@@ -22,6 +22,9 @@ catalog:
   "@emnapi/runtime": 1.11.0
   "@napi-rs/wasm-runtime": ^1.1.4
   binaryen: ^130.0.0
+  expo: ~54.0.34
+  expo-crypto: ^15.0.7
+  react-native: 0.81.5
   tailwindcss: ^4.3.0
   "@tailwindcss/vite": ^4.3.0
   "@fontsource-variable/inter": ^5.2.8

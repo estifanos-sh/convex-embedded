@@ -35,6 +35,7 @@ const main = defineConfig({
     "component/schema": "src/component/schema.ts",
     "devtools/index": "src/devtools/index.ts",
     "devtools/vite": "src/devtools/vite.ts",
+    "expo/index": "src/expo/index.ts",
     "internal/client": "src/client.ts",
     "internal/storage": "src/storage/binding.ts",
     node: "src/node/index.ts",
@@ -64,6 +65,9 @@ const main = defineConfig({
     "dist/devtools/*.mjs",
     "dist/devtools/*.d.mts",
     "dist/devtools/*.map",
+    "dist/expo/*.mjs",
+    "dist/expo/*.d.mts",
+    "dist/expo/*.map",
     "dist/internal/*.mjs",
     "dist/internal/*.d.mts",
     "dist/internal/*.map",
@@ -132,6 +136,8 @@ const main = defineConfig({
     neverBundle: [
       "virtual:convex-embedded",
       "virtual:convex-embedded/identity",
+      "expo",
+      "expo-crypto",
       "@tanstack/devtools",
       "@tanstack/devtools-vite",
       "solid-js",
@@ -139,6 +145,15 @@ const main = defineConfig({
       "solid-js/store",
     ],
   },
+});
+
+const metro = defineConfig({
+  clean: false,
+  dts: true,
+  entry: { metro: "src/metro.ts" },
+  format: ["esm", "cjs"],
+  target: "node20.19",
+  deps: { neverBundle: ["unplugin"] },
 });
 
 const thread = defineConfig({
@@ -153,4 +168,4 @@ const thread = defineConfig({
   outDir: "dist/thread",
 });
 
-export default defineConfig([main, thread]);
+export default defineConfig([main, metro, thread]);

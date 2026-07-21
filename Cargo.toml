@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/storage", "crates/remote", "crates/node"]
+members = ["crates/storage", "crates/remote", "crates/node", "crates/mobile"]
 exclude = ["vendor/convex"]
 
 [workspace.package]
