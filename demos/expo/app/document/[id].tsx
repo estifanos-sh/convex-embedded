@@ -15,6 +15,7 @@ import {
 
 import DocumentEditor from "@/src/editor";
 import { client } from "@/src/client";
+import { documentPreview } from "@/src/preview";
 import { colors } from "@/src/theme";
 import type { DocumentWrite, EditorDocument } from "@/src/types";
 
@@ -67,7 +68,6 @@ export function DocumentScreen({
     const generation = readGenerationRef.current + 1;
     readGenerationRef.current = generation;
     activeEditorTokenRef.current = "";
-    setEditorToken("");
     setEditorPainted(false);
     setPlaceholderVisible(true);
     placeholderOpacity.setValue(1);
@@ -81,7 +81,6 @@ export function DocumentScreen({
 
     setLoading(true);
     setError(null);
-    setDocument(null);
     void documentRead(id)
       .then((value) => {
         if (readGenerationRef.current !== generation) return;
@@ -149,6 +148,13 @@ export function DocumentScreen({
   const editorFailed = useCallback((token: string, message: string) => {
     if (activeEditorTokenRef.current === token) setWebViewCrash(message);
   }, []);
+  const currentEditorFailed = useCallback(
+    (message: string) => {
+      const token = activeEditorTokenRef.current;
+      if (token) editorFailed(token, message);
+    },
+    [editorFailed],
+  );
   const editorReady = useCallback(async (token: string) => {
     if (activeEditorTokenRef.current === token) setEditorPainted(true);
   }, []);
@@ -171,23 +177,18 @@ export function DocumentScreen({
       contentInsetAdjustmentBehavior: "never",
       nestedScrollEnabled: false,
       onContentProcessDidTerminate: () => {
-        editorFailed(
-          editorToken,
+        currentEditorFailed(
           "The editor process stopped. Recent local drafts are recovered when possible.",
         );
       },
       onError: (event) => {
-        editorFailed(editorToken, `The editor could not load: ${event.nativeEvent.description}`);
+        currentEditorFailed(`The editor could not load: ${event.nativeEvent.description}`);
       },
       onHttpError: (event) => {
-        editorFailed(
-          editorToken,
-          `The editor request failed with HTTP ${event.nativeEvent.statusCode}.`,
-        );
+        currentEditorFailed(`The editor request failed with HTTP ${event.nativeEvent.statusCode}.`);
       },
       onRenderProcessGone: () => {
-        editorFailed(
-          editorToken,
+        currentEditorFailed(
           "The editor process stopped. Recent local drafts are recovered when possible.",
         );
       },
@@ -195,10 +196,16 @@ export function DocumentScreen({
       scrollEnabled: true,
       style: styles.webView,
     }),
-    [editorFailed, editorToken],
+    [currentEditorFailed],
   );
 
-  const visibleError = webViewCrash ?? error;
+  const switchingDocument = document !== null && document.id !== id;
+  const showPlaceholder = placeholderVisible || switchingDocument;
+  const visibleError = switchingDocument ? null : (webViewCrash ?? error);
+  const preview = useMemo(
+    () => (document && !switchingDocument ? documentPreview(document.body) : ""),
+    [document, switchingDocument],
+  );
   return (
     <View style={styles.page}>
       {visibleError ? (
@@ -224,15 +231,14 @@ export function DocumentScreen({
         </View>
       ) : (
         <View style={styles.editorStage}>
-          {!loading && document ? (
+          {document ? (
             <View
-              accessibilityElementsHidden={placeholderVisible}
-              importantForAccessibility={placeholderVisible ? "no-hide-descendants" : "auto"}
+              accessibilityElementsHidden={showPlaceholder}
+              importantForAccessibility={showPlaceholder ? "no-hide-descendants" : "auto"}
               style={styles.editorFrame}
             >
               <DocumentEditor
-                active={active && applicationActive}
-                key={editorToken}
+                active={active && applicationActive && !loading && !switchingDocument}
                 document={document}
                 documentWrite={documentWrite}
                 dom={dom}
@@ -241,7 +247,7 @@ export function DocumentScreen({
               />
             </View>
           ) : null}
-          {placeholderVisible ? (
+          {showPlaceholder ? (
             <Animated.View
               accessibilityLabel="Opening the local document"
               accessibilityRole="progressbar"
@@ -250,22 +256,30 @@ export function DocumentScreen({
               pointerEvents="box-only"
               style={[styles.placeholder, { opacity: placeholderOpacity }]}
             >
-              <View style={styles.placeholderStatus}>
+              <View style={styles.placeholderHeader}>
+                {document && !switchingDocument ? (
+                  <Text numberOfLines={1} style={styles.placeholderTitle}>
+                    {document.title || "Untitled"}
+                  </Text>
+                ) : (
+                  <View style={styles.placeholderTitleBar} />
+                )}
                 <View style={styles.placeholderSave}>
                   <View style={styles.placeholderDot} />
                   <Text style={styles.placeholderSaveLabel}>Opening</Text>
                 </View>
               </View>
-              {document ? (
-                <Text numberOfLines={2} style={styles.placeholderTitle}>
-                  {document.title || "Untitled"}
-                </Text>
-              ) : (
-                <View style={styles.placeholderTitleBar} />
-              )}
               <View style={styles.placeholderBody}>
-                <View style={styles.placeholderLine} />
-                <View style={[styles.placeholderLine, styles.placeholderLineShort]} />
+                {preview ? (
+                  <Text numberOfLines={8} style={styles.placeholderCopy}>
+                    {preview}
+                  </Text>
+                ) : (
+                  <>
+                    <View style={styles.placeholderLine} />
+                    <View style={[styles.placeholderLine, styles.placeholderLineShort]} />
+                  </>
+                )}
               </View>
             </Animated.View>
           ) : null}
@@ -299,14 +313,14 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFillObject,
     backgroundColor: colors.background.secondary,
     paddingHorizontal: 20,
-    paddingTop: 22,
+    paddingTop: 14,
   },
-  placeholderStatus: {
-    minHeight: 30,
-    marginBottom: 18,
+  placeholderHeader: {
+    minHeight: 40,
+    marginBottom: 8,
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "flex-end",
+    gap: 14,
   },
   placeholderSave: {
     minHeight: 30,
@@ -329,23 +343,27 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   placeholderTitle: {
+    flex: 1,
     color: colors.content.primary,
-    fontSize: 34,
+    fontSize: 30,
     fontWeight: "600",
     letterSpacing: -1,
-    lineHeight: 39,
-    paddingBottom: 16,
+    lineHeight: 36,
   },
   placeholderTitleBar: {
-    width: "44%",
-    height: 34,
-    marginBottom: 21,
+    flex: 1,
+    height: 30,
     backgroundColor: colors.background.tertiary,
     borderRadius: 6,
   },
   placeholderBody: {
     gap: 12,
-    paddingTop: 30,
+    paddingTop: 14,
+  },
+  placeholderCopy: {
+    color: colors.content.primary,
+    fontSize: 17,
+    lineHeight: 29,
   },
   placeholderLine: {
     width: "82%",

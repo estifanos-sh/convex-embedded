@@ -15,9 +15,20 @@ import {
   textSplice,
   titleFromBlocks,
 } from "../src/text";
+import { documentPreview } from "../src/preview";
 import type { EditorDraft } from "../src/types";
 
 void describe("editor text", () => {
+  void it("builds an immediate native preview without repeating the title", () => {
+    const body = JSON.stringify([
+      { type: "heading", content: "Title" },
+      { type: "paragraph", content: [{ type: "text", text: "First line" }] },
+      { type: "paragraph", content: "Second line" },
+    ]);
+    assert.equal(documentPreview(body), "First line\nSecond line");
+    assert.equal(documentPreview("not json"), "");
+  });
+
   void it("creates Unicode-safe UTF-16 splices", () => {
     const samples = ["", "plain text", "🙂 alpha", "e\u0301", "雪の文書", "👨‍👩‍👧‍👦 family"];
     for (const before of samples) {

@@ -35,17 +35,28 @@ input {
   padding-bottom: max(48px, env(safe-area-inset-bottom));
 }
 
+.documentHeader {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  margin-bottom: 4px;
+}
+
+.documentTitle {
+  min-width: 0;
+}
+
 .documentStatus {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 12px;
-  margin-bottom: 18px;
+  min-height: 36px;
+  padding-top: 2px;
 }
 
 .saveState {
   display: inline-flex;
-  min-height: 30px;
+  min-height: 28px;
   flex: 0 0 auto;
   align-items: center;
   gap: 7px;
@@ -53,7 +64,7 @@ input {
   border-radius: 999px;
   background: #3c3a37;
   color: #b9b1aa;
-  padding: 6px 10px;
+  padding: 5px 9px;
   font-size: 11px;
   font-weight: 650;
 }
@@ -91,7 +102,7 @@ input {
 .documentSheet {
   width: min(100%, 760px);
   margin: 0 auto;
-  padding: 22px 20px 80px;
+  padding: 14px 20px 80px;
 }
 
 .titleLabel {
@@ -113,8 +124,8 @@ input {
   outline: 0;
   background: transparent;
   color: #ffffff;
-  padding: 0 0 16px;
-  font-size: clamp(30px, 8vw, 38px);
+  padding: 0 0 10px;
+  font-size: clamp(28px, 7.5vw, 34px);
   font-weight: 650;
   letter-spacing: -0.035em;
   line-height: 1.08;
@@ -157,7 +168,7 @@ input {
 }
 
 .editorCanvas {
-  margin: 12px -20px 0;
+  margin: -8px -20px 0;
 }
 
 .editorCanvas .bn-container {
@@ -179,11 +190,22 @@ input {
 .editorCanvas .bn-editor {
   min-height: 62dvh;
   background: transparent !important;
-  padding: 18px 20px 80px;
+  padding: 0 20px 80px;
 }
 
 .editorCanvas .bn-editor > .bn-block-group > .bn-block-outer:first-child {
   display: none;
+}
+
+.editorCanvas
+  .bn-editor
+  > .bn-block-group
+  > .bn-block-outer:first-child
+  + .bn-block-outer
+  > .bn-block
+  > .bn-block-content {
+  font-size: 1em !important;
+  font-weight: 400 !important;
 }
 
 .editorCanvas .bn-block-content {

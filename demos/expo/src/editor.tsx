@@ -31,7 +31,11 @@ type DocumentEditorProps = EditorProps & {
   dom?: import("expo/dom").DOMProps;
 };
 
-export default function DocumentEditor({
+export default function DocumentEditor(props: DocumentEditorProps) {
+  return <DocumentSession {...props} key={props.editorToken} />;
+}
+
+function DocumentSession({
   active,
   document,
   documentWrite,
@@ -282,43 +286,51 @@ export default function DocumentEditor({
   return (
     <main className="editorPage">
       <article className="documentSheet">
-        <div className="documentStatus">
-          {saveState === "error" ? (
-            <button
-              className={`saveState saveState--${saveState}`}
-              type="button"
-              onClick={() => flushRef.current()}
-            >
-              <span aria-hidden="true" />
-              {saveLabel(saveState)}
-            </button>
-          ) : (
-            <span aria-live="polite" className={`saveState saveState--${saveState}`} role="status">
-              <span aria-hidden="true" />
-              {saveLabel(saveState)}
-            </span>
-          )}
-        </div>
-        <label className="titleLabel" htmlFor="document-title">
-          Document title
-        </label>
-        <input
-          id="document-title"
-          className="titleInput"
-          enterKeyHint="next"
-          maxLength={90}
-          placeholder="Untitled"
-          value={title}
-          onBlur={settleTitle}
-          onChange={(event) => writeTitle(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter") return;
-            event.preventDefault();
-            const bodyBlock = editor.document.at(1);
-            if (bodyBlock) editor.setTextCursorPosition(bodyBlock, "start");
-            editor.focus();
-          }}
-        />
+        <header className="documentHeader">
+          <div className="documentTitle">
+            <label className="titleLabel" htmlFor="document-title">
+              Document title
+            </label>
+            <input
+              id="document-title"
+              className="titleInput"
+              enterKeyHint="next"
+              maxLength={90}
+              placeholder="Untitled"
+              value={title}
+              onBlur={settleTitle}
+              onChange={(event) => writeTitle(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter") return;
+                event.preventDefault();
+                const bodyBlock = editor.document.at(1);
+                if (bodyBlock) editor.setTextCursorPosition(bodyBlock, "start");
+                editor.focus();
+              }}
+            />
+          </div>
+          <div className="documentStatus">
+            {saveState === "error" ? (
+              <button
+                className={`saveState saveState--${saveState}`}
+                type="button"
+                onClick={() => flushRef.current()}
+              >
+                <span aria-hidden="true" />
+                {saveLabel(saveState)}
+              </button>
+            ) : (
+              <span
+                aria-live="polite"
+                className={`saveState saveState--${saveState}`}
+                role="status"
+              >
+                <span aria-hidden="true" />
+                {saveLabel(saveState)}
+              </span>
+            )}
+          </div>
+        </header>
 
         {saveError ? (
           <button className="recoveryNotice" type="button" onClick={() => flushRef.current()}>
