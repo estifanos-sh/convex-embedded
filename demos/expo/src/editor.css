@@ -27,8 +27,7 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
-button,
-input {
+button {
   font: inherit;
 }
 
@@ -41,145 +40,12 @@ input {
   padding-bottom: max(48px, env(safe-area-inset-bottom));
 }
 
-.documentHeader {
-  position: sticky;
-  z-index: 20;
-  top: 0;
-  display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) auto;
-  min-height: 56px;
-  align-items: center;
-  gap: 10px;
-  border-bottom: 1px solid rgb(163 156 148 / 22%);
-  background: #2a2825;
-  padding: 8px 12px;
-}
-
-.backButton {
-  display: grid;
-  width: 40px;
-  height: 40px;
-  place-items: center;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  color: #ffffff;
-  padding: 0;
-  touch-action: manipulation;
-}
-
-.backButton:active {
-  background: #3c3a37;
-}
-
-.backButton span {
-  margin-top: -2px;
-  font-size: 34px;
-  font-weight: 300;
-  line-height: 40px;
-}
-
-.documentTitle {
-  min-width: 0;
-}
-
-.documentStatus {
-  display: flex;
-  align-items: center;
-  min-height: 40px;
-}
-
-.saveState {
-  display: inline-flex;
-  min-height: 26px;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 7px;
-  border: 0;
-  border-radius: 999px;
-  background: #3c3a37;
-  color: #b9b1aa;
-  padding: 4px 8px;
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.saveState--saved {
-  background: transparent;
-  color: #97908a;
-  padding-inline: 4px;
-}
-
-.saveState > span {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #97908a;
-}
-
-.saveState--saved > span {
-  background: #b4ec92;
-}
-
-.saveState--dirty > span,
-.saveState--recovered > span {
-  background: #e6e2a8;
-}
-
-.saveState--saving > span {
-  background: #63a8f8;
-  animation: savePulse 900ms ease-in-out infinite alternate;
-}
-
-.saveState--error {
-  border-color: rgb(238 52 47 / 48%);
-  color: #ffcac1;
-}
-
-.saveState--error > span {
-  background: #ee342f;
-}
-
 .documentSheet {
   width: min(100%, 760px);
   max-width: 100%;
   margin: 0 auto;
   overflow-x: clip;
   padding: 0 0 80px;
-}
-
-.titleLabel {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
-.titleInput {
-  display: block;
-  width: 100%;
-  border: 0;
-  border-bottom: 1px solid transparent;
-  border-radius: 0;
-  outline: 0;
-  background: transparent;
-  color: #ffffff;
-  padding: 8px 0;
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.012em;
-  line-height: 24px;
-}
-
-.titleInput:focus {
-  border-bottom-color: rgb(225 215 205 / 70%);
-}
-
-.titleInput::placeholder {
-  color: #6d6863;
 }
 
 .recoveryNotice {
@@ -402,19 +268,4 @@ input {
   background: #2a2825;
   padding: 6px;
   box-shadow: 0 12px 36px rgb(0 0 0 / 38%);
-}
-
-@keyframes savePulse {
-  from {
-    opacity: 0.4;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .saveState--saving > span {
-    animation: none;
-  }
 }

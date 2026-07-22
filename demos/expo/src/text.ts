@@ -16,6 +16,18 @@ export type RecoveryDecision = {
   remove: boolean;
 };
 
+export type TitleRecoveryRecord = {
+  baseTitle: string;
+  title: string;
+  version: 1;
+};
+
+export type TitleRecoveryDecision = {
+  recovered: boolean;
+  remove: boolean;
+  title: string;
+};
+
 export const emptyBlocks: PartialBlock[] = [
   {
     type: "heading",
@@ -144,6 +156,26 @@ export function recoveryDecision(native: EditorDraft, candidate: unknown): Recov
   return { draft: native, recovered: false, remove: true };
 }
 
+export function titleRecoveryRecord(baseTitle: string, title: string): TitleRecoveryRecord {
+  return { baseTitle, title, version: 1 };
+}
+
+export function titleRecoveryDecision(
+  nativeTitle: string,
+  candidate: unknown,
+): TitleRecoveryDecision {
+  if (!isTitleRecoveryRecord(candidate)) {
+    return { recovered: false, remove: true, title: nativeTitle };
+  }
+  if (candidate.title === nativeTitle) {
+    return { recovered: false, remove: true, title: nativeTitle };
+  }
+  if (candidate.baseTitle === nativeTitle) {
+    return { recovered: true, remove: false, title: candidate.title };
+  }
+  return { recovered: false, remove: true, title: nativeTitle };
+}
+
 export function sameDraft(left: EditorDraft, right: EditorDraft): boolean {
   return left.body === right.body && left.title === right.title;
 }
@@ -179,5 +211,13 @@ function isRecoveryRecord(value: unknown): value is RecoveryRecord {
     typeof record.draft === "object" &&
     typeof record.draft.body === "string" &&
     typeof record.draft.title === "string"
+  );
+}
+
+function isTitleRecoveryRecord(value: unknown): value is TitleRecoveryRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<TitleRecoveryRecord>;
+  return (
+    record.version === 1 && typeof record.baseTitle === "string" && typeof record.title === "string"
   );
 }

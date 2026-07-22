@@ -16,16 +16,21 @@ import {
   recoveryEncode,
   recoveryRecord,
   sameDraft,
-  titleFromBlocks,
+  titleRecoveryDecision,
+  titleRecoveryRecord,
 } from "./text";
-import type { EditorDocument, EditorDraft, EditorProps } from "./types";
+import type {
+  EditorDocument,
+  EditorDraft,
+  EditorProps,
+  EditorSaveState,
+  EditorStatusPayload,
+} from "./types";
 
 const writeDelayMs = 250;
 const writeMaxLatencyMs = 1_000;
 const editorDelayMs = 100;
 const editorMaxLatencyMs = 500;
-
-type SaveState = "dirty" | "error" | "recovered" | "saved" | "saving";
 
 type DocumentEditorProps = EditorProps & {
   dom?: import("expo/dom").DOMProps;
@@ -37,11 +42,16 @@ export default function DocumentEditor(props: DocumentEditorProps) {
 
 function InteractiveDocument({
   active,
-  closeEditor,
+  closeRequest,
   document,
   documentWrite,
   editorReady,
+  editorStatusChanged,
   editorToken,
+  focusBodyRequest,
+  retryRequest,
+  title,
+  titleRevision,
 }: DocumentEditorProps) {
   const [initial] = useState(() => {
     const recovered = readRecovery(document);
@@ -51,20 +61,34 @@ function InteractiveDocument({
   const [initialPersistedFingerprint] = useState(() =>
     draftFingerprint({ body: document.body, title: document.title }),
   );
+  const [initialTitleRevision] = useState(() =>
+    initial.draft.title === title ? titleRevision : titleRevision + 1,
+  );
   const editor = useCreateBlockNote({
     initialContent: documentBlocks(initial.draft.body, initial.draft.title),
   });
-  const [title, setTitle] = useState(initial.draft.title);
-  const [saveState, setSaveState] = useState<SaveState>(
+  const [saveState, setSaveState] = useState<EditorSaveState>(
     initial.recovered ? "recovered" : initial.normalized ? "dirty" : "saved",
   );
   const [saveError, setSaveError] = useState<string | null>(null);
   const [recoveryUnavailable, setRecoveryUnavailable] = useState(false);
+  const [nativeTitleReady, setNativeTitleReady] = useState(false);
   const desiredRef = useRef(initial.draft);
   const persistedRef = useRef<EditorDraft>({ body: document.body, title: document.title });
   const persistedFingerprintRef = useRef(initialPersistedFingerprint);
+  const titleRef = useRef(initial.draft.title);
   const actionRef = useRef(documentWrite);
   const editorReadyRef = useRef(editorReady);
+  const editorStatusChangedRef = useRef(editorStatusChanged);
+  const saveStateRef = useRef(saveState);
+  const saveErrorRef = useRef(saveError);
+  const recoveryUnavailableRef = useRef(recoveryUnavailable);
+  const appliedTitleRevisionRef = useRef(initialTitleRevision);
+  const previousCloseRequestRef = useRef(closeRequest);
+  const previousFocusBodyRequestRef = useRef(focusBodyRequest);
+  const previousRetryRequestRef = useRef(retryRequest);
+  const lastStatusRef = useRef("");
+  const statusTaskRef = useRef<Promise<void>>(Promise.resolve());
   const trailingTimerRef = useRef<number | undefined>(undefined);
   const maxTimerRef = useRef<number | undefined>(undefined);
   const editorCancelRef = useRef<(() => void) | undefined>(undefined);
@@ -77,21 +101,43 @@ function InteractiveDocument({
   const flushEditorRef = useRef<() => void>(() => undefined);
   actionRef.current = documentWrite;
   editorReadyRef.current = editorReady;
+  editorStatusChangedRef.current = editorStatusChanged;
+  saveStateRef.current = saveState;
+  saveErrorRef.current = saveError;
+  recoveryUnavailableRef.current = recoveryUnavailable;
 
   useEffect(() => {
+    let cancelled = false;
     let secondFrame = 0;
     const firstFrame = window.requestAnimationFrame(() => {
       secondFrame = window.requestAnimationFrame(() => {
-        void editorReadyRef.current(editorToken).catch((error: unknown) => {
-          console.error("The native editor-ready action failed.", error);
-        });
+        const status = statusPayload(
+          saveStateRef.current,
+          saveErrorRef.current,
+          recoveryUnavailableRef.current,
+          appliedTitleRevisionRef.current,
+        );
+        lastStatusRef.current = statusKey(status);
+        void editorReadyRef
+          .current({
+            ...status,
+            title: initial.draft.title,
+            token: editorToken,
+          })
+          .then(() => {
+            if (!cancelled) setNativeTitleReady(true);
+          })
+          .catch((error: unknown) => {
+            console.error("The native editor-ready action failed.", error);
+          });
       });
     });
     return () => {
+      cancelled = true;
       window.cancelAnimationFrame(firstFrame);
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
     };
-  }, [editorToken]);
+  }, [editorToken, initial.draft.title]);
 
   const clearTimers = useCallback(() => {
     if (trailingTimerRef.current !== undefined) window.clearTimeout(trailingTimerRef.current);
@@ -122,6 +168,7 @@ function InteractiveDocument({
 
   const flush = useCallback(() => {
     clearTimers();
+    flushEditorRef.current();
     if (inFlightRef.current) {
       flushAfterFlightRef.current = true;
       return;
@@ -155,6 +202,7 @@ function InteractiveDocument({
       .then(() => {
         persistedRef.current = desired;
         persistedFingerprintRef.current = draftFingerprint(desired);
+        flushEditorRef.current();
         if (sameDraft(desiredRef.current, desired)) {
           deleteRecovery(document.id);
           setRecoveryUnavailable(false);
@@ -191,11 +239,22 @@ function InteractiveDocument({
     [scheduleWrite],
   );
 
+  const queueNativeTitle = useCallback(
+    (nextTitle: string) => {
+      desiredRef.current = { ...desiredRef.current, title: nextTitle };
+      setSaveState("dirty");
+      setSaveError(null);
+      if (!writeTitleRecovery(document.id, persistedRef.current.title, nextTitle)) {
+        setRecoveryUnavailable(true);
+      }
+      scheduleWrite();
+    },
+    [document.id, scheduleWrite],
+  );
+
   const writeEditorDraft = useCallback(() => {
     const body = JSON.stringify(editor.document);
-    const nextTitle = titleFromBlocks(editor.document);
-    setTitle(nextTitle);
-    queueDraft({ body, title: nextTitle });
+    queueDraft({ body, title: titleRef.current });
   }, [editor, queueDraft]);
 
   const flushEditor = useCallback(() => {
@@ -235,11 +294,12 @@ function InteractiveDocument({
   }, []);
 
   useEffect(() => {
+    if (!nativeTitleReady) return;
     if (initial.recovered || initial.normalized) {
       flushRecoveryRef.current();
       scheduleWrite();
     }
-  }, [initial.normalized, initial.recovered, scheduleWrite]);
+  }, [initial.normalized, initial.recovered, nativeTitleReady, scheduleWrite]);
 
   useEffect(() => {
     const flushPending = (): void => {
@@ -270,77 +330,72 @@ function InteractiveDocument({
     flushRef.current();
   }, [active]);
 
-  const writeTitle = useCallback(
-    (value: string) => {
-      setTitle(value);
-      const titleBlock = editor.document.at(0);
-      if (titleBlock) editor.updateBlock(titleBlock, { content: value });
-    },
-    [editor],
-  );
+  useEffect(() => {
+    if (!nativeTitleReady) return;
+    if (titleRevision < appliedTitleRevisionRef.current) return;
+    if (titleRevision === appliedTitleRevisionRef.current && titleRef.current === title) return;
+    appliedTitleRevisionRef.current = titleRevision;
+    titleRef.current = title;
+    const titleBlock = editor.document.at(0);
+    if (titleBlock) {
+      editor.updateBlock(titleBlock, { content: title });
+      queueNativeTitle(title);
+    }
+  }, [editor, nativeTitleReady, queueNativeTitle, title, titleRevision]);
 
-  const settleTitle = useCallback(() => {
-    if (title.trim()) return;
-    writeTitle("Untitled");
-  }, [title, writeTitle]);
+  useEffect(() => {
+    if (!nativeTitleReady) return;
+    const status = statusPayload(
+      saveState,
+      saveError,
+      recoveryUnavailable,
+      appliedTitleRevisionRef.current,
+    );
+    const key = statusKey(status);
+    if (lastStatusRef.current === key) return;
+    lastStatusRef.current = key;
+    statusTaskRef.current = statusTaskRef.current
+      .then(() => editorStatusChangedRef.current(editorToken, status))
+      .catch((error: unknown) => {
+        console.error("The native editor-status action failed.", error);
+      });
+  }, [editorToken, nativeTitleReady, recoveryUnavailable, saveError, saveState]);
+
+  useEffect(() => {
+    if (!nativeTitleReady) return;
+    if (previousFocusBodyRequestRef.current === focusBodyRequest) return;
+    previousFocusBodyRequestRef.current = focusBodyRequest;
+    let bodyBlock = editor.document.at(1);
+    if (!bodyBlock) {
+      const titleBlock = editor.document.at(0);
+      if (titleBlock) {
+        editor.insertBlocks([{ type: "paragraph", content: "" }], titleBlock, "after");
+        bodyBlock = editor.document.at(1);
+      }
+    }
+    if (bodyBlock) editor.setTextCursorPosition(bodyBlock, "start");
+    editor.focus();
+  }, [editor, focusBodyRequest, nativeTitleReady]);
+
+  useEffect(() => {
+    if (previousRetryRequestRef.current === retryRequest) return;
+    previousRetryRequestRef.current = retryRequest;
+    flushEditorRef.current();
+    flushRecoveryRef.current();
+    flushRef.current();
+  }, [retryRequest]);
+
+  useEffect(() => {
+    if (previousCloseRequestRef.current === closeRequest) return;
+    previousCloseRequestRef.current = closeRequest;
+    flushEditorRef.current();
+    flushRecoveryRef.current();
+    flushRef.current();
+  }, [closeRequest]);
 
   return (
     <main className="editorPage">
       <article className="documentSheet">
-        <header className="documentHeader">
-          <button
-            aria-label="Back to documents"
-            className="backButton"
-            type="button"
-            onClick={() => void closeEditor()}
-          >
-            <span aria-hidden="true">‹</span>
-          </button>
-          <div className="documentTitle">
-            <label className="titleLabel" htmlFor="document-title">
-              Document title
-            </label>
-            <input
-              id="document-title"
-              className="titleInput"
-              enterKeyHint="next"
-              maxLength={90}
-              placeholder="Untitled"
-              value={title}
-              onBlur={settleTitle}
-              onChange={(event) => writeTitle(event.currentTarget.value)}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter") return;
-                event.preventDefault();
-                const bodyBlock = editor.document.at(1);
-                if (bodyBlock) editor.setTextCursorPosition(bodyBlock, "start");
-                editor.focus();
-              }}
-            />
-          </div>
-          <div className="documentStatus">
-            {saveState === "error" ? (
-              <button
-                className={`saveState saveState--${saveState}`}
-                type="button"
-                onClick={() => flushRef.current()}
-              >
-                <span aria-hidden="true" />
-                {saveLabel(saveState)}
-              </button>
-            ) : (
-              <span
-                aria-live="polite"
-                className={`saveState saveState--${saveState}`}
-                role="status"
-              >
-                <span aria-hidden="true" />
-                {saveLabel(saveState)}
-              </span>
-            )}
-          </div>
-        </header>
-
         {saveError ? (
           <button className="recoveryNotice" type="button" onClick={() => flushRef.current()}>
             <strong>
@@ -380,10 +435,19 @@ function readRecovery(document: EditorDocument): { draft: EditorDraft; recovered
   const native = { body: document.body, title: document.title };
   try {
     const encoded = globalThis.localStorage.getItem(recoveryKey(document.id));
-    if (!encoded) return { draft: native, recovered: false };
-    const decision = recoveryDecision(native, recoveryDecode(encoded) ?? JSON.parse(encoded));
-    if (decision.remove) deleteRecovery(document.id);
-    return { draft: decision.draft, recovered: decision.recovered };
+    const decision = encoded
+      ? recoveryDecision(native, recoveryDecode(encoded) ?? JSON.parse(encoded))
+      : { draft: native, recovered: false, remove: false };
+    if (decision.remove) deleteBodyRecovery(document.id);
+    const titleDecision = titleRecoveryDecision(native.title, readTitleRecovery(document.id));
+    if (titleDecision.remove) deleteTitleRecovery(document.id);
+    if (!titleDecision.recovered) {
+      return { draft: decision.draft, recovered: decision.recovered };
+    }
+    return {
+      draft: { ...decision.draft, title: titleDecision.title },
+      recovered: true,
+    };
   } catch {
     deleteRecovery(document.id);
   }
@@ -402,8 +466,44 @@ function writeRecovery(id: string, base: string, draft: EditorDraft): boolean {
 }
 
 function deleteRecovery(id: string): void {
+  deleteBodyRecovery(id);
+  deleteTitleRecovery(id);
+}
+
+function deleteBodyRecovery(id: string): void {
   try {
     globalThis.localStorage.removeItem(recoveryKey(id));
+  } catch {
+    // Recovery is best effort and must never interrupt editing.
+  }
+}
+
+function writeTitleRecovery(id: string, baseTitle: string, title: string): boolean {
+  try {
+    globalThis.localStorage.setItem(
+      titleRecoveryKey(id),
+      JSON.stringify(titleRecoveryRecord(baseTitle, title)),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readTitleRecovery(id: string): unknown {
+  try {
+    const encoded = globalThis.localStorage.getItem(titleRecoveryKey(id));
+    if (!encoded) return undefined;
+    return JSON.parse(encoded) as unknown;
+  } catch {
+    deleteTitleRecovery(id);
+    return undefined;
+  }
+}
+
+function deleteTitleRecovery(id: string): void {
+  try {
+    globalThis.localStorage.removeItem(titleRecoveryKey(id));
   } catch {
     // Recovery is best effort and must never interrupt editing.
   }
@@ -413,12 +513,21 @@ function recoveryKey(id: string): string {
   return `convex-embedded:draft:${id}`;
 }
 
-function saveLabel(state: SaveState): string {
-  if (state === "dirty") return "Unsaved";
-  if (state === "error") return "Retry save";
-  if (state === "recovered") return "Recovered";
-  if (state === "saving") return "Saving";
-  return "Saved";
+function titleRecoveryKey(id: string): string {
+  return `convex-embedded:title:${id}`;
+}
+
+function statusPayload(
+  state: EditorSaveState,
+  error: string | null,
+  recoveryUnavailable: boolean,
+  titleRevision: number,
+): EditorStatusPayload {
+  return { error, recoveryUnavailable, state, titleRevision };
+}
+
+function statusKey(status: EditorStatusPayload): string {
+  return `${status.state}\u0000${status.error ?? ""}\u0000${status.recoveryUnavailable ? "1" : "0"}\u0000${status.titleRevision}`;
 }
 
 function errorMessage(error: unknown): string {

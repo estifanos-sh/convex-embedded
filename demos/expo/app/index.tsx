@@ -20,7 +20,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { client } from "@/src/client";
 import { useEmbeddedQuery } from "@/src/query";
 import { colors, fontSize, radius, spacing } from "@/src/theme";
-import { DocumentScreen } from "./document/[id]";
+import { DocumentScreen, type DocumentScreenHandle } from "./document/[id]";
 
 type DocumentSummary = FunctionReturnType<typeof api.documents.summaries>[number];
 
@@ -45,6 +45,7 @@ export default function DocumentsScreen() {
   const readyDocumentIdRef = React.useRef<string | null>(null);
   const requestedDocumentIdRef = React.useRef<string | null>(linkedDocumentId ?? null);
   const previousLinkedDocumentIdRef = React.useRef<string | undefined>(linkedDocumentId);
+  const documentScreenRef = React.useRef<DocumentScreenHandle>(null);
 
   const openDocument = React.useCallback((id: string) => {
     const alreadyReady = selectedDocumentIdRef.current === id && readyDocumentIdRef.current === id;
@@ -76,6 +77,14 @@ export default function DocumentsScreen() {
     setEditorVisible(false);
     if (linkedDocumentId !== undefined) router.setParams({ document: undefined });
   }, [linkedDocumentId]);
+  const requestCloseDocument = React.useCallback(() => {
+    const editor = documentScreenRef.current;
+    if (editor) {
+      editor.requestClose();
+      return;
+    }
+    closeDocument();
+  }, [closeDocument]);
 
   React.useEffect(() => {
     const previous = previousLinkedDocumentIdRef.current;
@@ -109,11 +118,11 @@ export default function DocumentsScreen() {
   React.useEffect(() => {
     if (!editorVisible) return;
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      closeDocument();
+      requestCloseDocument();
       return true;
     });
     return () => subscription.remove();
-  }, [closeDocument, editorVisible]);
+  }, [editorVisible, requestCloseDocument]);
 
   const documents: DocumentSummary[] = query.status === "ready" ? query.value : [];
 
@@ -140,7 +149,7 @@ export default function DocumentsScreen() {
               accessibilityElementsHidden={!editorVisible}
               importantForAccessibility={editorVisible ? "auto" : "no-hide-descendants"}
               onAccessibilityEscape={() => {
-                closeDocument();
+                requestCloseDocument();
               }}
               pointerEvents={editorVisible ? "auto" : "none"}
               style={styles.editorLayer}
@@ -150,6 +159,7 @@ export default function DocumentsScreen() {
                 documentId={selectedDocumentId}
                 onClose={closeDocument}
                 onReady={showReadyDocument}
+                ref={documentScreenRef}
               />
             </View>
           ) : null}

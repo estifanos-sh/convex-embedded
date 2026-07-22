@@ -13,6 +13,8 @@ import {
   recoveryEncode,
   recoveryRecord,
   textSplice,
+  titleRecoveryDecision,
+  titleRecoveryRecord,
   titleFromBlocks,
 } from "../src/text";
 import { documentPreview } from "../src/preview";
@@ -72,6 +74,24 @@ void describe("editor text", () => {
       title: "Stored title",
     });
     assert.equal(titleFromBlocks(parseBlocks(normalized.body)), "Stored title");
+  });
+
+  void it("mirrors a native title into block zero without changing document content", () => {
+    const body = [
+      { type: "heading", props: { level: 1 }, content: "Before" },
+      { type: "heading", props: { level: 2 }, content: "Section" },
+      { type: "paragraph", content: "Body text" },
+    ];
+    const next = normalizeDocumentDraft({ body: JSON.stringify(body), title: "After 🙂" });
+    const blocks = parseBlocks(next.body);
+
+    assert.equal(titleFromBlocks(blocks), "After 🙂");
+    assert.deepEqual(blocks.slice(1), body.slice(1));
+
+    const write = documentWrite("id", { body: JSON.stringify(body), title: "Before" }, next);
+    assert.ok(write);
+    assert.equal(write.title, "After 🙂");
+    assert.equal(write.splices.length, 1);
   });
 });
 
@@ -133,6 +153,29 @@ void describe("editor recovery", () => {
     const encoded = recoveryEncode(record);
     assert.ok(encoded.endsWith(`\n${draft.body}`));
     assert.deepEqual(recoveryDecode(encoded), record);
+  });
+
+  void it("recovers titles independently from body progress", () => {
+    const titleRecord = titleRecoveryRecord("Before", "After");
+    const advancedBody = { body: "new native body", title: "Before" };
+    const staleBodyRecovery = recoveryRecord(draftFingerprint(base), draft);
+
+    assert.equal(recoveryDecision(advancedBody, staleBodyRecovery).recovered, false);
+    assert.deepEqual(titleRecoveryDecision(advancedBody.title, titleRecord), {
+      recovered: true,
+      remove: false,
+      title: "After",
+    });
+    assert.deepEqual(titleRecoveryDecision("Changed elsewhere", titleRecord), {
+      recovered: false,
+      remove: true,
+      title: "Changed elsewhere",
+    });
+    assert.deepEqual(titleRecoveryDecision("After", titleRecord), {
+      recovered: false,
+      remove: true,
+      title: "After",
+    });
   });
 });
 

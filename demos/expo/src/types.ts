@@ -20,11 +20,30 @@ export type DocumentWrite = {
 
 export type DocumentWriteAction = (write: DocumentWrite) => Promise<void>;
 
+export type EditorSaveState = "dirty" | "error" | "recovered" | "saved" | "saving";
+
+export type EditorStatusPayload = {
+  error: string | null;
+  recoveryUnavailable: boolean;
+  state: EditorSaveState;
+  titleRevision: number;
+};
+
+export type EditorReadyPayload = EditorStatusPayload & {
+  title: string;
+  token: string;
+};
+
 export type EditorProps = {
   active: boolean;
-  closeEditor: () => Promise<void>;
+  closeRequest: number;
   document: EditorDocument;
   documentWrite: DocumentWriteAction;
-  editorReady: (token: string) => Promise<void>;
+  editorReady: (payload: EditorReadyPayload) => Promise<void>;
+  editorStatusChanged: (token: string, payload: EditorStatusPayload) => Promise<void>;
   editorToken: string;
+  focusBodyRequest: number;
+  retryRequest: number;
+  title: string;
+  titleRevision: number;
 };
