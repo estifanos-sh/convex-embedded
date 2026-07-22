@@ -12,9 +12,12 @@
 html,
 body,
 #root {
+  width: 100%;
+  max-width: 100%;
   min-height: 100%;
   margin: 0;
   background: #2a2825;
+  overflow-x: clip;
 }
 
 body {
@@ -30,8 +33,11 @@ input {
 }
 
 .editorPage {
+  width: 100%;
+  max-width: 100%;
   min-height: 100dvh;
   background: #2a2825;
+  overflow-x: clip;
   padding-bottom: max(48px, env(safe-area-inset-bottom));
 }
 
@@ -130,7 +136,9 @@ input {
 
 .documentSheet {
   width: min(100%, 760px);
+  max-width: 100%;
   margin: 0 auto;
+  overflow-x: clip;
   padding: 0 0 80px;
 }
 
@@ -201,6 +209,8 @@ input {
 }
 
 .editorCanvas .bn-container {
+  width: 100%;
+  max-width: 100%;
   min-height: 62dvh;
   background: transparent !important;
   color: #ffffff;
@@ -217,6 +227,8 @@ input {
 }
 
 .editorCanvas .bn-editor {
+  width: 100%;
+  max-width: 100%;
   min-height: 62dvh;
   background: transparent !important;
   padding: 0 16px 80px;
@@ -238,7 +250,68 @@ input {
 }
 
 .editorCanvas .bn-block-content {
+  min-width: 0;
+  max-width: 100%;
   line-height: 1.65;
+}
+
+.editorCanvas .bn-block-group,
+.editorCanvas .bn-block-outer,
+.editorCanvas .bn-block {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.editorCanvas .bn-editor [data-content-type="table"] {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.editorCanvas .bn-editor [data-content-type="table"] .tableWrapper {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0 0 8px;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.editorCanvas .bn-editor [data-content-type="table"] .tableWrapper::-webkit-scrollbar {
+  display: none;
+}
+
+.editorCanvas .bn-editor [data-content-type="table"] table {
+  border-collapse: collapse;
+  min-width: 100%;
+  max-width: none;
+}
+
+.editorCanvas .bn-editor [data-content-type="table"] th,
+.editorCanvas .bn-editor [data-content-type="table"] td {
+  min-width: 112px !important;
+  border-color: rgb(163 156 148 / 38%) !important;
+  padding: 9px 11px !important;
+}
+
+.editorCanvas .bn-block-content[data-content-type="codeBlock"] pre,
+.editorCanvas [data-file-block] .bn-visual-media,
+.editorCanvas [data-file-block] .bn-file-block-content-wrapper {
+  max-width: 100%;
+}
+
+.editorCanvas .bn-block-content[data-content-type="codeBlock"] pre {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.editorCanvas .bn-block-column-list {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .editorCanvas .bn-suggestion-menu {
@@ -283,6 +356,10 @@ input {
   line-height: 1.3;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.editorCanvas .bn-suggestion-menu .bn-ak-suggestion-menu-item-section[data-position="right"] {
+  display: none;
 }
 
 .editorCanvas .bn-toolbar {
