@@ -128,31 +128,12 @@ export default function DocumentsScreen() {
     <>
       <Stack.Screen options={{ headerShown: false }} />
       <View style={styles.screen}>
-        {editorVisible ? (
-          <View
-            style={[
-              styles.navigationBar,
-              styles.editorNavigationBar,
-              { height: insets.top + 56, paddingTop: insets.top },
-            ]}
-          >
-            <View style={styles.navigationSlot}>
-              <Pressable
-                accessibilityLabel="Back to documents"
-                accessibilityRole="button"
-                hitSlop={8}
-                onPress={closeDocument}
-                style={({ pressed }) => [styles.headerBack, pressed && styles.headerButtonPressed]}
-              >
-                <Text style={styles.headerBackLabel}>‹</Text>
-              </Pressable>
-            </View>
-            <View style={styles.navigationFill} />
-            <View style={styles.navigationSlot} />
-          </View>
-        ) : (
-          <View style={[styles.listNavigationBar, { height: insets.top + spacing.sm }]} />
-        )}
+        <View
+          style={[
+            editorVisible ? styles.editorNavigationBar : styles.listNavigationBar,
+            { height: insets.top + (editorVisible ? 0 : spacing.sm) },
+          ]}
+        />
         <View style={styles.contentArea}>
           {selectedDocumentId ? (
             <View
@@ -167,6 +148,7 @@ export default function DocumentsScreen() {
               <DocumentScreen
                 active={editorVisible}
                 documentId={selectedDocumentId}
+                onClose={closeDocument}
                 onReady={showReadyDocument}
               />
             </View>
@@ -405,25 +387,11 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background.primary,
   },
-  navigationBar: {
-    zIndex: 1,
-    paddingHorizontal: spacing.lg,
-    flexDirection: "row",
-    alignItems: "center",
-  },
   editorNavigationBar: {
     backgroundColor: colors.background.secondary,
   },
   listNavigationBar: {
     backgroundColor: colors.background.primary,
-  },
-  navigationSlot: {
-    width: 52,
-    alignItems: "flex-start",
-    justifyContent: "center",
-  },
-  navigationFill: {
-    flex: 1,
   },
   contentArea: {
     flex: 1,
@@ -484,27 +452,6 @@ const styles = StyleSheet.create({
     borderRadius: radius.full,
     borderCurve: "continuous",
     boxShadow: "0 8px 24px rgba(0, 0, 0, 0.28)",
-  },
-  headerButtonPressed: {
-    opacity: 0.58,
-  },
-  headerBack: {
-    width: 44,
-    height: 44,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: radius.full,
-    overflow: "hidden",
-    backgroundColor: colors.background.tertiary,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-  },
-  headerBackLabel: {
-    marginTop: -3,
-    color: colors.content.primary,
-    fontSize: 42,
-    fontWeight: "300",
-    lineHeight: 44,
   },
   headerButtonLabel: {
     color: colors.content.primary,

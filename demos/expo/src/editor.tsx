@@ -37,6 +37,7 @@ export default function DocumentEditor(props: DocumentEditorProps) {
 
 function InteractiveDocument({
   active,
+  closeEditor,
   document,
   documentWrite,
   editorReady,
@@ -287,6 +288,14 @@ function InteractiveDocument({
     <main className="editorPage">
       <article className="documentSheet">
         <header className="documentHeader">
+          <button
+            aria-label="Back to documents"
+            className="backButton"
+            type="button"
+            onClick={() => void closeEditor()}
+          >
+            <span aria-hidden="true">‹</span>
+          </button>
           <div className="documentTitle">
             <label className="titleLabel" htmlFor="document-title">
               Document title
@@ -353,11 +362,11 @@ function InteractiveDocument({
             editor={editor}
             emojiPicker={false}
             filePanel={false}
-            formattingToolbar={false}
-            linkToolbar={false}
+            formattingToolbar
+            linkToolbar
             onChange={queueEditor}
             sideMenu={false}
-            slashMenu={false}
+            slashMenu
             tableHandles={false}
             theme="dark"
           />

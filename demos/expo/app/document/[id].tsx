@@ -39,10 +39,12 @@ export default function DocumentRoute() {
 export function DocumentScreen({
   active = true,
   documentId: id,
+  onClose,
   onReady,
 }: {
   active?: boolean;
   documentId?: string;
+  onClose: () => void;
   onReady?: (id: string) => void;
 }) {
   const [document, setDocument] = useState<EditorDocument | null>(null);
@@ -119,6 +121,9 @@ export function DocumentScreen({
     },
     [editorFailed],
   );
+  const closeEditor = useCallback(async () => {
+    onClose();
+  }, [onClose]);
   const editorReady = useCallback(
     async (token: string) => {
       if (activeEditorTokenRef.current === token) {
@@ -184,24 +189,32 @@ export function DocumentScreen({
   return (
     <View style={styles.page}>
       {visibleError ? (
-        <View style={styles.state}>
-          <View style={styles.errorCard}>
-            <Text selectable style={styles.eyebrow}>
-              Convex embedded
+        <View style={styles.errorPage}>
+          <View style={styles.placeholderHeader}>
+            <EditorBackButton onPress={onClose} />
+            <Text numberOfLines={1} style={styles.placeholderTitle}>
+              {document?.title || "Document"}
             </Text>
-            <Text selectable style={styles.stateTitle}>
-              Editor unavailable
-            </Text>
-            <Text selectable style={styles.errorCopy}>
-              {visibleError}
-            </Text>
-            <Pressable
-              accessibilityRole="button"
-              onPress={read}
-              style={({ pressed }) => [styles.retry, pressed && styles.retryPressed]}
-            >
-              <Text style={styles.retryLabel}>Open again</Text>
-            </Pressable>
+          </View>
+          <View style={styles.state}>
+            <View style={styles.errorCard}>
+              <Text selectable style={styles.eyebrow}>
+                Convex embedded
+              </Text>
+              <Text selectable style={styles.stateTitle}>
+                Editor unavailable
+              </Text>
+              <Text selectable style={styles.errorCopy}>
+                {visibleError}
+              </Text>
+              <Pressable
+                accessibilityRole="button"
+                onPress={read}
+                style={({ pressed }) => [styles.retry, pressed && styles.retryPressed]}
+              >
+                <Text style={styles.retryLabel}>Open again</Text>
+              </Pressable>
+            </View>
           </View>
         </View>
       ) : (
@@ -214,6 +227,7 @@ export function DocumentScreen({
             >
               <DocumentEditor
                 active={active && applicationActive && !loading && !switchingDocument}
+                closeEditor={closeEditor}
                 document={document}
                 documentWrite={documentWrite}
                 dom={dom}
@@ -225,13 +239,14 @@ export function DocumentScreen({
           {showPlaceholder ? (
             <View
               accessibilityLabel="Opening the local document"
-              accessibilityRole="progressbar"
               accessibilityViewIsModal
+              accessible={false}
               importantForAccessibility="yes"
-              pointerEvents="box-only"
+              pointerEvents="auto"
               style={styles.placeholder}
             >
               <View style={styles.placeholderHeader}>
+                <EditorBackButton onPress={onClose} />
                 {document && !switchingDocument ? (
                   <Text numberOfLines={1} style={styles.placeholderTitle}>
                     {document.title || "Untitled"}
@@ -264,6 +279,20 @@ export function DocumentScreen({
   );
 }
 
+function EditorBackButton({ onPress }: { onPress: () => void }) {
+  return (
+    <Pressable
+      accessibilityLabel="Back to documents"
+      accessibilityRole="button"
+      hitSlop={8}
+      onPress={onPress}
+      style={({ pressed }) => [styles.placeholderBack, pressed && styles.placeholderBackPressed]}
+    >
+      <Text style={styles.placeholderBackLabel}>‹</Text>
+    </Pressable>
+  );
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -281,21 +310,42 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background.secondary,
   },
+  errorPage: {
+    flex: 1,
+    backgroundColor: colors.background.secondary,
+  },
   editorFrame: {
     flex: 1,
   },
   placeholder: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: colors.background.secondary,
-    paddingHorizontal: 16,
-    paddingTop: 12,
   },
   placeholderHeader: {
-    minHeight: 36,
-    marginBottom: 4,
+    minHeight: 56,
+    paddingHorizontal: 12,
     flexDirection: "row",
-    alignItems: "flex-start",
+    alignItems: "center",
     gap: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  placeholderBack: {
+    width: 40,
+    height: 40,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 999,
+  },
+  placeholderBackPressed: {
+    backgroundColor: colors.background.tertiary,
+  },
+  placeholderBackLabel: {
+    marginTop: -2,
+    color: colors.content.primary,
+    fontSize: 34,
+    fontWeight: "300",
+    lineHeight: 40,
   },
   placeholderSave: {
     minHeight: 26,
@@ -305,7 +355,6 @@ const styles = StyleSheet.create({
     gap: 7,
     backgroundColor: colors.background.tertiary,
     borderRadius: 999,
-    transform: [{ translateY: 7 }],
   },
   placeholderDot: {
     width: 7,
@@ -321,21 +370,20 @@ const styles = StyleSheet.create({
   placeholderTitle: {
     flex: 1,
     color: colors.content.primary,
-    fontSize: 26,
+    fontSize: 17,
     fontWeight: "600",
-    letterSpacing: -1,
-    lineHeight: 28,
-    transform: [{ translateY: 9 }],
+    letterSpacing: -0.2,
+    lineHeight: 20,
   },
   placeholderTitleBar: {
     flex: 1,
-    height: 30,
+    height: 20,
     backgroundColor: colors.background.tertiary,
     borderRadius: 6,
   },
   placeholderBody: {
     gap: 12,
-    paddingTop: 0,
+    padding: 16,
   },
   placeholderCopy: {
     color: colors.content.primary,
