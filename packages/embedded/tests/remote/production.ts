@@ -11,6 +11,7 @@ import { ConvexEmbeddedClient } from "../../src/node/client";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
+import { fixtureAdminKey, fixtureRemoteUrl } from "../testkit/remote";
 import * as documents from "../fixture/convex/documents";
 
 const remoteUrl = fixtureRemoteUrl();
@@ -107,7 +108,7 @@ describe("v5 production pull contract", () => {
       authenticated as unknown as {
         setAdminAuth(token: string, identity: { issuer: string; subject: string }): void;
       }
-    ).setAdminAuth(productionAdminKey(), {
+    ).setAdminAuth(fixtureAdminKey(), {
       issuer: "https://cut2.embedded.test",
       subject: `cut2-${crypto.randomUUID()}`,
     });
@@ -594,16 +595,6 @@ async function stableCount(read: () => number, quietMs = 250, timeoutMs = 2_000)
   throw new Error("Timed out waiting for the retained-query callback baseline.");
 }
 
-function productionAdminKey(): string {
-  const key = process.env.CONVEX_EMBEDDED_FIXTURE_ADMIN_KEY?.trim();
-  if (!key) {
-    throw new Error(
-      "Set CONVEX_EMBEDDED_FIXTURE_ADMIN_KEY to the independently owned fixture deployment key.",
-    );
-  }
-  return key;
-}
-
 function largeBody(bytes: number): string {
   const body = new Uint8Array(bytes);
   let state = 0x9e3779b9;
@@ -614,12 +605,4 @@ function largeBody(bytes: number): string {
     body[index] = 32 + ((state >>> 0) % 95);
   }
   return new TextDecoder().decode(body);
-}
-
-function fixtureRemoteUrl(): string {
-  const url = process.env.CONVEX_EMBEDDED_FIXTURE_URL?.trim();
-  if (!url) {
-    throw new Error("Set CONVEX_EMBEDDED_FIXTURE_URL to the deployment of tests/fixture/convex.");
-  }
-  return url;
 }

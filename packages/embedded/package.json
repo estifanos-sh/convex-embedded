@@ -152,7 +152,7 @@
     "wasm": "node scripts/wasm.ts",
     "style": "node scripts/style.ts",
     "dev": "vp pack --watch",
-    "test": "vp pack && vp test run --config vite/tests.ts --project unit --project storage --project server --project surface && vp test run --config vite/tests.ts --project runtime --maxWorkers=1 && vp test run --config vite/tests.ts --project remote",
+    "test": "vp pack && vp test run --config vite/tests.ts --project unit --project storage --project server --project surface && vp test run --config vite/tests.ts --project runtime --maxWorkers=1",
     "test:unit": "vp test run --config vite/tests.ts --project unit",
     "test:runtime": "vp test run --config vite/tests.ts --project runtime --maxWorkers=1",
     "test:storage": "vp test run --config vite/tests.ts --project storage",

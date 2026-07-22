@@ -18,7 +18,6 @@ export default defineConfig({
       "packages/embedded/tests/storage/**/*.ts",
       "packages/embedded/tests/runtime/**/*.ts",
       "packages/embedded/tests/server/**/*.ts",
-      "packages/embedded/tests/remote/**/*.ts",
       "packages/embedded/tests/surface/**/*.ts",
     ],
   },
