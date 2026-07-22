@@ -349,11 +349,10 @@ const styles = StyleSheet.create({
   },
   placeholderSave: {
     minHeight: 26,
-    paddingHorizontal: 8,
+    paddingHorizontal: 4,
     flexDirection: "row",
     alignItems: "center",
     gap: 7,
-    backgroundColor: colors.background.tertiary,
     borderRadius: 999,
   },
   placeholderDot: {
@@ -383,7 +382,9 @@ const styles = StyleSheet.create({
   },
   placeholderBody: {
     gap: 12,
-    padding: 16,
+    paddingHorizontal: 20,
+    paddingTop: 18,
+    paddingBottom: 16,
   },
   placeholderCopy: {
     color: colors.content.primary,

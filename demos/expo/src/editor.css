@@ -104,6 +104,12 @@ input {
   font-weight: 600;
 }
 
+.saveState--saved {
+  background: transparent;
+  color: #97908a;
+  padding-inline: 4px;
+}
+
 .saveState > span {
   width: 7px;
   height: 7px;
@@ -231,22 +237,11 @@ input {
   max-width: 100%;
   min-height: 62dvh;
   background: transparent !important;
-  padding: 0 16px 80px;
+  padding: 18px 20px 80px;
 }
 
 .editorCanvas .bn-editor > .bn-block-group > .bn-block-outer:first-child {
   display: none;
-}
-
-.editorCanvas
-  .bn-editor
-  > .bn-block-group
-  > .bn-block-outer:first-child
-  + .bn-block-outer
-  > .bn-block
-  > .bn-block-content {
-  font-size: 1em !important;
-  font-weight: 400 !important;
 }
 
 .editorCanvas .bn-block-content {
