@@ -261,6 +261,34 @@ button {
   border-color: rgb(163 156 148 / 24%);
 }
 
+.editorCanvas .tableDeleteButton {
+  position: fixed;
+  z-index: 50;
+  right: 16px;
+  bottom: max(16px, env(safe-area-inset-bottom));
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgb(255 180 171 / 34%);
+  border-radius: 999px;
+  background: rgb(62 53 50 / 96%);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 34%);
+  color: #ffb4ab;
+  padding: 10px 14px;
+  touch-action: manipulation;
+}
+
+.editorCanvas .tableDeleteButton:active {
+  background: rgb(91 58 54 / 98%);
+  transform: scale(0.98);
+}
+
+.editorCanvas .tableDeleteButton span {
+  font-size: 14px;
+  font-weight: 650;
+}
+
 .editorCanvas .bn-link-toolbar {
   max-width: calc(100vw - 24px) !important;
   border: 1px solid rgb(163 156 148 / 30%);

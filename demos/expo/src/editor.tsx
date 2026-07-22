@@ -2,14 +2,16 @@
 
 import { BlockNoteView } from "@blocknote/ariakit";
 import "@blocknote/ariakit/style.css";
-import { useCreateBlockNote } from "@blocknote/react";
+import { useBlockNoteEditor, useCreateBlockNote, useEditorState } from "@blocknote/react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import "./editor.css";
 import {
   documentWrite as createDocumentWrite,
   documentBlocks,
   draftFingerprint,
+  isEmptyTable,
   normalizeDocumentDraft,
   recoveryDecode,
   recoveryDecision,
@@ -393,6 +395,41 @@ function InteractiveDocument({
     flushRef.current();
   }, [closeRequest]);
 
+  const deleteEmptyTable = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "Backspace" || event.nativeEvent.isComposing) return;
+      const selection = editor.prosemirrorState.selection;
+      if (!selection.empty || selection.$from.parentOffset !== 0) return;
+      let isFirstCell = false;
+      for (let depth = selection.$from.depth; depth >= 2; depth -= 1) {
+        const role = selection.$from.node(depth).type.spec.tableRole;
+        if (role !== "cell" && role !== "header_cell") continue;
+        const rowDepth = depth - 1;
+        const tableDepth = depth - 2;
+        isFirstCell =
+          selection.$from.node(rowDepth).type.spec.tableRole === "row" &&
+          selection.$from.node(tableDepth).type.spec.tableRole === "table" &&
+          selection.$from.index(rowDepth) === 0 &&
+          selection.$from.index(tableDepth) === 0;
+        break;
+      }
+      if (!isFirstCell) return;
+      const block = editor.getTextCursorPosition().block;
+      if (!isEmptyTable(block)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      let target = editor.getNextBlock(block)?.id;
+      if (!target) {
+        target = editor.insertBlocks([{ type: "paragraph", content: "" }], block, "after")[0]?.id;
+      }
+      editor.removeBlocks([block]);
+      if (target) editor.setTextCursorPosition(target, "start");
+      editor.focus();
+    },
+    [editor],
+  );
+
   return (
     <main className="editorPage">
       <article className="documentSheet">
@@ -412,7 +449,7 @@ function InteractiveDocument({
           </p>
         ) : null}
 
-        <div className="editorCanvas">
+        <div className="editorCanvas" onKeyDownCapture={deleteEmptyTable}>
           <BlockNoteView
             editor={editor}
             emojiPicker={false}
@@ -424,10 +461,61 @@ function InteractiveDocument({
             slashMenu
             tableHandles={false}
             theme="dark"
-          />
+          >
+            <TableDeleteButton />
+          </BlockNoteView>
         </div>
       </article>
     </main>
+  );
+}
+
+function TableDeleteButton() {
+  const editor = useBlockNoteEditor();
+  const block = useEditorState({
+    editor,
+    selector: ({ editor }) => {
+      const selected = editor.getSelection()?.blocks ?? [editor.getTextCursorPosition().block];
+      return selected.length === 1 && selected[0]?.type === "table" ? selected[0] : undefined;
+    },
+  });
+  const deleteTable = useCallback(() => {
+    if (!block) return;
+    let target = editor.getNextBlock(block)?.id;
+    if (!target) {
+      target = editor.insertBlocks([{ type: "paragraph", content: "" }], block, "after")[0]?.id;
+    }
+    editor.removeBlocks([block]);
+    if (target) editor.setTextCursorPosition(target, "start");
+    editor.focus();
+  }, [block, editor]);
+
+  if (!block) return null;
+  return (
+    <button
+      aria-label="Delete table"
+      className="tableDeleteButton"
+      onClick={deleteTable}
+      onPointerDown={(event) => event.preventDefault()}
+      type="button"
+    >
+      <TrashIcon />
+      <span>Delete table</span>
+    </button>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg aria-hidden="true" fill="none" height="20" viewBox="0 0 24 24" width="20">
+      <path
+        d="M5 7h14M9 7V4h6v3m2 0-.7 13H7.7L7 7m3 4v5m4-5v5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
   );
 }
 

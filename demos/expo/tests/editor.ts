@@ -6,6 +6,7 @@ import {
   documentBlocks,
   draftFingerprint,
   emptyBlocks,
+  isEmptyTable,
   normalizeDocumentDraft,
   parseBlocks,
   recoveryDecode,
@@ -21,6 +22,35 @@ import { documentPreview } from "../src/preview";
 import type { EditorDraft } from "../src/types";
 
 void describe("editor text", () => {
+  void it("recognizes only completely empty BlockNote tables", () => {
+    assert.equal(
+      isEmptyTable({
+        type: "table",
+        content: {
+          rows: [
+            { cells: [[], [], []] },
+            {
+              cells: [
+                { type: "tableCell", content: [] },
+                { type: "tableCell", content: [] },
+                { type: "tableCell", content: [] },
+              ],
+            },
+          ],
+        },
+      }),
+      true,
+    );
+    assert.equal(
+      isEmptyTable({
+        type: "table",
+        content: { rows: [{ cells: [[{ type: "text", text: "kept" }], [], []] }] },
+      }),
+      false,
+    );
+    assert.equal(isEmptyTable({ type: "paragraph", content: [] }), false);
+  });
+
   void it("builds an immediate native preview without repeating the title", () => {
     const body = JSON.stringify([
       { type: "heading", content: "Title" },

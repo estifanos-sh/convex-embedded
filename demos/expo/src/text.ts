@@ -180,6 +180,34 @@ export function sameDraft(left: EditorDraft, right: EditorDraft): boolean {
   return left.body === right.body && left.title === right.title;
 }
 
+export function isEmptyTable(block: unknown): boolean {
+  if (!block || typeof block !== "object") return false;
+  const candidate = block as { content?: unknown; type?: unknown };
+  if (candidate.type !== "table" || !candidate.content || typeof candidate.content !== "object") {
+    return false;
+  }
+
+  const rows = (candidate.content as { rows?: unknown }).rows;
+  if (!Array.isArray(rows) || rows.length === 0) return false;
+  let cells = 0;
+  for (const row of rows) {
+    if (!row || typeof row !== "object") return false;
+    const rowCells = (row as { cells?: unknown }).cells;
+    if (!Array.isArray(rowCells) || rowCells.length === 0) return false;
+    for (const cell of rowCells) {
+      cells += 1;
+      if (Array.isArray(cell)) {
+        if (cell.length > 0) return false;
+        continue;
+      }
+      if (!cell || typeof cell !== "object" || !("type" in cell)) return false;
+      const content = (cell as { content?: unknown }).content;
+      if (!Array.isArray(content) || content.length > 0) return false;
+    }
+  }
+  return cells > 0;
+}
+
 export function titleFromBlocks(blocks: readonly (PartialBlock | Block)[]): string {
   const titleBlock = blocks[0];
   return titleBlock ? blockText(titleBlock).trim().slice(0, 90) : "";
