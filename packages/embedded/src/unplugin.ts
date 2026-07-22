@@ -27,6 +27,7 @@ import {
   createEmbeddedBundle,
   type EmbeddedBundleInput,
   type EmbeddedBundleResult,
+  type EmbeddedCompatibleRuntimeIdentity,
 } from "./bundler";
 import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "./schema";
 import {
@@ -47,6 +48,8 @@ import {
  * @public
  */
 export interface ConvexEmbeddedPluginOptions extends Omit<EmbeddedBundleInput, "root"> {
+  /** Exact reviewed prior runtime identities whose durable mutations this build may replay. */
+  compatiblePriorRuntimes?: readonly EmbeddedCompatibleRuntimeIdentity[];
   /**
    * Disable the plugin. Useful when composing framework configs conditionally.
    *
@@ -135,7 +138,9 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
       this.addWatchFile?.(convexRoot());
       for (const file of watchFiles(generated)) this.addWatchFile?.(file);
       if (id === RESOLVED_VIRTUAL_MODULE_ID) return renderEmbeddedBundle(generated);
-      if (id === RESOLVED_VIRTUAL_IDENTITY_MODULE_ID) return renderEmbeddedIdentity(generated);
+      if (id === RESOLVED_VIRTUAL_IDENTITY_MODULE_ID) {
+        return renderEmbeddedIdentity(generated, options.compatiblePriorRuntimes);
+      }
       return null;
     },
 

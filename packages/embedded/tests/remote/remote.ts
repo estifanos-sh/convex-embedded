@@ -25,7 +25,9 @@ type PushArgs = {
   kind: "mutation";
   clientId: string;
   mutationId: string;
-  acknowledgeMutationId?: string;
+  replayId: string;
+  logicalFingerprint: string;
+  acknowledgeReplayId?: string;
   runtime: typeof testRuntime;
   functionName: string;
   args: unknown;
@@ -91,7 +93,9 @@ async function runPull(
 async function pushArgs(input: {
   clientId?: string;
   mutationId: string;
-  acknowledgeMutationId?: string;
+  replayId?: string;
+  logicalFingerprint?: string;
+  acknowledgeReplayId?: string;
   functionName: string;
   args: unknown;
   result?: unknown;
@@ -109,7 +113,9 @@ async function pushArgs(input: {
     kind: "mutation",
     clientId: input.clientId ?? crypto.randomUUID(),
     mutationId: input.mutationId,
-    acknowledgeMutationId: input.acknowledgeMutationId,
+    replayId: input.replayId ?? input.mutationId,
+    logicalFingerprint: input.logicalFingerprint ?? input.mutationId,
+    acknowledgeReplayId: input.acknowledgeReplayId,
     runtime: testRuntime,
     functionName: input.functionName,
     args: input.args,
@@ -264,7 +270,7 @@ describe("v5 real Convex vertical slice", () => {
       await pushArgs({
         clientId,
         mutationId: laterMutationId,
-        acknowledgeMutationId: mutationId,
+        acknowledgeReplayId: mutationId,
         functionName: "replay:insertNull",
         args: {
           slug: `${prefix}-later`,
@@ -288,7 +294,7 @@ describe("v5 real Convex vertical slice", () => {
       request: {
         kind: "acknowledge",
         clientId,
-        mutationId: laterMutationId,
+        replayId: laterMutationId,
       },
     });
     const acknowledged = await client.query(api.mutation.list, {
@@ -1563,20 +1569,53 @@ describe("v5 real Convex vertical slice", () => {
     });
     const first = await runPush(client, request);
     const retry = await runPush(client, request);
+    const freshAttempt = await runPush(client, {
+      ...request,
+      replayId: crypto.randomUUID(),
+      mutationTime: request.mutationTime + 1,
+    });
     const requestArgs = request.args as Record<string, unknown>;
     expect(first.outcome).toBe("applied");
     expect(retry).toEqual(first);
+    expect(freshAttempt).toEqual(first);
     await expect(
       runPush(client, {
         ...request,
+        replayId: crypto.randomUUID(),
+        logicalFingerprint: crypto.randomUUID(),
         args: { ...requestArgs, updatedAt: Number(requestArgs.updatedAt) + 1 },
       }),
-    ).rejects.toThrow(/different replay fingerprint/i);
+    ).rejects.toThrow(/different logical mutation or replay attempt/i);
     for (const insert of first.inserts) {
       if (insert.table === "documents") {
         await client.mutation(api.documents.remove, { id: insert.id as never });
       }
     }
+  });
+
+  test("refreshes a cached applied settlement after its document was deleted", async () => {
+    const client = new ConvexHttpClient(remoteUrl);
+    const mutationId = crypto.randomUUID();
+    const request = await pushArgs({
+      mutationId,
+      functionName: "replay:insertNull",
+      args: { title: mutationId, slug: mutationId, updatedAt: readTime() },
+      inserts: [{ mutationId, ordinal: 0, table: "documents" }],
+    });
+    const first = await runPush(client, request);
+    const document = first.inserts.find((insert) => insert.table === "documents");
+    if (!document) throw new Error("Applied insert did not return a document ID.");
+    await client.mutation(api.documents.remove, { id: document.id as never });
+
+    const replayed = await runPush(client, request);
+
+    expect(replayed.outcome).toBe("applied");
+    expect(replayed.authoritative).toContainEqual({
+      op: "del",
+      table: "documents",
+      rowId: document.id,
+      plainHash: await hashValue(null),
+    });
   });
 
   test("deduplicates a durable mutation after the worker client id changes", async () => {
@@ -1603,7 +1642,7 @@ describe("v5 real Convex vertical slice", () => {
       undefined,
     );
     await client.mutation(api.embedded.push, {
-      request: { kind: "acknowledge", clientId: nextClientId, mutationId },
+      request: { kind: "acknowledge", clientId: nextClientId, replayId: mutationId },
     });
     expect(
       (await remoteClientMetadata(client, firstClientId)).metadata?.acknowledgedThrough,

@@ -215,7 +215,9 @@ static MAX_COMMIT_SEQ: LazyLock<String> = LazyLock::new(|| {
         "SELECT MAX(seq) FROM (\
          SELECT COALESCE(MAX({COMMIT_SEQ}), 0) AS seq FROM {COMMITS} WHERE {IDENTITY_KEY} = ? \
          UNION ALL SELECT COALESCE(MAX({UPDATED_COMMIT_SEQ}), 0) AS seq FROM {DIRTY_HEADS} WHERE {IDENTITY_KEY} = ? \
-         UNION ALL SELECT COALESCE(MAX({COMMIT_SEQ}), 0) AS seq FROM {MUTATIONS} WHERE {IDENTITY_KEY} = ?)"
+         UNION ALL SELECT COALESCE(MAX({COMMIT_SEQ}), 0) AS seq FROM {MUTATIONS} WHERE {IDENTITY_KEY} = ? \
+         UNION ALL SELECT COALESCE(MAX({COMMIT_SEQ}), 0) AS seq FROM {REMOTE} WHERE {IDENTITY_KEY} = ? \
+         AND {WATERMARK} >= 'push_envelope:' AND {WATERMARK} < 'push_envelope;')"
     )
 });
 static COMMIT_EXISTS: LazyLock<String> = LazyLock::new(|| {
@@ -1171,6 +1173,13 @@ static READ_RESULT: LazyLock<String> = LazyLock::new(|| {
 });
 static READ_RESULT_SKELETON_HASH: LazyLock<String> =
     LazyLock::new(|| select_where(RESULTS, [Expr::col(alias(SKELETON_HASH))], [eq(KEY)]));
+static READ_RESULT_PATHS: LazyLock<String> = LazyLock::new(|| {
+    select_where(
+        RESULTS,
+        [Expr::col(alias(KEY)), Expr::col(alias(PATHS))],
+        [eq(IDENTITY)],
+    )
+});
 static READ_RESULT_STALE: LazyLock<String> = LazyLock::new(|| {
     select_where(
         RESULTS,
@@ -2072,6 +2081,10 @@ pub(crate) fn read_result() -> &'static str {
 
 pub(crate) fn read_result_skeleton_hash() -> &'static str {
     &READ_RESULT_SKELETON_HASH
+}
+
+pub(crate) fn read_result_paths() -> &'static str {
+    &READ_RESULT_PATHS
 }
 
 pub(crate) fn result_stale_read() -> &'static str {

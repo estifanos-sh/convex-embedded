@@ -140,6 +140,51 @@ fn push_envelope_queue_reads_in_ordinal_order_and_drains_on_complete() {
 }
 
 #[test]
+fn reopen_seeds_commit_sequence_after_the_durable_push_tail() {
+    let path = tmp_path("envelope_reopen_commit_sequence.db");
+    {
+        let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
+        store.setup(&schema()).unwrap();
+        store
+            .remote_push_envelope_write(
+                "retained",
+                50,
+                r#"{"mutationId":"retained","commitSeq":50,"crdt":[]}"#,
+                5,
+            )
+            .unwrap();
+    }
+
+    let reopened = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
+    reopened.setup(&schema()).unwrap();
+    let committed = reopened
+        .commit(
+            doc_writes(vec![issue(&reopened, "after-reopen", "after", "open")]),
+            &CommitOptions::terminal(
+                MutationCall {
+                    args: "{}".into(),
+                    mutation_id: "after-reopen".into(),
+                    name: "issues:write".into(),
+                },
+                "null",
+                false,
+                Some(CommitPush {
+                    mutation_id: "after-reopen".into(),
+                    json: r#"{"mutationId":"after-reopen","commitSeq":0,"crdt":[]}"#.into(),
+                    now_ms: 6,
+                }),
+            ),
+        )
+        .unwrap();
+
+    assert_eq!(committed.commit_seq, 51);
+    let queued = reopened.remote_push_envelope_read(10).unwrap();
+    assert_eq!(queued.len(), 2);
+    assert!(queued[0].contains(r#""mutationId":"retained""#));
+    assert!(queued[1].contains(r#""mutationId":"after-reopen""#));
+}
+
+#[test]
 fn local_commit_writes_its_push_envelope_atomically() {
     let store = EmbeddedStore::open(tmp_path("envelope_commit.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();

@@ -342,6 +342,7 @@ async function startWorkerRemote(
   await state.store.remote.start({
     auth,
     clientId: remote.clientId,
+    compatiblePriorRuntimes: remote.compatiblePriorRuntimes,
     moduleGraphHash: remote.moduleGraphHash,
     operationTimeoutMs: remote.operationTimeoutMs,
     protocolVersion: remote.protocolVersion,

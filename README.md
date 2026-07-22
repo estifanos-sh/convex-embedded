@@ -133,14 +133,15 @@ export const setCompact = embedded.local.mutation({
 
 ```ts
 // application code
-import { localApi } from "./convex/_generated/embedded";
+import { localApi } from "./convex/generated/embedded";
 
 await client.mutation(localApi["preferences.local"].setCompact, { compact: true });
 ```
 
-The build plugin regenerates `_generated/embedded.ts` from the schema and function graph. Treat it
-like other generated Convex output: do not edit it by hand, and always pass the imported schema to
-the plugin so stale placement metadata cannot enter a device build.
+The build plugin regenerates `generated/embedded.ts` from the schema and function graph. Keep this
+contract outside Convex CLI-owned `_generated`, which codegen replaces. Treat it like other
+generated Convex output: do not edit it by hand, and always pass the imported schema and matching
+`generatedPath` to every bundler adapter so stale placement metadata cannot enter a device build.
 
 ## 2. Configure the browser build
 
@@ -164,7 +165,7 @@ import { defineConfig } from "vite";
 import schema from "./convex/schema";
 
 export default defineConfig({
-  plugins: [convexEmbedded({ schema })],
+  plugins: [convexEmbedded({ generatedPath: "generated/embedded.ts", schema })],
 });
 ```
 
@@ -185,14 +186,16 @@ The plugin options are relative to the Vite project root:
 ```ts
 convexEmbedded({
   convexDir: "convex",
+  generatedPath: "generated/embedded.ts",
   schema,
   schemaPath: "schema.ts",
 });
 ```
 
-The paths above are the defaults; `schema` is required so every build regenerates and verifies the
-device contract. Files in `convex/` with a top-level `"use node"` directive are hosted-only and are
-intentionally excluded from the local registry.
+`convexDir` and `schemaPath` above are the defaults. Set `generatedPath` to a checked-in path outside
+`_generated` when `convex/embedded.ts` imports the contract. `schema` is required so every build
+regenerates and verifies the device contract. Files in `convex/` with a top-level `"use node"`
+directive are hosted-only and are intentionally excluded from the local registry.
 
 ### Rollup, Rolldown, Webpack, Rspack, and esbuild
 
@@ -274,16 +277,20 @@ import { withConvexEmbedded } from "@convex-dev/embedded/metro";
 import { getDefaultConfig } from "expo/metro-config";
 import schema from "./convex/schema";
 
-module.exports = withConvexEmbedded(getDefaultConfig(__dirname), { schema });
+module.exports = withConvexEmbedded(getDefaultConfig(__dirname), {
+  generatedPath: "generated/embedded.ts",
+  schema,
+});
 ```
 
-Passing `schema` makes Metro regenerate and validate `convex/_generated/embedded.ts` before
+Passing `schema` makes Metro regenerate and validate `convex/generated/embedded.ts` before
 materializing its registry. If `schema` is omitted, Metro requires that generated contract to
 already exist and be current.
 
 Metro builds its registry when the configuration loads. Restart Metro after changing the schema or
-any device function source. The Expo client currently supports local storage and local function
-execution; native remote replication is not yet enabled.
+any device function source. The Expo client supports local storage, local functions, and native
+remote replication when passed a Convex deployment `url`. The native remote uses the same Rust
+protocol driver as Node. Omit `url` for local-only execution.
 
 ### Frameworks and server rendering
 

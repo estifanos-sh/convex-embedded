@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vp dev",
+    "build:package": "vp run @convex-dev/embedded#build:ts",
+    "dev": "vp run build:package && vp dev",
     "build": "tsc && vp build",
     "preview": "vp preview",
     "typecheck": "tsc --noEmit"
@@ -14,7 +15,6 @@
     "@blocknote/core": "^0.47.2",
     "@blocknote/react": "^0.47.2",
     "@convex-dev/embedded": "workspace:*",
-    "@convex-dev/static-hosting": "^0.1.4",
     "@fontsource-variable/inter": "catalog:",
     "@tailwindcss/forms": "catalog:",
     "@tailwindcss/vite": "catalog:",

@@ -70,6 +70,7 @@ export function mergeRemoteTicks(first: RemoteTick, last: RemoteTick): RemoteTic
   return {
     changedResults: [...new Set([...first.changedResults, ...last.changedResults])],
     changedTables: [...new Set([...first.changedTables, ...last.changedTables])],
+    connected: last.connected ?? first.connected,
     pending: last.pending ?? first.pending,
     pullAttempted: first.pullAttempted + last.pullAttempted,
     pullChangesApplied: first.pullChangesApplied + last.pullChangesApplied,

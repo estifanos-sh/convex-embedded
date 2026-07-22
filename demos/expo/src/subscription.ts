@@ -24,6 +24,114 @@ export interface EmbeddedQueryClient {
   ): EmbeddedQueryWatch<FunctionReturnType<Query>>;
 }
 
+export type EmbeddedQueryWaitOptions<Value> = {
+  accept?: (value: Value) => boolean;
+  onError?: (error: Error) => void;
+  onUpdate?: (value: Value) => void;
+  signal?: AbortSignal;
+  timeoutMessage?: string;
+  timeoutMs?: number;
+};
+
+export type EmbeddedQuerySubscription<Value> = {
+  close: () => void;
+  result: Promise<Value>;
+};
+
+/**
+ * Open a watched query and retain its remote scope until the caller closes the subscription.
+ */
+export function openQuerySubscription<Query extends FunctionReference<"query">>(
+  client: EmbeddedQueryClient,
+  query: Query,
+  args: FunctionArgs<Query>,
+  options: EmbeddedQueryWaitOptions<FunctionReturnType<Query>> = {},
+): EmbeddedQuerySubscription<FunctionReturnType<Query>> {
+  let closed = false;
+  let settled = false;
+  let unsubscribe: (() => void) | undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let rejectResult: (error: unknown) => void = () => undefined;
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    if (timeout !== undefined) clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", close);
+    unsubscribe?.();
+    if (!settled) {
+      settled = true;
+      rejectResult(abortError());
+    }
+  };
+
+  const result = new Promise<FunctionReturnType<Query>>((resolve, reject) => {
+    rejectResult = reject;
+    if (options.signal?.aborted) {
+      close();
+      return;
+    }
+
+    options.signal?.addEventListener("abort", close, { once: true });
+    const fail = (error: unknown) => {
+      if (settled) {
+        options.onError?.(toError(error));
+        return;
+      }
+      settled = true;
+      reject(error);
+      close();
+    };
+    const read = (watch: EmbeddedQueryWatch<FunctionReturnType<Query>>) => {
+      try {
+        const value = watch.localQueryResult();
+        if (value === undefined) return;
+        if (settled) {
+          options.onUpdate?.(value);
+          return;
+        }
+        if (options.accept && !options.accept(value)) return;
+        settled = true;
+        if (timeout !== undefined) clearTimeout(timeout);
+        resolve(value);
+      } catch (error: unknown) {
+        fail(error);
+      }
+    };
+
+    try {
+      const watch = client.watchQuery(query, args);
+      unsubscribe = watch.onUpdate(() => read(watch));
+      if (closed) unsubscribe();
+      else read(watch);
+    } catch (error: unknown) {
+      fail(error);
+    }
+
+    if (options.timeoutMs !== undefined && !settled && !closed) {
+      timeout = setTimeout(() => {
+        fail(new Error(options.timeoutMessage ?? "The embedded query did not become ready."));
+      }, options.timeoutMs);
+    }
+  });
+
+  return { close, result };
+}
+
+/**
+ * Wait for a watched query value, keeping the subscription alive while an initially absent remote
+ * row is pulled into embedded storage.
+ */
+export function waitForQuerySubscription<Query extends FunctionReference<"query">>(
+  client: EmbeddedQueryClient,
+  query: Query,
+  args: FunctionArgs<Query>,
+  options: EmbeddedQueryWaitOptions<FunctionReturnType<Query>> = {},
+): Promise<FunctionReturnType<Query>> {
+  const subscription = openQuerySubscription(client, query, args, options);
+  return subscription.result.finally(subscription.close);
+}
+
 /** Identify a query subscription by its Convex function path and argument values. */
 export function queryIdentity<Query extends FunctionReference<"query">>(
   query: Query,
@@ -76,4 +184,10 @@ export function useQuerySubscription<Query extends FunctionReference<"query">>(
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error("The embedded query failed.");
+}
+
+function abortError(): Error {
+  const error = new Error("The embedded query was cancelled.");
+  error.name = "AbortError";
+  return error;
 }

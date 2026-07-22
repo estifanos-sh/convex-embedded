@@ -39,8 +39,8 @@ import { client, subscribeBrowserDebug } from "./lib/client";
 import { readQuery, type QueryState } from "./lib/query";
 
 const diffDelayMs = 90;
-const draftDebounceMs = 250;
-const draftMaxLatencyMs = 1000;
+const draftDebounceMs = 40;
+const draftMaxLatencyMs = 160;
 const createDocumentMutation = api.documents.create;
 const getDocument = api.documents.get;
 const listDocuments = api.documents.list;

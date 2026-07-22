@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::{RemoteError, RemoteResult};
 
-pub const EMBEDDED_PROTOCOL_VERSION: i64 = 24;
+pub const EMBEDDED_PROTOCOL_VERSION: i64 = 25;
 
 /// Reserved local partition key for unauthenticated data; non-hex so it never collides with a `hashValue` digest.
 pub const EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY: &str = "unauthenticated";
@@ -119,6 +119,9 @@ pub struct RemoteConfig {
     pub client_id: ClientId,
     pub author_client_id: ClientId,
     pub auth: RemoteAuth,
+    /// Prior runtime identities whose locally-authored mutations the current build explicitly
+    /// declares replay-compatible. Matching is exact; durable envelopes are never rewritten.
+    pub compatible_prior_runtimes: Vec<RuntimeWireIdentity>,
     pub runtime: RuntimeWireIdentity,
     pub timing: RemoteTiming,
 }
@@ -131,6 +134,7 @@ impl RemoteConfig {
             client_id: ClientId::default(),
             author_client_id: ClientId::default(),
             auth: RemoteAuth::None,
+            compatible_prior_runtimes: Vec::new(),
             runtime: RuntimeWireIdentity {
                 schema_hash: "local".to_owned(),
                 module_graph_hash: "local".to_owned(),

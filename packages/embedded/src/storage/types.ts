@@ -812,6 +812,8 @@ export interface RemoteDocPushWire {
 
 /** One native remote replication tick result. @internal */
 export interface RemoteTick {
+  /** Native actor transport transition; absent when connectivity did not change. */
+  connected?: boolean;
   changedTables: string[];
   rowsApplied: number;
   pullAttempted: number;
@@ -881,6 +883,8 @@ export interface RemoteReroot {
 export interface RemoteStartOptions {
   auth?: (args: { forceRefreshToken: boolean }) => Promise<string | null> | string | null;
   clientId?: string;
+  /** Exact prior runtime identities approved for transport-only replay by this build. */
+  compatiblePriorRuntimes?: readonly RemoteRuntimeIdentity[];
   moduleGraphHash: string;
   /** Receives native actor transitions after their local transaction commits. */
   notify?: (tick: RemoteTick) => void;
@@ -891,6 +895,13 @@ export interface RemoteStartOptions {
   /** Internal browser WASM socket bridge. */
   transport?: RemoteTransportHost;
   url: string;
+}
+
+/** Runtime identity fields carried by a durable mutation envelope. @internal */
+export interface RemoteRuntimeIdentity {
+  moduleGraphHash: string;
+  protocolVersion: number;
+  schemaHash: string;
 }
 
 /** Internal raw transport host for the browser WASM remote driver. @internal */

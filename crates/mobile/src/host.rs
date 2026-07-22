@@ -10,11 +10,12 @@ use storage::{EmbeddedStore, StorageError};
 
 use crate::{BridgeError, BridgeResult};
 
-type Job = Box<dyn FnOnce(&EmbeddedStore) + Send>;
+pub(crate) type Job = Box<dyn FnOnce(&EmbeddedStore) + Send>;
 
 pub(crate) struct StoreHost {
     store: Arc<EmbeddedStore>,
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
+    remote: Mutex<Option<crate::remote::RemoteHost>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -57,6 +58,7 @@ impl StoreHost {
         Ok(Self {
             store,
             jobs: Mutex::new(Some(jobs_tx)),
+            remote: Mutex::new(None),
             thread: Mutex::new(Some(thread)),
         })
     }
@@ -84,14 +86,92 @@ impl StoreHost {
             .map_err(BridgeError::from)
     }
 
+    pub(crate) fn remote_start(&self, options: crate::remote::StartOptions) -> BridgeResult<()> {
+        let mut remote = lock(&self.remote);
+        if remote.is_some() {
+            return Err(BridgeError::Remote(
+                "remote client is already started".to_owned(),
+            ));
+        }
+        let jobs = lock(&self.jobs)
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| BridgeError::Closed("store is closed".to_owned()))?;
+        *remote = Some(crate::remote::RemoteHost::start(options, jobs)?);
+        Ok(())
+    }
+
+    pub(crate) fn remote_next(&self) -> BridgeResult<Vec<serde_json::Value>> {
+        let remote = lock(&self.remote)
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| BridgeError::Remote("remote client is not started".to_owned()))?;
+        Ok(remote.events().next())
+    }
+
+    pub(crate) fn remote_auth_write(
+        &self,
+        id: u64,
+        token: Option<String>,
+        error: Option<String>,
+    ) -> BridgeResult<()> {
+        let remote = lock(&self.remote)
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| BridgeError::Remote("remote client is not started".to_owned()))?;
+        remote.events().auth_write(id, token, error)
+    }
+
+    pub(crate) fn remote_pull(&self) -> BridgeResult<serde_json::Value> {
+        self.with_remote(|remote| remote.pull())
+    }
+
+    pub(crate) fn remote_identity(&self) -> BridgeResult<String> {
+        self.with_remote(|remote| remote.identity())
+    }
+
+    pub(crate) fn remote_doc_push(
+        &self,
+        table: &str,
+        id: &str,
+        first_commit_seq: i64,
+        updated_commit_seq: i64,
+    ) -> BridgeResult<serde_json::Value> {
+        self.with_remote(|remote| remote.doc_push(table, id, first_commit_seq, updated_commit_seq))
+    }
+
+    pub(crate) fn remote_scope_write(&self, scope: &str) -> BridgeResult<()> {
+        self.with_remote(|remote| remote.scope_write(scope))
+    }
+
+    pub(crate) fn remote_close(&self) -> BridgeResult<()> {
+        let remote = lock(&self.remote).take();
+        if let Some(remote) = remote {
+            remote.close()?;
+        }
+        Ok(())
+    }
+
+    fn with_remote<T>(
+        &self,
+        operation: impl FnOnce(crate::remote::RemoteHost) -> BridgeResult<T>,
+    ) -> BridgeResult<T> {
+        let remote = lock(&self.remote)
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| BridgeError::Remote("remote client is not started".to_owned()))?;
+        operation(remote)
+    }
+
     fn close(&self) -> BridgeResult<()> {
+        let remote_result = self.remote_close();
         lock(&self.jobs).take();
         if let Some(thread) = lock(&self.thread).take() {
             thread
                 .join()
                 .map_err(|_| BridgeError::Host("storage thread panicked".to_owned()))?;
         }
-        Ok(())
+        remote_result
     }
 }
 

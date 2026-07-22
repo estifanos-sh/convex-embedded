@@ -36,6 +36,43 @@ const idleRunner = { subscribeEvents: () => () => undefined } as unknown as Runn
 
 const noopIdentity = async (): Promise<void> => undefined;
 
+const emptyPending = {
+  checkpoints: 0,
+  inflight: 0,
+  mutations: 0,
+  scope: 0,
+  settlements: 0,
+  uploads: 0,
+} as const;
+
+describe("node remote loop status", () => {
+  test("reports idle when a productive native turn drains every pending lane", async () => {
+    const events: EmbeddedInternalEvent[] = [];
+    const remote = {
+      pull: async () => ({
+        ...emptyTick(),
+        pending: emptyPending,
+        pullAttempted: 1,
+        pullSnapshots: 1,
+        received: 1,
+        rowsApplied: 3,
+      }),
+    } as unknown as RemoteSurface;
+
+    const stop = startRemoteLoop(remote, idleRunner, noopIdentity, (event) => events.push(event));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    stop();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        status: "idle",
+        tick: expect.objectContaining({ pending: emptyPending }),
+        type: "remote",
+      }),
+    );
+  });
+});
+
 describe("node remote loop client retirement", () => {
   test("rotates a retired client once with a fresh id, then resumes", async () => {
     const events: EmbeddedInternalEvent[] = [];

@@ -69,6 +69,35 @@ fn member(server_id: &str) -> RemoteMember {
     }
 }
 
+fn retained_result(key: &str, server_id: Option<&str>, revision: usize) -> ResultEntry {
+    let paths = server_id.map_or_else(
+        || b"[]".to_vec(),
+        |server_id| {
+            serde_json::to_vec(&serde_json::json!([{
+                "path": "/value",
+                "table": "issues",
+                "rowId": server_id,
+            }]))
+            .unwrap()
+        },
+    );
+    ResultEntry {
+        key: key.into(),
+        function: "issues:read".into(),
+        args: "{}".into(),
+        schema_hash: "schema".into(),
+        module_hash: "module".into(),
+        skeleton: if server_id.is_some() {
+            br#"{"value":null}"#.to_vec()
+        } else {
+            b"null".to_vec()
+        },
+        paths,
+        skeleton_hash: format!("{key}:{revision}"),
+        clock: revision as f64,
+    }
+}
+
 fn rows(store: &EmbeddedStore) -> Vec<serde_json::Value> {
     parse_docs(
         &store
@@ -298,6 +327,93 @@ fn a_projection_is_deleted_only_after_its_final_membership_edge_exits() {
         .unwrap();
     assert_eq!(final_exit.projection_deleted, 1);
     assert!(rows(&store).is_empty());
+}
+
+#[test]
+fn a_projection_is_deleted_only_after_membership_and_retained_result_edges_exit() {
+    let store =
+        EmbeddedStore::open(tmp_path("membership_result_edges.db").to_str().unwrap()).unwrap();
+    store.setup(&schema()).unwrap();
+
+    let mut list = snapshot(
+        "issues:list:{}",
+        vec![member(SERVER_ID)],
+        vec![projection(SERVER_ID, "shared", 1.0, 1)],
+        "list:1",
+        1,
+    );
+    list.result = Some(Box::new(retained_result("result:list", Some(SERVER_ID), 1)));
+    store.remote_page_write(&list).unwrap();
+
+    let mut point = snapshot("issues:point:{}", Vec::new(), Vec::new(), "point:1", 2);
+    point.result = Some(Box::new(retained_result(
+        "result:point",
+        Some(SERVER_ID),
+        1,
+    )));
+    store.remote_page_write(&point).unwrap();
+
+    let mut list_exit = snapshot("issues:list:{}", Vec::new(), Vec::new(), "list:2", 3);
+    list_exit.result = Some(Box::new(retained_result("result:list", None, 2)));
+    let first_exit = store.remote_page_write(&list_exit).unwrap();
+    assert_eq!(first_exit.projection_deleted, 0);
+    assert_eq!(rows(&store).len(), 1, "the point result still owns the row");
+
+    let mut point_exit = snapshot("issues:point:{}", Vec::new(), Vec::new(), "point:2", 4);
+    point_exit.result = Some(Box::new(retained_result("result:point", None, 2)));
+    let final_exit = store.remote_page_write(&point_exit).unwrap();
+    assert_eq!(final_exit.projection_deleted, 1);
+    assert!(rows(&store).is_empty());
+    assert_eq!(
+        store.result_read("result:point").unwrap().unwrap().paths,
+        b"[]"
+    );
+}
+
+#[test]
+fn an_unchanged_projection_is_materialized_when_membership_reenters() {
+    let store = EmbeddedStore::open(tmp_path("membership_reentry.db").to_str().unwrap()).unwrap();
+    store.setup(&schema()).unwrap();
+    let authoritative = projection(SERVER_ID, "returned", 1.0, 1);
+
+    store
+        .remote_page_write(&snapshot(
+            "issues:all:{}",
+            vec![member(SERVER_ID)],
+            vec![authoritative.clone()],
+            "all:1",
+            1,
+        ))
+        .unwrap();
+    let exit = store
+        .remote_page_write(&snapshot(
+            "issues:all:{}",
+            Vec::new(),
+            Vec::new(),
+            "all:2",
+            2,
+        ))
+        .unwrap();
+    assert_eq!(exit.projection_deleted, 1);
+    assert!(rows(&store).is_empty());
+
+    let reentry = store
+        .remote_page_write(&snapshot(
+            "issues:all:{}",
+            vec![member(SERVER_ID)],
+            vec![authoritative],
+            "all:3",
+            3,
+        ))
+        .unwrap();
+
+    assert_eq!(reentry.projection.committed.len(), 1);
+    assert_eq!(rows(&store).len(), 1);
+    assert_eq!(rows(&store)[0]["title"], "returned");
+    assert_eq!(
+        store.subscription_membership_read("issues:all:{}").unwrap(),
+        vec![member(SERVER_ID)]
+    );
 }
 
 #[test]
@@ -536,6 +652,72 @@ fn mixed_projection_membership_crdt_and_invalidation_commit_together() {
             .as_deref(),
         Some("cursor:crdt")
     );
+}
+
+#[test]
+fn crdt_pull_does_not_resurrect_or_wedge_a_pending_local_delete() {
+    let checkpoint = text_checkpoint("remote");
+    let store = EmbeddedStore::open(
+        tmp_path("membership_crdt_pending_delete.db")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    store.setup(&crdt_schema()).unwrap();
+    store
+        .remote_page_write(&crdt_pull(
+            SERVER_ID,
+            &checkpoint,
+            checkpoint.projection_hash.clone(),
+            1.0,
+        ))
+        .unwrap();
+    let local_id = rows(&store)[0]["_id"].as_str().unwrap().to_owned();
+
+    store
+        .commit(
+            WriteBatch {
+                deletes: vec![DeleteIn {
+                    table: "issues".into(),
+                    id: local_id.clone(),
+                }],
+                ..WriteBatch::default()
+            },
+            &CommitOptions::default(),
+        )
+        .unwrap();
+    assert!(rows(&store).is_empty());
+    assert_eq!(
+        store.id_local_read("issues", SERVER_ID).unwrap(),
+        Some(local_id.clone()),
+        "the optimistic delete keeps its remote id mapping until settlement",
+    );
+
+    let mut repeated = crdt_pull(
+        SERVER_ID,
+        &checkpoint,
+        checkpoint.projection_hash.clone(),
+        2.0,
+    );
+    repeated.cursor = Some("cursor:while-delete-pending".into());
+    store.remote_page_write(&repeated).unwrap();
+
+    assert!(
+        rows(&store).is_empty(),
+        "the repeated authoritative projection must not resurrect the optimistic delete",
+    );
+    assert_eq!(
+        store
+            .remote_cursor_read("issues:crdt:{}")
+            .unwrap()
+            .as_deref(),
+        Some("cursor:while-delete-pending"),
+        "the CRDT pull completes instead of wedging later membership exits",
+    );
+    assert!(store
+        .crdt_remote_state("issues", &local_id, "body", CrdtFieldKind::Text)
+        .unwrap()
+        .is_some());
 }
 
 #[test]

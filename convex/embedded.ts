@@ -1,7 +1,7 @@
 import { defineEmbedded } from "@convex-dev/embedded/server";
 
 import { components } from "./_generated/api";
-import { embeddedManifest } from "./_generated/embedded";
+import { embeddedManifest } from "./generated/embedded";
 import schema from "./schema";
 
 export const embedded = defineEmbedded({
@@ -10,4 +10,5 @@ export const embedded = defineEmbedded({
   schema,
 });
 
+// The browser and Expo demos share these root-deployment replication endpoints.
 export const { upload, push, pull } = embedded;

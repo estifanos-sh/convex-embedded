@@ -1,5 +1,6 @@
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { StoreAdapter, type StoreBinding } from "../storage/binding";
+import type { RemoteStartOptions, RemoteTick } from "../storage/types";
 import { decodeResponse, encodeRequest } from "./codec";
 import type { NativeStoreObject } from "./module";
 import { loadNativeModule } from "./native";
@@ -11,9 +12,14 @@ export async function openExpoStore(path: string): Promise<StoreAdapter> {
   return new StoreAdapter(new ExpoStoreBinding(store));
 }
 
-/** Full local StoreBinding facade over the native binary request channel. */
-class ExpoStoreBinding implements StoreBinding {
+/** Full StoreBinding facade over the native binary request channel. @internal */
+export class ExpoStoreBinding implements StoreBinding {
   private closed = false;
+  private remoteActive = false;
+  private remoteGeneration = 0;
+  private remotePoll: Promise<void> | undefined;
+  private remotePollError: unknown;
+  private remoteStop: (() => void) | undefined;
 
   constructor(private readonly native: NativeStoreObject) {}
 
@@ -89,10 +95,53 @@ class ExpoStoreBinding implements StoreBinding {
     this.invoke("scheduleFail", [jobId, nowMs]);
   scheduleCancel: StoreBinding["scheduleCancel"] = (jobId, nowMs) =>
     this.invoke("scheduleCancel", [jobId, nowMs]);
+  remoteStart: NonNullable<StoreBinding["remoteStart"]> = async (options) => {
+    this.ensureOpen();
+    if (this.remoteActive) throw new Error("Convex Embedded Expo remote is already started.");
+    const { auth: _auth, notify: _notify, transport: _transport, ...nativeOptions } = options;
+    await this.invoke("remoteStart", [nativeOptions]);
+    this.remotePollError = undefined;
+    this.remoteActive = true;
+    const generation = ++this.remoteGeneration;
+    let stop: (() => void) | undefined;
+    const stopped = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    this.remoteStop = stop;
+    this.remotePoll = this.pollRemote(options, generation, stopped);
+  };
+  remoteClose: NonNullable<StoreBinding["remoteClose"]> = async () => {
+    if (!this.remoteActive) return;
+    // Stop the event loop before asking Rust to wake the outstanding blocking `remoteNext` call.
+    // Otherwise an empty close wake can race into one more wait before the close promise resolves.
+    this.remoteActive = false;
+    this.remoteStop?.();
+    this.remoteStop = undefined;
+    try {
+      await this.invoke("remoteClose", []);
+    } finally {
+      await this.remotePoll;
+      this.remotePoll = undefined;
+      this.remotePollError = undefined;
+    }
+  };
+  remotePull: NonNullable<StoreBinding["remotePull"]> = (_localProgress) =>
+    this.invokeRemote("remotePull", []);
+  remoteIdentity: NonNullable<StoreBinding["remoteIdentity"]> = () =>
+    this.invokeRemote("remoteIdentity", []);
+  remoteDocPush: NonNullable<StoreBinding["remoteDocPush"]> = (
+    table,
+    id,
+    firstCommitSeq,
+    updatedCommitSeq,
+  ) => this.invokeRemote("remoteDocPush", [table, id, firstCommitSeq, updatedCommitSeq]);
+  remoteScopeWrite: NonNullable<StoreBinding["remoteScopeWrite"]> = (scopeJson) =>
+    this.invokeRemote("remoteScopeWrite", [scopeJson]);
   clear: StoreBinding["clear"] = () => this.invoke("clear", []);
 
   async close(): Promise<void> {
     if (this.closed) return;
+    await this.remoteClose();
     this.closed = true;
     try {
       await this.native.close();
@@ -106,7 +155,64 @@ class ExpoStoreBinding implements StoreBinding {
     return decodeResponse<T>(await this.native.call(encodeRequest(operation, args)));
   }
 
+  private async invokeRemote<T>(operation: string, args: unknown[]): Promise<T> {
+    if (this.remotePollError) throw this.remotePollError;
+    return await this.invoke<T>(operation, args);
+  }
+
+  private async pollRemote(
+    options: RemoteStartOptions,
+    generation: number,
+    stopped: Promise<void>,
+  ): Promise<void> {
+    while (this.remoteActive && generation === this.remoteGeneration) {
+      try {
+        const events = await this.invoke<RemoteBridgeEvent[]>("remoteNext", []);
+        for (const event of events) {
+          if (!this.remoteActive || generation !== this.remoteGeneration) return;
+          if (event.kind === "tick") {
+            options.notify?.(event.tick);
+            continue;
+          }
+          const auth = Promise.resolve()
+            .then(() => options.auth?.({ forceRefreshToken: event.forceRefreshToken }))
+            .then(
+              (token) => ({ kind: "token" as const, token: token ?? null }),
+              (error: unknown) => ({ error, kind: "error" as const }),
+            );
+          const result = await Promise.race([
+            auth,
+            stopped.then(() => ({ kind: "closed" as const })),
+          ]);
+          if (
+            result.kind === "closed" ||
+            !this.remoteActive ||
+            generation !== this.remoteGeneration
+          ) {
+            return;
+          }
+          if (result.kind === "token") {
+            await this.invoke("remoteAuthWrite", [event.id, result.token, null]);
+          } else {
+            await this.invoke("remoteAuthWrite", [event.id, null, errorMessage(result.error)]);
+          }
+        }
+      } catch (error) {
+        if (this.remoteActive) this.remotePollError = error;
+        return;
+      }
+    }
+  }
+
   private ensureOpen(): void {
     if (this.closed) throw new Error("Convex Embedded Expo store is closed.");
   }
+}
+
+type RemoteBridgeEvent =
+  | { kind: "auth"; id: number; forceRefreshToken: boolean }
+  | { kind: "tick"; tick: RemoteTick };
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -41,6 +41,12 @@ export interface ConvexEmbeddedClientOptions {
    * @defaultValue `"convex-embedded.sqlite3"`
    */
   path?: string;
+  /** Convex deployment URL. Omit for a local-only client. */
+  url?: string;
+  /** Receive timeout for one native remote protocol tick. */
+  receiveTimeoutMs?: number;
+  /** Timeout for native remote query, mutation, and action work. */
+  operationTimeoutMs?: number;
 }
 
 /**
@@ -51,8 +57,8 @@ export interface ConvexEmbeddedClientOptions {
  * load custom native modules. Install `expo-crypto` with Expo's version-aware
  * installer, then configure Metro with
  * `@convex-dev/embedded/metro` so the generated placement contract and local
- * Convex modules are included in the application bundle. Expo currently runs
- * local storage and local functions without native remote replication.
+ * Convex modules are included in the application bundle. Pass `url` to enable
+ * native remote replication over the same Rust driver used by Node.
  *
  * @example
  * ```ts
@@ -73,9 +79,18 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
     }
     super({
       authState: createEmbeddedAuthState(),
+      compatiblePriorRuntimes: embeddedIdentity.compatiblePriorRuntimes,
       manifest: embeddedManifest,
       moduleGraphHash: embeddedIdentity.moduleGraphHash,
       modules,
+      remote:
+        options.url === undefined
+          ? undefined
+          : {
+              url: options.url,
+              operationTimeoutMs: options.operationTimeoutMs,
+              receiveTimeoutMs: options.receiveTimeoutMs,
+            },
       storeSchema: embeddedSchema.runtimeStoreSchema,
       store: openExpoStore(path),
     });

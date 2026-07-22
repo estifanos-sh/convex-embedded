@@ -2,7 +2,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{BridgeError, BridgeResult};
 
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub(crate) struct Request {

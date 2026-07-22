@@ -14,13 +14,16 @@ export default defineSchema({
   mutations: defineTable({
     clientId: v.string(),
     mutationId: v.string(),
+    replayId: v.optional(v.string()),
     fingerprint: v.string(),
+    logicalFingerprint: v.optional(v.string()),
     settlement: settlementValidator,
     settledAt: v.number(),
     identity: v.optional(v.string()),
   })
     .index("by_clientid_and_mutationid", ["clientId", "mutationId"])
     .index("by_identity_and_mutationid", ["identity", "mutationId"])
+    .index("by_identity_and_replayid", ["identity", "replayId"])
     .index("by_clientid_and_settledat", ["clientId", "settledAt"])
     .index("by_identity_and_settledat", ["identity", "settledAt"]),
 
@@ -31,13 +34,16 @@ export default defineSchema({
     requestId: v.string(),
     functionName: v.string(),
     mutationId: v.string(),
+    replayId: v.optional(v.string()),
     fingerprint: v.string(),
+    logicalFingerprint: v.optional(v.string()),
     runtime: v.object({
       schemaHash: v.string(),
       moduleGraphHash: v.string(),
       protocolVersion: v.number(),
     }),
     acknowledgeMutationId: v.optional(v.string()),
+    acknowledgeReplayId: v.optional(v.string()),
     resultHash: v.string(),
     mutationTime: v.number(),
     randomSeed: v.string(),

@@ -11,7 +11,7 @@ import {
   type WorkerState,
   type RemoteTransportLimits,
 } from "../../src/browser/runtime";
-import { remotePendingIsEmpty, remoteTickHasWork } from "../../src/rev";
+import { mergeRemoteTicks, remotePendingIsEmpty, remoteTickHasWork } from "../../src/rev";
 import type { RemoteTick } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 
@@ -639,7 +639,8 @@ describe("remote tick activity", () => {
         remote: {
           pull: async () => {
             pull += 1;
-            if (pull === 1) return tick({ pullDiagnostics: 1 });
+            if (pull === 1)
+              return tick({ connected: true, pullDiagnostics: 1, pullError: "apply failed" });
             if (pull === 2) return tick({ pullAttempted: 0 });
             if (pull === 3) return tick({ pullSnapshots: 1 });
             return tick({ pullAttempted: 0 });
@@ -725,6 +726,13 @@ describe("remote tick activity", () => {
   test("continues draining after transport ingress", () => {
     expect(remoteTickHasWork(tick({ received: 1 }))).toBe(true);
     expect(remoteTickHasWork(tick({ sent: 4, storeJobs: 6 }))).toBe(true);
+  });
+
+  test("keeps the latest explicit connectivity transition when ticks merge", () => {
+    expect(mergeRemoteTicks(tick({ connected: true }), tick({ connected: false })).connected).toBe(
+      false,
+    );
+    expect(mergeRemoteTicks(tick({ connected: false }), tick({})).connected).toBe(false);
   });
 
   test("keeps application and replication progress active", () => {

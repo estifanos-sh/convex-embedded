@@ -2020,12 +2020,16 @@ dependencies = [
 name = "mobile"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "base64 0.13.1",
+ "convex",
  "jni",
+ "remote",
  "serde",
  "serde_json",
  "storage",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

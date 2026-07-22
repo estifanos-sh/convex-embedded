@@ -18,7 +18,7 @@ export type DocumentWrite = {
   title?: string;
 };
 
-export type DocumentWriteAction = (write: DocumentWrite) => Promise<void>;
+export type DocumentWriteAction = (write: DocumentWrite) => Promise<EditorDraft>;
 
 export type EditorSaveState = "dirty" | "error" | "recovered" | "saved" | "saving";
 

@@ -1,8 +1,8 @@
 # Convex Embedded Expo demo
 
-This Expo Router app exercises the package-owned iOS and Android storage binding. It is local-only:
-queries and mutations run against the embedded database on the device, and native remote replication
-is not enabled yet.
+This Expo Router app exercises the package-owned iOS and Android storage binding. Queries and
+mutations run against the embedded database on the device, remain available offline, and replicate
+to the configured Convex deployment.
 
 The app requires an Expo development build or a release build. Expo Go cannot load the custom
 `ConvexEmbeddedNative` module.
@@ -16,6 +16,13 @@ vp run @convex-dev/embedded-demo-expo#native:ios
 # or: vp run @convex-dev/embedded-demo-expo#native:android
 vp run @convex-dev/embedded-demo-expo#typecheck
 ```
+
+Metro and the browser Vite demo share `VITE_CONVEX_URL` from the repository root `.env.local`.
+Metro maps that client-safe URL to `EXPO_PUBLIC_CONVEX_URL` at bundle time, so do not create a
+second env file under `demos/expo`. CI and EAS builds should set `VITE_CONVEX_URL` in their build
+environment because the uncommitted root env file is not present in remote builds. Metro fails with
+an actionable error when the canonical URL is missing rather than silently building a local-only
+demo.
 
 Build and open a native development app with one of these commands:
 
@@ -36,7 +43,9 @@ vp run @convex-dev/embedded-demo-expo#start
 ```
 
 Restart Metro whenever the Convex schema or a device function changes. The Metro adapter regenerates
-the embedded module registry and placement contract during configuration.
+the embedded module registry and the shared `convex/generated/embedded.ts` placement contract during
+configuration. Vite uses that same generated path, which remains available when Convex codegen
+replaces `convex/_generated`.
 
 EAS development and store builds use `eas.json`. Run EAS from this directory so it picks up the demo
 configuration. A checkout is intentionally not linked to any maintainer's Expo account, so sign in

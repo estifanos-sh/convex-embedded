@@ -3,6 +3,10 @@ import { describe, expect, test, vi } from "vite-plus/test";
 import { decodeRequest, decodeResponse, encodeRequest } from "../../src/expo/codec";
 import { installExpoCrypto } from "../../src/expo/cryptography";
 import { createNativeModuleLoader, type NativeModule } from "../../src/expo/module";
+import type { NativeStoreObject } from "../../src/expo/module";
+import { ExpoStoreBinding } from "../../src/expo/store";
+
+vi.mock("../../src/expo/native", () => ({ loadNativeModule: vi.fn() }));
 
 describe("Expo native bridge", () => {
   test("encodes positional arguments, bytes, and exact integers", () => {
@@ -14,7 +18,7 @@ describe("Expo native bridge", () => {
       buffers: [new Uint8Array([1, 2, 3])],
       json: '["blob",{"$buffer":0},{"$integer":"9007199254740993"}]',
       operation: "blobWrite",
-      version: 1,
+      version: 2,
     });
   });
 
@@ -29,7 +33,7 @@ describe("Expo native bridge", () => {
   });
 
   test("loads once and rejects missing or stale native modules", () => {
-    const native = module(1);
+    const native = module(2);
     const resolve = vi.fn(() => native);
     const load = createNativeModuleLoader(resolve);
 
@@ -37,8 +41,8 @@ describe("Expo native bridge", () => {
     expect(load()).toBe(native);
     expect(resolve).toHaveBeenCalledOnce();
     expect(() => createNativeModuleLoader(() => null)()).toThrow("not linked");
-    expect(() => createNativeModuleLoader(() => module(2))()).toThrow(
-      "does not match JavaScript version 1",
+    expect(() => createNativeModuleLoader(() => module(1))()).toThrow(
+      "does not match JavaScript version 2",
     );
   });
 
@@ -96,6 +100,122 @@ describe("Expo native bridge", () => {
       32,
     );
   });
+
+  test("remote close unblocks an outstanding event wait", async () => {
+    let finishNext: ((value: Uint8Array) => void) | undefined;
+    let nextStarted: (() => void) | undefined;
+    const waiting = new Promise<void>((resolve) => {
+      nextStarted = resolve;
+    });
+    const operations: string[] = [];
+    const native: NativeStoreObject = {
+      call: async (bytes) => {
+        const request = decodeRequest(bytes);
+        operations.push(request.operation);
+        if (request.operation === "remoteNext") {
+          nextStarted?.();
+          return await new Promise<Uint8Array>((resolve) => {
+            finishNext = resolve;
+          });
+        }
+        if (request.operation === "remoteClose") {
+          finishNext?.(response("[]", []));
+        }
+        return response("null", []);
+      },
+      clockRead: () => 0,
+      close: async () => undefined,
+      release: () => undefined,
+    };
+    const binding = new ExpoStoreBinding(native);
+
+    await binding.remoteStart({
+      moduleGraphHash: "module",
+      protocolVersion: 24,
+      schemaHash: "schema",
+      url: "https://example.convex.cloud",
+    });
+    await waiting;
+    await binding.remoteClose();
+
+    expect(operations).toEqual(["remoteStart", "remoteNext", "remoteClose"]);
+  });
+
+  test("forwards exact compatible prior runtimes to the native remote", async () => {
+    let finishNext: ((value: Uint8Array) => void) | undefined;
+    let startOptions: unknown;
+    const native: NativeStoreObject = {
+      call: async (bytes) => {
+        const request = decodeRequest(bytes);
+        if (request.operation === "remoteStart") {
+          [startOptions] = JSON.parse(request.json) as [unknown];
+        }
+        if (request.operation === "remoteNext") {
+          return await new Promise<Uint8Array>((resolve) => {
+            finishNext = resolve;
+          });
+        }
+        if (request.operation === "remoteClose") finishNext?.(response("[]", []));
+        return response("null", []);
+      },
+      clockRead: () => 0,
+      close: async () => undefined,
+      release: () => undefined,
+    };
+    const binding = new ExpoStoreBinding(native);
+    const compatiblePriorRuntimes = [
+      { moduleGraphHash: "prior", protocolVersion: 24, schemaHash: "schema" },
+    ];
+
+    await binding.remoteStart({
+      compatiblePriorRuntimes,
+      moduleGraphHash: "current",
+      protocolVersion: 25,
+      schemaHash: "schema",
+      url: "https://example.convex.cloud",
+    });
+    await binding.remoteClose();
+
+    expect(startOptions).toMatchObject({ compatiblePriorRuntimes });
+  });
+
+  test("remote close does not wait for an unresolved auth callback", async () => {
+    let next = 0;
+    const operations: string[] = [];
+    const native: NativeStoreObject = {
+      call: async (bytes) => {
+        const request = decodeRequest(bytes);
+        operations.push(request.operation);
+        if (request.operation === "remoteNext" && next++ === 0) {
+          return response('[{"kind":"auth","id":7,"forceRefreshToken":false}]', []);
+        }
+        return response(request.operation === "remoteNext" ? "[]" : "null", []);
+      },
+      clockRead: () => 0,
+      close: async () => undefined,
+      release: () => undefined,
+    };
+    const binding = new ExpoStoreBinding(native);
+    let authStarted: (() => void) | undefined;
+    const waiting = new Promise<void>((resolve) => {
+      authStarted = resolve;
+    });
+
+    await binding.remoteStart({
+      auth: async () => {
+        authStarted?.();
+        return await new Promise<string>(() => undefined);
+      },
+      moduleGraphHash: "module",
+      protocolVersion: 24,
+      schemaHash: "schema",
+      url: "https://example.convex.cloud",
+    });
+    await waiting;
+    await binding.remoteClose();
+
+    expect(operations).toEqual(["remoteStart", "remoteNext", "remoteClose"]);
+  });
 });
 
 function module(version: number): NativeModule {
@@ -119,7 +239,7 @@ function response(json: string, buffers: Uint8Array[]): Uint8Array {
   string(bytes, "error");
   bytes.push(0xc0);
   string(bytes, "version");
-  bytes.push(1);
+  bytes.push(2);
   return Uint8Array.from(bytes);
 }
 

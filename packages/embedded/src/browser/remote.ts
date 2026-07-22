@@ -5,6 +5,7 @@ export function remoteConfigKey(
 ): string {
   return JSON.stringify({
     authFetchToken: remote.authFetchToken,
+    compatiblePriorRuntimes: remote.compatiblePriorRuntimes ?? [],
     moduleGraphHash: remote.moduleGraphHash,
     operationTimeoutMs: remote.operationTimeoutMs ?? null,
     protocolVersion: remote.protocolVersion,

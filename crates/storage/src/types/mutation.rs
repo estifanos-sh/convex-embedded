@@ -234,6 +234,12 @@ pub struct RuntimeWireIdentity {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PushEnvelope {
     pub mutation_id: String,
+    /// Durable idempotency key for this prepared replay attempt. The logical mutation id remains
+    /// stable across a safe retry after the server rejects a stale prepared form.
+    pub replay_id: String,
+    /// Hash of the durable, unprepared mutation envelope. Unlike the hosted replay fingerprint,
+    /// this does not change when CRDT bases and projections are prepared again.
+    pub logical_fingerprint: String,
     pub commit_seq: i64,
     pub runtime: RuntimeWireIdentity,
     pub function: String,

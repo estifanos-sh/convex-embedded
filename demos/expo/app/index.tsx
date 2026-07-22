@@ -155,7 +155,7 @@ export default function DocumentsScreen() {
               style={styles.editorLayer}
             >
               <DocumentScreen
-                active={editorVisible}
+                active={editorVisible || openingDocumentId === selectedDocumentId}
                 documentId={selectedDocumentId}
                 onClose={closeDocument}
                 onReady={showReadyDocument}

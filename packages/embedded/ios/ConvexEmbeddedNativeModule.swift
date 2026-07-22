@@ -1,8 +1,18 @@
 import ExpoModulesCore
+import Dispatch
 import Foundation
 import ConvexEmbeddedMobile
 
 public final class ConvexEmbeddedNativeModule: Module {
+  // `remoteNext` intentionally blocks until the Rust actor commits work or closes. Expo's default
+  // AsyncFunction queue is serial, so every store call must use a concurrent queue or that wait
+  // would prevent identity, pull, auth, and close calls from ever reaching Rust.
+  private static let storeQueue = DispatchQueue(
+    label: "dev.convex.embedded.store",
+    qos: .userInitiated,
+    attributes: .concurrent
+  )
+
   public func definition() -> ModuleDefinition {
     Name("ConvexEmbeddedNative")
 
@@ -33,13 +43,13 @@ public final class ConvexEmbeddedNativeModule: Module {
     Class("Store", ConvexEmbeddedNativeStore.self) {
       AsyncFunction("call") { (store: ConvexEmbeddedNativeStore, request: Data) in
         try store.call(request)
-      }
+      }.runOnQueue(Self.storeQueue)
       Function("clockRead") { (store: ConvexEmbeddedNativeStore) in
         try store.clockRead()
       }
       AsyncFunction("close") { (store: ConvexEmbeddedNativeStore) in
         try store.close()
-      }
+      }.runOnQueue(Self.storeQueue)
     }
   }
 

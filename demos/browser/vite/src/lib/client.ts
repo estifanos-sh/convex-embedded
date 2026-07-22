@@ -1,7 +1,6 @@
 import { ConvexEmbeddedClient } from "@convex-dev/embedded/browser";
-import { getConvexUrl } from "@convex-dev/static-hosting";
 
-declare const __CONVEX_EMBEDDED_CONVEX_URL__: string | null;
+declare const __CONVEX_EMBEDDED_CONVEX_URL__: string;
 
 export interface BrowserDebugEvent {
   detail?: unknown;
@@ -10,6 +9,7 @@ export interface BrowserDebugEvent {
 }
 
 declare global {
+  var __convexEmbeddedDemoClient: ConvexEmbeddedClient | undefined;
   var __CONVEX_EMBEDDED_DEBUG_EVENTS__: BrowserDebugEvent[] | undefined;
   var __CONVEX_EMBEDDED_DEBUG_LOG__:
     | ((event: Omit<BrowserDebugEvent, "source"> & { source: "worker" }) => void)
@@ -18,19 +18,15 @@ declare global {
 
 // The demo is unreleased: protocol changes select a fresh store instead of replaying stale work.
 const DEMO_STORAGE_ID = "document-demo-p21";
-const configuredConvexUrl = __CONVEX_EMBEDDED_CONVEX_URL__?.trim() ?? "";
-const remoteUrl = configuredConvexUrl || hostedRemoteUrl();
+const remoteUrl = __CONVEX_EMBEDDED_CONVEX_URL__.trim();
+if (!remoteUrl) {
+  throw new Error(
+    "Missing Convex deployment URL. Set VITE_CONVEX_URL in the repository root .env.local.",
+  );
+}
 const debugEnabled = new URLSearchParams(globalThis.location?.search ?? "").has("debug");
 
 if (debugEnabled) installDebugCapture();
-
-function hostedRemoteUrl(): string {
-  try {
-    return getConvexUrl();
-  } catch {
-    return "";
-  }
-}
 
 try {
   if (globalThis.localStorage?.getItem("convex-embedded.storageId") !== DEMO_STORAGE_ID) {
@@ -41,7 +37,9 @@ try {
   // the browser package falls back to its normal default.
 }
 
-export const client = new ConvexEmbeddedClient(remoteUrl ? { url: remoteUrl } : undefined);
+export const client =
+  globalThis.__convexEmbeddedDemoClient ??
+  (globalThis.__convexEmbeddedDemoClient = new ConvexEmbeddedClient({ url: remoteUrl }));
 
 export function subscribeBrowserDebug(listener: (event: BrowserDebugEvent) => void): () => void {
   const handler = (event: Event) => listener((event as CustomEvent<BrowserDebugEvent>).detail);

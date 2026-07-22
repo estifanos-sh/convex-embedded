@@ -15,7 +15,10 @@ import { AppState, Keyboard, Pressable, StyleSheet, Text, TextInput, View } from
 
 import DocumentEditor from "@/src/editor";
 import { client } from "@/src/client";
+import { useEmbeddedConnectionState } from "@/src/connection";
 import { documentPreview } from "@/src/preview";
+import { openQuerySubscription } from "@/src/subscription";
+import { documentStatus, type DocumentStatusTone } from "@/src/status";
 import { colors } from "@/src/theme";
 import type {
   DocumentWrite,
@@ -25,22 +28,51 @@ import type {
   EditorStatusPayload,
 } from "@/src/types";
 
-async function documentRead(id: string): Promise<EditorDocument | null> {
-  const document = await client.query(api.documents.get, { id: id as Id<"documents"> });
-  if (!document) return null;
+const materializedIdPrefix = "documents|";
+
+function documentOpen(
+  id: string,
+  signal: AbortSignal,
+  onUpdate: (document: EditorDocument | null) => void,
+): { close: () => void; result: Promise<EditorDocument> } {
+  const subscription = openQuerySubscription(
+    client,
+    api.documents.get,
+    { id: id as Id<"documents"> },
+    {
+      accept: (value) => value !== null && value._id.startsWith(materializedIdPrefix),
+      onUpdate: (value) => onUpdate(value ? editorDocument(value) : null),
+      signal,
+      timeoutMessage: "This document could not be downloaded to embedded storage.",
+      timeoutMs: 15_000,
+    },
+  );
   return {
-    body: document.body,
-    id: document._id,
-    title: document.title,
+    close: subscription.close,
+    result: subscription.result.then((document) => {
+      if (!document) throw new Error("This document is no longer available.");
+      return editorDocument(document);
+    }),
   };
 }
 
-async function documentWrite(write: DocumentWrite): Promise<void> {
-  await client.mutation(api.documents.writeBody, {
+function editorDocument(document: {
+  body: string;
+  _id: Id<"documents">;
+  title: string;
+}): EditorDocument {
+  return { body: document.body, id: document._id, title: document.title };
+}
+
+async function documentWrite(
+  write: DocumentWrite,
+): Promise<Pick<EditorDocument, "body" | "title">> {
+  const updated = await client.mutation(api.documents.writeBody, {
     id: write.id as Id<"documents">,
     splices: write.splices,
     ...(write.title === undefined ? {} : { title: write.title }),
   });
+  return { body: updated.body, title: updated.title };
 }
 
 export default function DocumentRoute() {
@@ -63,6 +95,7 @@ type DocumentScreenProps = {
 
 export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenProps>(
   function DocumentScreen({ active = true, documentId: id, onClose, onReady }, ref) {
+    const connection = useEmbeddedConnectionState();
     const [document, setDocument] = useState<EditorDocument | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [editorToken, setEditorToken] = useState("");
@@ -79,13 +112,52 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
     const [focusBodyRequest, setFocusBodyRequest] = useState(0);
     const [retryRequest, setRetryRequest] = useState(0);
     const activeEditorTokenRef = useRef("");
+    const documentRef = useRef<EditorDocument | null>(null);
+    const loadedDocumentIdRef = useRef<string | null>(null);
     const latestTitlesRef = useRef(new Map<string, string>());
+    const readAbortRef = useRef<AbortController | null>(null);
     const readGenerationRef = useRef(0);
+    const readSubscriptionRef = useRef<(() => void) | null>(null);
     const titleRevisionRef = useRef(0);
+
+    const applyDocumentUpdate = useCallback((generation: number, value: EditorDocument | null) => {
+      if (readGenerationRef.current !== generation) return;
+      if (value === null) {
+        documentRef.current = null;
+        setDocument(null);
+        setError("This document is no longer available.");
+        return;
+      }
+
+      const previous = documentRef.current;
+      const localTitle = latestTitlesRef.current.get(value.id);
+      const titleCanFollowRemote =
+        previous?.id === value.id && (localTitle === previous.title || localTitle === value.title);
+      documentRef.current = value;
+      loadedDocumentIdRef.current = value.id;
+      setDocument(value);
+      if (titleCanFollowRemote) {
+        latestTitlesRef.current.set(value.id, value.title);
+        setTitle(value.title);
+      }
+    }, []);
+
+    const closeDocumentRead = useCallback(() => {
+      readGenerationRef.current += 1;
+      readAbortRef.current?.abort();
+      readAbortRef.current = null;
+      readSubscriptionRef.current?.();
+      readSubscriptionRef.current = null;
+    }, []);
 
     const read = useCallback(() => {
       const generation = readGenerationRef.current + 1;
       readGenerationRef.current = generation;
+      readAbortRef.current?.abort();
+      readSubscriptionRef.current?.();
+      readSubscriptionRef.current = null;
+      const readAbort = new AbortController();
+      readAbortRef.current = readAbort;
       activeEditorTokenRef.current = "";
       setReadyEditorToken("");
       setPlaceholderVisible(true);
@@ -101,15 +173,20 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
 
       setLoading(true);
       setError(null);
-      void documentRead(id)
+      const subscription = documentOpen(id, readAbort.signal, (value) =>
+        applyDocumentUpdate(generation, value),
+      );
+      readSubscriptionRef.current = subscription.close;
+      void subscription.result
         .then((value) => {
-          if (readGenerationRef.current !== generation) return;
-          if (!value) {
-            setError("Document not found in embedded storage.");
+          if (readGenerationRef.current !== generation) {
+            subscription.close();
             return;
           }
           const token = `${value.id}:${generation}`;
           activeEditorTokenRef.current = token;
+          loadedDocumentIdRef.current = value.id;
+          documentRef.current = value;
           latestTitlesRef.current.set(value.id, value.title);
           titleRevisionRef.current = 0;
           setTitle(value.title);
@@ -118,20 +195,46 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
           setDocument(value);
         })
         .catch((reason: unknown) => {
-          if (readGenerationRef.current === generation) setError(errorMessage(reason));
+          if (readGenerationRef.current === generation && !isAbortError(reason)) {
+            setError(errorMessage(reason));
+          }
         })
         .finally(() => {
           if (readGenerationRef.current === generation) setLoading(false);
         });
-    }, [id]);
+    }, [applyDocumentUpdate, id]);
+
+    const retainDocumentRead = useCallback(() => {
+      if (!id) return;
+      const generation = readGenerationRef.current + 1;
+      readGenerationRef.current = generation;
+      readAbortRef.current?.abort();
+      readSubscriptionRef.current?.();
+      const readAbort = new AbortController();
+      readAbortRef.current = readAbort;
+      const subscription = documentOpen(id, readAbort.signal, (value) =>
+        applyDocumentUpdate(generation, value),
+      );
+      readSubscriptionRef.current = subscription.close;
+      void subscription.result.catch((reason: unknown) => {
+        if (readGenerationRef.current === generation && !isAbortError(reason)) {
+          setError(errorMessage(reason));
+        }
+      });
+    }, [applyDocumentUpdate, id]);
 
     useEffect(() => {
-      read();
-      return () => {
-        readGenerationRef.current += 1;
-        activeEditorTokenRef.current = "";
-      };
-    }, [read]);
+      if (!active) {
+        closeDocumentRead();
+        return;
+      }
+      if (loadedDocumentIdRef.current === id && activeEditorTokenRef.current) {
+        retainDocumentRead();
+      } else {
+        read();
+      }
+      return closeDocumentRead;
+    }, [active, closeDocumentRead, id, read, retainDocumentRead]);
 
     useEffect(() => {
       const subscription = AppState.addEventListener("change", (state) => {
@@ -165,12 +268,21 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
     }, []);
     const editorDocumentWrite = useCallback(async (write: DocumentWrite) => {
       const title = write.title === latestTitlesRef.current.get(write.id) ? write.title : undefined;
-      if (write.splices.length === 0 && title === undefined) return;
-      await documentWrite({
-        id: write.id,
-        splices: write.splices,
-        ...(title === undefined ? {} : { title }),
-      });
+      if (write.splices.length === 0 && title === undefined) {
+        const current = documentRef.current;
+        if (!current) throw new Error("Document not found.");
+        return { body: current.body, title: current.title };
+      }
+      try {
+        return await documentWrite({
+          id: write.id,
+          splices: write.splices,
+          ...(title === undefined ? {} : { title }),
+        });
+      } catch (error: unknown) {
+        console.error("The embedded document write failed.", error);
+        throw error;
+      }
     }, []);
 
     useEffect(() => {
@@ -219,6 +331,8 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
     );
 
     const switchingDocument = document !== null && document.id !== id;
+    const materializedDocument =
+      document && document.id.startsWith(materializedIdPrefix) ? document : null;
     const showPlaceholder = placeholderVisible;
     const visibleError = webViewCrash ?? error;
     useEffect(() => {
@@ -284,6 +398,7 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
     return (
       <View style={styles.page}>
         <EditorHeader
+          connection={connection}
           editable={
             Boolean(document) &&
             !loading &&
@@ -333,7 +448,7 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
           </View>
         ) : (
           <View style={styles.editorStage}>
-            {document ? (
+            {materializedDocument ? (
               <View
                 accessibilityElementsHidden={showPlaceholder}
                 importantForAccessibility={showPlaceholder ? "no-hide-descendants" : "auto"}
@@ -342,7 +457,7 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
                 <DocumentEditor
                   active={editorActive}
                   closeRequest={closeRequest}
-                  document={document}
+                  document={materializedDocument}
                   documentWrite={editorDocumentWrite}
                   dom={dom}
                   editorReady={editorReady}
@@ -386,6 +501,7 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
 );
 
 function EditorHeader({
+  connection,
   editable,
   onBack,
   onFocus,
@@ -397,6 +513,7 @@ function EditorHeader({
   state,
   title,
 }: {
+  connection: ReturnType<typeof useEmbeddedConnectionState>;
   editable: boolean;
   onBack: () => void;
   onFocus: () => void;
@@ -408,7 +525,8 @@ function EditorHeader({
   state: EditorSaveState | "opening";
   title: string;
 }) {
-  const status = editorStatusView(state);
+  const status = documentStatus(state, connection);
+  const color = statusColor(status.tone);
   return (
     <View style={styles.editorHeader}>
       <Pressable
@@ -451,20 +569,17 @@ function EditorHeader({
             pressed && styles.headerStatusPressed,
           ]}
         >
-          <EditorStatusContent color={status.color} label={status.label} />
+          <EditorStatusContent color={color} label={status.label} />
         </Pressable>
       ) : (
         <View
-          accessibilityLabel={status.label}
+          accessibilityLabel={status.accessibilityLabel}
           accessibilityLiveRegion="polite"
           accessibilityRole="text"
           accessible
-          style={[
-            styles.headerStatus,
-            state !== "saved" && state !== "opening" && styles.headerStatusActive,
-          ]}
+          style={[styles.headerStatus, status.emphasized && styles.headerStatusActive]}
         >
-          <EditorStatusContent color={status.color} label={status.label} />
+          <EditorStatusContent color={color} label={status.label} />
         </View>
       )}
     </View>
@@ -482,17 +597,20 @@ function EditorStatusContent({ color, label }: { color: string; label: string })
   );
 }
 
-function editorStatusView(state: EditorSaveState | "opening"): { color: string; label: string } {
-  if (state === "dirty") return { color: "#e6e2a8", label: "Unsaved" };
-  if (state === "error") return { color: colors.content.error, label: "Retry" };
-  if (state === "opening") return { color: colors.content.tertiary, label: "Opening" };
-  if (state === "recovered") return { color: "#e6e2a8", label: "Recovered" };
-  if (state === "saving") return { color: "#63a8f8", label: "Saving" };
-  return { color: "#b4ec92", label: "Saved" };
+function statusColor(tone: DocumentStatusTone): string {
+  if (tone === "error") return colors.content.error;
+  if (tone === "idle") return colors.content.tertiary;
+  if (tone === "progress") return "#63a8f8";
+  if (tone === "warning") return "#e6e2a8";
+  return "#b4ec92";
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 const styles = StyleSheet.create({

@@ -1,5 +1,5 @@
 /** Internal wire revision. Increment for every breaking client/component protocol change. */
-export const EMBEDDED_PROTOCOL_VERSION = 24;
+export const EMBEDDED_PROTOCOL_VERSION = 25;
 
 /** Stable Convex error code for a client/component wire revision mismatch. */
 export const EMBEDDED_PROTOCOL_MISMATCH = "EMBEDDED_PROTOCOL_MISMATCH";

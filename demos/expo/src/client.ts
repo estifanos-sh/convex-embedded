@@ -4,9 +4,16 @@ import { ConvexEmbeddedClient } from "@convex-dev/embedded/expo";
 const scope = globalThis as typeof globalThis & {
   __convexEmbeddedDemoClient?: ConvexEmbeddedClient;
 };
+const deploymentUrl = process.env.EXPO_PUBLIC_CONVEX_URL?.trim();
+if (!deploymentUrl) {
+  throw new Error(
+    "Missing Convex deployment URL. Set VITE_CONVEX_URL in the repository root .env.local and reload Metro.",
+  );
+}
 
 export const client =
   scope.__convexEmbeddedDemoClient ??
   (scope.__convexEmbeddedDemoClient = new ConvexEmbeddedClient({
     path: "convex-embedded-demo.sqlite3",
+    url: deploymentUrl,
   }));

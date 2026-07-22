@@ -40,13 +40,13 @@ class ConvexEmbeddedNativeModule : Module() {
     Class("Store", ConvexEmbeddedNativeStore::class) {
       AsyncFunction("call") { store: ConvexEmbeddedNativeStore, request: ByteArray ->
         store.call(request)
-      }
+      }.runOnQueue(appContext.backgroundCoroutineScope)
       Function("clockRead") { store: ConvexEmbeddedNativeStore ->
         store.clockRead()
       }
       AsyncFunction("close") { store: ConvexEmbeddedNativeStore ->
         store.close()
-      }
+      }.runOnQueue(appContext.backgroundCoroutineScope)
     }
   }
 }
@@ -55,13 +55,11 @@ class ConvexEmbeddedNativeStore(
   appContext: expo.modules.kotlin.AppContext,
   private var handle: Long,
 ) : SharedObject(appContext) {
-  @Synchronized
   fun call(request: ByteArray): ByteArray {
     val current = openHandle()
     return Native.call(current, request)
   }
 
-  @Synchronized
   fun clockRead(): Double = Native.clockRead(openHandle())
 
   @Synchronized
@@ -76,6 +74,7 @@ class ConvexEmbeddedNativeStore(
     close()
   }
 
+  @Synchronized
   private fun openHandle(): Long {
     if (handle == 0L) throw NativeStoreException("Native store is closed.")
     return handle

@@ -2125,6 +2125,110 @@ impl EmbeddedStore {
         Ok(envelopes)
     }
 
+    /// Atomically rotate only the hosted replay-attempt id for an exact queued mutation.
+    ///
+    /// The logical mutation id, commit sequence, CRDT payloads, and every local document row stay
+    /// unchanged. This is intentionally compare-and-swap shaped so a crashed recovery retries the
+    /// already-persisted attempt instead of creating another one.
+    pub fn remote_push_replay_write(
+        &self,
+        mutation_id: &str,
+        expected_commit_seq: i64,
+        expected_replay_id: &str,
+        replay_id: &str,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        if replay_id.is_empty() || replay_id == expected_replay_id {
+            return Err(StorageError::Unsatisfiable(
+                "remote replay id rotation requires a distinct non-empty id".to_owned(),
+            ));
+        }
+        let _guard = lock(&self.operation_lock);
+        let watermark = format!("{REMOTE_PUSH_ENVELOPE_PREFIX}{mutation_id}");
+        let commit_seq = self
+            .driver
+            .run_row(
+                sql::read_remote_commit_seq(),
+                vec![
+                    text_value(self.identity_key.clone()),
+                    text_value(watermark.clone()),
+                ],
+                |row| int_at(row, 0),
+            )?
+            .ok_or_else(|| {
+                StorageError::Unsatisfiable(format!(
+                    "push envelope {mutation_id} must exist before replay rotation"
+                ))
+            })?;
+        if commit_seq != expected_commit_seq {
+            return Err(StorageError::Unsatisfiable(format!(
+                "push replay commit sequence {expected_commit_seq} does not match queued sequence {commit_seq}"
+            )));
+        }
+        let envelope_json = self
+            .driver
+            .run_row(
+                sql::read_remote_cursor(),
+                vec![
+                    text_value(self.identity_key.clone()),
+                    text_value(watermark.clone()),
+                ],
+                |row| optional_text_at(row, 0),
+            )?
+            .flatten()
+            .ok_or_else(|| {
+                StorageError::Unsatisfiable(format!(
+                    "push envelope {mutation_id} has no replay payload"
+                ))
+            })?;
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&envelope_json).map_err(|error| StorageError::Decode {
+                expected: "push envelope JSON",
+                index: 0,
+                got: error.to_string(),
+            })?;
+        let object = envelope
+            .as_object_mut()
+            .ok_or_else(|| StorageError::Decode {
+                expected: "push envelope object",
+                index: 0,
+                got: "non-object".to_owned(),
+            })?;
+        if object.get("mutationId").and_then(serde_json::Value::as_str) != Some(mutation_id) {
+            return Err(StorageError::Unsatisfiable(
+                "rotated replay does not match its logical mutation id".to_owned(),
+            ));
+        }
+        let current_replay_id = object
+            .get("replayId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(mutation_id);
+        if current_replay_id != expected_replay_id {
+            return Err(StorageError::Unsatisfiable(format!(
+                "push replay id changed from expected {expected_replay_id}"
+            )));
+        }
+        object.insert(
+            "replayId".to_owned(),
+            serde_json::Value::String(replay_id.to_owned()),
+        );
+        let encoded = serde_json::to_string(&envelope).map_err(|error| StorageError::Decode {
+            expected: "encoded push envelope",
+            index: 0,
+            got: error.to_string(),
+        })?;
+        self.driver.execute(
+            sql::write_remote_cursor(),
+            vec![
+                text_value(self.identity_key.clone()),
+                text_value(watermark),
+                Value::from_i64(commit_seq),
+                text_value(encoded),
+                Value::from_i64(now_ms),
+            ],
+        )
+    }
+
     /// Exact durable work counts used by the remote actor's convergence snapshot.
     pub fn remote_pending_read(&self) -> Result<RemotePending, StorageError> {
         let _guard = lock(&self.operation_lock);
@@ -2403,13 +2507,32 @@ impl EmbeddedStore {
             )?;
         }
         let push_watermark = format!("{REMOTE_PUSH_ENVELOPE_PREFIX}{op_id}");
+        let replay_id = self
+            .driver
+            .run_row(
+                sql::read_remote_cursor(),
+                vec![
+                    text_value(self.identity_key.clone()),
+                    text_value(push_watermark.clone()),
+                ],
+                |row| optional_text_at(row, 0),
+            )?
+            .flatten()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .and_then(|value| {
+                value
+                    .get("replayId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| op_id.to_owned());
         self.driver.execute(
             sql::write_remote_cursor(),
             vec![
                 text_value(self.identity_key.clone()),
-                text_value(format!("{REMOTE_RECEIPT_PREFIX}{op_id}")),
+                text_value(format!("{REMOTE_RECEIPT_PREFIX}{replay_id}")),
                 Value::from_i64(commit_seq),
-                text_value(op_id.to_owned()),
+                text_value(replay_id),
                 Value::from_i64(0),
             ],
         )?;
@@ -3248,6 +3371,18 @@ impl EmbeddedStore {
             } else {
                 record_order(record, existing_projection.as_ref())
             };
+            // Membership exit deliberately retains the authoritative projection metadata while
+            // removing the materialized document. If the same row later re-enters a subscription,
+            // an equal projection hash is not a zero-write duplicate: the document must be
+            // materialized again. Treat `Known` as a no-op only while its physical row exists.
+            let order = if matches!(order, RecordOrder::Known)
+                && record.row.is_some()
+                && self.doc_read_unlocked(&record.table, &local_id)?.is_none()
+            {
+                RecordOrder::Adopt
+            } else {
+                order
+            };
             match order {
                 RecordOrder::Stale => {
                     if let Some(commit) = self
@@ -3417,6 +3552,8 @@ impl EmbeddedStore {
         subscription: &str,
         members: &[RemoteMember],
         retained: &FxHashSet<RemoteMember>,
+        released: &FxHashSet<RemoteMember>,
+        replacing_result_key: Option<&str>,
         now_ms: i64,
         projection: &mut AuthoritativeApplyResult,
     ) -> Result<usize, StorageError> {
@@ -3455,7 +3592,7 @@ impl EmbeddedStore {
             }
         }
 
-        if previous == current {
+        if previous == current && released.is_empty() {
             return Ok(0);
         }
 
@@ -3482,8 +3619,21 @@ impl EmbeddedStore {
         }
 
         let mut projection_deleted = 0;
-        for exited in previous.difference(&current) {
-            if retained.contains(exited) || self.membership_row_has_edge_unlocked(exited)? {
+        let mut exited = previous
+            .difference(&current)
+            .cloned()
+            .collect::<FxHashSet<_>>();
+        exited.extend(released.iter().cloned());
+        let result_edges = if exited.is_empty() {
+            FxHashSet::default()
+        } else {
+            self.result_edges_read_unlocked(replacing_result_key)?
+        };
+        for exited in &exited {
+            if retained.contains(exited)
+                || self.membership_row_has_edge_unlocked(exited)?
+                || result_edges.contains(exited)
+            {
                 continue;
             }
             if self.membership_projection_delete_unlocked(exited, now_ms, projection)? {
@@ -3509,6 +3659,33 @@ impl EmbeddedStore {
                 |_| Ok(()),
             )?
             .is_some())
+    }
+
+    /// Rows disclosed by other retained authored results. Result disclosures are durable ownership
+    /// edges just like subscription membership: one subscription can observe a deletion before a
+    /// point-result subscription receives its corresponding `null` result. Read the union once per
+    /// membership page so releasing many rows does not rescan every retained result for every row.
+    /// Ignore the result currently being replaced because its incoming paths are represented by
+    /// `retained`; otherwise its stale stored paths would keep the row alive forever.
+    fn result_edges_read_unlocked(
+        &self,
+        replacing_result_key: Option<&str>,
+    ) -> Result<FxHashSet<RemoteMember>, StorageError> {
+        let mut edges = FxHashSet::default();
+        self.driver.run_rows(
+            sql::read_result_paths(),
+            vec![text_value(self.identity_key.clone())],
+            |row| {
+                let key = text_at(row, 0)?;
+                if replacing_result_key == Some(key.as_str()) {
+                    return Ok(());
+                }
+                let paths = blob_at(row, 1)?;
+                edges.extend(result_disclosed_rows_from_paths(&paths)?);
+                Ok(())
+            },
+        )?;
+        Ok(edges)
     }
 
     fn remote_doc_id_read_unlocked(
@@ -3817,11 +3994,31 @@ impl EmbeddedStore {
             self.materialize_dirty_heads_in_tx_unlocked()?;
             let mut projection = self.remote_doc_page_write_unlocked(&pull.projections)?;
 
-            let retained = result_disclosed_rows(pull.result.as_deref());
+            let retained = result_disclosed_rows(pull.result.as_deref())?;
+            let (released, replacing_result_key) = match pull.result.as_deref() {
+                Some(entry) => {
+                    let previous = self
+                        .result_read_unlocked(&entry.key)?
+                        .as_ref()
+                        .map(|entry| result_disclosed_rows(Some(entry)))
+                        .transpose()?
+                        .unwrap_or_default();
+                    (
+                        previous
+                            .difference(&retained)
+                            .cloned()
+                            .collect::<FxHashSet<_>>(),
+                        Some(entry.key.as_str()),
+                    )
+                }
+                None => (FxHashSet::default(), None),
+            };
             let projection_deleted = self.membership_snapshot_write_unlocked(
                 &pull.subscription,
                 &pull.members,
                 &retained,
+                &released,
+                replacing_result_key,
                 pull.received_time,
                 &mut projection,
             )?;
@@ -3903,6 +4100,8 @@ impl EmbeddedStore {
                 subscription,
                 &[],
                 &FxHashSet::default(),
+                &FxHashSet::default(),
+                None,
                 now_ms,
                 &mut projection,
             )?;
@@ -4043,14 +4242,34 @@ impl EmbeddedStore {
         let local_id = self
             .projection_map_remote_id_unlocked(&change.table, &change.document_id, None, now_ms)?
             .local_id;
-        let row_json = self
-            .doc_read_unlocked(&change.table, &local_id)?
+        let mut projection = self
+            .remote_doc_read_unlocked(&change.table, &local_id)?
             .ok_or_else(|| {
                 StorageError::Unsatisfiable(format!(
                     "remote pull CRDT field {}.{} has no authoritative projection",
                     change.table, change.document_id
                 ))
             })?;
+        let local_row = self.doc_read_unlocked(&change.table, &local_id)?;
+        let pending_delete = local_row.is_none()
+            && self
+                .read_dirty_head_unlocked(&change.table, &local_id)?
+                .is_some_and(|head| head.change.op == RowChangeOp::Delete);
+        let row_json = match local_row {
+            Some(row) => row,
+            None if pending_delete => projection.server_row.clone().ok_or_else(|| {
+                StorageError::Unsatisfiable(format!(
+                    "remote pull CRDT field {}.{} has no authoritative server row",
+                    change.table, change.document_id
+                ))
+            })?,
+            None => {
+                return Err(StorageError::Unsatisfiable(format!(
+                    "remote pull CRDT field {}.{} has no authoritative projection",
+                    change.table, change.document_id
+                )));
+            }
+        };
         let current =
             self.read_crdt_field_state_unlocked(&change.table, &local_id, &change.field)?;
         let (state, changed) = remote_pull_crdt_state(current, change)?;
@@ -4070,16 +4289,12 @@ impl EmbeddedStore {
             )
         })?;
         let accepted_value = crate::crdt::crdt_field_value(&accepted, change.kind)?;
-        let mut projection = self
-            .remote_doc_read_unlocked(&change.table, &local_id)?
-            .ok_or_else(|| {
-                StorageError::Unsatisfiable(
-                    "accepted remote CRDT state has no projection metadata".to_owned(),
-                )
-            })?;
         let base_row = projection.server_row.as_deref().unwrap_or(&row_json);
         projection.server_row = Some(patch_row_field(base_row, &change.field, accepted_value)?);
         self.remote_doc_write_unlocked(&projection)?;
+        if pending_delete {
+            return Ok(None);
+        }
         let value = crate::crdt::crdt_field_value(&state, change.kind)?;
         let patched = patch_row_field(&row_json, &change.field, value)?;
         if patched == row_json {
@@ -5396,14 +5611,31 @@ fn parse_json_row(row: &str) -> Result<serde_json::Value, StorageError> {
     })
 }
 
-fn result_disclosed_rows(result: Option<&ResultEntry>) -> FxHashSet<RemoteMember> {
-    let mut rows = FxHashSet::default();
+fn result_disclosed_rows(
+    result: Option<&ResultEntry>,
+) -> Result<FxHashSet<RemoteMember>, StorageError> {
     let Some(entry) = result else {
-        return rows;
+        return Ok(FxHashSet::default());
     };
-    let Ok(serde_json::Value::Array(paths)) = serde_json::from_slice(&entry.paths) else {
-        return rows;
+    result_disclosed_rows_from_paths(&entry.paths)
+}
+
+fn result_disclosed_rows_from_paths(paths: &[u8]) -> Result<FxHashSet<RemoteMember>, StorageError> {
+    let paths = serde_json::from_slice::<serde_json::Value>(paths).map_err(|error| {
+        StorageError::Decode {
+            expected: "retained result paths",
+            index: 0,
+            got: error.to_string(),
+        }
+    })?;
+    let serde_json::Value::Array(paths) = paths else {
+        return Err(StorageError::Decode {
+            expected: "retained result paths array",
+            index: 0,
+            got: "non-array".to_owned(),
+        });
     };
+    let mut rows = FxHashSet::default();
     for path in paths {
         if let (Some(table), Some(server_document_id)) = (
             path.get("table").and_then(serde_json::Value::as_str),
@@ -5415,7 +5647,7 @@ fn result_disclosed_rows(result: Option<&ResultEntry>) -> FxHashSet<RemoteMember
             });
         }
     }
-    rows
+    Ok(rows)
 }
 
 impl EmbeddedStore {

@@ -33,6 +33,7 @@ import {
 export interface WorkerRunnerInit {
   acceptedResultTimeoutMs?: number;
   closeTimeoutMs?: number;
+  compatiblePriorRuntimes?: readonly import("../storage/types").RemoteRuntimeIdentity[];
   debug?: boolean;
   identity?: RuntimeIdentity;
   initTimeoutMs?: number;
@@ -171,6 +172,7 @@ export class WorkerRunner implements Runner {
                 ? {
                     authFetchToken: init.remoteAuth !== undefined,
                     clientId: this.clientId,
+                    compatiblePriorRuntimes: init.compatiblePriorRuntimes,
                     moduleGraphHash: init.identity?.moduleGraphHash ?? "local",
                     operationTimeoutMs: init.remote.operationTimeoutMs,
                     protocolVersion: init.identity?.protocolVersion ?? EMBEDDED_PROTOCOL_VERSION,

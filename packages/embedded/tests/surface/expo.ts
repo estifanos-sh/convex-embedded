@@ -58,11 +58,11 @@ describe("Expo package surface", () => {
     expect(gradle).not.toMatch(/cargo|externalNativeBuild|cmake/i);
   });
 
-  test("maps every required local StoreBinding operation", () => {
+  test("maps every required StoreBinding operation", () => {
     const source = readFileSync(join(root, "src/expo/store.ts"), "utf8");
-    const operations = [...source.matchAll(/this\.invoke\("([A-Za-z]+)"/g)].map(
-      ([, operation]) => operation,
-    );
+    const operations = [
+      ...source.matchAll(/this\.invoke(?:Remote)?(?:<[^>]+>)?\("([A-Za-z]+)"/g),
+    ].map(([, operation]) => operation);
     const rust = readFileSync(join(root, "../../crates/mobile/src/lib.rs"), "utf8");
     const dispatch = rust.slice(rust.indexOf("fn dispatch("), rust.indexOf("fn mutation_record("));
     const rustOperations = dispatch
@@ -117,11 +117,39 @@ describe("Expo package surface", () => {
       "scheduleComplete",
       "scheduleFail",
       "scheduleCancel",
+      "remoteStart",
+      "remoteNext",
+      "remoteAuthWrite",
+      "remotePull",
+      "remoteIdentity",
+      "remoteDocPush",
+      "remoteScopeWrite",
+      "remoteClose",
       "clear",
     ]);
     expect(new Set(operations)).toEqual(expected);
     expect(new Set(rustOperations)).toEqual(expected);
     expect(source).not.toContain("commitOneDocWrite");
+  });
+
+  test("runs blocking iOS store calls on a concurrent queue", () => {
+    const swift = readFileSync(join(root, "ios/ConvexEmbeddedNativeModule.swift"), "utf8");
+    expect(swift).toContain("attributes: .concurrent");
+    expect(swift).toMatch(/AsyncFunction\("call"\)[\s\S]*?\.runOnQueue\(Self\.storeQueue\)/);
+    expect(swift).toMatch(/AsyncFunction\("close"\)[\s\S]*?\.runOnQueue\(Self\.storeQueue\)/);
+  });
+
+  test("runs blocking Android store calls on the lifecycle-owned background scope", () => {
+    const kotlin = readFileSync(
+      join(root, "android/src/main/java/expo/modules/convexembedded/ConvexEmbeddedNativeModule.kt"),
+      "utf8",
+    );
+    expect(kotlin).toMatch(
+      /AsyncFunction\("call"\)[\s\S]*?\.runOnQueue\(appContext\.backgroundCoroutineScope\)/,
+    );
+    expect(kotlin).toMatch(
+      /AsyncFunction\("close"\)[\s\S]*?\.runOnQueue\(appContext\.backgroundCoroutineScope\)/,
+    );
   });
 
   test("declares every expected prebuilt artifact path", () => {

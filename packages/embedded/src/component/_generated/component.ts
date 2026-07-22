@@ -204,7 +204,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
     acknowledge: FunctionReference<
       "mutation",
       "internal",
-      { clientId: string; identity?: string; mutationId: string },
+      { clientId: string; identity?: string; replayId: string },
       null,
       Name
     >;
@@ -275,7 +275,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       {
         request:
           | {
-              acknowledgeMutationId?: string;
+              acknowledgeReplayId?: string;
               changes: Array<
                 | {
                     contentHash: string;
@@ -317,6 +317,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               fingerprint: string;
               identity?: string;
               kind: "apply";
+              logicalFingerprint: string;
+              replayId: string;
               runtime: {
                 moduleGraphHash: string;
                 protocolVersion: number;
@@ -359,7 +361,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
                 | { kind: "unsupported" };
             }
           | {
-              acknowledgeMutationId?: string;
+              acknowledgeReplayId?: string;
               changes: Array<
                 | {
                     contentHash: string;
@@ -379,6 +381,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               fingerprint: string;
               identity?: string;
               kind: "failure";
+              logicalFingerprint: string;
+              replayId: string;
               revisions: Array<
                 | {
                     content: "value";
@@ -616,7 +620,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       "internal",
       { functionName: string; requestId: string },
       {
-        acknowledgeMutationId?: string;
+        acknowledgeReplayId?: string;
         clientId: string;
         crdt: Array<{
           baseSeq: number;
@@ -640,6 +644,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           table: string;
         }>;
         fingerprint: string;
+        logicalFingerprint: string;
         inserts: Array<{
           mutationId: string;
           ordinal: number;
@@ -649,6 +654,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         mutationId: string;
         mutationTime: number;
         randomSeed: string;
+        replayId: string;
         reads: Array<
           | {
               crdt: Array<{
@@ -702,7 +708,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       "mutation",
       "internal",
       {
-        acknowledgeMutationId?: string;
+        acknowledgeReplayId?: string;
         clientId: string;
         crdt: Array<{
           baseSeq: number;
@@ -735,6 +741,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           table: string;
         }>;
         kind: "push";
+        logicalFingerprint: string;
         mutationId: string;
         mutationTime: number;
         randomSeed: string;
@@ -764,6 +771,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             }
         >;
         requestId: string;
+        replayId: string;
         resultHash: string;
         revisionCheckpoints: Array<{
           operation: "create" | "retain";

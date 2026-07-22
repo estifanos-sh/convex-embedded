@@ -85,6 +85,7 @@ export type WorkerRequest =
       remote?: {
         authFetchToken: boolean;
         clientId?: string;
+        compatiblePriorRuntimes?: readonly import("../storage/types").RemoteRuntimeIdentity[];
         moduleGraphHash: string;
         operationTimeoutMs?: number;
         protocolVersion: number;

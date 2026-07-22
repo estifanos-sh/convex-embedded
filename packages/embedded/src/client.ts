@@ -32,12 +32,7 @@ import {
   type RunMutationTiming,
   type StopOnUpdate,
 } from "./runtime/runner";
-import {
-  consumeRemoteTick,
-  remotePendingIsEmpty,
-  REMOTE_PULL_DIAGNOSTIC_ERROR,
-  remoteTickHasWork,
-} from "./rev";
+import { consumeRemoteTick, remotePendingIsEmpty, REMOTE_PULL_DIAGNOSTIC_ERROR } from "./rev";
 import { toRuntimeStoreSchema, type ConvexEmbeddedSchema } from "./schema";
 import type {
   RemoteStartOptions,
@@ -232,6 +227,8 @@ interface EmbeddedClientBaseOptions {
   store: StorageBackend | Promise<StorageBackend>;
   /** Mutable auth state shared with the remote driver. */
   authState?: EmbeddedAuthState;
+  /** Reviewed build migrations that may replay exact prior runtime envelopes. */
+  compatiblePriorRuntimes?: readonly import("./storage/types").RemoteRuntimeIdentity[];
   /** Optional native remote replication configuration. */
   remote?: ConvexEmbeddedRemoteOptions;
 }
@@ -407,6 +404,7 @@ export class EmbeddedClient {
   private localState: EmbeddedConnectionState["local"] = "starting";
   private remoteState: EmbeddedConnectionState["remote"] = "disabled";
   private remoteError: string | undefined;
+  private remotePullError: string | undefined;
   private remoteIncarnation: string | undefined;
   private remoteGeneration = -1;
   private remoteSequence = -1;
@@ -812,6 +810,7 @@ export class EmbeddedClient {
     this.localState = "closed";
     this.remoteState = this.remoteState === "disabled" ? "disabled" : "closed";
     this.remoteError = undefined;
+    this.remotePullError = undefined;
     for (const state of this.queries.values()) {
       state.stop?.();
       state.stop = undefined;
@@ -877,6 +876,7 @@ export class EmbeddedClient {
     if (!remote?.pull) return undefined;
     const tick = await remote.pull(true);
     consumeRemoteTick(tick, runner, (event) => this.emitEvent(event));
+    this.emitEvent(remoteTickEvent(tick));
     return tick;
   }
 
@@ -940,11 +940,17 @@ export class EmbeddedClient {
         }
         const startRemote = async () => {
           await store.remote!.start({
-            ...toRemoteStartOptions(options.remote!, this.auth, this.clientId, {
-              schemaHash: schema.hash ?? "local",
-              moduleGraphHash,
-              protocolVersion: EMBEDDED_PROTOCOL_VERSION,
-            }),
+            ...toRemoteStartOptions(
+              options.remote!,
+              this.auth,
+              this.clientId,
+              {
+                schemaHash: schema.hash ?? "local",
+                moduleGraphHash,
+                protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+              },
+              options.compatiblePriorRuntimes,
+            ),
             notify: (tick) => {
               consumeRemoteTick(tick, runner, (event) => this.emitEvent(event));
               this.emitEvent(remoteTickEvent(tick));
@@ -1211,9 +1217,19 @@ export class EmbeddedClient {
           this.remoteSequence = event.sequence;
         }
       }
+      if ((event.tick?.pullSnapshots ?? 0) > 0) this.remotePullError = undefined;
+      if ((event.tick?.pullDiagnostics ?? 0) > 0) {
+        this.remotePullError = event.error ?? event.tick?.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR;
+      }
       if (event.status === "error") {
         this.remoteState = "error";
-        this.remoteError = event.error;
+        this.remoteError =
+          event.error?.includes("remote command channel closed") && this.remotePullError
+            ? this.remotePullError
+            : event.error;
+      } else if (this.remotePullError !== undefined && event.status !== "closed") {
+        this.remoteState = "error";
+        this.remoteError = this.remotePullError;
       } else if (event.status === "offline") {
         this.remoteState = "offline";
         this.remoteError = undefined;
@@ -1233,10 +1249,20 @@ export class EmbeddedClient {
         }
         this.remoteError = undefined;
       } else if (event.status === "connected") {
-        this.remoteState = "connected";
+        if (remotePendingIsEmpty(event.tick?.pending)) {
+          this.remoteState = "ready";
+        } else if (event.tick?.pending !== undefined || this.remoteState !== "ready") {
+          this.remoteState = "connected";
+        }
         this.remoteError = undefined;
       } else if (event.status === "tick") {
-        if (this.remoteState !== "offline") this.remoteState = "connected";
+        if (this.remoteState !== "offline") {
+          if (remotePendingIsEmpty(event.tick?.pending)) {
+            this.remoteState = "ready";
+          } else if (event.tick?.pending !== undefined || this.remoteState !== "ready") {
+            this.remoteState = "connected";
+          }
+        }
         this.remoteError = undefined;
       } else if (event.status === "idle") {
         this.remoteState = remotePendingIsEmpty(event.tick?.pending) ? "ready" : "connected";
@@ -1421,11 +1447,13 @@ function toRemoteStartOptions(
   auth: EmbeddedAuthState,
   clientId: string,
   runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number },
+  compatiblePriorRuntimes?: readonly import("./storage/types").RemoteRuntimeIdentity[],
 ): RemoteStartOptions {
   return {
     auth: async (request) =>
       (await auth.fetchToken?.({ forceRefreshToken: request?.forceRefreshToken ?? false })) ?? null,
     clientId,
+    compatiblePriorRuntimes,
     moduleGraphHash: runtime.moduleGraphHash,
     operationTimeoutMs: options.operationTimeoutMs,
     protocolVersion: runtime.protocolVersion,
@@ -1554,7 +1582,6 @@ export function startRemoteLoop(
           pullDiagnostic = tick.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR;
         }
         if (!stopped) consumeRemoteTick(tick, runner, emit);
-        const active = remoteTickHasWork(tick);
         // The native actor owns websocket ingress after this bounded wake turn. JavaScript enters
         // it again only for new local durable work or a changed authored-query scope.
         const delay = wakePending ? 0 : undefined;
@@ -1571,11 +1598,33 @@ export function startRemoteLoop(
           nextDelay = delay;
           return;
         }
+        if (tick.connected === false) {
+          emit({
+            at: getTimerTime(),
+            attempt,
+            status: "offline",
+            tick: toRemoteEventTick(tick),
+            type: "remote",
+          });
+          nextDelay = delay;
+          return;
+        }
+        if (tick.connected === true) {
+          emit({
+            at: getTimerTime(),
+            attempt,
+            status: remotePendingIsEmpty(tick.pending) ? "idle" : "connected",
+            tick: toRemoteEventTick(tick),
+            type: "remote",
+          });
+          nextDelay = delay;
+          return;
+        }
         emit({
           at: getTimerTime(),
           attempt,
           ...(delay === undefined ? {} : { nextRunAt: getTimerTime() + delay }),
-          status: active || !remotePendingIsEmpty(tick.pending) ? "tick" : "idle",
+          status: remotePendingIsEmpty(tick.pending) ? "idle" : "tick",
           tick: toRemoteEventTick(tick),
           type: "remote",
         });
@@ -1649,8 +1698,26 @@ function remoteTickEvent(tick: RemoteTick): EmbeddedRemoteEvent {
     return {
       at: getTimerTime(),
       attempt: 0,
-      error: REMOTE_PULL_DIAGNOSTIC_ERROR,
+      error: tick.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR,
       status: "error",
+      tick: toRemoteEventTick(tick),
+      type: "remote",
+    };
+  }
+  if (tick.connected === false) {
+    return {
+      at: getTimerTime(),
+      attempt: 0,
+      status: "offline",
+      tick: toRemoteEventTick(tick),
+      type: "remote",
+    };
+  }
+  if (tick.connected === true) {
+    return {
+      at: getTimerTime(),
+      attempt: 0,
+      status: remotePendingIsEmpty(tick.pending) ? "idle" : "connected",
       tick: toRemoteEventTick(tick),
       type: "remote",
     };
@@ -1658,7 +1725,7 @@ function remoteTickEvent(tick: RemoteTick): EmbeddedRemoteEvent {
   return {
     at: getTimerTime(),
     attempt: 0,
-    status: remoteTickHasWork(tick) || !remotePendingIsEmpty(tick.pending) ? "tick" : "idle",
+    status: remotePendingIsEmpty(tick.pending) ? "idle" : "tick",
     tick: toRemoteEventTick(tick),
     type: "remote",
   };

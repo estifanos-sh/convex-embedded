@@ -62,6 +62,15 @@ impl RemoteClient {
     where
         F: Fn(RemoteTick) + Send + 'static,
     {
+        self.start_with_observer_and_exit(observe, |_| {})
+    }
+
+    /// Start the native actor and report its terminal result after the driver exits.
+    pub fn start_with_observer_and_exit<F, E>(&self, observe: F, exit: E) -> RemoteResult<()>
+    where
+        F: Fn(RemoteTick) + Send + 'static,
+        E: Fn(Option<String>) + Send + 'static,
+    {
         let mut state = lock(&self.inner.state);
         let driver = match &mut *state {
             RemoteState::NotStarted(driver) => *driver.take().ok_or(RemoteError::AlreadyStarted)?,
@@ -78,7 +87,9 @@ impl RemoteClient {
                     .enable_all()
                     .build()
                     .map_err(|error| RemoteError::Join(error.to_string()))?;
-                runtime.block_on(driver.run_with_observer(receiver, observe))
+                let result = runtime.block_on(driver.run_with_observer(receiver, observe));
+                exit(result.as_ref().err().map(ToString::to_string));
+                result
             })
             .map_err(|error| RemoteError::Join(error.to_string()))?;
         *state = RemoteState::Running {

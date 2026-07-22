@@ -80,7 +80,7 @@ pub fn blob_args(
 pub fn mutation_args(
     envelope: &PushEnvelope,
     client_id: &str,
-    acknowledge_mutation_id: Option<&str>,
+    acknowledge_replay_id: Option<&str>,
 ) -> RemoteResult<ConvexArgs> {
     let args = json_to_convex(envelope.args.clone())?;
     if !matches!(args, Value::Object(_)) {
@@ -99,6 +99,14 @@ pub fn mutation_args(
         (
             "mutationId".to_owned(),
             Value::String(envelope.mutation_id.clone()),
+        ),
+        (
+            "replayId".to_owned(),
+            Value::String(envelope.replay_id.clone()),
+        ),
+        (
+            "logicalFingerprint".to_owned(),
+            Value::String(envelope.logical_fingerprint.clone()),
         ),
         ("runtime".to_owned(), encode_runtime(&envelope.runtime)),
         (
@@ -170,10 +178,10 @@ pub fn mutation_args(
             ),
         ),
     ]);
-    if let Some(mutation_id) = acknowledge_mutation_id {
+    if let Some(replay_id) = acknowledge_replay_id {
         request.insert(
-            "acknowledgeMutationId".to_owned(),
-            Value::String(mutation_id.to_owned()),
+            "acknowledgeReplayId".to_owned(),
+            Value::String(replay_id.to_owned()),
         );
     }
     Ok(BTreeMap::from([(
@@ -493,8 +501,21 @@ pub fn decode_envelope(json: &str) -> RemoteResult<PushEnvelope> {
         decode_runtime(fields.get("clientRuntime").ok_or_else(|| {
             RemoteError::Protocol("push envelope missing clientRuntime".to_owned())
         })?)?;
+    let mutation_id = json_string(fields, "mutationId")?;
+    let replay_id = fields
+        .get("replayId")
+        .map(|_| json_string(fields, "replayId"))
+        .transpose()?
+        .unwrap_or_else(|| mutation_id.clone());
+    let logical_fingerprint = fields
+        .get("logicalFingerprint")
+        .map(|_| json_string(fields, "logicalFingerprint"))
+        .transpose()?
+        .unwrap_or(logical_envelope_fingerprint(&value)?);
     Ok(PushEnvelope {
-        mutation_id: json_string(fields, "mutationId")?,
+        mutation_id,
+        replay_id,
+        logical_fingerprint,
         commit_seq: json_i64(fields, "commitSeq")?,
         runtime,
         function: json_string(fields, "functionName")?,
@@ -541,6 +562,21 @@ pub fn decode_envelope(json: &str) -> RemoteResult<PushEnvelope> {
             .map(decode_revision_checkpoint)
             .collect::<RemoteResult<Vec<_>>>()?,
     })
+}
+
+fn logical_envelope_fingerprint(value: &serde_json::Value) -> RemoteResult<String> {
+    let mut logical = value.clone();
+    let fields = logical
+        .as_object_mut()
+        .ok_or_else(|| RemoteError::Protocol("push envelope was not an object".to_owned()))?;
+    fields.remove("replayId");
+    fields.remove("logicalFingerprint");
+    let encoded = serde_json::to_vec(&logical).map_err(|error| {
+        RemoteError::Protocol(format!(
+            "logical push envelope could not be encoded: {error}"
+        ))
+    })?;
+    Ok(sha256_hex(&encoded))
 }
 
 fn decode_revision_checkpoint(value: &serde_json::Value) -> RemoteResult<RevisionCheckpoint> {

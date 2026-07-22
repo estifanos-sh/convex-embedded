@@ -9,6 +9,11 @@ import { mutationGeneric, queryGeneric } from "convex/server";
 import { ConvexError, v } from "convex/values";
 
 import {
+  mutationIdentityMatches,
+  mutationReplayMatches,
+  mutationReplaySettlement,
+} from "./compatibility";
+import {
   appliedSettlementInputValidator,
   changeInputValidator,
   crdtEffectValidator,
@@ -72,9 +77,11 @@ const witnessValidator = v.object({
 });
 const commitFields = {
   clientId: v.string(),
+  replayId: v.string(),
   fingerprint: v.string(),
+  logicalFingerprint: v.string(),
   runtime: runtimeValidator,
-  acknowledgeMutationId: v.optional(v.string()),
+  acknowledgeReplayId: v.optional(v.string()),
   identity: v.optional(v.string()),
 };
 const correctionTargetValidator = v.object({ table: v.string(), rowId: v.string() });
@@ -115,19 +122,72 @@ export const commit = mutation({
 
     await clientWrite(ctx, request.clientId, request.runtime, request.identity);
 
-    const prior = await mutationCacheRead(ctx, request.identity, request.settlement.mutationId);
-    if (prior) {
-      if (prior.fingerprint !== request.fingerprint) {
-        throw new ConvexError({
-          code: "EMBEDDED_MUTATION_ID_REUSE",
-          message: "Mutation ID was reused with a different replay fingerprint.",
-        });
+    const replayPrior = await mutationReplayRead(ctx, request.identity, request.replayId);
+    if (replayPrior) {
+      if (
+        !mutationReplayMatches(
+          {
+            fingerprint: replayPrior.fingerprint,
+            logicalFingerprint: replayPrior.logicalFingerprint,
+            replayId: replayPrior.replayId,
+            outcome: replayPrior.settlement.outcome,
+          },
+          {
+            fingerprint: request.fingerprint,
+            logicalFingerprint: request.logicalFingerprint,
+            mutationId: request.settlement.mutationId,
+            replayId: request.replayId,
+          },
+        )
+      ) {
+        mutationIdReuse(replayPrior.settlement.outcome);
       }
+      const settlement =
+        request.kind === "apply"
+          ? mutationReplaySettlement(replayPrior.settlement, request.crdt)
+          : replayPrior.settlement;
       throw new ConvexError({
         code: "EMBEDDED_DUPLICATE",
         message: "Mutation was already applied.",
-        settlement: prior.settlement,
+        settlement,
       });
+    }
+
+    const logicalPrior = await mutationLogicalRead(
+      ctx,
+      request.identity,
+      request.settlement.mutationId,
+    );
+    if (logicalPrior) {
+      if (
+        !mutationIdentityMatches(
+          {
+            fingerprint: logicalPrior.fingerprint,
+            logicalFingerprint: logicalPrior.logicalFingerprint,
+            replayId: logicalPrior.replayId,
+            outcome: logicalPrior.settlement.outcome,
+          },
+          {
+            fingerprint: request.fingerprint,
+            logicalFingerprint: request.logicalFingerprint,
+            mutationId: request.settlement.mutationId,
+            replayId: request.replayId,
+          },
+        )
+      ) {
+        mutationIdReuse(logicalPrior.settlement.outcome);
+      }
+      if (logicalPrior.settlement.outcome === "applied") {
+        const settlement =
+          request.kind === "apply"
+            ? mutationReplaySettlement(logicalPrior.settlement, request.crdt)
+            : logicalPrior.settlement;
+        throw new ConvexError({
+          code: "EMBEDDED_DUPLICATE",
+          message: "Mutation was already applied.",
+          settlement,
+        });
+      }
     }
 
     if (request.kind === "apply") {
@@ -151,13 +211,8 @@ export const commit = mutation({
       );
     }
 
-    if (request.acknowledgeMutationId) {
-      await acknowledgeWrite(
-        ctx,
-        request.clientId,
-        request.acknowledgeMutationId,
-        request.identity,
-      );
+    if (request.acknowledgeReplayId) {
+      await acknowledgeWrite(ctx, request.acknowledgeReplayId, request.identity);
     }
 
     if (request.kind === "apply") {
@@ -205,7 +260,9 @@ export const commit = mutation({
     await ctx.db.insert("mutations", {
       clientId: request.clientId,
       mutationId: settlement.mutationId,
+      replayId: request.replayId,
       fingerprint: request.fingerprint,
+      logicalFingerprint: request.logicalFingerprint,
       settlement,
       settledAt,
       ...(request.identity === undefined ? {} : { identity: request.identity }),
@@ -373,7 +430,8 @@ export const settlementRead = query({
       .withIndex("by_clientid_and_mutationid", (q) =>
         q.eq("clientId", args.clientId).eq("mutationId", args.mutationId),
       )
-      .unique();
+      .order("desc")
+      .first();
     return row === null ? null : { fingerprint: row.fingerprint, settlement: row.settlement };
   },
 });
@@ -389,7 +447,9 @@ export const replayWrite = mutation({
     requestId: v.string(),
     functionName: v.string(),
     mutationId: v.string(),
+    replayId: v.string(),
     fingerprint: v.string(),
+    logicalFingerprint: v.string(),
     resultHash: v.string(),
     mutationTime: v.number(),
     randomSeed: v.string(),
@@ -400,22 +460,58 @@ export const replayWrite = mutation({
     crdt: v.array(crdtEffectValidator),
     revisionCheckpoints: v.array(revisionCheckpointValidator),
     runtime: runtimeValidator,
-    acknowledgeMutationId: v.optional(v.string()),
+    acknowledgeReplayId: v.optional(v.string()),
     expiresAt: v.number(),
   },
   returns: v.union(settlementValidator, v.null()),
   handler: async (ctx, args) => {
     await clientWrite(ctx, args.clientId, args.runtime, args.identity);
     await replayDelete(ctx);
-    const settled = await mutationCacheRead(ctx, args.identity, args.mutationId);
-    if (settled) {
-      if (settled.fingerprint !== args.fingerprint) {
-        throw new ConvexError({
-          code: "EMBEDDED_MUTATION_ID_REUSE",
-          message: "Mutation ID was reused with a different replay fingerprint.",
-        });
+    const replaySettled = await mutationReplayRead(ctx, args.identity, args.replayId);
+    if (replaySettled) {
+      if (
+        !mutationReplayMatches(
+          {
+            fingerprint: replaySettled.fingerprint,
+            logicalFingerprint: replaySettled.logicalFingerprint,
+            replayId: replaySettled.replayId,
+            outcome: replaySettled.settlement.outcome,
+          },
+          {
+            fingerprint: args.fingerprint,
+            logicalFingerprint: args.logicalFingerprint,
+            mutationId: args.mutationId,
+            replayId: args.replayId,
+          },
+        )
+      ) {
+        mutationIdReuse(replaySettled.settlement.outcome);
       }
-      return settled.settlement;
+      return mutationReplaySettlement(replaySettled.settlement, args.crdt);
+    }
+    const logicalSettled = await mutationLogicalRead(ctx, args.identity, args.mutationId);
+    if (logicalSettled) {
+      if (
+        !mutationIdentityMatches(
+          {
+            fingerprint: logicalSettled.fingerprint,
+            logicalFingerprint: logicalSettled.logicalFingerprint,
+            replayId: logicalSettled.replayId,
+            outcome: logicalSettled.settlement.outcome,
+          },
+          {
+            fingerprint: args.fingerprint,
+            logicalFingerprint: args.logicalFingerprint,
+            mutationId: args.mutationId,
+            replayId: args.replayId,
+          },
+        )
+      ) {
+        mutationIdReuse(logicalSettled.settlement.outcome);
+      }
+      if (logicalSettled.settlement.outcome === "applied") {
+        return mutationReplaySettlement(logicalSettled.settlement, args.crdt);
+      }
     }
     const prior = await ctx.db
       .query("replays")
@@ -427,7 +523,12 @@ export const replayWrite = mutation({
       )
       .unique();
     if (prior) {
-      if (prior.mutationId !== args.mutationId || prior.fingerprint !== args.fingerprint) {
+      if (
+        prior.mutationId !== args.mutationId ||
+        (prior.replayId ?? prior.mutationId) !== args.replayId ||
+        prior.fingerprint !== args.fingerprint ||
+        prior.logicalFingerprint !== args.logicalFingerprint
+      ) {
         throw new ConvexError({
           code: "EMBEDDED_REPLAY_TOKEN_REUSE",
           message: "Replay token was reused for a different mutation.",
@@ -469,9 +570,11 @@ export const replayConsume = mutation({
       kind: v.literal("push"),
       clientId: v.string(),
       mutationId: v.string(),
+      replayId: v.string(),
       fingerprint: v.string(),
+      logicalFingerprint: v.string(),
       runtime: runtimeValidator,
-      acknowledgeMutationId: v.optional(v.string()),
+      acknowledgeReplayId: v.optional(v.string()),
       resultHash: v.string(),
       mutationTime: v.number(),
       randomSeed: v.string(),
@@ -496,9 +599,11 @@ export const replayConsume = mutation({
       kind: replay.kind,
       clientId: replay.clientId,
       mutationId: replay.mutationId,
+      replayId: replay.replayId ?? replay.mutationId,
       fingerprint: replay.fingerprint,
+      logicalFingerprint: replay.logicalFingerprint ?? replay.fingerprint,
       runtime: replay.runtime,
-      acknowledgeMutationId: replay.acknowledgeMutationId,
+      acknowledgeReplayId: replay.acknowledgeReplayId ?? replay.acknowledgeMutationId,
       resultHash: replay.resultHash,
       mutationTime: replay.mutationTime,
       randomSeed: replay.randomSeed,
@@ -774,21 +879,20 @@ export const installation = query({
 });
 
 export const acknowledge = mutation({
-  args: { clientId: v.string(), mutationId: v.string(), identity: v.optional(v.string()) },
+  args: { clientId: v.string(), replayId: v.string(), identity: v.optional(v.string()) },
   returns: v.null(),
   handler: async (ctx, args) => {
-    await acknowledgeWrite(ctx, args.clientId, args.mutationId, args.identity);
+    await acknowledgeWrite(ctx, args.replayId, args.identity);
     return null;
   },
 });
 
 async function acknowledgeWrite(
   ctx: MutationCtx,
-  clientId: string,
-  mutationId: string,
+  replayId: string,
   identity?: string,
 ): Promise<void> {
-  const row = await mutationCacheRead(ctx, identity, mutationId);
+  const row = await mutationReplayRead(ctx, identity, replayId);
   if (!row) return;
   const client = await clientRead(ctx, row.clientId);
   if (client && row._creationTime > (client.acknowledgedThrough ?? 0)) {
@@ -799,7 +903,7 @@ async function acknowledgeWrite(
 }
 
 /** Mutation identity survives page, worker, and remote-client incarnations. */
-async function mutationCacheRead(
+async function mutationLogicalRead(
   ctx: MutationCtx,
   identity: string | undefined,
   mutationId: string,
@@ -809,7 +913,38 @@ async function mutationCacheRead(
     .withIndex("by_identity_and_mutationid", (q) =>
       q.eq("identity", identity).eq("mutationId", mutationId),
     )
+    .order("desc")
+    .first();
+}
+
+async function mutationReplayRead(
+  ctx: MutationCtx,
+  identity: string | undefined,
+  replayId: string,
+) {
+  const current = await ctx.db
+    .query("mutations")
+    .withIndex("by_identity_and_replayid", (q) =>
+      q.eq("identity", identity).eq("replayId", replayId),
+    )
     .unique();
+  if (current) return current;
+  const legacy = await ctx.db
+    .query("mutations")
+    .withIndex("by_identity_and_mutationid", (q) =>
+      q.eq("identity", identity).eq("mutationId", replayId),
+    )
+    .order("desc")
+    .first();
+  return legacy?.replayId === undefined ? legacy : null;
+}
+
+function mutationIdReuse(priorOutcome: "applied" | "conflict" | "rejected" | "rebase"): never {
+  throw new ConvexError({
+    code: "EMBEDDED_MUTATION_ID_REUSE",
+    message: "Mutation ID was reused for a different logical mutation or replay attempt.",
+    priorOutcome,
+  });
 }
 
 async function crdtRead(

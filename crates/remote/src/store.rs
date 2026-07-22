@@ -43,6 +43,7 @@ pub trait RemoteStore {
         table: &str,
         server_document_id: &str,
     ) -> Result<Option<String>, StorageError>;
+    fn doc_read(&self, table: &str, local_id: &str) -> Result<Option<String>, StorageError>;
     fn remote_doc_read(&self, table: &str, local_id: &str)
         -> Result<Option<RowHead>, StorageError>;
 
@@ -51,6 +52,18 @@ pub trait RemoteStore {
     fn remote_subscription_read(&self) -> Result<Vec<String>, StorageError>;
     fn remote_pending_read(&self) -> Result<storage::RemotePending, StorageError>;
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError>;
+    fn remote_push_replay_write(
+        &self,
+        _mutation_id: &str,
+        _expected_commit_seq: i64,
+        _expected_replay_id: &str,
+        _replay_id: &str,
+        _now_ms: i64,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unsatisfiable(
+            "remote store cannot rotate replay ids".to_owned(),
+        ))
+    }
     fn remote_settlement_write(
         &self,
         settlement: &RemoteSettlementWrite,
@@ -203,6 +216,9 @@ impl RemoteStore for std::sync::Arc<storage::EmbeddedStore> {
     ) -> Result<Option<String>, StorageError> {
         storage::EmbeddedStore::id_local_read(self, table, server_document_id)
     }
+    fn doc_read(&self, table: &str, local_id: &str) -> Result<Option<String>, StorageError> {
+        storage::EmbeddedStore::doc_read(self, table, local_id)
+    }
     fn remote_doc_read(
         &self,
         table: &str,
@@ -224,6 +240,23 @@ impl RemoteStore for std::sync::Arc<storage::EmbeddedStore> {
     }
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         storage::EmbeddedStore::remote_push_envelope_read(self, num_items)
+    }
+    fn remote_push_replay_write(
+        &self,
+        mutation_id: &str,
+        expected_commit_seq: i64,
+        expected_replay_id: &str,
+        replay_id: &str,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        storage::EmbeddedStore::remote_push_replay_write(
+            self,
+            mutation_id,
+            expected_commit_seq,
+            expected_replay_id,
+            replay_id,
+            now_ms,
+        )
     }
     fn remote_settlement_write(
         &self,
@@ -359,6 +392,9 @@ impl<S: RemoteStore + ?Sized> RemoteStore for Box<S> {
     ) -> Result<Option<String>, StorageError> {
         self.as_ref().id_local_read(table, server_document_id)
     }
+    fn doc_read(&self, table: &str, local_id: &str) -> Result<Option<String>, StorageError> {
+        self.as_ref().doc_read(table, local_id)
+    }
     fn remote_doc_read(
         &self,
         table: &str,
@@ -380,6 +416,22 @@ impl<S: RemoteStore + ?Sized> RemoteStore for Box<S> {
     }
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         self.as_ref().remote_push_envelope_read(num_items)
+    }
+    fn remote_push_replay_write(
+        &self,
+        mutation_id: &str,
+        expected_commit_seq: i64,
+        expected_replay_id: &str,
+        replay_id: &str,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.as_ref().remote_push_replay_write(
+            mutation_id,
+            expected_commit_seq,
+            expected_replay_id,
+            replay_id,
+            now_ms,
+        )
     }
     fn remote_settlement_write(
         &self,
@@ -529,6 +581,10 @@ mod tests {
             self.record("id_local_read");
             Ok(None)
         }
+        fn doc_read(&self, _table: &str, _local_id: &str) -> Result<Option<String>, StorageError> {
+            self.record("doc_read");
+            Ok(None)
+        }
         fn remote_doc_read(
             &self,
             _table: &str,
@@ -559,6 +615,17 @@ mod tests {
         ) -> Result<Vec<String>, StorageError> {
             self.record("remote_push_envelope_read");
             Ok(Vec::new())
+        }
+        fn remote_push_replay_write(
+            &self,
+            _mutation_id: &str,
+            _expected_commit_seq: i64,
+            _expected_replay_id: &str,
+            _replay_id: &str,
+            _now_ms: i64,
+        ) -> Result<(), StorageError> {
+            self.record("remote_push_replay_write");
+            Ok(())
         }
         fn remote_settlement_write(
             &self,
@@ -630,7 +697,7 @@ mod tests {
         }
     }
 
-    const EVERY_METHOD: [&str; 25] = [
+    const EVERY_METHOD: [&str; 27] = [
         "store_job_count",
         "schema_table_names",
         "identity_write",
@@ -641,12 +708,14 @@ mod tests {
         "blob_write",
         "id_read",
         "id_local_read",
+        "doc_read",
         "remote_doc_read",
         "remote_cursor_read",
         "remote_progress_has",
         "remote_subscription_read",
         "remote_pending_read",
         "remote_push_envelope_read",
+        "remote_push_replay_write",
         "remote_settlement_write",
         "remote_receipt_read",
         "remote_receipt_delete",
@@ -684,12 +753,14 @@ mod tests {
         let _ = boxed.blob_write("k", Vec::new());
         let _ = boxed.id_read("t", "l");
         let _ = boxed.id_local_read("t", "s");
+        let _ = boxed.doc_read("t", "l");
         let _ = boxed.remote_doc_read("t", "l");
         let _ = boxed.remote_cursor_read("s");
         let _ = boxed.remote_progress_has();
         let _ = boxed.remote_subscription_read();
         let _ = boxed.remote_pending_read();
         let _ = boxed.remote_push_envelope_read(1);
+        let _ = boxed.remote_push_replay_write("m", 1, "m", "replay", 0);
         let _ = boxed.remote_settlement_write(&RemoteSettlementWrite {
             mutation_id: String::new(),
             expected_commit_seq: 0,

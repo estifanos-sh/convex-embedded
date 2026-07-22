@@ -13,13 +13,14 @@ import {
   recoveryDecision,
   recoveryEncode,
   recoveryRecord,
+  sameDraft,
   textSplice,
   titleRecoveryDecision,
   titleRecoveryRecord,
   titleFromBlocks,
 } from "../src/text";
 import { documentPreview } from "../src/preview";
-import type { EditorDraft } from "../src/types";
+import type { DocumentWrite, EditorDraft } from "../src/types";
 
 void describe("editor text", () => {
   void it("recognizes only completely empty BlockNote tables", () => {
@@ -235,3 +236,82 @@ void describe("editor writes", () => {
     assert.equal(result, "hello bright world");
   });
 });
+
+void describe("editor convergence", () => {
+  const blank: EditorDraft = { body: JSON.stringify(emptyBlocks), title: "Untitled" };
+  const materialized: EditorDraft = {
+    body: JSON.stringify([
+      { id: "title", type: "heading", content: "Notes" },
+      { id: "body", type: "paragraph", content: "Written on another device" },
+    ]),
+    title: "Notes",
+  };
+
+  void it("adopts a materialized body into an untouched editor without writing", () => {
+    const destructive = documentWrite("id", materialized, blank);
+    assert.ok(destructive);
+    assert.ok(destructive.splices[0]!.delete > 0);
+
+    const session = openSession(blank);
+    adoptExternal(session, materialized);
+    flushSession(session);
+
+    assert.deepEqual(session.writes, []);
+    assert.deepEqual(session.base, materialized);
+    assert.deepEqual(session.desired, materialized);
+  });
+
+  void it("ignores an external value that repeats the settled base", () => {
+    const session = openSession(materialized);
+    adoptExternal(session, { ...materialized });
+    flushSession(session);
+    assert.deepEqual(session.writes, []);
+  });
+
+  void it("splices a user edit against the adopted body", () => {
+    const session = openSession(blank);
+    adoptExternal(session, materialized);
+    session.desired = {
+      body: materialized.body.replace("another device", "another device and here"),
+      title: materialized.title,
+    };
+    flushSession(session);
+
+    assert.equal(session.writes.length, 1);
+    const splice = session.writes[0]!.splices[0]!;
+    assert.equal(splice.delete, 0);
+    assert.equal(
+      materialized.body.slice(0, splice.index) +
+        splice.insert +
+        materialized.body.slice(splice.index + splice.delete),
+      session.desired.body,
+    );
+
+    adoptExternal(session, session.desired);
+    flushSession(session);
+    assert.equal(session.writes.length, 1);
+  });
+});
+
+type EditorSession = {
+  base: EditorDraft;
+  desired: EditorDraft;
+  writes: DocumentWrite[];
+};
+
+function openSession(document: EditorDraft): EditorSession {
+  return { base: document, desired: document, writes: [] };
+}
+
+function adoptExternal(session: EditorSession, incoming: EditorDraft): void {
+  if (sameDraft(incoming, session.base)) return;
+  session.base = incoming;
+  session.desired = incoming;
+}
+
+function flushSession(session: EditorSession): void {
+  const write = documentWrite("id", session.base, session.desired);
+  if (!write) return;
+  session.writes.push(write);
+  session.base = session.desired;
+}

@@ -685,6 +685,24 @@ describe("retained-result cache read path", () => {
     expect(hit.authority.foreign).toBe(false);
     expect(hit.points).toEqual([id]);
 
+    const pendingId = localId("messages", "pending");
+    await mapped.id.write({
+      table: "messages",
+      localId: pendingId,
+      mapping: "mapped",
+      convexId: "hostedPending",
+      createdTime: 1,
+      updatedTime: 1,
+    });
+    const pending = probe();
+    const notMaterialized = await createReader<DataModel>(mapped, schema, pending.tracker).get(
+      "messages",
+      "hostedPending" as never,
+    );
+    expect(notMaterialized).toBeNull();
+    expect(pending.authority.foreign).toBe(true);
+    expect(pending.points).toEqual([pendingId]);
+
     const miss = probe();
     const absent = await createReader<DataModel>(mapped, schema, miss.tracker).get(
       "messages",

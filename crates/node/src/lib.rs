@@ -436,6 +436,7 @@ pub struct JsScheduledJob {
 pub struct JsRemoteStartOptions {
     pub auth: Option<JsFunction>,
     pub client_id: Option<String>,
+    pub compatible_prior_runtimes: Option<Vec<JsRuntimeWireIdentity>>,
     pub module_graph_hash: String,
     pub notify: Option<JsFunction>,
     pub operation_timeout_ms: Option<u32>,
@@ -444,6 +445,13 @@ pub struct JsRemoteStartOptions {
     pub schema_hash: String,
     pub transport: Option<JsObject>,
     pub url: String,
+}
+
+#[napi(object)]
+pub struct JsRuntimeWireIdentity {
+    pub module_graph_hash: String,
+    pub protocol_version: i64,
+    pub schema_hash: String,
 }
 
 #[napi(object)]
@@ -507,6 +515,7 @@ pub struct JsRemotePending {
 
 #[napi(object)]
 pub struct JsRemoteTick {
+    pub connected: Option<bool>,
     pub changed_tables: Vec<String>,
     pub rows_applied: u32,
     pub pull_attempted: u32,
@@ -2282,6 +2291,12 @@ impl RemoteStore for NativeRemoteStore {
         self.run(move |store| store.id_local_read(&table, &server_document_id))
     }
 
+    fn doc_read(&self, table: &str, local_id: &str) -> Result<Option<String>, StorageError> {
+        let table = table.to_owned();
+        let local_id = local_id.to_owned();
+        self.run(move |store| store.doc_read(&table, &local_id))
+    }
+
     fn remote_doc_read(
         &self,
         table: &str,
@@ -2311,6 +2326,28 @@ impl RemoteStore for NativeRemoteStore {
 
     fn remote_push_envelope_read(&self, num_items: usize) -> Result<Vec<String>, StorageError> {
         self.run(move |store| store.remote_push_envelope_read(num_items))
+    }
+
+    fn remote_push_replay_write(
+        &self,
+        mutation_id: &str,
+        expected_commit_seq: i64,
+        expected_replay_id: &str,
+        replay_id: &str,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        let mutation_id = mutation_id.to_owned();
+        let expected_replay_id = expected_replay_id.to_owned();
+        let replay_id = replay_id.to_owned();
+        self.run(move |store| {
+            store.remote_push_replay_write(
+                &mutation_id,
+                expected_commit_seq,
+                &expected_replay_id,
+                &replay_id,
+                now_ms,
+            )
+        })
     }
 
     fn remote_settlement_write(
@@ -2434,6 +2471,28 @@ impl RemoteStore for WasmRemoteStore {
         self.run(move |store| store.remote_push_envelope_read(num_items))
     }
 
+    fn remote_push_replay_write(
+        &self,
+        mutation_id: &str,
+        expected_commit_seq: i64,
+        expected_replay_id: &str,
+        replay_id: &str,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        let mutation_id = mutation_id.to_owned();
+        let expected_replay_id = expected_replay_id.to_owned();
+        let replay_id = replay_id.to_owned();
+        self.run(move |store| {
+            store.remote_push_replay_write(
+                &mutation_id,
+                expected_commit_seq,
+                &expected_replay_id,
+                &replay_id,
+                now_ms,
+            )
+        })
+    }
+
     fn remote_settlement_write(
         &self,
         settlement: &storage::RemoteSettlementWrite,
@@ -2551,6 +2610,12 @@ impl RemoteStore for WasmRemoteStore {
         let table = table.to_owned();
         let server_document_id = server_document_id.to_owned();
         self.run(move |store| store.id_local_read(&table, &server_document_id))
+    }
+
+    fn doc_read(&self, table: &str, local_id: &str) -> Result<Option<String>, StorageError> {
+        let table = table.to_owned();
+        let local_id = local_id.to_owned();
+        self.run(move |store| store.doc_read(&table, &local_id))
     }
 
     fn remote_doc_read(
@@ -2974,6 +3039,16 @@ fn remote_config(options: JsRemoteStartOptions) -> napi::Result<RemoteConfig> {
     if let Some(auth) = options.auth {
         config.auth = remote_auth_fetcher(&auth)?;
     }
+    config.compatible_prior_runtimes = options
+        .compatible_prior_runtimes
+        .unwrap_or_default()
+        .into_iter()
+        .map(|runtime| storage::RuntimeWireIdentity {
+            schema_hash: runtime.schema_hash,
+            module_graph_hash: runtime.module_graph_hash,
+            protocol_version: runtime.protocol_version,
+        })
+        .collect();
     config.runtime = storage::RuntimeWireIdentity {
         schema_hash: options.schema_hash,
         module_graph_hash: options.module_graph_hash,
@@ -3020,6 +3095,7 @@ fn millis(value: u32) -> Duration {
 
 fn js_remote_tick(tick: remote::RemoteTick) -> JsRemoteTick {
     JsRemoteTick {
+        connected: tick.connected,
         changed_tables: tick.changed_tables,
         rows_applied: saturating_u32(tick.rows_applied),
         pull_attempted: saturating_u32(tick.pull_attempted),

@@ -1,4 +1,4 @@
-const EXPO_NATIVE_API_VERSION = 1;
+const EXPO_NATIVE_API_VERSION = 2;
 
 /** Native Expo SharedObject contract. @internal */
 export interface NativeStoreObject {

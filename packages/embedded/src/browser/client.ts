@@ -17,7 +17,7 @@ import {
 import type { ConvexEmbeddedSchema } from "../schema";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { loadWasmModule, type WasmModule, type WasmSource } from "./artifact";
-import { createRuntimeIdentity } from "./identity";
+import { createRuntimeIdentity, embeddedCompatiblePriorRuntimes } from "./identity";
 import { storageOwnerLockName } from "./coordinator/protocol";
 import { requestStoragePersistence } from "./opfs";
 import {
@@ -179,6 +179,7 @@ function defaultBrowserRuntime(
   }
   const ownership = createBrowserStorageOwnership(identity);
   const runner = new WorkerRunner(defaultRuntimeWorker(), {
+    compatiblePriorRuntimes: embeddedCompatiblePriorRuntimes(),
     identity,
     initTimeoutMs: BROWSER_WORKER_INIT_TIMEOUT_MS,
     onDispose: () => ownership.close(),

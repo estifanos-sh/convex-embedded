@@ -124,8 +124,10 @@ type RevisionCheckpoint = {
 type ReplayEnvelope = {
   clientId: string;
   mutationId: string;
+  replayId: string;
   fingerprint: string;
-  acknowledgeMutationId?: string;
+  logicalFingerprint: string;
+  acknowledgeReplayId?: string;
   runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number };
   resultHash: string;
   mutationTime: number;
@@ -642,10 +644,12 @@ function buildMutationBuilder(
             request: {
               kind: "apply",
               clientId,
+              replayId: replay.replayId,
               fingerprint,
+              logicalFingerprint: replay.logicalFingerprint,
               runtime: replay.runtime,
               ...(identity === null ? {} : { identity }),
-              acknowledgeMutationId: replay.acknowledgeMutationId,
+              acknowledgeReplayId: replay.acknowledgeReplayId,
               verification: witnessState.unsupported
                 ? { kind: "unsupported" }
                 : witnessState.conflict
@@ -739,7 +743,9 @@ const readWitnessValidator = v.union(
 const replayValidator = v.object({
   clientId: v.string(),
   mutationId: v.string(),
-  acknowledgeMutationId: v.optional(v.string()),
+  replayId: v.string(),
+  logicalFingerprint: v.string(),
+  acknowledgeReplayId: v.optional(v.string()),
   runtime: v.object({
     schemaHash: v.string(),
     moduleGraphHash: v.string(),
@@ -1232,7 +1238,7 @@ const pushRequestValidator = v.union(
   v.object({
     kind: v.literal("acknowledge"),
     clientId: v.string(),
-    mutationId: v.string(),
+    replayId: v.string(),
   }),
   v.object({
     kind: v.literal("blob"),
@@ -1437,7 +1443,7 @@ function buildPush(
         const identity = await identityAttributeOf(ctx);
         await ctx.runMutation(component.protocol.acknowledge, {
           clientId: args.clientId,
-          mutationId: args.mutationId,
+          replayId: args.replayId,
           ...(identity === null ? {} : { identity }),
         });
         return null;
@@ -1470,7 +1476,9 @@ function buildPush(
           requestId,
           functionName: args.functionName,
           mutationId: args.mutationId,
+          replayId: args.replayId,
           fingerprint,
+          logicalFingerprint: args.logicalFingerprint,
           resultHash: args.resultHash,
           mutationTime: args.mutationTime,
           randomSeed: args.randomSeed,
@@ -1481,10 +1489,12 @@ function buildPush(
           crdt: args.crdt,
           revisionCheckpoints: args.revisionCheckpoints,
           runtime: args.runtime,
-          acknowledgeMutationId: args.acknowledgeMutationId,
+          acknowledgeReplayId: args.acknowledgeReplayId,
           expiresAt: readTime() + REPLAY_TTL_MS,
         })) as Settlement | null;
-        if (prior) return prior;
+        if (prior) {
+          return await refreshAppliedSettlement(ctx, prior, tableNames, crdtFields, placements);
+        }
 
         const authoredArgs = (await resolveArgRefs(
           ctx,
@@ -1546,10 +1556,12 @@ function buildPush(
             request: {
               kind: "failure",
               clientId: args.clientId,
+              replayId: args.replayId,
               fingerprint,
+              logicalFingerprint: args.logicalFingerprint,
               runtime: args.runtime,
               ...(identity === null ? {} : { identity }),
-              acknowledgeMutationId: args.acknowledgeMutationId,
+              acknowledgeReplayId: args.acknowledgeReplayId,
               settlement,
               changes,
               revisions,
@@ -2670,6 +2682,51 @@ async function authoritativeChanges(
     }
   }
   return changes;
+}
+
+/** Refresh a cached applied result so a late replay cannot restore an older server projection. */
+async function refreshAppliedSettlement(
+  ctx: GenericMutationCtx<any>,
+  settlement: Settlement,
+  tableNames: string[],
+  crdtFields: Map<string, Map<string, CrdtKind>>,
+  placements: EmbeddedSchemaPlacements,
+): Promise<Settlement> {
+  if (settlement.outcome !== "applied") {
+    return settlement;
+  }
+  const originalTargets = new Set(
+    settlement.authoritative.map(({ table, rowId }) => `${table}\u0000${rowId}`),
+  );
+  const targets = uniqueTargets(
+    [...settlement.authoritative, ...settlement.crdt].map(({ table, rowId }) => ({ table, rowId })),
+  );
+  if (targets.length === 0) return settlement;
+  const current = await authoritativeChanges(ctx, targets, tableNames, crdtFields, placements);
+  return {
+    ...settlement,
+    authoritative: current
+      .filter(
+        (change) =>
+          change.op === "del" || originalTargets.has(`${change.table}\u0000${change.rowId}`),
+      )
+      .map((change) =>
+        change.op === "put"
+          ? {
+              op: change.op,
+              table: change.table,
+              rowId: change.rowId,
+              fields: change.fields,
+              plainHash: change.contentHash,
+            }
+          : {
+              op: change.op,
+              table: change.table,
+              rowId: change.rowId,
+              plainHash: change.contentHash,
+            },
+      ),
+  };
 }
 
 /** A stale witness is a conflict only in ordering; retain an after-image only when content differs. */

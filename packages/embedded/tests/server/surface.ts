@@ -618,7 +618,9 @@ describe("v5 server surface", () => {
     const envelope = {
       clientId: "client-1",
       mutationId: "mutation-1",
+      replayId: "replay-1",
       fingerprint: "fingerprint",
+      logicalFingerprint: "logical-fingerprint",
       runtime: {
         moduleGraphHash: "modules",
         protocolVersion: EMBEDDED_PROTOCOL_VERSION,
@@ -1423,7 +1425,7 @@ describe("v5 server surface", () => {
     expect(push.value.request.optional).toBe(false);
     expect(pushRequest.type).toBe("union");
     expect(Object.keys(pushRequest.value[0]!.value).sort()).toEqual([
-      "acknowledgeMutationId",
+      "acknowledgeReplayId",
       "afterImages",
       "argRefs",
       "args",
@@ -1432,10 +1434,12 @@ describe("v5 server surface", () => {
       "functionName",
       "inserts",
       "kind",
+      "logicalFingerprint",
       "mutationId",
       "mutationTime",
       "randomSeed",
       "reads",
+      "replayId",
       "resultHash",
       "revisionCheckpoints",
       "runtime",
@@ -1445,7 +1449,7 @@ describe("v5 server surface", () => {
     expect(Object.keys(pushRequest.value[1]!.value).sort()).toEqual([
       "clientId",
       "kind",
-      "mutationId",
+      "replayId",
     ]);
     expect(Object.keys(pushRequest.value[2]!.value).sort()).toEqual([
       "bytes",

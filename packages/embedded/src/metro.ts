@@ -20,7 +20,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { createEmbeddedBundle, generateEmbedded, type EmbeddedBundleInput } from "./bundler";
+import {
+  createEmbeddedBundle,
+  generateEmbedded,
+  type EmbeddedBundleInput,
+  type EmbeddedCompatibleRuntimeIdentity,
+} from "./bundler";
 import {
   fromVirtualSourceId,
   renderEmbeddedBundle,
@@ -33,6 +38,8 @@ import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "./schema";
 
 /** Options for {@link withConvexEmbedded}. @public */
 export interface ConvexEmbeddedMetroOptions extends Omit<EmbeddedBundleInput, "root"> {
+  /** Exact reviewed prior runtime identities whose durable mutations this build may replay. */
+  compatiblePriorRuntimes?: readonly EmbeddedCompatibleRuntimeIdentity[];
   /** Disable generation and return the original Metro configuration unchanged. */
   disabled?: boolean;
   /** Project root. Defaults to Metro's `projectRoot`, then `process.cwd()`. */
@@ -105,7 +112,9 @@ export async function withConvexEmbedded<Config extends object>(
   await mkdir(cacheDir, { recursive: true });
   await Promise.all([
     writeIfChanged(registryPath, renderEmbeddedBundle(bundle)),
-    renderEmbeddedIdentity(bundle).then((source) => writeIfChanged(identityPath, source)),
+    renderEmbeddedIdentity(bundle, options.compatiblePriorRuntimes).then((source) =>
+      writeIfChanged(identityPath, source),
+    ),
   ]);
 
   const sourceFiles = new Set(

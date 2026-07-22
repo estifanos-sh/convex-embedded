@@ -150,9 +150,14 @@ export interface EmbeddedRemoteEvent {
   /** Monotonic event sequence within one generation. */
   sequence?: number;
   tick?: {
+    connected?: boolean;
     changedTables: string[];
     rowsApplied: number;
+    /** Permanent pull-application diagnostics retained until a new snapshot succeeds. */
+    pullDiagnostics?: number;
+    pullError?: string;
     pullAttempted: number;
+    pullSnapshots?: number;
     pushAccepted: number;
     pushAttempted: number;
     pushConflicts: number;

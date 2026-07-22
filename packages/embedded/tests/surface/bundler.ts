@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -131,6 +131,50 @@ describe("embedded bundler core", () => {
       await expect(createEmbeddedBundle({ root })).rejects.toThrow(
         "Could not find generated Embedded contract",
       );
+    });
+  });
+
+  test("bootstraps a custom generated contract imported by device functions", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await file(
+        convexDir,
+        "embedded.ts",
+        'import { embeddedManifest } from "./generated/embedded";\nvoid embeddedManifest;\n',
+      );
+      await file(
+        convexDir,
+        "messages.ts",
+        `import "./embedded";\n${canonical("replicated", "query", "list")}`,
+      );
+      const generatedPath = "generated/embedded.ts";
+
+      const generated = await generateEmbedded({
+        analysis: analyzeEmbeddedSchema(fixtureSchema),
+        generatedPath,
+        root,
+      });
+      const bundle = await createEmbeddedBundle({ generatedPath, root });
+
+      expect(generated.path).toBe(path.join(convexDir, generatedPath));
+      expect(bundle.modules).toEqual({ messages: path.join(convexDir, "messages.ts") });
+      expect(bundle.sourceFiles).not.toContain(generated.path);
+    });
+  });
+
+  test("does not rewrite an unchanged generated contract", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const input = { analysis: analyzeEmbeddedSchema(fixtureSchema), root };
+
+      const generated = await generateEmbedded(input);
+      const before = await stat(generated.path, { bigint: true });
+      await generateEmbedded(input);
+      const after = await stat(generated.path, { bigint: true });
+
+      expect(after.ino).toBe(before.ino);
+      expect(after.mtimeNs).toBe(before.mtimeNs);
     });
   });
 
@@ -317,6 +361,41 @@ describe("embedded bundler core", () => {
       const after = await renderEmbeddedIdentity(afterBundle);
 
       expect(after).not.toBe(before);
+    });
+  });
+
+  test("embeds only reviewed prior runtime identities", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "feed.ts", canonical("replicated", "query", "list"));
+      const bundle = await createFixtureBundle(root);
+      const currentSource = await renderEmbeddedIdentity(bundle);
+      const currentIdentity = JSON.parse(
+        currentSource.slice(currentSource.indexOf("= ") + 2, currentSource.lastIndexOf(";")),
+      );
+      const prior = {
+        moduleGraphHash: "prior-module-graph",
+        protocolVersion: 24,
+        schemaHash: bundle.runtimeSchemaHash!,
+        targetModuleGraphHash: currentIdentity.moduleGraphHash as string,
+      };
+
+      const source = await renderEmbeddedIdentity(bundle, [prior]);
+      const { targetModuleGraphHash: _, ...transportIdentity } = prior;
+      expect(source).toContain(`"compatiblePriorRuntimes":[${JSON.stringify(transportIdentity)}]`);
+      await expect(renderEmbeddedIdentity(bundle, [{ ...prior, schemaHash: "" }])).rejects.toThrow(
+        "schemaHash must be non-empty",
+      );
+      await expect(
+        renderEmbeddedIdentity(bundle, [{ ...prior, protocolVersion: 26 }]),
+      ).rejects.toThrow("cannot be newer than 25");
+      await expect(
+        renderEmbeddedIdentity(bundle, [{ ...prior, protocolVersion: 25 }]),
+      ).resolves.toContain('"protocolVersion":25');
+      await expect(
+        renderEmbeddedIdentity(bundle, [{ ...prior, targetModuleGraphHash: "another-build" }]),
+      ).rejects.toThrow("does not match the current moduleGraphHash");
     });
   });
 

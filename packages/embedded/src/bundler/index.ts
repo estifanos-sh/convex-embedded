@@ -61,8 +61,22 @@ export interface EmbeddedBundleInput {
    */
   schemaPath?: string;
 
-  /** Generated literal device schema, relative to `convexDir`. */
+  /**
+   * Generated literal device schema, relative to `convexDir`.
+   *
+   * Keep checked-in contracts outside Convex CLI-owned `_generated`, for
+   * example `generated/embedded.ts`.
+   */
   generatedPath?: string;
+}
+
+/** An exact prior runtime identity approved by the current build. @public */
+export interface EmbeddedCompatibleRuntimeIdentity {
+  moduleGraphHash: string;
+  protocolVersion: number;
+  schemaHash: string;
+  /** Module graph of the one current build this compatibility review applies to. */
+  targetModuleGraphHash: string;
 }
 
 export interface GenerateEmbeddedInput extends EmbeddedBundleInput {
@@ -104,6 +118,9 @@ export interface EmbeddedBundleResult {
 
   /** Hash of the generated, placement-aware schema payload. */
   schemaHash: string;
+
+  /** Stable storage schema hash used by the remote wire identity. */
+  runtimeSchemaHash?: string;
 
   /** Hash of the canonical function manifest. */
   manifestHash: string;
@@ -176,10 +193,23 @@ export async function generateEmbedded(
   const bundle = await createEmbeddedBundleInner(input, false);
   const source = renderGenerated({ analysis: input.analysis, bundle });
   await mkdir(path.dirname(bundle.generatedPath), { recursive: true });
+  try {
+    if ((await readFile(bundle.generatedPath, "utf8")) === source) {
+      return { path: bundle.generatedPath, source };
+    }
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+  }
   const temporary = `${bundle.generatedPath}.${process.pid}.tmp`;
   await writeFile(temporary, source, "utf8");
   await rename(temporary, bundle.generatedPath);
   return { path: bundle.generatedPath, source };
+}
+
+function isMissingFile(error: unknown): boolean {
+  return (
+    error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
 }
 
 async function createEmbeddedBundleInner(
@@ -193,7 +223,9 @@ async function createEmbeddedBundleInner(
   const generatedPath = resolveInputPath(convexDir, input.generatedPath ?? DEFAULT_GENERATED_PATH);
   await assertSchemaFile(schemaPath);
   await assertEmbeddedEntrypoint(embeddedPath);
-  const files = await listConvexFiles(convexDir);
+  const files = (await listConvexFiles(convexDir)).filter(
+    (file) => path.resolve(file) !== generatedPath,
+  );
   const modules: Record<string, string> = {};
   const manifest: EmbeddedFunctionManifest = {};
   const seen = new Map<string, string>();
@@ -240,6 +272,7 @@ async function createEmbeddedBundleInner(
   for (const file of Object.values(modules)) {
     const reachable = await readDeviceImportGraph({
       entry: path.resolve(file),
+      generatedPath,
       placementByFile,
       resolver,
       root,
@@ -251,9 +284,11 @@ async function createEmbeddedBundleInner(
   const schemaSourceHash = hashBytes(await readFile(schemaPath));
   const manifestHash = hashJson(manifest);
   let schemaHash = schemaSourceHash;
+  let runtimeSchemaHash: string | undefined;
   if (requireGenerated) {
-    schemaHash = (await assertGeneratedFile(generatedPath, { manifestHash, schemaSourceHash }))
-      .analysisHash;
+    const generated = await assertGeneratedFile(generatedPath, { manifestHash, schemaSourceHash });
+    schemaHash = generated.analysisHash;
+    runtimeSchemaHash = generated.runtimeSchemaHash;
   }
 
   return {
@@ -262,6 +297,7 @@ async function createEmbeddedBundleInner(
     manifestHash,
     modules,
     schemaHash,
+    runtimeSchemaHash,
     schemaPath,
     schemaSourceHash,
     sourceFiles: [...sourceFiles].sort(),
@@ -278,12 +314,13 @@ interface ProjectResolver {
 
 async function readDeviceImportGraph(options: {
   entry: string;
+  generatedPath: string;
   sources: Map<string, string>;
   placementByFile: Map<string, FunctionPlacement | "node">;
   resolver: ProjectResolver;
   root: string;
 }): Promise<Set<string>> {
-  const { entry, placementByFile, resolver, root, sources } = options;
+  const { entry, generatedPath, placementByFile, resolver, root, sources } = options;
   const visited = new Set<string>();
   const visit = async (file: string): Promise<void> => {
     if (visited.has(file)) return;
@@ -292,8 +329,10 @@ async function readDeviceImportGraph(options: {
     for (const match of source.matchAll(STATIC_IMPORT)) {
       const specifier = match[2];
       if (!specifier) continue;
+      if (isGeneratedImport(file, specifier, generatedPath)) continue;
       const target = await resolveProjectImport(file, specifier, resolver);
       if (target === undefined) continue;
+      if (target === generatedPath) continue;
       let placement = placementByFile.get(target);
       if (placement === undefined) {
         const targetSource = await readProjectSource(target, sources);
@@ -324,6 +363,14 @@ async function readDeviceImportGraph(options: {
   return visited;
 }
 
+function isGeneratedImport(importer: string, specifier: string, generatedPath: string): boolean {
+  if (!specifier.startsWith(".") && !path.isAbsolute(specifier)) return false;
+  const base = path.resolve(path.dirname(importer), specifier);
+  if (base === generatedPath) return true;
+  if (path.extname(base) !== "") return false;
+  return PROJECT_SOURCE_EXTENSIONS.some((extension) => `${base}${extension}` === generatedPath);
+}
+
 async function assertGeneratedFile(
   file: string,
   expected: { manifestHash: string; schemaSourceHash: string },
@@ -332,6 +379,7 @@ async function assertGeneratedFile(
   formatVersion: number;
   manifestHash: string;
   schemaSourceHash: string;
+  runtimeSchemaHash: string;
 }> {
   let source: string;
   try {
@@ -339,7 +387,7 @@ async function assertGeneratedFile(
     source = await readFile(file, "utf8");
   } catch {
     throw new Error(
-      `Could not find generated Embedded contract at ${file}. Generate convex/_generated/embedded.ts before building.`,
+      `Could not find generated Embedded contract at ${file}. Run the Embedded generator before building.`,
     );
   }
   const firstLine = source.split(/\r?\n/, 1)[0] ?? "";
@@ -383,7 +431,19 @@ async function assertGeneratedFile(
   if (hashJson(embeddedSchema) !== identity.analysisHash) {
     throw new Error(`Generated Embedded contract at ${file} failed its schema integrity check`);
   }
-  return identity;
+  const runtimeSchemaHash = readRuntimeSchemaHash(embeddedSchema);
+  if (runtimeSchemaHash === undefined) {
+    throw new Error(`Generated Embedded contract at ${file} has no runtime storage schema hash`);
+  }
+  return { ...identity, runtimeSchemaHash };
+}
+
+function readRuntimeSchemaHash(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const runtimeStoreSchema = (value as Record<string, unknown>).runtimeStoreSchema;
+  if (typeof runtimeStoreSchema !== "object" || runtimeStoreSchema === null) return undefined;
+  const hash = (runtimeStoreSchema as Record<string, unknown>).hash;
+  return typeof hash === "string" && hash.length > 0 ? hash : undefined;
 }
 
 function isGeneratedIdentity(value: unknown): value is {

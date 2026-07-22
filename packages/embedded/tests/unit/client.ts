@@ -539,6 +539,10 @@ describe("connection invariants", () => {
         type: "remote",
       });
       expect(client.connectionState().remote).toBe("ready");
+
+      emit?.({ at: 5, attempt: 4, status: "connected", type: "remote" });
+      emit?.({ at: 6, attempt: 5, status: "tick", type: "remote" });
+      expect(client.connectionState().remote).toBe("ready");
     } finally {
       await client.close();
     }
@@ -563,6 +567,97 @@ describe("connection invariants", () => {
       emit?.({ at: 1, attempt: 1, status: "offline", type: "remote" });
       emit?.({ at: 2, attempt: 2, status: "tick", type: "remote" });
       expect(client.connectionState().remote).toBe("offline");
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a permanent pull diagnostic survives reconnect events until a snapshot succeeds", async () => {
+    let emit: ((event: EmbeddedEvent) => void) | undefined;
+    const runner = {
+      identity: { read: async () => undefined, write: async () => undefined },
+      remote: { identity: { read: async () => undefined } },
+      subscribeEvents: (listener: (event: EmbeddedEvent) => void) => {
+        emit = listener;
+        return () => undefined;
+      },
+    } as unknown as Runner;
+    const client = new EmbeddedClient({ eagerRunner: runner, remoteConfigured: true, runner });
+    const tick = {
+      changedTables: [],
+      pending: {
+        checkpoints: 0,
+        inflight: 0,
+        mutations: 0,
+        scope: 0,
+        settlements: 0,
+        uploads: 0,
+      },
+      pullAttempted: 0,
+      pushAccepted: 0,
+      pushAttempted: 0,
+      pushConflicts: 0,
+      pushFailed: 0,
+      pushRebases: 0,
+      pushed: 0,
+      received: 0,
+      reconnected: false,
+      retainedRevisions: 0,
+      rowsApplied: 0,
+      sent: 0,
+      receiptsPushed: 0,
+      storeJobs: 0,
+    };
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      emit?.({
+        at: 1,
+        attempt: 1,
+        error: "snapshot could not be applied",
+        status: "error",
+        tick: { ...tick, pullDiagnostics: 1, pullError: "snapshot could not be applied" },
+        type: "remote",
+      });
+      emit?.({
+        at: 2,
+        attempt: 2,
+        error: "[convex-embedded:remote] remote command channel closed",
+        status: "error",
+        type: "remote",
+      });
+      expect(client.connectionState()).toEqual({
+        local: "ready",
+        remote: "error",
+        remoteError: "snapshot could not be applied",
+      });
+      emit?.({
+        at: 3,
+        attempt: 3,
+        status: "offline",
+        tick: { ...tick, connected: false },
+        type: "remote",
+      });
+      emit?.({
+        at: 4,
+        attempt: 4,
+        status: "idle",
+        tick: { ...tick, connected: true },
+        type: "remote",
+      });
+      expect(client.connectionState()).toEqual({
+        local: "ready",
+        remote: "error",
+        remoteError: "snapshot could not be applied",
+      });
+
+      emit?.({
+        at: 5,
+        attempt: 5,
+        status: "idle",
+        tick: { ...tick, connected: true, pullSnapshots: 1 },
+        type: "remote",
+      });
+      expect(client.connectionState().remote).toBe("ready");
     } finally {
       await client.close();
     }

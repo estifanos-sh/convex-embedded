@@ -157,9 +157,6 @@ importers:
       '@convex-dev/embedded':
         specifier: workspace:*
         version: link:../../../packages/embedded
-      '@convex-dev/static-hosting':
-        specifier: ^0.1.4
-        version: 0.1.4(convex@1.42.1(react@19.2.7))(react@19.2.7)
       '@fontsource-variable/inter':
         specifier: 'catalog:'
         version: 5.2.8

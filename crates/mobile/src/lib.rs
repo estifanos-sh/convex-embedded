@@ -9,6 +9,7 @@ mod host;
 #[cfg(target_os = "android")]
 mod jni;
 mod model;
+mod remote;
 mod wire;
 
 pub use ffi::{
@@ -39,6 +40,8 @@ enum BridgeError {
     #[error("{0}")]
     Protocol(String),
     #[error("{0}")]
+    Remote(String),
+    #[error("{0}")]
     Storage(String),
     #[error("JSON codec failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -50,6 +53,7 @@ impl BridgeError {
             Self::Closed(_) => "closed",
             Self::Host(_) => "host",
             Self::Protocol(_) | Self::Json(_) => "protocol",
+            Self::Remote(_) => "remote",
             Self::Storage(_) => "storage",
         }
     }
@@ -367,6 +371,38 @@ fn dispatch(host: &host::StoreHost, request: &Request) -> BridgeResult<Response>
                 _ => store.schedule_cancel(&job_id, now_ms),
             })?;
             Response::value(&value.map(schedule_out))
+        }
+        "remoteStart" => {
+            let (options,): (remote::StartOptions,) = wire::payload(request)?;
+            host.remote_start(options)?;
+            Response::value(&())
+        }
+        "remoteNext" => Response::value(&host.remote_next()?),
+        "remoteAuthWrite" => {
+            let (id, token, error): (u64, Option<String>, Option<String>) = wire::payload(request)?;
+            host.remote_auth_write(id, token, error)?;
+            Response::value(&())
+        }
+        "remotePull" => Response::value(&host.remote_pull()?),
+        "remoteIdentity" => Response::value(&host.remote_identity()?),
+        "remoteDocPush" => {
+            let (table, id, first_commit_seq, updated_commit_seq): (String, String, i64, i64) =
+                wire::payload(request)?;
+            Response::value(&host.remote_doc_push(
+                &table,
+                &id,
+                first_commit_seq,
+                updated_commit_seq,
+            )?)
+        }
+        "remoteScopeWrite" => {
+            let (scope,): (String,) = wire::payload(request)?;
+            host.remote_scope_write(&scope)?;
+            Response::value(&())
+        }
+        "remoteClose" => {
+            host.remote_close()?;
+            Response::value(&())
         }
         "clear" => {
             host.run(storage::EmbeddedStore::clear)?;

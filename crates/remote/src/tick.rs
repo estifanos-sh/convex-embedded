@@ -22,6 +22,8 @@ impl RemotePending {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteTick {
+    /// Transport connectivity transition observed by the native actor.
+    pub connected: Option<bool>,
     pub changed_tables: Vec<String>,
     pub rows_applied: usize,
     pub pull_attempted: usize,
@@ -65,6 +67,7 @@ impl RemoteTick {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn has_observable_progress(&self) -> bool {
         !self.changed_tables.is_empty()
+            || self.connected.is_some()
             || self.rows_applied > 0
             || self.push_accepted > 0
             || self.push_failed > 0
@@ -93,6 +96,9 @@ impl RemoteTick {
             }
         }
         self.rows_applied += other.rows_applied;
+        if other.connected.is_some() {
+            self.connected = other.connected;
+        }
         self.pull_attempted += other.pull_attempted;
         self.push_accepted += other.push_accepted;
         self.push_attempted += other.push_attempted;

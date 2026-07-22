@@ -684,6 +684,7 @@ pub(crate) fn max_commit_seq_params(identity_key: &str) -> Vec<Value> {
         text_value(identity_key.to_owned()),
         text_value(identity_key.to_owned()),
         text_value(identity_key.to_owned()),
+        text_value(identity_key.to_owned()),
     ]
 }
 

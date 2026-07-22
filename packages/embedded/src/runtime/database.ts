@@ -285,7 +285,7 @@ export function createReader<DM extends GenericDataModel>(
           version,
           crdt: await crdtReadWitnesses(store, def, stored),
           contentHash: await hashDocument(
-            stored,
+            stored ?? null,
             (def.crdtFields ?? []).map((field) => field.field),
           ),
         });
@@ -444,7 +444,7 @@ export function createWriter<DM extends GenericDataModel>(
       version,
       crdt: await crdtReadWitnesses(store, def, stored),
       contentHash: await hashDocument(
-        stored,
+        stored ?? null,
         (def.crdtFields ?? []).map((field) => field.field),
       ),
     });

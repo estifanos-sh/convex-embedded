@@ -6,6 +6,11 @@ declare module "virtual:convex-embedded" {
 
 declare module "virtual:convex-embedded/identity" {
   export const embeddedIdentity: {
+    compatiblePriorRuntimes: ReadonlyArray<{
+      moduleGraphHash: string;
+      protocolVersion: number;
+      schemaHash: string;
+    }>;
     moduleGraphHash: string;
     schemaHash: string;
   };

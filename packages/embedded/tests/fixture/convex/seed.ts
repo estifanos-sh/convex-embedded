@@ -41,7 +41,9 @@ export const commit = embedded.remote.mutation({
     const identity = {
       identity: args.identityKey,
       clientId: args.clientId,
+      replayId: args.mutationId,
       fingerprint: args.mutationId,
+      logicalFingerprint: args.mutationId,
       runtime: {
         schemaHash: "fixture",
         moduleGraphHash: "fixture",
@@ -65,7 +67,9 @@ export const commit = embedded.remote.mutation({
       await ctx.runMutation(components.embedded.protocol.commit, {
         request: {
           ...identity,
+          replayId: `${args.mutationId}:files`,
           fingerprint: `${args.mutationId}:files`,
+          logicalFingerprint: `${args.mutationId}:files`,
           kind: "apply",
           verification: { kind: "ready", witnesses: [] },
           settlement: {
@@ -112,7 +116,9 @@ export const client = embedded.remote.mutation({
       requestId,
       functionName,
       mutationId,
+      replayId: mutationId,
       fingerprint: mutationId,
+      logicalFingerprint: mutationId,
       resultHash: mutationId,
       mutationTime: readTime(),
       randomSeed: mutationId,
@@ -137,7 +143,9 @@ export const client = embedded.remote.mutation({
       request: {
         identity: args.identityKey,
         clientId: args.clientId,
+        replayId: mutationId,
         fingerprint: mutationId,
+        logicalFingerprint: mutationId,
         runtime: {
           schemaHash: args.schemaHash,
           moduleGraphHash: args.moduleGraphHash,

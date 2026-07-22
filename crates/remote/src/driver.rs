@@ -158,6 +158,8 @@ pub struct RemoteDriver<
     remote_write_order: VecDeque<String>,
     remote_write_paused: bool,
     remote_write_pending: BTreeMap<String, PendingRemoteWrite>,
+    replay_inflight_discarding: bool,
+    replay_inflight_invalidated: bool,
     replay_waiting_for_remote_write: bool,
     scope: RemoteScope,
     scope_pending_removals: BTreeSet<String>,
@@ -359,6 +361,8 @@ where
             remote_write_order: VecDeque::new(),
             remote_write_paused: false,
             remote_write_pending: BTreeMap::new(),
+            replay_inflight_discarding: false,
+            replay_inflight_invalidated: false,
             replay_waiting_for_remote_write: false,
             scope: RemoteScope::default(),
             scope_pending_removals: BTreeSet::new(),
@@ -718,6 +722,9 @@ where
                     return Ok((result, tick));
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) if self.replay_inflight_discarding => {
+                    continue;
+                }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     return Err(RemoteError::Protocol(
                         "mutation response channel closed".to_owned(),
@@ -811,6 +818,7 @@ where
                     Ok(true) => {
                         let tick = self
                             .complete_actor_turn(RemoteTick {
+                                connected: Some(true),
                                 reconnected: true,
                                 ..RemoteTick::default()
                             })
@@ -819,7 +827,10 @@ where
                             observe(tick);
                         }
                     }
-                    Ok(false) => {}
+                    Ok(false) => observe(RemoteTick {
+                        connected: Some(false),
+                        ..RemoteTick::default()
+                    }),
                     Err(error) => return Err(error),
                 },
                 ActorEvent::RemoteWrite(applied) => {
@@ -1006,6 +1017,7 @@ where
                 tick.reconnected = self
                     .reconnect(format!("TransportReceiveError: {e}"))
                     .await?;
+                tick.connected = Some(tick.reconnected);
                 if tick.reconnected {
                     tick.sent += self.flush_outbound().await?;
                 }
@@ -1033,6 +1045,7 @@ where
                     }
                     Err(reason) => {
                         tick.reconnected = self.reconnect(reason).await?;
+                        tick.connected = Some(tick.reconnected);
                         if tick.reconnected {
                             tick.sent += self.flush_outbound().await?;
                         }
@@ -1042,6 +1055,7 @@ where
             TransportEvent::Timeout => {}
             TransportEvent::Closed(reason) => {
                 tick.reconnected = self.reconnect(reason).await?;
+                tick.connected = Some(tick.reconnected);
                 if tick.reconnected {
                     tick.sent += self.flush_outbound().await?;
                 }
@@ -1111,6 +1125,9 @@ where
                     self.inflight_remote_push.push_front(inflight);
                     break;
                 }
+                Err(oneshot::error::TryRecvError::Closed) if self.replay_inflight_discarding => {
+                    continue;
+                }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     return Err(RemoteError::Protocol(
                         "remote push response channel closed".to_owned(),
@@ -1122,23 +1139,65 @@ where
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push("settlement");
+            if self.replay_inflight_discarding {
+                continue;
+            }
             match inflight.kind {
                 InflightRemotePushKind::Mutation {
                     acknowledgements,
                     envelope,
                 } => {
-                    tick.merge(self.complete_remote_push(
+                    if let Some(prior_outcome) = mutation_reuse_prior_outcome(&result) {
+                        if prior_outcome == PushOutcome::Applied
+                            || envelope.replay_id != envelope.mutation_id
+                        {
+                            return Err(function_result_error(protocol::EMBEDDED_PUSH, &result));
+                        }
+                        let replay_id = format!("replay:{}", Uuid::new_v4());
+                        self.store.remote_push_replay_write(
+                            &envelope.mutation_id,
+                            envelope.commit_seq,
+                            &envelope.replay_id,
+                            &replay_id,
+                            self.clock.now_ms()?,
+                        )?;
+                        // The prior attempt was terminal without applying app effects. Drain every
+                        // request already sent behind it, then prepare the unchanged durable
+                        // mutation again under the persisted replay id. Waiting for a changed pull
+                        // result here can deadlock forever: a rejected attempt has no hosted
+                        // aftermath, so an unchanged live subscription emits no new snapshot. A
+                        // genuinely stale CRDT retry will still receive the ordinary `rebase`
+                        // outcome, whose separate path waits for the authoritative page write.
+                        self.replay_inflight_discarding = true;
+                        self.replay_inflight_invalidated = false;
+                        continue;
+                    }
+                    let (settlement, outcome) = self.complete_remote_push(
                         envelope.as_ref(),
                         &result,
                         RemoteTick::default(),
-                    )?);
+                    )?;
+                    tick.merge(settlement);
                     if !acknowledgements.is_empty() {
                         self.store.remote_receipt_delete(&acknowledgements)?;
                         tick.receipts_pushed += acknowledgements.len();
                     }
                     if self.replay_waiting_for_remote_write {
-                        self.inflight_remote_push.clear();
-                        break;
+                        // A rebase leaves the current durable envelope at the queue front. Drain
+                        // the already-sent suffix before pulling and preparing it again; dropping
+                        // those receivers would let a late hosted result poison the next attempt.
+                        self.replay_inflight_discarding = true;
+                        self.replay_inflight_invalidated = false;
+                        continue;
+                    }
+                    if matches!(outcome, PushOutcome::Conflict | PushOutcome::Rejected) {
+                        // Every request already in this window was prepared against the
+                        // speculative effects of the rejected prefix. Keep their original
+                        // receivers alive: same-field suffixes will return `rebase`, while
+                        // independent suffixes may still settle normally. Re-dispatching here
+                        // would race those already-sent mutations with a different replay
+                        // fingerprint.
+                        self.replay_inflight_invalidated = true;
                     }
                 }
                 InflightRemotePushKind::Checkpoint { checkpoint_id } => {
@@ -1154,6 +1213,10 @@ where
                     }
                 }
             }
+        }
+        if self.inflight_remote_push.is_empty() {
+            self.replay_inflight_discarding = false;
+            self.replay_inflight_invalidated = false;
         }
         Ok(tick)
     }
@@ -1422,8 +1485,8 @@ where
         if self.receipt_queue_empty {
             return Ok(tick);
         }
-        let mutation_ids = self.store.remote_receipt_read(REMOTE_RECEIPT_LIMIT)?;
-        if mutation_ids.is_empty() {
+        let replay_ids = self.store.remote_receipt_read(REMOTE_RECEIPT_LIMIT)?;
+        if replay_ids.is_empty() {
             self.receipt_queue_empty = true;
             return Ok(tick);
         }
@@ -1434,9 +1497,9 @@ where
                 Value::String(self.config.client_id.as_str().to_owned()),
             ),
             (
-                "mutationId".to_owned(),
+                "replayId".to_owned(),
                 Value::String(
-                    mutation_ids
+                    replay_ids
                         .last()
                         .expect("a non-empty acknowledgment batch has a final mutation")
                         .clone(),
@@ -1456,9 +1519,9 @@ where
         };
         tick.merge(remote_tick);
         if matches!(result, FunctionResult::Value(Value::Null)) {
-            self.store.remote_receipt_delete(&mutation_ids)?;
-            tick.receipts_pushed += mutation_ids.len();
-            self.receipt_queue_empty = mutation_ids.len() < REMOTE_RECEIPT_LIMIT;
+            self.store.remote_receipt_delete(&replay_ids)?;
+            tick.receipts_pushed += replay_ids.len();
+            self.receipt_queue_empty = replay_ids.len() < REMOTE_RECEIPT_LIMIT;
         } else if let error @ (RemoteError::Retired(_) | RemoteError::DeploymentMismatch(_)) =
             function_result_error(protocol::EMBEDDED_PUSH, &result)
         {
@@ -1688,10 +1751,14 @@ where
 
     async fn dispatch_ready_remote_pushes(&mut self) -> RemoteResult<RemoteTick> {
         let mut tick = RemoteTick::default();
-        if self.replay_waiting_for_remote_write || self.push_queue_empty {
+        if self.replay_waiting_for_remote_write
+            || self.replay_inflight_discarding
+            || (self.replay_inflight_invalidated && !self.inflight_remote_push.is_empty())
+            || self.push_queue_empty
+        {
             return Ok(tick);
         }
-        let queued = self
+        let mut queued = self
             .store
             .remote_push_envelope_read(REPLAY_INFLIGHT_LIMIT)?
             .into_iter()
@@ -1712,9 +1779,15 @@ where
         }
         for (queued, (mutation_id, commit_seq)) in queued.iter().zip(&inflight_envelopes) {
             if queued.mutation_id != *mutation_id || queued.commit_seq != *commit_seq {
-                return Err(RemoteError::Protocol(
-                    "ordered replay window diverged from the durable queue".to_owned(),
-                ));
+                // A local commit can make the durable prefix change while an older window is
+                // already hosted (for example, a legacy store whose commit-sequence cache was
+                // seeded below a retained push envelope). Keep every durable envelope, drain the
+                // original receivers without adopting their out-of-order results, then replay the
+                // stable durable order. Their persisted replay IDs make any hosted success return
+                // the same cached settlement rather than execute twice.
+                self.replay_inflight_discarding = true;
+                self.replay_inflight_invalidated = false;
+                return Ok(tick);
             }
         }
         if queued.len() <= inflight_envelopes.len() {
@@ -1722,10 +1795,17 @@ where
             return Ok(tick);
         }
 
+        let capacity = REPLAY_INFLIGHT_LIMIT - inflight_envelopes.len();
+        for envelope in queued
+            .iter_mut()
+            .skip(inflight_envelopes.len())
+            .take(capacity)
+        {
+            self.prepare_transport_runtime(envelope)?;
+        }
         let mut prefixes = self.speculative_crdt_prefixes()?;
         let mut acknowledgements = self.store.remote_receipt_read(REMOTE_RECEIPT_LIMIT)?;
         tick.sent += self.ensure_connected().await?;
-        let capacity = REPLAY_INFLIGHT_LIMIT - inflight_envelopes.len();
         for mut envelope in queued
             .into_iter()
             .skip(inflight_envelopes.len())
@@ -1762,6 +1842,40 @@ where
         tick.sent += self.flush_outbound().await?;
         self.push_queue_empty = self.store.remote_push_envelope_read(1)?.is_empty();
         Ok(tick)
+    }
+
+    fn prepare_transport_runtime(&self, envelope: &mut PushEnvelope) -> RemoteResult<()> {
+        let queued = &envelope.runtime;
+        let current = &self.config.runtime;
+        if queued == current {
+            return Ok(());
+        }
+        if queued.protocol_version > current.protocol_version {
+            return Err(RemoteError::DeploymentMismatch(format!(
+                "queued mutation {} requires newer embedded protocol {} (this app uses {}); local data was preserved, so update the app before replaying it",
+                envelope.mutation_id, queued.protocol_version, current.protocol_version
+            )));
+        }
+        if queued.schema_hash != current.schema_hash
+            || !self.config.compatible_prior_runtimes.contains(queued)
+        {
+            return Err(RemoteError::DeploymentMismatch(format!(
+                "queued mutation {} uses embedded protocol {} with schemaHash={} and moduleGraphHash={}, but this app uses protocol {} with schemaHash={} and moduleGraphHash={} and did not declare that exact prior runtime compatible; local data was preserved and the legacy envelope was not upgraded—rebuild with explicit compatible-prior-runtime migration metadata before replaying it",
+                envelope.mutation_id,
+                queued.protocol_version,
+                queued.schema_hash,
+                queued.module_graph_hash,
+                current.protocol_version,
+                current.schema_hash,
+                current.module_graph_hash
+            )));
+        }
+
+        // This is a transport-only compatibility projection. The exact prior identity was
+        // declared compatible by the current build. The durable envelope keeps the identity under
+        // which its logical mutation was authored; mutation and replay fingerprints remain stable.
+        envelope.runtime = current.clone();
+        Ok(())
     }
 
     fn speculative_crdt_prefixes(
@@ -2122,7 +2236,7 @@ where
         envelope: &PushEnvelope,
         result: &FunctionResult,
         result_tick: RemoteTick,
-    ) -> RemoteResult<RemoteTick> {
+    ) -> RemoteResult<(RemoteTick, PushOutcome)> {
         let mut tick = RemoteTick::default();
         let response = mutation_push_response(envelope, result)?;
         let queued = self.read_queued_envelope()?.ok_or_else(|| {
@@ -2153,7 +2267,7 @@ where
             tick.push_rebases += 1;
             self.wait_for_rebase_remote_write();
             tick.merge(result_tick);
-            return Ok(tick);
+            return Ok((tick, response.outcome));
         }
         let projections = self.authoritative_projections(&queued, &response, now)?;
         let crdt = if response.outcome == PushOutcome::Applied {
@@ -2178,14 +2292,24 @@ where
                         || settled.row_id != prepared.row_id
                         || settled.field != prepared.field
                         || settled.kind != prepared.kind
-                        || settled.head_seq != prepared.base_seq + 1
                         || settled.projection_hash != prepared.projection_hash
                     {
                         return Err(RemoteError::Protocol(
                             "applied settlement CRDT acknowledgement changed identity".to_owned(),
                         ));
                     }
-                    Ok(storage::CrdtRemoteWrite {
+                    if settled.head_seq == prepared.base_seq {
+                        // A delayed idempotent replay may arrive after pull already observed the
+                        // accepted CRDT head. Consume the durable mutation without writing the
+                        // same payload at a fictitious next sequence.
+                        return Ok(None);
+                    }
+                    if settled.head_seq != prepared.base_seq + 1 {
+                        return Err(RemoteError::Protocol(
+                            "applied settlement CRDT acknowledgement changed identity".to_owned(),
+                        ));
+                    }
+                    Ok(Some(storage::CrdtRemoteWrite {
                         table: local.table.clone(),
                         id: local.row_id.clone(),
                         field: local.field.clone(),
@@ -2193,9 +2317,12 @@ where
                         head_seq: settled.head_seq,
                         projection_hash: settled.projection_hash.clone(),
                         payload: prepared.payload.clone(),
-                    })
+                    }))
                 })
                 .collect::<RemoteResult<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect()
         } else {
             if !response.crdt.is_empty() {
                 return Err(RemoteError::Protocol(
@@ -2267,7 +2394,7 @@ where
         tick.retained_revisions.extend(settled.projection.reroots);
         self.receipt_queue_empty = false;
         tick.merge(result_tick);
-        Ok(tick)
+        Ok((tick, response.outcome))
     }
 
     fn wait_for_rebase_remote_write(&mut self) {
@@ -2625,9 +2752,16 @@ where
         for change in &page.changes {
             let pull::PullChangeBody::Row(row) = &change.body;
             if !pull_change_has_changed(change, &accepted_changes) {
-                let undisclosed_member = member_rows.contains(&(row.table.clone(), row.id.clone()))
-                    && self.store.id_local_read(&row.table, &row.id)?.is_none();
-                if !undisclosed_member {
+                let missing_member_projection =
+                    if member_rows.contains(&(row.table.clone(), row.id.clone())) {
+                        match self.store.id_local_read(&row.table, &row.id)? {
+                            Some(local_id) => self.store.doc_read(&row.table, &local_id)?.is_none(),
+                            None => true,
+                        }
+                    } else {
+                        false
+                    };
+                if !missing_member_projection {
                     continue;
                 }
             }
@@ -3445,6 +3579,22 @@ fn convex_error_code(data: &Value) -> Option<&str> {
     }
 }
 
+fn mutation_reuse_prior_outcome(result: &FunctionResult) -> Option<PushOutcome> {
+    let FunctionResult::ConvexError(error) = result else {
+        return None;
+    };
+    let Value::Object(fields) = &error.data else {
+        return None;
+    };
+    if fields.get("code") != Some(&Value::String("EMBEDDED_MUTATION_ID_REUSE".to_owned())) {
+        return None;
+    }
+    let Value::String(outcome) = fields.get("priorOutcome")? else {
+        return None;
+    };
+    PushOutcome::parse(outcome)
+}
+
 fn mutation_push_response(
     envelope: &PushEnvelope,
     result: &FunctionResult,
@@ -3742,7 +3892,7 @@ mod tests {
     use crate::{
         config::{RemoteConfig, RemoteFunction},
         transport::{ConnectRequest, RemoteTransport, TransportEvent},
-        RemoteError, RemotePending, SystemRemoteClock,
+        RemoteError, RemotePending, RemoteTick, SystemRemoteClock,
     };
     use convex::{base_client::FunctionResult, ConvexError, Value};
 
@@ -4134,6 +4284,39 @@ mod tests {
         ])))
     }
 
+    fn conflict_push_result(mutation_id: &str) -> FunctionResult {
+        FunctionResult::Value(Value::Object(BTreeMap::from([
+            (
+                "mutationId".to_owned(),
+                Value::String(mutation_id.to_owned()),
+            ),
+            ("outcome".to_owned(), Value::String("conflict".to_owned())),
+            (
+                "error".to_owned(),
+                Value::String("authoritative state changed".to_owned()),
+            ),
+            ("inserts".to_owned(), Value::Array(Vec::new())),
+            ("schedules".to_owned(), Value::Array(Vec::new())),
+            ("uploads".to_owned(), Value::Array(Vec::new())),
+            ("revisions".to_owned(), Value::Array(Vec::new())),
+            ("crdt".to_owned(), Value::Array(Vec::new())),
+            ("authoritative".to_owned(), Value::Array(Vec::new())),
+        ])))
+    }
+
+    fn mutation_reuse_result(outcome: &str) -> FunctionResult {
+        FunctionResult::ConvexError(ConvexError {
+            message: "Mutation ID was reused with a different replay fingerprint.".to_owned(),
+            data: Value::Object(BTreeMap::from([
+                (
+                    "code".to_owned(),
+                    Value::String("EMBEDDED_MUTATION_ID_REUSE".to_owned()),
+                ),
+                ("priorOutcome".to_owned(), Value::String(outcome.to_owned())),
+            ])),
+        })
+    }
+
     async fn wait_for_actor_trace(
         trace: &Arc<Mutex<Vec<&'static str>>>,
         expected: &[&'static str],
@@ -4244,6 +4427,8 @@ mod tests {
     fn rejected_targets_include_crdt_only_rows_and_deduplicate_mixed_rows() {
         let mut envelope = storage::PushEnvelope {
             mutation_id: "mutation".to_owned(),
+            replay_id: "mutation".to_owned(),
+            logical_fingerprint: "logical".to_owned(),
             commit_seq: 1,
             runtime: storage::RuntimeWireIdentity {
                 schema_hash: "schema".to_owned(),
@@ -4797,8 +4982,11 @@ mod tests {
     #[tokio::test]
     async fn remote_receipt_propagates_a_terminal_push_result() {
         let store = test_store("remote-ack-terminal.db");
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&replay_envelope_json("ack-me", 1)).unwrap();
+        envelope["replayId"] = serde_json::Value::String("replay:ack-me".to_owned());
         store
-            .remote_push_envelope_write("ack-me", 1, &replay_envelope_json("ack-me", 1), 1)
+            .remote_push_envelope_write("ack-me", 1, &envelope.to_string(), 1)
             .unwrap();
         store
             .remote_settlement_write(&storage::RemoteSettlementWrite {
@@ -4815,7 +5003,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.remote_receipt_read(8).unwrap(),
-            vec!["ack-me".to_owned()]
+            vec!["replay:ack-me".to_owned()]
         );
 
         let trace = Arc::new(Mutex::new(TransportTrace {
@@ -5291,6 +5479,113 @@ mod tests {
         first_send.send(applied_push_result("first")).unwrap();
     }
 
+    #[tokio::test]
+    async fn changed_durable_prefix_drains_then_replays_without_deleting_local_work() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-live-prefix-change.db");
+        store
+            .remote_push_envelope_write("first", 1, &replay_envelope_json("first", 1), 1)
+            .unwrap();
+        store
+            .remote_push_envelope_write("second", 2, &replay_envelope_json("second", 2), 2)
+            .unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+
+        // `second` models the window sent before a same-sequence legacy insertion changed the
+        // durable prefix to `first, second`.
+        let second = crate::push::decode_envelope(&replay_envelope_json("second", 2)).unwrap();
+        let (second_send, second_result) = oneshot::channel();
+        driver.inflight_remote_push.push_back(InflightRemotePush {
+            kind: InflightRemotePushKind::Mutation {
+                acknowledgements: Vec::new(),
+                envelope: Box::new(second),
+            },
+            result: second_result,
+        });
+
+        let changed = driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert_eq!(changed.push_attempted, 0);
+        assert!(driver.replay_inflight_discarding);
+        assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 2);
+
+        second_send.send(applied_push_result("second")).unwrap();
+        let discarded = driver.remote_settlement_write().unwrap();
+        assert!(!discarded.has_observable_progress());
+        assert!(!driver.replay_inflight_discarding);
+        assert!(driver.inflight_remote_push.is_empty());
+        assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 2);
+
+        let replayed = driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert_eq!(replayed.push_attempted, 2);
+        assert_eq!(driver.inflight_remote_push.len(), 2);
+        let replay_ids = driver
+            .inflight_remote_push
+            .iter()
+            .filter_map(|inflight| match &inflight.kind {
+                InflightRemotePushKind::Mutation { envelope, .. } => {
+                    Some(envelope.replay_id.as_str())
+                }
+                InflightRemotePushKind::Blob | InflightRemotePushKind::Checkpoint { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replay_ids, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn changed_durable_prefix_counts_a_closed_suffix_as_drained() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-live-prefix-closed.db");
+        store
+            .remote_push_envelope_write("first", 1, &replay_envelope_json("first", 1), 1)
+            .unwrap();
+        store
+            .remote_push_envelope_write("second", 2, &replay_envelope_json("second", 2), 2)
+            .unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+
+        let second = crate::push::decode_envelope(&replay_envelope_json("second", 2)).unwrap();
+        let (second_send, second_result) = oneshot::channel::<FunctionResult>();
+        driver.inflight_remote_push.push_back(InflightRemotePush {
+            kind: InflightRemotePushKind::Mutation {
+                acknowledgements: Vec::new(),
+                envelope: Box::new(second),
+            },
+            result: second_result,
+        });
+
+        driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert!(driver.replay_inflight_discarding);
+
+        drop(second_send);
+        let drained = driver.remote_settlement_write().unwrap();
+        assert_eq!(drained, RemoteTick::default());
+        assert!(!driver.replay_inflight_discarding);
+        assert!(driver.inflight_remote_push.is_empty());
+        assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 2);
+
+        let replayed = driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert_eq!(replayed.push_attempted, 2);
+        assert_eq!(driver.inflight_remote_push.len(), 2);
+    }
+
     #[test]
     fn large_blob_staging_enqueues_every_chunk_without_waiting_for_a_response() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
@@ -5655,6 +5950,11 @@ mod tests {
             .unwrap();
         closed.await.unwrap().unwrap();
         task.await.unwrap().unwrap();
+        let observed = observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(observed.iter().any(|tick| tick.connected == Some(false)));
+        assert!(observed.iter().any(|tick| tick.connected == Some(true)));
         assert_eq!(
             trace
                 .lock()
@@ -5829,7 +6129,7 @@ mod tests {
         let edit = crate::push::decode_envelope(&crdt_envelope_json("edit", 1, 0)).unwrap();
         let suffix = crate::push::decode_envelope(&crdt_envelope_json("suffix", 2, 1)).unwrap();
         let (edit_send, edit_result) = oneshot::channel();
-        let (_suffix_send, suffix_result) = oneshot::channel();
+        let (suffix_send, suffix_result) = oneshot::channel();
         driver.inflight_remote_push.extend([
             InflightRemotePush {
                 kind: InflightRemotePushKind::Mutation {
@@ -5854,14 +6154,204 @@ mod tests {
         assert_eq!(tick.push_accepted, 0);
         assert_eq!(tick.pushed, 0);
 
-        assert!(driver.inflight_remote_push.is_empty());
+        assert_eq!(driver.inflight_remote_push.len(), 1);
+        assert!(driver.replay_inflight_discarding);
         assert!(driver.replay_waiting_for_remote_write);
+
+        suffix_send.send(rebase_push_result("suffix")).unwrap();
+        let drained = driver.remote_settlement_write().unwrap();
+        assert_eq!(drained, RemoteTick::default());
+        assert!(driver.inflight_remote_push.is_empty());
+        assert!(!driver.replay_inflight_discarding);
 
         let durable = store.remote_push_envelope_read(10).unwrap();
         assert_eq!(durable.len(), 2);
         let front = crate::push::decode_envelope(&durable[0]).unwrap();
         assert_eq!(front.mutation_id, "edit");
         assert_eq!(front.commit_seq, 1);
+    }
+
+    #[tokio::test]
+    async fn conflict_drains_the_invalidated_inflight_window_before_dispatching_again() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-conflict-invalidates-window.db");
+        store
+            .remote_push_envelope_write("first", 1, &replay_envelope_json("first", 1), 1)
+            .unwrap();
+        store
+            .remote_push_envelope_write("suffix", 2, &replay_envelope_json("suffix", 2), 2)
+            .unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+
+        let first = crate::push::decode_envelope(&replay_envelope_json("first", 1)).unwrap();
+        // This suffix models the already-sent CRDT request whose speculative base depended on
+        // the front mutation. Its durable form remains authoritative and is intentionally not
+        // rewritten while the original response is still in flight.
+        let suffix = crate::push::decode_envelope(&crdt_envelope_json("suffix", 2, 1)).unwrap();
+        let (first_send, first_result) = oneshot::channel();
+        let (suffix_send, suffix_result) = oneshot::channel();
+        driver.inflight_remote_push.extend([
+            InflightRemotePush {
+                kind: InflightRemotePushKind::Mutation {
+                    acknowledgements: Vec::new(),
+                    envelope: Box::new(first),
+                },
+                result: first_result,
+            },
+            InflightRemotePush {
+                kind: InflightRemotePushKind::Mutation {
+                    acknowledgements: Vec::new(),
+                    envelope: Box::new(suffix),
+                },
+                result: suffix_result,
+            },
+        ]);
+
+        first_send.send(conflict_push_result("first")).unwrap();
+        let conflict = driver.remote_settlement_write().unwrap();
+
+        assert_eq!(conflict.push_conflicts, 1);
+        assert!(driver.replay_inflight_invalidated);
+        assert_eq!(driver.inflight_remote_push.len(), 1);
+        assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 1);
+
+        let dispatched = driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert_eq!(dispatched.push_attempted, 0);
+        assert_eq!(driver.inflight_remote_push.len(), 1);
+        assert_eq!(sent_mutation_frames(&trace), 0);
+
+        suffix_send.send(rebase_push_result("suffix")).unwrap();
+        let rebase = driver.remote_settlement_write().unwrap();
+        assert_eq!(rebase.push_rebases, 1);
+        assert!(driver.replay_waiting_for_remote_write);
+        assert!(!driver.replay_inflight_invalidated);
+        assert!(driver.inflight_remote_push.is_empty());
+        assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_replay_reuse_rotates_only_the_attempt_and_redispatches_after_the_suffix() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-replay-attempt-rotation.db");
+        let front_json = replay_envelope_json("edit", 1);
+        store
+            .remote_push_envelope_write("edit", 1, &front_json, 1)
+            .unwrap();
+        store
+            .remote_push_envelope_write("suffix", 2, &replay_envelope_json("suffix", 2), 2)
+            .unwrap();
+        let front = crate::push::decode_envelope(&front_json).unwrap();
+        let logical_fingerprint = front.logical_fingerprint.clone();
+        let suffix = crate::push::decode_envelope(&replay_envelope_json("suffix", 2)).unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        let (front_send, front_result) = oneshot::channel();
+        let (suffix_send, suffix_result) = oneshot::channel();
+        driver.inflight_remote_push.extend([
+            InflightRemotePush {
+                kind: InflightRemotePushKind::Mutation {
+                    acknowledgements: Vec::new(),
+                    envelope: Box::new(front),
+                },
+                result: front_result,
+            },
+            InflightRemotePush {
+                kind: InflightRemotePushKind::Mutation {
+                    acknowledgements: Vec::new(),
+                    envelope: Box::new(suffix),
+                },
+                result: suffix_result,
+            },
+        ]);
+
+        front_send.send(mutation_reuse_result("rejected")).unwrap();
+        let rotated = driver.remote_settlement_write().unwrap();
+        assert_eq!(rotated, RemoteTick::default());
+        assert!(!driver.replay_waiting_for_remote_write);
+        assert!(driver.replay_inflight_discarding);
+        assert_eq!(driver.inflight_remote_push.len(), 1);
+
+        let durable = store.remote_push_envelope_read(10).unwrap();
+        assert_eq!(durable.len(), 2);
+        let rotated_front = crate::push::decode_envelope(&durable[0]).unwrap();
+        assert_eq!(rotated_front.mutation_id, "edit");
+        assert_ne!(rotated_front.replay_id, "edit");
+        assert!(rotated_front.replay_id.starts_with("replay:"));
+        assert_eq!(rotated_front.logical_fingerprint, logical_fingerprint);
+
+        suffix_send.send(rebase_push_result("suffix")).unwrap();
+        driver.remote_settlement_write().unwrap();
+        assert!(driver.inflight_remote_push.is_empty());
+        assert!(!driver.replay_inflight_discarding);
+        assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 2);
+
+        driver.connected = true;
+        driver.push_queue_empty = false;
+        let dispatched = driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert_eq!(dispatched.push_attempted, 2);
+        assert_eq!(driver.inflight_remote_push.len(), 2);
+        assert_eq!(sent_mutation_frames(&trace), 2);
+
+        let InflightRemotePushKind::Mutation { envelope, .. } =
+            &driver.inflight_remote_push[0].kind
+        else {
+            panic!("expected the rotated mutation at the replay window front")
+        };
+        assert_eq!(envelope.mutation_id, "edit");
+        assert_eq!(envelope.replay_id, rotated_front.replay_id);
+    }
+
+    #[test]
+    fn applied_replay_reuse_fails_closed_without_rotating_the_attempt() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport { trace };
+        let store = test_store("remote-applied-replay-reuse.db");
+        let envelope_json = replay_envelope_json("edit", 1);
+        store
+            .remote_push_envelope_write("edit", 1, &envelope_json, 1)
+            .unwrap();
+        let envelope = crate::push::decode_envelope(&envelope_json).unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        let (send, result) = oneshot::channel();
+        driver.inflight_remote_push.push_back(InflightRemotePush {
+            kind: InflightRemotePushKind::Mutation {
+                acknowledgements: Vec::new(),
+                envelope: Box::new(envelope),
+            },
+            result,
+        });
+
+        send.send(mutation_reuse_result("applied")).unwrap();
+        assert!(matches!(
+            driver.remote_settlement_write(),
+            Err(RemoteError::Protocol(message)) if message.contains("Mutation ID was reused")
+        ));
+        let durable = store.remote_push_envelope_read(1).unwrap();
+        assert_eq!(
+            crate::push::decode_envelope(&durable[0]).unwrap().replay_id,
+            "edit"
+        );
     }
 
     fn documents_crdt_schema() -> storage::StoreSchema {
@@ -6033,6 +6523,244 @@ mod tests {
             .iter()
             .filter(|message| matches!(message, ClientMessage::Mutation { .. }))
             .count()
+    }
+
+    fn sent_mutation_request(trace: &Arc<Mutex<TransportTrace>>) -> serde_json::Value {
+        let trace = trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let args = trace
+            .sent
+            .iter()
+            .find_map(|message| match message {
+                ClientMessage::Mutation { args, .. } => Some(args.get()),
+                _ => None,
+            })
+            .expect("a mutation frame was sent");
+        let args: serde_json::Value = serde_json::from_str(args).unwrap();
+        args.as_array().unwrap()[0]["request"].clone()
+    }
+
+    #[tokio::test]
+    async fn compatible_legacy_envelope_uses_current_protocol_only_on_the_wire() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-legacy-envelope-upgrade.db");
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&replay_envelope_json("legacy", 1)).unwrap();
+        legacy["clientRuntime"]["protocolVersion"] =
+            serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION - 1);
+        legacy["clientRuntime"]["moduleGraphHash"] =
+            serde_json::Value::String("legacy-modules".to_owned());
+        let decoded_legacy = crate::push::decode_envelope(&legacy.to_string()).unwrap();
+        store
+            .remote_push_envelope_write("legacy", 1, &legacy.to_string(), 1)
+            .unwrap();
+        let mut config = RemoteConfig::new("https://example.convex.cloud".parse().unwrap());
+        config
+            .compatible_prior_runtimes
+            .push(decoded_legacy.runtime.clone());
+        let mut driver = RemoteDriver::open_with_store(
+            config,
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+
+        let tick = driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert_eq!(tick.push_attempted, 1);
+        let request = sent_mutation_request(&trace);
+        assert_eq!(
+            request["runtime"]["protocolVersion"].as_f64(),
+            Some(crate::config::EMBEDDED_PROTOCOL_VERSION as f64)
+        );
+        assert_eq!(request["runtime"]["moduleGraphHash"], "local");
+        assert_eq!(request["runtime"]["schemaHash"], "local");
+        assert_eq!(request["mutationId"], "legacy");
+        assert_eq!(request["replayId"], decoded_legacy.replay_id);
+        assert_eq!(
+            request["logicalFingerprint"],
+            decoded_legacy.logical_fingerprint
+        );
+
+        let inflight = match &driver.inflight_remote_push[0].kind {
+            InflightRemotePushKind::Mutation { envelope, .. } => envelope,
+            InflightRemotePushKind::Blob | InflightRemotePushKind::Checkpoint { .. } => {
+                panic!("expected an inflight mutation")
+            }
+        };
+        assert_eq!(
+            inflight.runtime.protocol_version,
+            crate::config::EMBEDDED_PROTOCOL_VERSION
+        );
+        assert_eq!(inflight.mutation_id, "legacy");
+        assert_eq!(inflight.replay_id, decoded_legacy.replay_id);
+        assert_eq!(
+            inflight.logical_fingerprint,
+            decoded_legacy.logical_fingerprint
+        );
+
+        let durable = store.remote_push_envelope_read(1).unwrap();
+        let durable = crate::push::decode_envelope(&durable[0]).unwrap();
+        assert_eq!(
+            durable.runtime.protocol_version,
+            crate::config::EMBEDDED_PROTOCOL_VERSION - 1
+        );
+        assert_eq!(durable.runtime.module_graph_hash, "legacy-modules");
+        assert_eq!(durable.replay_id, decoded_legacy.replay_id);
+        assert_eq!(
+            durable.logical_fingerprint,
+            decoded_legacy.logical_fingerprint
+        );
+    }
+
+    #[tokio::test]
+    async fn incompatible_legacy_envelope_is_preserved_and_not_sent() {
+        for (name, schema_hash, module_graph_hash) in [
+            ("schema", "legacy-schema", "local"),
+            ("modules", "local", "legacy-modules"),
+        ] {
+            let trace = Arc::new(Mutex::new(TransportTrace::default()));
+            let transport = TraceTransport {
+                trace: Arc::clone(&trace),
+            };
+            let store = test_store(&format!("remote-legacy-envelope-{name}.db"));
+            let mut legacy: serde_json::Value =
+                serde_json::from_str(&replay_envelope_json("legacy", 1)).unwrap();
+            legacy["clientRuntime"]["protocolVersion"] =
+                serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION - 1);
+            legacy["clientRuntime"]["schemaHash"] =
+                serde_json::Value::String(schema_hash.to_owned());
+            legacy["clientRuntime"]["moduleGraphHash"] =
+                serde_json::Value::String(module_graph_hash.to_owned());
+            store
+                .remote_push_envelope_write("legacy", 1, &legacy.to_string(), 1)
+                .unwrap();
+            let mut driver = RemoteDriver::open_with_store(
+                RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+                Arc::clone(&store),
+                transport,
+                SystemRemoteClock::default(),
+            );
+            driver.connected = true;
+
+            let error = driver.dispatch_ready_remote_pushes().await.unwrap_err();
+            assert!(matches!(
+                error,
+                RemoteError::DeploymentMismatch(message)
+                    if message.contains("local data was preserved")
+                        && message.contains("legacy envelope was not upgraded")
+            ));
+            assert_eq!(sent_mutation_frames(&trace), 0);
+            assert!(driver.inflight_remote_push.is_empty());
+            let durable = store.remote_push_envelope_read(1).unwrap();
+            assert_eq!(durable, vec![legacy.to_string()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_legacy_envelope_with_a_different_schema_is_preserved_and_not_sent() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-declared-legacy-schema-mismatch.db");
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&replay_envelope_json("legacy", 1)).unwrap();
+        legacy["clientRuntime"]["protocolVersion"] =
+            serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION - 1);
+        legacy["clientRuntime"]["schemaHash"] =
+            serde_json::Value::String("legacy-schema".to_owned());
+        let decoded = crate::push::decode_envelope(&legacy.to_string()).unwrap();
+        store
+            .remote_push_envelope_write("legacy", 1, &legacy.to_string(), 1)
+            .unwrap();
+        let mut config = RemoteConfig::new("https://example.convex.cloud".parse().unwrap());
+        config.compatible_prior_runtimes.push(decoded.runtime);
+        let mut driver = RemoteDriver::open_with_store(
+            config,
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+
+        let error = driver.dispatch_ready_remote_pushes().await.unwrap_err();
+        assert!(matches!(error, RemoteError::DeploymentMismatch(_)));
+        assert_eq!(sent_mutation_frames(&trace), 0);
+        assert_eq!(
+            store.remote_push_envelope_read(1).unwrap(),
+            vec![legacy.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_protocol_envelope_from_a_different_module_graph_is_preserved_and_not_sent() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-same-protocol-module-mismatch.db");
+        let mut queued: serde_json::Value =
+            serde_json::from_str(&replay_envelope_json("queued", 1)).unwrap();
+        queued["clientRuntime"]["moduleGraphHash"] =
+            serde_json::Value::String("prior-modules".to_owned());
+        store
+            .remote_push_envelope_write("queued", 1, &queued.to_string(), 1)
+            .unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+
+        let error = driver.dispatch_ready_remote_pushes().await.unwrap_err();
+        assert!(matches!(error, RemoteError::DeploymentMismatch(_)));
+        assert_eq!(sent_mutation_frames(&trace), 0);
+        assert_eq!(
+            store.remote_push_envelope_read(1).unwrap(),
+            vec![queued.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_same_protocol_envelope_from_a_different_module_graph_is_sent() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = test_store("remote-declared-same-protocol-module-mismatch.db");
+        let mut queued: serde_json::Value =
+            serde_json::from_str(&replay_envelope_json("queued", 1)).unwrap();
+        queued["clientRuntime"]["moduleGraphHash"] =
+            serde_json::Value::String("prior-modules".to_owned());
+        let decoded = crate::push::decode_envelope(&queued.to_string()).unwrap();
+        store
+            .remote_push_envelope_write("queued", 1, &queued.to_string(), 1)
+            .unwrap();
+        let mut config = RemoteConfig::new("https://example.convex.cloud".parse().unwrap());
+        config.compatible_prior_runtimes.push(decoded.runtime);
+        let mut driver = RemoteDriver::open_with_store(
+            config,
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+
+        let tick = driver.dispatch_ready_remote_pushes().await.unwrap();
+        assert_eq!(tick.push_attempted, 1);
+        assert_eq!(sent_mutation_frames(&trace), 1);
+        let request = sent_mutation_request(&trace);
+        assert_eq!(request["runtime"]["moduleGraphHash"], "local");
+        let durable = store.remote_push_envelope_read(1).unwrap();
+        let durable = crate::push::decode_envelope(&durable[0]).unwrap();
+        assert_eq!(durable.runtime.module_graph_hash, "prior-modules");
     }
 
     #[tokio::test]
@@ -6232,6 +6960,134 @@ mod tests {
             sent_mutation_frames(&trace),
             1,
             "no duplicate mutation frame is sent beyond the single legitimate re-dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_crdt_replay_drains_after_pull_already_observed_the_accepted_head() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let transport = TraceTransport {
+            trace: Arc::clone(&trace),
+        };
+        let store = documents_crdt_store("remote-crdt-applied-replay-observed.db");
+        store
+            .remote_page_write(&documents_page_write("srv1"))
+            .unwrap();
+        let local_id = storage::testkit::parse_docs(
+            &store
+                .doc_page_read(&storage::ReadSpec {
+                    table: "documents".to_owned(),
+                    ..storage::ReadSpec::default()
+                })
+                .unwrap(),
+        )[0]["_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mint = documents_crdt_store("remote-crdt-applied-replay-mint.db");
+        mint.crdt_field_intent_write(
+            "documents",
+            "seed",
+            "body",
+            storage::CrdtFieldKind::Text,
+            &storage::CrdtOperation::TextSplice {
+                index: 0,
+                delete: 0,
+                insert: "hi".to_owned(),
+            },
+            1,
+        )
+        .unwrap();
+        let payload = mint
+            .crdt_field_intent_write(
+                "documents",
+                "seed",
+                "body",
+                storage::CrdtFieldKind::Text,
+                &storage::CrdtOperation::TextSplice {
+                    index: 2,
+                    delete: 0,
+                    insert: "!".to_owned(),
+                },
+                2,
+            )
+            .unwrap();
+        let accepted = mint
+            .crdt_snapshot_read("documents", "seed")
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.field == "body")
+            .expect("the accepted snapshot includes the queued payload");
+
+        store
+            .remote_push_envelope_write(
+                "edit",
+                1,
+                &crdt_row_envelope_json("edit", 1, 0, &local_id, payload),
+                1,
+            )
+            .unwrap();
+        store
+            .remote_page_write(&documents_crdt_advance_pull(
+                "srv1",
+                accepted.bytes,
+                accepted.projection_hash.clone(),
+            ))
+            .unwrap();
+
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            transport,
+            SystemRemoteClock::default(),
+        );
+        driver.connected = true;
+        driver.dispatch_ready_remote_pushes().await.unwrap();
+        let InflightRemotePushKind::Mutation {
+            envelope: prepared, ..
+        } = &driver.inflight_remote_push[0].kind
+        else {
+            panic!("the retained mutation must be dispatched")
+        };
+        assert_eq!(prepared.crdt[0].base_seq, 1);
+        assert_eq!(prepared.crdt[0].projection_hash, accepted.projection_hash);
+        let row_id = prepared.crdt[0].row_id.clone();
+        let request_id = trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sent
+            .iter()
+            .find_map(|message| match message {
+                ClientMessage::Mutation { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .expect("dispatch emits one mutation frame");
+        trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
+            .extend(covering_mutation_events(
+                request_id,
+                applied_push_result_with_crdt("edit", &row_id, 1, &accepted.projection_hash),
+            ));
+
+        driver
+            .receive_once_with_timeout(Duration::ZERO)
+            .await
+            .unwrap();
+        driver
+            .receive_once_with_timeout(Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(store.remote_push_envelope_read(10).unwrap().is_empty());
+        assert_eq!(
+            store
+                .crdt_head_read("documents", &local_id, "body")
+                .unwrap(),
+            Some(1),
+            "an idempotent replay must not invent a second accepted CRDT sequence"
         );
     }
 
@@ -6912,8 +7768,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_member_edge_reapplies_its_projection_even_when_the_change_repeats_the_accepted_hash()
-    {
+    async fn a_member_reapplies_its_missing_projection_even_when_the_change_repeats_the_accepted_hash(
+    ) {
         let store = documents_crdt_store("remote-member-filtered-projection.db");
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport { trace };
@@ -6975,6 +7831,41 @@ mod tests {
             steady.projections.len(),
             0,
             "once the member is disclosed locally the unchanged projection stays filtered",
+        );
+
+        let local_id = driver
+            .store()
+            .id_local_read("documents", "srv1")
+            .unwrap()
+            .expect("the member keeps its local id mapping");
+        driver
+            .store()
+            .commit(
+                storage::WriteBatch {
+                    deletes: vec![storage::DeleteIn {
+                        table: "documents".to_owned(),
+                        id: local_id.clone(),
+                    }],
+                    ..storage::WriteBatch::default()
+                },
+                &storage::CommitOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            driver.store().doc_read("documents", &local_id).unwrap(),
+            None
+        );
+        assert_eq!(
+            driver.store().id_local_read("documents", "srv1").unwrap(),
+            Some(local_id),
+            "an optimistic local deletion keeps the server id mapping until settlement",
+        );
+
+        let after_local_delete = assemble_result_pull(&mut driver, point_get_page("srv1", true));
+        assert_eq!(
+            after_local_delete.projections.len(),
+            1,
+            "a still-authoritative member must restore its missing projection so a co-delivered CRDT state can apply",
         );
     }
 }
