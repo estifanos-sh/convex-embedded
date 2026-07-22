@@ -174,6 +174,9 @@ export function DocumentScreen({
   const switchingDocument = document !== null && document.id !== id;
   const showPlaceholder = placeholderVisible;
   const visibleError = switchingDocument ? null : (webViewCrash ?? error);
+  useEffect(() => {
+    if (visibleError && id) onReady?.(id);
+  }, [id, onReady, visibleError]);
   const preview = useMemo(
     () => (document && !switchingDocument ? documentPreview(document.body) : ""),
     [document, switchingDocument],
@@ -284,26 +287,25 @@ const styles = StyleSheet.create({
   placeholder: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: colors.background.secondary,
-    paddingHorizontal: 20,
-    paddingTop: 14,
+    paddingHorizontal: 16,
+    paddingTop: 12,
   },
   placeholderHeader: {
-    minHeight: 42,
+    minHeight: 36,
     marginBottom: 4,
     flexDirection: "row",
     alignItems: "flex-start",
-    gap: 14,
+    gap: 10,
   },
   placeholderSave: {
-    minHeight: 28,
-    marginTop: 2,
-    paddingHorizontal: 9,
+    minHeight: 26,
+    paddingHorizontal: 8,
     flexDirection: "row",
     alignItems: "center",
     gap: 7,
     backgroundColor: colors.background.tertiary,
     borderRadius: 999,
-    transform: [{ translateY: 8 }],
+    transform: [{ translateY: 7 }],
   },
   placeholderDot: {
     width: 7,
@@ -319,11 +321,11 @@ const styles = StyleSheet.create({
   placeholderTitle: {
     flex: 1,
     color: colors.content.primary,
-    fontSize: 30,
+    fontSize: 26,
     fontWeight: "600",
     letterSpacing: -1,
-    lineHeight: 32,
-    transform: [{ translateY: 10 }],
+    lineHeight: 28,
+    transform: [{ translateY: 9 }],
   },
   placeholderTitleBar: {
     flex: 1,
@@ -338,7 +340,7 @@ const styles = StyleSheet.create({
   placeholderCopy: {
     color: colors.content.primary,
     fontSize: 16,
-    lineHeight: 27.5,
+    lineHeight: 26.5,
   },
   placeholderLine: {
     width: "82%",

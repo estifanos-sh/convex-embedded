@@ -12,6 +12,7 @@ import {
   Pressable,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -21,17 +22,21 @@ import { useEmbeddedQuery } from "@/src/query";
 import { colors, fontSize, radius, spacing } from "@/src/theme";
 import { DocumentScreen } from "./document/[id]";
 
-const summaryArgs = { limit: 40 } as const;
-
 type DocumentSummary = FunctionReturnType<typeof api.documents.summaries>[number];
 
 export default function DocumentsScreen() {
   const insets = useSafeAreaInsets();
   const params = useLocalSearchParams<{ document?: string | string[] }>();
   const linkedDocumentId = Array.isArray(params.document) ? params.document[0] : params.document;
-  const query = useEmbeddedQuery(api.documents.summaries, summaryArgs);
   const [creating, setCreating] = React.useState(false);
   const [createError, setCreateError] = React.useState<string | null>(null);
+  const [search, setSearch] = React.useState("");
+  const queryArgs = React.useMemo(() => {
+    const prefix = search.trim();
+    return prefix ? { limit: 40, prefix } : { limit: 40 };
+  }, [search]);
+  const query = useEmbeddedQuery(api.documents.summaries, queryArgs);
+  const [openingDocumentId, setOpeningDocumentId] = React.useState<string | null>(null);
   const [selectedDocumentId, setSelectedDocumentId] = React.useState<string | null>(
     linkedDocumentId ?? null,
   );
@@ -47,11 +52,13 @@ export default function DocumentsScreen() {
     setSelectedDocumentId(id);
     if (alreadyReady) {
       requestedDocumentIdRef.current = null;
+      setOpeningDocumentId(null);
       setEditorVisible(true);
       return;
     }
     readyDocumentIdRef.current = null;
     requestedDocumentIdRef.current = id;
+    setOpeningDocumentId(id);
     setEditorVisible(false);
   }, []);
   const showReadyDocument = React.useCallback((id: string) => {
@@ -59,11 +66,13 @@ export default function DocumentsScreen() {
     readyDocumentIdRef.current = id;
     if (requestedDocumentIdRef.current !== id) return;
     requestedDocumentIdRef.current = null;
+    setOpeningDocumentId(null);
     setEditorVisible(true);
   }, []);
   const closeDocument = React.useCallback(() => {
     Keyboard.dismiss();
     requestedDocumentIdRef.current = null;
+    setOpeningDocumentId(null);
     setEditorVisible(false);
     if (linkedDocumentId !== undefined) router.setParams({ document: undefined });
   }, [linkedDocumentId]);
@@ -71,8 +80,13 @@ export default function DocumentsScreen() {
   React.useEffect(() => {
     const previous = previousLinkedDocumentIdRef.current;
     previousLinkedDocumentIdRef.current = linkedDocumentId;
-    if (linkedDocumentId !== undefined && linkedDocumentId !== previous)
+    if (linkedDocumentId !== undefined && linkedDocumentId !== previous) {
       openDocument(linkedDocumentId);
+    } else if (linkedDocumentId === undefined && previous !== undefined) {
+      requestedDocumentIdRef.current = null;
+      setOpeningDocumentId(null);
+      setEditorVisible(false);
+    }
   }, [linkedDocumentId, openDocument]);
 
   const createDocument = React.useCallback(async () => {
@@ -114,9 +128,15 @@ export default function DocumentsScreen() {
     <>
       <Stack.Screen options={{ headerShown: false }} />
       <View style={styles.screen}>
-        <View style={[styles.navigationBar, { height: insets.top + 56, paddingTop: insets.top }]}>
-          <View style={styles.navigationSlot}>
-            {editorVisible ? (
+        {editorVisible ? (
+          <View
+            style={[
+              styles.navigationBar,
+              styles.editorNavigationBar,
+              { height: insets.top + 56, paddingTop: insets.top },
+            ]}
+          >
+            <View style={styles.navigationSlot}>
               <Pressable
                 accessibilityLabel="Back to documents"
                 accessibilityRole="button"
@@ -126,35 +146,13 @@ export default function DocumentsScreen() {
               >
                 <Text style={styles.headerBackLabel}>‹</Text>
               </Pressable>
-            ) : null}
+            </View>
+            <View style={styles.navigationFill} />
+            <View style={styles.navigationSlot} />
           </View>
-          <Text numberOfLines={1} style={styles.navigationTitle}>
-            {editorVisible ? "" : "Documents"}
-          </Text>
-          <View style={[styles.navigationSlot, styles.navigationSlotRight]}>
-            {!editorVisible ? (
-              <Pressable
-                accessibilityLabel="Create document"
-                accessibilityRole="button"
-                disabled={creating}
-                hitSlop={8}
-                onPress={() => void createDocument()}
-                style={({ pressed }) => [
-                  styles.headerButton,
-                  styles.headerButtonSurface,
-                  pressed && styles.buttonPressed,
-                  creating && styles.buttonDisabled,
-                ]}
-              >
-                {creating ? (
-                  <ActivityIndicator color={colors.content.primary} size="small" />
-                ) : (
-                  <Text style={styles.headerButtonLabel}>+</Text>
-                )}
-              </Pressable>
-            ) : null}
-          </View>
-        </View>
+        ) : (
+          <View style={[styles.listNavigationBar, { height: insets.top + spacing.sm }]} />
+        )}
         <View style={styles.contentArea}>
           {selectedDocumentId ? (
             <View
@@ -183,29 +181,83 @@ export default function DocumentsScreen() {
               contentInsetAdjustmentBehavior="never"
               contentContainerStyle={documents.length === 0 ? styles.emptyContent : styles.content}
               data={documents}
+              keyboardDismissMode="on-drag"
+              keyboardShouldPersistTaps="handled"
               keyExtractor={(document) => document._id}
               ListHeaderComponent={
-                createError ? (
-                  <View accessibilityRole="alert" style={styles.errorBanner}>
-                    <Text selectable style={styles.errorText}>
-                      {createError}
-                    </Text>
-                  </View>
-                ) : null
+                <View style={styles.listHeader}>
+                  <TextInput
+                    accessibilityLabel="Search documents"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    clearButtonMode="while-editing"
+                    onChangeText={setSearch}
+                    placeholder="Search documents"
+                    placeholderTextColor={colors.content.tertiary}
+                    returnKeyType="search"
+                    style={styles.searchInput}
+                    value={search}
+                  />
+                  {createError ? (
+                    <View accessibilityRole="alert" style={styles.errorBanner}>
+                      <Text selectable style={styles.errorText}>
+                        {createError}
+                      </Text>
+                    </View>
+                  ) : null}
+                </View>
               }
               ListEmptyComponent={
-                <QueryState
-                  creating={creating}
-                  onCreate={createDocument}
-                  onRetry={query.retry}
-                  state={query}
-                />
+                search.trim() && query.status === "ready" ? (
+                  <View style={styles.state}>
+                    <Text selectable style={styles.stateTitle}>
+                      No matching documents
+                    </Text>
+                    <Text selectable style={styles.stateCopy}>
+                      Try a different title.
+                    </Text>
+                  </View>
+                ) : (
+                  <QueryState
+                    creating={creating}
+                    onCreate={createDocument}
+                    onRetry={query.retry}
+                    state={query}
+                  />
+                )
               }
               renderItem={({ item }) => (
-                <DocumentRow document={item} onOpen={() => openDocument(item._id)} />
+                <DocumentRow
+                  document={item}
+                  opening={openingDocumentId === item._id}
+                  onOpen={() => openDocument(item._id)}
+                />
               )}
               style={styles.list}
             />
+            <View
+              pointerEvents="box-none"
+              style={[styles.fabWrap, { bottom: Math.max(20, insets.bottom + 16) }]}
+            >
+              <Pressable
+                accessibilityLabel="Create document"
+                accessibilityRole="button"
+                disabled={creating}
+                hitSlop={8}
+                onPress={() => void createDocument()}
+                style={({ pressed }) => [
+                  styles.fab,
+                  pressed && styles.buttonPressed,
+                  creating && styles.buttonDisabled,
+                ]}
+              >
+                {creating ? (
+                  <ActivityIndicator color={colors.content.primary} size="small" />
+                ) : (
+                  <Text style={styles.headerButtonLabel}>+</Text>
+                )}
+              </Pressable>
+            </View>
           </View>
         </View>
       </View>
@@ -213,7 +265,15 @@ export default function DocumentsScreen() {
   );
 }
 
-function DocumentRow({ document, onOpen }: { document: DocumentSummary; onOpen: () => void }) {
+function DocumentRow({
+  document,
+  opening,
+  onOpen,
+}: {
+  document: DocumentSummary;
+  opening: boolean;
+  onOpen: () => void;
+}) {
   return (
     <Pressable
       accessibilityHint="Opens this document"
@@ -239,13 +299,17 @@ function DocumentRow({ document, onOpen }: { document: DocumentSummary; onOpen: 
         </Text>
         <Text style={styles.rowMeta}>{formatDate(document.updatedAt)}</Text>
       </View>
-      <Text
-        accessibilityElementsHidden
-        importantForAccessibility="no-hide-descendants"
-        style={styles.chevron}
-      >
-        ›
-      </Text>
+      {opening ? (
+        <ActivityIndicator color={colors.content.secondary} size="small" />
+      ) : (
+        <Text
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          style={styles.chevron}
+        >
+          ›
+        </Text>
+      )}
     </Pressable>
   );
 }
@@ -288,10 +352,10 @@ function QueryState({
         <Text style={styles.emptyIconLabel}>✦</Text>
       </View>
       <Text selectable style={styles.stateTitle}>
-        Your local workspace is ready
+        Your workspace is ready
       </Text>
       <Text selectable style={styles.stateCopy}>
-        Create a document. It stays in the embedded database on this device.
+        Create a document. Changes are stored instantly and remain available offline.
       </Text>
       <ActionButton
         disabled={creating}
@@ -339,36 +403,34 @@ function formatDate(value: number): string {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: colors.background.secondary,
+    backgroundColor: colors.background.primary,
   },
   navigationBar: {
     zIndex: 1,
     paddingHorizontal: spacing.lg,
     flexDirection: "row",
     alignItems: "center",
+  },
+  editorNavigationBar: {
     backgroundColor: colors.background.secondary,
+  },
+  listNavigationBar: {
+    backgroundColor: colors.background.primary,
   },
   navigationSlot: {
     width: 52,
     alignItems: "flex-start",
     justifyContent: "center",
   },
-  navigationSlotRight: {
-    alignItems: "flex-end",
-  },
-  navigationTitle: {
+  navigationFill: {
     flex: 1,
-    color: colors.content.primary,
-    fontSize: fontSize.title,
-    fontWeight: "700",
-    textAlign: "center",
   },
   contentArea: {
     flex: 1,
   },
   list: {
     flex: 1,
-    backgroundColor: colors.background.secondary,
+    backgroundColor: colors.background.primary,
   },
   editorLayer: {
     ...StyleSheet.absoluteFillObject,
@@ -376,31 +438,52 @@ const styles = StyleSheet.create({
   },
   listLayer: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: colors.background.secondary,
+    backgroundColor: colors.background.primary,
   },
   listLayerHidden: {
     opacity: 0,
   },
   content: {
-    paddingBottom: spacing.lg,
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingBottom: 112,
   },
   emptyContent: {
     flexGrow: 1,
-    padding: spacing.lg,
+    paddingHorizontal: spacing.md,
+    paddingBottom: 112,
   },
-  headerButton: {
-    width: 44,
-    height: 44,
+  listHeader: {
+    gap: spacing.sm,
+    paddingBottom: spacing.sm,
+  },
+  searchInput: {
+    minHeight: 44,
+    color: colors.content.primary,
+    backgroundColor: colors.background.secondary,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.lg,
+    borderCurve: "continuous",
+    paddingHorizontal: spacing.md,
+    fontSize: 16,
+  },
+  fabWrap: {
+    position: "absolute",
+    right: spacing.xl,
+  },
+  fab: {
+    width: 52,
+    height: 52,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: radius.full,
     overflow: "hidden",
-  },
-  headerButtonSurface: {
     backgroundColor: colors.accent,
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.18)",
+    borderColor: "rgba(255, 255, 255, 0.3)",
     borderRadius: radius.full,
+    borderCurve: "continuous",
+    boxShadow: "0 8px 24px rgba(0, 0, 0, 0.28)",
   },
   headerButtonPressed: {
     opacity: 0.58,
@@ -448,15 +531,17 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   row: {
-    minHeight: 68,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
+    minHeight: 62,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.md,
-    backgroundColor: "transparent",
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
+    backgroundColor: colors.background.secondary,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.lg,
+    borderCurve: "continuous",
   },
   rowPressed: {
     backgroundColor: colors.background.tertiary,
@@ -515,7 +600,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: spacing.md,
     paddingHorizontal: spacing.xxl,
-    paddingBottom: spacing.xxxl,
+    paddingVertical: spacing.xxxl,
   },
   stateTitle: {
     maxWidth: 320,

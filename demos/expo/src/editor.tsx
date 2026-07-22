@@ -353,8 +353,8 @@ function InteractiveDocument({
             editor={editor}
             emojiPicker={false}
             filePanel={false}
-            formattingToolbar
-            linkToolbar
+            formattingToolbar={false}
+            linkToolbar={false}
             onChange={queueEditor}
             sideMenu={false}
             slashMenu={false}
