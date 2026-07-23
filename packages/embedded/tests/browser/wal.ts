@@ -23,10 +23,10 @@ declare const Worker: new (
 };
 
 const createDocument = makeFunctionReference<"mutation", Record<string, never>, { _id: string }>(
-  "documents:create",
+  "documents:write",
 );
 const listDocuments = makeFunctionReference<"query", { limit?: number }, { _id: string }[]>(
-  "documents:list",
+  "documents:read",
 );
 
 interface WalResult {

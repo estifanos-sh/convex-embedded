@@ -20,19 +20,17 @@ const createDocument = makeFunctionReference<
   "mutation",
   { body?: string; slug?: string; title?: string; updatedAt?: number },
   DocumentRow
->("documents:create");
+>("documents:write");
 const writeDocumentBody = makeFunctionReference<
   "mutation",
   { id: string; splices: { delete: number; index: number; insert: string }[] },
   DocumentRow
->("documents:writeBody");
-const removeDocument = makeFunctionReference<"mutation", { id: string }, null>("documents:remove");
+>("documents:write");
+const removeDocument = makeFunctionReference<"mutation", { id: string }, null>("documents:del");
 const listDocuments = makeFunctionReference<"query", { limit?: number }, DocumentRow[]>(
-  "documents:list",
+  "documents:read",
 );
-const getDocument = makeFunctionReference<"query", { id: string }, DocumentRow | null>(
-  "documents:get",
-);
+const getDocument = makeFunctionReference<"query", { id: string }, DocumentRow[]>("documents:read");
 const generateUploadUrl = makeFunctionReference<"mutation", Record<string, never>, string>(
   "files:generateUploadUrl",
 );
@@ -244,7 +242,7 @@ describe("browser runtime", () => {
         .find(
           (event) =>
             event.kind === "mutation" &&
-            event.name === "documents:create" &&
+            event.name === "documents:write" &&
             event.phase === "finish",
         );
       expect(operation?.phase).toBe("finish");

@@ -127,7 +127,7 @@ describe("browser page lifecycle", () => {
     const values: unknown[] = [];
     const errors: unknown[] = [];
     const stop = runtime.onUpdate(
-      "documents:list" as never,
+      "documents:read" as never,
       {},
       (value) => values.push(value),
       (error) => errors.push(error),
@@ -188,11 +188,11 @@ describe("browser page lifecycle", () => {
     runtime.suspend();
 
     expect(terminated).toBe(0);
-    await expect(runtime.runQuery("documents:list" as never)).rejects.toThrow(
+    await expect(runtime.runQuery("documents:read" as never)).rejects.toThrow(
       "browser runtime is suspended",
     );
     await runtime.resume();
-    await expect(runtime.runQuery("documents:list" as never)).resolves.toBeUndefined();
+    await expect(runtime.runQuery("documents:read" as never)).resolves.toBeUndefined();
     expect(terminated).toBe(0);
     await runtime.close();
   });

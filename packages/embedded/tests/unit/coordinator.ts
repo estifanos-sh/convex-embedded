@@ -454,7 +454,7 @@ describe("browser deployment coordination", () => {
       args: {},
       clientId: "second",
       id: 2,
-      name: "documents:get",
+      name: "documents:read",
       op: WorkerCommand.Query,
     });
     await waitUntil(() => firstQueries === 1);

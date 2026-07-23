@@ -61,8 +61,8 @@ export const browserCommands = {
     const browserUrl = `/@fs${browserDistPath}?offline=${getTimerTime()}`;
     const hosted = new ConvexHttpClient(remoteUrl);
     const history = makeFunctionReference<"query">("documents:history");
-    const update = makeFunctionReference<"mutation">("documents:update");
-    const remove = makeFunctionReference<"mutation">("documents:remove");
+    const update = makeFunctionReference<"mutation">("documents:write");
+    const remove = makeFunctionReference<"mutation">("documents:del");
     const initialTitle = `${runId}:local`;
     const offlineTitle = `${runId}:offline`;
     const authoritativeTitle = `${runId}:authoritative`;
@@ -390,7 +390,7 @@ export const browserCommands = {
     const handoffTitle = `${runId}:follower`;
     const terminatedTitle = `${runId}:terminated-follower`;
     const hosted = new ConvexHttpClient(remoteUrl);
-    const remove = makeFunctionReference<"mutation">("documents:remove");
+    const remove = makeFunctionReference<"mutation">("documents:del");
     let remoteId: string | undefined;
     try {
       await installMetalDevicePage(owner, pageUrl, browserUrl, {

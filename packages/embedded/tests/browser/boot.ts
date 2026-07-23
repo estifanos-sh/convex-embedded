@@ -38,7 +38,7 @@ const createDocument = makeFunctionReference<
   "mutation",
   { body: string; slug: string; title: string; updatedAt: number },
   { _id: string }
->("documents:create");
+>("documents:write");
 
 interface SeedRequest {
   op: "seed";

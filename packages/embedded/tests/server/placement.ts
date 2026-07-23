@@ -150,7 +150,7 @@ describe("explicit function placement", () => {
           },
         },
         meta: {
-          getFunctionMetadata: async () => ({ name: "documents:update", visibility: "public" }),
+          getFunctionMetadata: async () => ({ name: "documents:write", visibility: "public" }),
           getRequestMetadata: async () => ({ requestId: "request" }),
         },
         runMutation: async () => null,

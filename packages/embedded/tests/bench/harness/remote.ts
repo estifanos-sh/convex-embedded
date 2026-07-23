@@ -51,9 +51,9 @@ export async function runBrowserRemoteBenchmark(
   const directPrefix = `${prefix}:direct`;
   const embeddedPrefix = `${prefix}:embedded`;
   const hosted = new ConvexHttpClient(options.remoteUrl);
-  const createDocument = makeFunctionReference<"mutation">("documents:create");
-  const updateDocument = makeFunctionReference<"mutation">("documents:update");
-  const removeDocument = makeFunctionReference<"mutation">("documents:remove");
+  const createDocument = makeFunctionReference<"mutation">("documents:write");
+  const updateDocument = makeFunctionReference<"mutation">("documents:write");
+  const removeDocument = makeFunctionReference<"mutation">("documents:del");
   const fillerIds: string[] = [];
   let unrelatedDocumentId: string | undefined;
   const convexBrowserUrl = `/@fs${convexBrowserWebPath}?direct=${getTimerTime()}`;
@@ -635,8 +635,8 @@ export async function runBrowserRemoteBenchmark(
       lifecycle: { create: true, crdt: true, delete: true, plain: true },
       notes: [
         "direct and Embedded paths use independent writer and observer clients against one deployment",
-        "each direct sample patches one plain slug field observed by one documents:get point query",
-        "each Embedded sample splices one CRDT body field observed by one documents:get point query",
+        "each direct sample patches one plain slug field observed by one documents:read point query",
+        "each Embedded sample splices one CRDT body field observed by one documents:read point query",
         "both observer paths retain the same documents:summaries partial list ({_id,title,updatedAt}, no body) in the engine-owned retained-result cache",
         "the partial list is foreign/cache-served: cacheServes is nonzero and its resultRows are empty, so row applies never re-emit it",
         "every Embedded body sample requires one point delta, zero plain-row applies, zero list transitions, and zero retained-result writes",

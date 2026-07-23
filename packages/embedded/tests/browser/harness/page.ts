@@ -75,8 +75,8 @@ export async function installEmbeddedPage(
         error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       const writeDocument = async (body: string) => {
         const title = `${channel}:${body}`;
-        const row = (await client.mutation("documents:create", {})) as { _id: string };
-        await client.mutation("documents:update", {
+        const row = (await client.mutation("documents:write", {})) as { _id: string };
+        await client.mutation("documents:write", {
           id: row._id,
           title,
           updatedAt: Math.trunc(performance.now()),
@@ -94,13 +94,13 @@ export async function installEmbeddedPage(
       };
       if (initialQuery) {
         try {
-          pushRows((await client.query("documents:list", {})) as Array<{ title: string }>);
+          pushRows((await client.query("documents:read", {})) as Array<{ title: string }>);
         } catch (error) {
           errors.push(formatError(error));
           throw error;
         }
       }
-      const watch = client.watchQuery("documents:list", {});
+      const watch = client.watchQuery("documents:read", {});
       watch.onUpdate(
         () => {
           pushRows((watch.localQueryResult() ?? []) as Array<{ title: string }>);
@@ -255,8 +255,8 @@ export async function installMetalDevicePage(
         if (!client || watchTarget.kind === "none") return;
         const watch =
           watchTarget.kind === "document"
-            ? client.watchQuery("documents:get", { id: watchTarget.id })
-            : client.watchQuery("documents:list", { limit: queryLimit });
+            ? client.watchQuery("documents:read", { id: watchTarget.id })
+            : client.watchQuery("documents:read", { limit: queryLimit });
         stopWatch = watch.onUpdate(
           () => {
             try {
@@ -374,7 +374,8 @@ export async function installMetalDevicePage(
         if (!revision) return null;
         const current =
           document ??
-          ((await currentClient().query("documents:get", { id })) as MetalDocument | null);
+          ((await currentClient().query("documents:read", { id })) as MetalDocument[])[0] ??
+          null;
         const value = revision.value as Omit<MetalDocument, "_id" | "_creationTime"> | undefined;
         return {
           doc:
@@ -394,12 +395,12 @@ export async function installMetalDevicePage(
       };
       const rows = async () => {
         if (watchTarget.kind === "document") {
-          const result = (await currentClient().query("documents:get", {
+          const [result] = (await currentClient().query("documents:read", {
             id: watchTarget.id,
-          })) as MetalDocument | null;
+          })) as MetalDocument[];
           return result && result.title.startsWith(`${runId}:`) ? [result] : [];
         }
-        const result = (await currentClient().query("documents:list", {
+        const result = (await currentClient().query("documents:read", {
           limit: queryLimit,
         })) as MetalDocument[];
         return result.filter((row) => row.title.startsWith(`${runId}:`));
@@ -493,10 +494,10 @@ export async function installMetalDevicePage(
       } = {
         connectionState: () => currentClient().connectionState(),
         writeBody: async (id, body) => {
-          await currentClient().mutation("documents:writeBody", { id, splices: [body] });
+          await currentClient().mutation("documents:write", { id, splices: [body] });
         },
         writeDraft: async (id, title) => {
-          await currentClient().mutation("documents:update", {
+          await currentClient().mutation("documents:write", {
             id,
             title,
             updatedAt: performance.now(),
@@ -504,7 +505,7 @@ export async function installMetalDevicePage(
         },
         close,
         create: async (title) => {
-          const doc = (await currentClient().mutation("documents:create", {
+          const doc = (await currentClient().mutation("documents:write", {
             body: bodyFor(title),
             slug: title,
             title,
@@ -587,10 +588,7 @@ export async function installMetalDevicePage(
         snapshot: async (id) =>
           await revisionEntry(
             id,
-            (await currentClient().mutation("documents:savepoint", { id })) as Record<
-              string,
-              unknown
-            >,
+            (await currentClient().mutation("rev:savepoint", { id })) as Record<string, unknown>,
           ),
         storageId,
       };
@@ -623,11 +621,11 @@ export async function installDirectRemoteBenchPage(
       type Row = { _id: string; title: string; updatedAt: number };
       const client = new ConvexClient(remoteUrl);
       const summaries = makeFunctionReference("documents:summaries");
-      const get = makeFunctionReference("documents:get");
-      const create = makeFunctionReference("documents:create");
-      const update = makeFunctionReference("documents:update");
-      const writeSlug = makeFunctionReference("documents:writeSlug");
-      const remove = makeFunctionReference("documents:remove");
+      const get = makeFunctionReference("documents:read");
+      const create = makeFunctionReference("documents:write");
+      const update = makeFunctionReference("documents:write");
+      const writeSlug = makeFunctionReference("documents:write");
+      const remove = makeFunctionReference("documents:del");
       let rows: Row[] = [];
       let summaryKeys: string[] = [];
       let stopDocument: (() => void) | undefined;
@@ -713,7 +711,7 @@ export async function installDirectRemoteBenchPage(
         select: (id) => {
           stopDocument?.();
           stopDocument = client.onUpdate(get, { id }, (value: unknown) => {
-            const document = value as { slug?: string; title?: string } | null;
+            const document = (value as Array<{ slug?: string; title?: string }> | undefined)?.[0];
             documentTitle = document?.title;
             documentSlug = document?.slug;
             pointTransitions += 1;
@@ -813,9 +811,10 @@ export async function installBrowserRemoteBenchPage(
       };
       const watchDocument = (id: string) => {
         if (documentStops.has(id)) return;
-        const documentWatch = client.watchQuery("documents:get", { id });
+        const documentWatch = client.watchQuery("documents:read", { id });
         const refreshDocument = () => {
-          documents.set(id, documentWatch.localQueryResult() as Document | null);
+          const result = documentWatch.localQueryResult() as Document[] | undefined;
+          documents.set(id, result?.[0] ?? null);
           pointTransitions += 1;
           notify();
         };
@@ -951,7 +950,7 @@ export async function installBrowserRemoteBenchPage(
         create: async (title: string, body: string) => {
           const acceptedBefore = accepted;
           const startedAt = absoluteNow();
-          const created = (await client.mutation("documents:create", {
+          const created = (await client.mutation("documents:write", {
             body,
             slug: title,
             title,
@@ -966,7 +965,7 @@ export async function installBrowserRemoteBenchPage(
         },
         eventCount: () => events.length,
         evidenceSince,
-        remove: async (id: string) => await client.mutation("documents:remove", { id }),
+        remove: async (id: string) => await client.mutation("documents:del", { id }),
         // Cut 7 §4.5: disclosing the selected row via its point query places a non-member row in the
         // partial list's index range, so the list evaluates foreign and is served from the cache.
         select: (id: string) => watchDocument(id),
@@ -980,7 +979,7 @@ export async function installBrowserRemoteBenchPage(
           let admission: BrowserRemoteAdmissionTiming | undefined;
           runtimeAdmission = undefined;
           await client.mutation(
-            "documents:update",
+            "documents:write",
             { id, title, updatedAt },
             {
               onTiming: (timing: BrowserRemoteAdmissionTiming) => {
@@ -1016,7 +1015,7 @@ export async function installBrowserRemoteBenchPage(
           let admission: BrowserRemoteAdmissionTiming | undefined;
           runtimeAdmission = undefined;
           await client.mutation(
-            "documents:writeBody",
+            "documents:write",
             { splices: [body], id },
             {
               onTiming: (timing: BrowserRemoteAdmissionTiming) => {
@@ -1114,7 +1113,7 @@ export async function installBrowserScalePage(
         }
         throw new Error(`Timed out waiting for ${label}`);
       };
-      const watch = client.watchQuery("documents:list", { limit: queryLimit });
+      const watch = client.watchQuery("documents:read", { limit: queryLimit });
       const stop = watch.onUpdate(() => {
         updateCount += 1;
         refreshTitles();
@@ -1127,7 +1126,7 @@ export async function installBrowserScalePage(
 
       const run = async (durationMs: number) => {
         const created = (await client.mutation(
-          "documents:create",
+          "documents:write",
           documentFields(`${prefix}seed`),
         )) as { _id: string };
         await waitFor(() => latestTitles.includes(`${prefix}seed`), "seed document fanout");
@@ -1141,7 +1140,7 @@ export async function installBrowserScalePage(
           finalTitle = `${prefix}fanout-${fanoutWrites}`;
           const startedAt = performance.now();
           const fields = documentFields(finalTitle);
-          await client.mutation("documents:update", {
+          await client.mutation("documents:write", {
             id: created._id,
             title: fields.title,
             updatedAt: fields.updatedAt,
@@ -1280,17 +1279,17 @@ export async function installBrowserBenchPage(
         };
       };
       const writeDocument = async (title: string) => {
-        await client.mutation("documents:create", documentFields(title));
+        await client.mutation("documents:write", documentFields(title));
       };
       const queryRows = async () => {
-        const rows = (await client.query("documents:list", { limit: queryLimit })) as Array<{
+        const rows = (await client.query("documents:read", { limit: queryLimit })) as Array<{
           _id: string;
           title: string;
         }>;
         return rows.filter((row) => row.title.startsWith(prefix));
       };
       const startWatch = async () => {
-        const watch = client.watchQuery("documents:list", { limit: queryLimit });
+        const watch = client.watchQuery("documents:read", { limit: queryLimit });
         const stop = watch.onUpdate(() => undefined);
         watchers.push(stop);
         await waitFor(() => {
@@ -1363,7 +1362,7 @@ export async function installBrowserBenchPage(
         const samples: BrowserLatencyBenchSample[] = [];
         for (let index = 0; index < iterations; index += 1) {
           samples.push(
-            await timeMutation("documents:create", () => writeDocument(`${prefix}sample-${index}`)),
+            await timeMutation("documents:write", () => writeDocument(`${prefix}sample-${index}`)),
           );
         }
         rows = await queryRows();

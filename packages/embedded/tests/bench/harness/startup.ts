@@ -154,7 +154,7 @@ export async function runBrowserStartupBenchmark(
         const client = new module.ConvexEmbeddedClient();
         const constructMs = performance.now() - constructStartedAt;
         const readyStartedAt = performance.now();
-        await client.query("documents:list", {});
+        await client.query("documents:read", {});
         const readyQueryMs = performance.now() - readyStartedAt;
         const closeStartedAt = performance.now();
         await client.close();
@@ -257,7 +257,7 @@ export async function runBrowserStartupBenchmark(
         const module = await importClient(`attach-${token}`);
         const leader = new module.ConvexEmbeddedClient();
         const leaderStartedAt = performance.now();
-        await leader.query("documents:list", {});
+        await leader.query("documents:read", {});
         const leaderReadyMs = performance.now() - leaderStartedAt;
         takeDebugEvents();
         const totalStartedAt = performance.now();
@@ -265,7 +265,7 @@ export async function runBrowserStartupBenchmark(
         const follower = new module.ConvexEmbeddedClient();
         const constructMs = performance.now() - constructStartedAt;
         const readyStartedAt = performance.now();
-        await follower.query("documents:list", {});
+        await follower.query("documents:read", {});
         const readyQueryMs = performance.now() - readyStartedAt;
         const closeStartedAt = performance.now();
         await follower.close();

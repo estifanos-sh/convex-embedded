@@ -169,7 +169,7 @@ describe("v5 real Convex vertical slice", () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     await expect(
       runPull(hosted, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { limit: 1 },
         runtime: {
           ...testRuntime,
@@ -218,12 +218,64 @@ describe("v5 real Convex vertical slice", () => {
     }
   }, 20_000);
 
+  test("dispatches a single documents:write intent and rejects ambiguous combinations", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "embedded-v5-write-intent-"));
+    const client = new ConvexEmbeddedClient({
+      modules: { documents },
+      path: join(directory, "embedded.sqlite3"),
+      schema,
+    });
+    try {
+      const created = await client.mutation(api.documents.write, {});
+      const id = created._id;
+
+      const slugged = await client.mutation(api.documents.write, { id, slug: "intent-slug" });
+      expect(slugged.slug).toBe("intent-slug");
+      const patched = await client.mutation(api.documents.write, {
+        id,
+        title: "Patched",
+        updatedAt: 123,
+      });
+      expect(patched).toMatchObject({ title: "Patched", updatedAt: 123 });
+      const flushed = await client.mutation(api.documents.write, {
+        id,
+        splices: [],
+        title: "Flushed",
+      });
+      expect(flushed.title).toBe("Flushed");
+
+      await expect(
+        client.mutation(api.documents.write, { id, slug: "conflict", title: "conflict" }),
+      ).rejects.toThrow(/slug change must be the only edit/);
+      await expect(
+        client.mutation(api.documents.write, {
+          id,
+          splices: [{ index: 0, delete: 0, insert: "x" }],
+          slug: "conflict",
+        }),
+      ).rejects.toThrow(/slug change must be the only edit/);
+      await expect(
+        client.mutation(api.documents.write, {
+          id,
+          splices: [{ index: 0, delete: 0, insert: "x" }],
+          updatedAt: 5,
+        }),
+      ).rejects.toThrow(/separate edits/);
+      await expect(client.mutation(api.documents.write, { id })).rejects.toThrow(
+        /An update requires splices, slug, title, or updatedAt/,
+      );
+    } finally {
+      await client.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test("exposes code-controlled retention with retirement and deletion fences", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const clientId = `zzzz-v5-retention-${crypto.randomUUID()}`;
     const prefix = `v5-retention-${crypto.randomUUID()}`;
     await runPull(client, {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { prefix },
       runtime: testRuntime,
     });
@@ -365,7 +417,7 @@ describe("v5 real Convex vertical slice", () => {
       ),
     ).rejects.toThrow(/retired/i);
 
-    if (inserted) await client.mutation(api.documents.remove, { id: inserted as never });
+    if (inserted) await client.mutation(api.documents.del, { id: inserted as never });
   }, 20_000);
 
   test("bounds filtered operational scans and revision history pages", async () => {
@@ -507,14 +559,14 @@ describe("v5 real Convex vertical slice", () => {
       expect(secondRevisionPage).toMatchObject({ isDone: true, page: [expect.any(Object)] });
       expect([...firstRevisionPage.page, ...secondRevisionPage.page]).toHaveLength(3);
 
-      const document = await client.mutation(api.documents.create, {
+      const document = await client.mutation(api.documents.write, {
         slug: prefix,
         title: prefix,
       });
       documentId = document._id;
       const savepoints: Array<{ revId: string }> = [];
       for (let count = 1; count <= 3; count += 1) {
-        const savepoint = await client.mutation(api.documents.savepoint, { id: document._id });
+        const savepoint = await client.mutation(api.rev.savepoint, { id: document._id });
         savepoints.push(savepoint);
         revisionIds.push({ revId: savepoint.revId, rowId: document._id, table: "documents" });
         const page = await client.query(api.remote.history, {
@@ -553,7 +605,7 @@ describe("v5 real Convex vertical slice", () => {
         await client.mutation(api.revision.remove, { ...revision, numItems: 2 });
       }
       if (documentId !== undefined) {
-        await client.mutation(api.documents.remove, { id: documentId as never });
+        await client.mutation(api.documents.del, { id: documentId as never });
       }
       await commit(
         "applied",
@@ -576,19 +628,19 @@ describe("v5 real Convex vertical slice", () => {
   test("composes first-party migrations through the Embedded internal mutation", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-migration-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, {
+    const document = await client.mutation(api.documents.write, {
       slug: prefix,
       title: prefix,
       updatedAt: -123,
     });
     await client.mutation(api.migrations.run, {});
 
-    expect(await client.query(api.documents.get, { id: document._id })).toMatchObject({
+    expect((await client.query(api.documents.read, { id: document._id }))[0]).toMatchObject({
       title: `migrated:${prefix}`,
       updatedAt: 123,
     });
     const pulled = await runPull(client, {
-      functionName: "documents:get",
+      functionName: "documents:read",
       args: { id: document._id },
       runtime: testRuntime,
     });
@@ -599,7 +651,7 @@ describe("v5 real Convex vertical slice", () => {
         rowId: document._id,
       }),
     );
-    await client.mutation(api.documents.remove, { id: document._id });
+    await client.mutation(api.documents.del, { id: document._id });
   }, 20_000);
 
   test("replays one local Node mutation through the V5 native remote", async () => {
@@ -618,28 +670,28 @@ describe("v5 real Convex vertical slice", () => {
       events.push(event);
       if (events.length > 40) events.shift();
     });
-    const watch = client.watchQuery(api.documents.list, { prefix: slug });
+    const watch = client.watchQuery(api.documents.read, { prefix: slug });
     const stop = watch.onUpdate(() => undefined);
     let hostedId: string | undefined;
     try {
-      const local = await client.mutation(api.documents.create, {
+      const local = await client.mutation(api.documents.write, {
         body: "abc",
         slug,
         title: slug,
         updatedAt: readTime(),
       });
       let deadline = getTimerTime() + 15_000;
-      let remote = await hosted.query(api.documents.getBySlug, { slug });
+      let remote = (await hosted.query(api.documents.read, { slug }))[0];
       while (!remote && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.getBySlug, { slug });
+        remote = (await hosted.query(api.documents.read, { slug }))[0];
       }
       expect(remote).not.toBeNull();
       if (!remote) throw new Error("Native V5 replay did not reach hosted Convex.");
       hostedId = remote._id;
       expect(remote.title).toBe(slug);
       expect(remote._id).not.toBe(local._id);
-      const locallySpliced = await client.mutation(api.documents.writeBody, {
+      const locallySpliced = await client.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 1, delete: 0, insert: "X" }],
       });
@@ -647,7 +699,7 @@ describe("v5 real Convex vertical slice", () => {
       deadline = getTimerTime() + 15_000;
       while (remote.body !== "aXbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.getBySlug, { slug });
+        remote = (await hosted.query(api.documents.read, { slug }))[0];
         if (!remote) throw new Error("Native V5 CRDT target disappeared from hosted Convex.");
       }
       expect(remote.body, JSON.stringify(events)).toBe("aXbc");
@@ -656,7 +708,7 @@ describe("v5 real Convex vertical slice", () => {
       stop();
       await client.close();
       if (hostedId !== undefined) {
-        await hosted.mutation(api.documents.remove, { id: hostedId as never });
+        await hosted.mutation(api.documents.del, { id: hostedId as never });
       }
       await rm(directory, { recursive: true, force: true });
     }
@@ -666,7 +718,7 @@ describe("v5 real Convex vertical slice", () => {
     const directory = await mkdtemp(join(tmpdir(), "embedded-v5-hosted-watch-"));
     const slug = `v5-hosted-watch-${crypto.randomUUID()}`;
     const hosted = new ConvexHttpClient(remoteUrl);
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "hosted watch",
       slug,
       title: slug,
@@ -678,15 +730,15 @@ describe("v5 real Convex vertical slice", () => {
       schema,
       url: remoteUrl,
     });
-    const listWatch = client.watchQuery(api.documents.list, { prefix: slug });
+    const listWatch = client.watchQuery(api.documents.read, { prefix: slug });
     const stopList = listWatch.onUpdate(() => undefined);
     let stopHistory: (() => void) | undefined;
     try {
       const pullDeadline = getTimerTime() + 15_000;
-      let local = await client.query(api.documents.getBySlug, { slug });
+      let local = (await client.query(api.documents.read, { slug }))[0];
       while (!local && getTimerTime() < pullDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await client.query(api.documents.getBySlug, { slug });
+        local = (await client.query(api.documents.read, { slug }))[0];
       }
       if (!local) throw new Error("Hosted-watch client did not pull the document.");
 
@@ -700,7 +752,7 @@ describe("v5 real Convex vertical slice", () => {
         latest = history.localQueryResult();
       });
 
-      const revision = await hosted.mutation(api.documents.savepoint, { id: created._id });
+      const revision = await hosted.mutation(api.rev.savepoint, { id: created._id });
       const updateDeadline = getTimerTime() + 15_000;
       while (
         !latest?.page.some((row) => row.revId === revision.revId) &&
@@ -713,7 +765,7 @@ describe("v5 real Convex vertical slice", () => {
       stopHistory?.();
       stopList();
       await client.close();
-      await hosted.mutation(api.documents.remove, { id: created._id });
+      await hosted.mutation(api.documents.del, { id: created._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 25_000);
@@ -721,7 +773,7 @@ describe("v5 real Convex vertical slice", () => {
   test("rebases concurrent CRDT edits by pulling opaque payloads and retrying", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-crdt-rebase-${crypto.randomUUID()}`;
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "abc",
       slug,
       title: slug,
@@ -749,17 +801,17 @@ describe("v5 real Convex vertical slice", () => {
       }),
     );
     const watches = clients.map((client) => {
-      const watch = client.watchQuery(api.documents.list, { prefix: slug });
+      const watch = client.watchQuery(api.documents.read, { prefix: slug });
       return watch.onUpdate(() => undefined);
     });
     try {
       const local = await Promise.all(
         clients.map(async (client) => {
           const deadline = getTimerTime() + 15_000;
-          let row = await client.query(api.documents.getBySlug, { slug });
+          let row = (await client.query(api.documents.read, { slug }))[0];
           while (!row && getTimerTime() < deadline) {
             await new Promise((resolve) => setTimeout(resolve, 100));
-            row = await client.query(api.documents.getBySlug, { slug });
+            row = (await client.query(api.documents.read, { slug }))[0];
           }
           if (!row) {
             throw new Error(
@@ -770,24 +822,24 @@ describe("v5 real Convex vertical slice", () => {
         }),
       );
       await Promise.all([
-        clients[0]!.mutation(api.documents.writeBody, {
+        clients[0]!.mutation(api.documents.write, {
           id: local[0]!._id,
           splices: [{ index: 1, delete: 0, insert: "A" }],
         }),
-        clients[1]!.mutation(api.documents.writeBody, {
+        clients[1]!.mutation(api.documents.write, {
           id: local[1]!._id,
           splices: [{ index: 1, delete: 0, insert: "B" }],
         }),
       ]);
       const deadline = getTimerTime() + 15_000;
-      let remote = await hosted.query(api.documents.get, { id: created._id });
+      let remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       while (
         remote &&
         (!remote.body.includes("A") || !remote.body.includes("B")) &&
         getTimerTime() < deadline
       ) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.body).toHaveLength(5);
       expect(remote?.body).toContain("A");
@@ -795,7 +847,7 @@ describe("v5 real Convex vertical slice", () => {
       const hostedBody = remote?.body;
       const convergenceDeadline = getTimerTime() + 15_000;
       let converged = await Promise.all(
-        clients.map((client) => client.query(api.documents.getBySlug, { slug })),
+        clients.map((client) => client.query(api.documents.read, { slug }).then((rows) => rows[0])),
       );
       while (
         converged.some((row) => row?.body !== hostedBody) &&
@@ -803,7 +855,9 @@ describe("v5 real Convex vertical slice", () => {
       ) {
         await new Promise((resolve) => setTimeout(resolve, 100));
         converged = await Promise.all(
-          clients.map((client) => client.query(api.documents.getBySlug, { slug })),
+          clients.map((client) =>
+            client.query(api.documents.read, { slug }).then((rows) => rows[0]),
+          ),
         );
       }
       expect(
@@ -814,7 +868,7 @@ describe("v5 real Convex vertical slice", () => {
       stopEvents.forEach((stop) => stop());
       watches.forEach((stop) => stop());
       await Promise.all(clients.map((client) => client.close()));
-      await hosted.mutation(api.documents.remove, { id: created._id });
+      await hosted.mutation(api.documents.del, { id: created._id });
       await Promise.all(
         directories.map((directory) => rm(directory, { recursive: true, force: true })),
       );
@@ -824,7 +878,7 @@ describe("v5 real Convex vertical slice", () => {
   test("carries opaque CRDT checkpoints through app-authorized savepoint replay", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-crdt-revision-${crypto.randomUUID()}`;
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "seed",
       slug,
       title: slug,
@@ -837,7 +891,7 @@ describe("v5 real Convex vertical slice", () => {
       schema,
       url: remoteUrl,
     });
-    const watch = client.watchQuery(api.documents.list, { prefix: slug });
+    const watch = client.watchQuery(api.documents.read, { prefix: slug });
     const stop = watch.onUpdate(() => undefined);
     let acceptedPushes = 0;
     let received = 0;
@@ -861,15 +915,15 @@ describe("v5 real Convex vertical slice", () => {
     });
     try {
       const pullDeadline = getTimerTime() + 15_000;
-      let local = await client.query(api.documents.getBySlug, { slug });
+      let local = (await client.query(api.documents.read, { slug }))[0];
       while (!local && getTimerTime() < pullDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await client.query(api.documents.getBySlug, { slug });
+        local = (await client.query(api.documents.read, { slug }))[0];
       }
       if (!local) throw new Error("CRDT revision client did not pull the document.");
       const receivedAfterInitialPull = received;
 
-      await client.mutation(api.documents.writeBody, {
+      await client.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 4, delete: 0, insert: " saved" }],
       });
@@ -886,7 +940,7 @@ describe("v5 real Convex vertical slice", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
       await (client as unknown as { __pullRemoteOnce(): Promise<unknown> }).__pullRemoteOnce();
 
-      const revision = await client.mutation(api.documents.savepoint, { id: local._id });
+      const revision = await client.mutation(api.rev.savepoint, { id: local._id });
       const savepointDeadline = getTimerTime() + 15_000;
       while (acceptedPushes < 2 && getTimerTime() < savepointDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -901,7 +955,7 @@ describe("v5 real Convex vertical slice", () => {
         value: { body: "seed saved" },
       });
 
-      await client.mutation(api.documents.writeBody, {
+      await client.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 10, delete: 0, insert: " later" }],
       });
@@ -919,14 +973,14 @@ describe("v5 real Convex vertical slice", () => {
       }
       expect(acceptedPushes, JSON.stringify(remoteTicks.slice(-20))).toBeGreaterThanOrEqual(4);
       expect(remoteErrors).toEqual([]);
-      expect(await hosted.query(api.documents.get, { id: created._id })).toMatchObject({
+      expect((await hosted.query(api.documents.read, { id: created._id }))[0]).toMatchObject({
         body: "seed saved",
       });
     } finally {
       stop();
       stopEvents();
       await client.close();
-      await hosted.mutation(api.documents.remove, { id: created._id });
+      await hosted.mutation(api.documents.del, { id: created._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 40_000);
@@ -934,7 +988,7 @@ describe("v5 real Convex vertical slice", () => {
   test("answers a checkpoint request and pulls after covered payload deletion", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-crdt-checkpoint-${crypto.randomUUID()}`;
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "abc",
       slug,
       title: slug,
@@ -950,7 +1004,7 @@ describe("v5 real Convex vertical slice", () => {
       schema,
       url: remoteUrl,
     });
-    const firstWatch = first.watchQuery(api.documents.list, { prefix: slug });
+    const firstWatch = first.watchQuery(api.documents.read, { prefix: slug });
     const stopFirst = firstWatch.onUpdate(() => undefined);
     const remoteEvents: Array<{
       error?: string;
@@ -990,44 +1044,44 @@ describe("v5 real Convex vertical slice", () => {
     let removed = false;
     try {
       let deadline = getTimerTime() + 15_000;
-      let local = await first.query(api.documents.getBySlug, { slug });
+      let local = (await first.query(api.documents.read, { slug }))[0];
       while (!local && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await first.query(api.documents.getBySlug, { slug });
+        local = (await first.query(api.documents.read, { slug }))[0];
       }
       if (!local) throw new Error("Checkpoint client did not pull the hosted document.");
 
-      await first.mutation(api.documents.writeBody, {
+      await first.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 1, delete: 0, insert: "X" }],
       });
       deadline = getTimerTime() + 15_000;
-      let remote = await hosted.query(api.documents.get, { id: created._id });
+      let remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       while (remote?.body !== "aXbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.body).toBe("aXbc");
 
-      await first.mutation(api.documents.writeBody, {
+      await first.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 2, delete: 0, insert: "Y" }],
       });
       deadline = getTimerTime() + 15_000;
       while (remote?.body !== "aXYbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.body).toBe("aXYbc");
 
-      await first.mutation(api.documents.writeBody, {
+      await first.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 3, delete: 0, insert: "Z" }],
       });
       deadline = getTimerTime() + 15_000;
       while (remote?.body !== "aXYZbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.body).toBe("aXYZbc");
 
@@ -1039,7 +1093,7 @@ describe("v5 real Convex vertical slice", () => {
       const firstCheckpointPage = (await hosted.query(api.embedded.pull, {
         request: {
           kind: "checkpoint",
-          functionName: "documents:getBySlug",
+          functionName: "documents:read",
           args: { slug },
           runtime: testRuntime,
           table: "documents",
@@ -1107,7 +1161,7 @@ describe("v5 real Convex vertical slice", () => {
       const finalCheckpointPage = (await hosted.query(api.embedded.pull, {
         request: {
           kind: "checkpoint",
-          functionName: "documents:getBySlug",
+          functionName: "documents:read",
           args: { slug },
           runtime: testRuntime,
           table: "documents",
@@ -1122,14 +1176,14 @@ describe("v5 real Convex vertical slice", () => {
       expect(finalCheckpointPage.payloads.map((payload) => payload.seq)).toEqual([2, 3]);
       expect(finalCheckpointPage.isDone).toBe(true);
 
-      await first.mutation(api.documents.writeBody, {
+      await first.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 4, delete: 0, insert: "W" }],
       });
       deadline = getTimerTime() + 15_000;
       while (remote?.body !== "aXYZWbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.body).toBe("aXYZWbc");
       field = await hosted.query(api.crdt.field, {
@@ -1150,17 +1204,19 @@ describe("v5 real Convex vertical slice", () => {
         schema,
         url: remoteUrl,
       });
-      const secondWatch = second.watchQuery(api.documents.list, { prefix: slug });
+      const secondWatch = second.watchQuery(api.documents.read, { prefix: slug });
       stopSecond = secondWatch.onUpdate(() => undefined);
       deadline = getTimerTime() + 15_000;
-      let pulled = await second.query(api.documents.getBySlug, { slug });
+      let pulled = (await second.query(api.documents.read, { slug }))[0];
       while (pulled?.body !== "aXYZWbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        pulled = await second.query(api.documents.getBySlug, { slug });
+        pulled = (await second.query(api.documents.read, { slug }))[0];
       }
       expect(pulled?.body).toBe("aXYZWbc");
-      expect((await hosted.query(api.documents.get, { id: created._id }))?.body).toBe("aXYZWbc");
-      const revision = await first.mutation(api.documents.savepoint, { id: local._id });
+      expect((await hosted.query(api.documents.read, { id: created._id }))[0]?.body).toBe(
+        "aXYZWbc",
+      );
+      const revision = await first.mutation(api.rev.savepoint, { id: local._id });
       deadline = getTimerTime() + 15_000;
       let hostedRevision = await hosted.query(api.revision.get, {
         rowId: created._id,
@@ -1176,10 +1232,10 @@ describe("v5 real Convex vertical slice", () => {
       expect(hostedRevision?.crdt).toEqual([
         expect.objectContaining({ field: "body", kind: "text" }),
       ]);
-      await first.mutation(api.documents.remove, { id: local._id });
+      await first.mutation(api.documents.del, { id: local._id });
       removed = true;
       deadline = getTimerTime() + 15_000;
-      while ((await hosted.query(api.documents.get, { id: created._id })) !== null) {
+      while ((await hosted.query(api.documents.read, { id: created._id })).length > 0) {
         if (getTimerTime() >= deadline) throw new Error("Embedded delete did not settle remotely.");
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
@@ -1209,7 +1265,7 @@ describe("v5 real Convex vertical slice", () => {
       stopEvents();
       stopSecond?.();
       await Promise.all([first.close(), second?.close()]);
-      if (!removed) await hosted.mutation(api.documents.remove, { id: created._id });
+      if (!removed) await hosted.mutation(api.documents.del, { id: created._id });
       await Promise.all(
         directories.map((directory) => rm(directory, { recursive: true, force: true })),
       );
@@ -1219,7 +1275,7 @@ describe("v5 real Convex vertical slice", () => {
   test("requests and answers a checkpoint before a CRDT tail grows unbounded", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-crdt-auto-checkpoint-${crypto.randomUUID()}`;
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "a",
       slug,
       title: slug,
@@ -1232,30 +1288,30 @@ describe("v5 real Convex vertical slice", () => {
       schema,
       url: remoteUrl,
     });
-    const watch = client.watchQuery(api.documents.list, { prefix: slug });
+    const watch = client.watchQuery(api.documents.read, { prefix: slug });
     const stop = watch.onUpdate(() => undefined);
     try {
       let deadline = getTimerTime() + 15_000;
-      let local = await client.query(api.documents.getBySlug, { slug });
+      let local = (await client.query(api.documents.read, { slug }))[0];
       while (!local && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await client.query(api.documents.getBySlug, { slug });
+        local = (await client.query(api.documents.read, { slug }))[0];
       }
       if (!local) throw new Error("Automatic checkpoint client did not pull the document.");
 
       let body = "a";
       for (let edit = 0; edit < 17; edit += 1) {
         const insert = String.fromCharCode(98 + edit);
-        await client.mutation(api.documents.writeBody, {
+        await client.mutation(api.documents.write, {
           id: local._id,
           splices: [{ index: body.length, delete: 0, insert }],
         });
         body += insert;
         deadline = getTimerTime() + 15_000;
-        let remote = await hosted.query(api.documents.get, { id: created._id });
+        let remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
         while (remote?.body !== body && getTimerTime() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 50));
-          remote = await hosted.query(api.documents.get, { id: created._id });
+          remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
         }
         expect(remote?.body).toBe(body);
       }
@@ -1280,7 +1336,7 @@ describe("v5 real Convex vertical slice", () => {
     } finally {
       stop();
       await client.close();
-      await hosted.mutation(api.documents.remove, { id: created._id });
+      await hosted.mutation(api.documents.del, { id: created._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 60_000);
@@ -1288,7 +1344,7 @@ describe("v5 real Convex vertical slice", () => {
   test("executes a scheduled mutation once on the authoritative server", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-schedule-${crypto.randomUUID()}`;
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "abc",
       slug,
       title: slug,
@@ -1301,39 +1357,41 @@ describe("v5 real Convex vertical slice", () => {
       schema,
       url: remoteUrl,
     });
-    const watch = client.watchQuery(api.documents.list, { prefix: slug });
+    const watch = client.watchQuery(api.documents.read, { prefix: slug });
     const stop = watch.onUpdate(() => undefined);
     try {
       let deadline = getTimerTime() + 15_000;
-      let local = await client.query(api.documents.getBySlug, { slug });
+      let local = (await client.query(api.documents.read, { slug }))[0];
       while (!local && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await client.query(api.documents.getBySlug, { slug });
+        local = (await client.query(api.documents.read, { slug }))[0];
       }
       if (!local) throw new Error("Schedule client did not pull the hosted document.");
 
-      await client.mutation(api.documents.scheduleAppend, { id: local._id });
-      expect((await client.query(api.documents.getBySlug, { slug }))?.title).toBe(slug);
+      await client.mutation(api.schedule.append, { id: local._id });
+      expect((await client.query(api.documents.read, { slug }))[0]?.title).toBe(slug);
 
-      let remote = await hosted.query(api.documents.get, { id: created._id });
+      let remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       while (remote?.title !== `${slug}!` && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.title).toBe(`${slug}!`);
       await new Promise((resolve) => setTimeout(resolve, 500));
-      expect((await hosted.query(api.documents.get, { id: created._id }))?.title).toBe(`${slug}!`);
+      expect((await hosted.query(api.documents.read, { id: created._id }))[0]?.title).toBe(
+        `${slug}!`,
+      );
 
-      let converged = await client.query(api.documents.getBySlug, { slug });
+      let converged = (await client.query(api.documents.read, { slug }))[0];
       while (converged?.title !== `${slug}!` && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        converged = await client.query(api.documents.getBySlug, { slug });
+        converged = (await client.query(api.documents.read, { slug }))[0];
       }
       expect(converged?.title).toBe(`${slug}!`);
     } finally {
       stop();
       await client.close();
-      await hosted.mutation(api.documents.remove, { id: created._id });
+      await hosted.mutation(api.documents.del, { id: created._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 25_000);
@@ -1341,7 +1399,7 @@ describe("v5 real Convex vertical slice", () => {
   test("maps and cancels a hosted schedule through its local ID", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-schedule-cancel-${crypto.randomUUID()}`;
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "abc",
       slug,
       title: slug,
@@ -1354,7 +1412,7 @@ describe("v5 real Convex vertical slice", () => {
       schema,
       url: remoteUrl,
     });
-    const watch = client.watchQuery(api.documents.list, { prefix: slug });
+    const watch = client.watchQuery(api.documents.read, { prefix: slug });
     const stop = watch.onUpdate(() => undefined);
     let acceptedPushes = 0;
     let failedPushes = 0;
@@ -1369,18 +1427,18 @@ describe("v5 real Convex vertical slice", () => {
     });
     try {
       const deadline = getTimerTime() + 15_000;
-      let local = await client.query(api.documents.getBySlug, { slug });
+      let local = (await client.query(api.documents.read, { slug }))[0];
       while (!local && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await client.query(api.documents.getBySlug, { slug });
+        local = (await client.query(api.documents.read, { slug }))[0];
       }
       if (!local) throw new Error("Schedule cancellation client did not pull the document.");
 
-      const scheduleId = await client.mutation(api.documents.scheduleAppendAfter, {
+      const scheduleId = await client.mutation(api.schedule.appendAfter, {
         id: local._id,
         delayMs: 15_000,
       });
-      await client.mutation(api.documents.cancelAppend, { scheduleId });
+      await client.mutation(api.schedule.cancel, { scheduleId });
       const settlementDeadline = getTimerTime() + 15_000;
       while (
         acceptedPushes + failedPushes + conflictPushes < 2 &&
@@ -1394,12 +1452,12 @@ describe("v5 real Convex vertical slice", () => {
       ).toMatchObject({ acceptedPushes: 2, conflictPushes: 0, failedPushes: 0 });
       await new Promise((resolve) => setTimeout(resolve, 16_000));
 
-      expect((await hosted.query(api.documents.get, { id: created._id }))?.title).toBe(slug);
+      expect((await hosted.query(api.documents.read, { id: created._id }))[0]?.title).toBe(slug);
     } finally {
       stop();
       stopEvents();
       await client.close();
-      await hosted.mutation(api.documents.remove, { id: created._id });
+      await hosted.mutation(api.documents.del, { id: created._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 40_000);
@@ -1412,7 +1470,7 @@ describe("v5 real Convex vertical slice", () => {
       schema,
       url: remoteUrl,
     });
-    const watch = client.watchQuery(api.documents.list, { prefix: crypto.randomUUID() });
+    const watch = client.watchQuery(api.documents.read, { prefix: crypto.randomUUID() });
     const stop = watch.onUpdate(() => undefined);
     let acceptedPushes = 0;
     let attemptedPushes = 0;
@@ -1426,7 +1484,7 @@ describe("v5 real Convex vertical slice", () => {
       if (event.error) remoteErrors.push(event.error);
     });
     try {
-      const url = await client.mutation(api.documents.generateUploadUrl, {});
+      const url = await client.mutation(api.upload.url, {});
       expect(url).toContain("upload");
       const deadline = getTimerTime() + 15_000;
       while (acceptedPushes < 1 && getTimerTime() < deadline) {
@@ -1447,26 +1505,26 @@ describe("v5 real Convex vertical slice", () => {
   test("journals a direct hosted mutation and pulls its query membership", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-direct-${crypto.randomUUID()}`;
-    const created = await client.mutation(api.documents.create, {
+    const created = await client.mutation(api.documents.write, {
       title: prefix,
       slug: prefix,
       updatedAt: readTime(),
     });
     const pull = await runPull(client, {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { prefix },
       runtime: testRuntime,
     });
     expect(pull.changes).toContainEqual(
       expect.objectContaining({ op: "put", rowId: created._id, table: "documents" }),
     );
-    await client.mutation(api.documents.remove, { id: created._id });
+    await client.mutation(api.documents.del, { id: created._id });
   });
 
   test("returns only CRDT payloads after the durable client frontier", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const slug = `v5-crdt-delta-${crypto.randomUUID()}`;
-    const created = await hosted.mutation(api.documents.create, {
+    const created = await hosted.mutation(api.documents.write, {
       body: "abc",
       slug,
       title: slug,
@@ -1484,19 +1542,19 @@ describe("v5 real Convex vertical slice", () => {
       if (event.type === "remote") events.push(event);
     });
     const stop = embedded
-      .watchQuery(api.documents.list, { prefix: slug })
+      .watchQuery(api.documents.read, { prefix: slug })
       .onUpdate(() => undefined);
     const request = {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { prefix: slug },
       runtime: testRuntime,
     };
     try {
       let deadline = getTimerTime() + 15_000;
-      let local = await embedded.query(api.documents.getBySlug, { slug });
+      let local = (await embedded.query(api.documents.read, { slug }))[0];
       while (!local && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await embedded.query(api.documents.getBySlug, { slug });
+        local = (await embedded.query(api.documents.read, { slug }))[0];
       }
       if (!local) {
         throw new Error(
@@ -1504,15 +1562,15 @@ describe("v5 real Convex vertical slice", () => {
         );
       }
 
-      await embedded.mutation(api.documents.writeBody, {
+      await embedded.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 1, delete: 0, insert: "X" }],
       });
       deadline = getTimerTime() + 15_000;
-      let remote = await hosted.query(api.documents.get, { id: created._id });
+      let remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       while (remote?.body !== "aXbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.body).toBe("aXbc");
 
@@ -1530,15 +1588,15 @@ describe("v5 real Convex vertical slice", () => {
       expect(firstBody?.checkpoint).toBeDefined();
       if (!firstBody) throw new Error("Initial pull did not carry the CRDT body field.");
 
-      await embedded.mutation(api.documents.writeBody, {
+      await embedded.mutation(api.documents.write, {
         id: local._id,
         splices: [{ index: 2, delete: 0, insert: "Y" }],
       });
       deadline = getTimerTime() + 15_000;
-      remote = await hosted.query(api.documents.get, { id: created._id });
+      remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       while (remote?.body !== "aXYbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: created._id });
+        remote = (await hosted.query(api.documents.read, { id: created._id }))[0];
       }
       expect(remote?.body, JSON.stringify(events)).toBe("aXYbc");
 
@@ -1553,7 +1611,7 @@ describe("v5 real Convex vertical slice", () => {
       stop();
       stopEvents();
       await embedded.close();
-      await hosted.mutation(api.documents.remove, { id: created._id });
+      await hosted.mutation(api.documents.del, { id: created._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 25_000);
@@ -1588,7 +1646,7 @@ describe("v5 real Convex vertical slice", () => {
     ).rejects.toThrow(/different logical mutation or replay attempt/i);
     for (const insert of first.inserts) {
       if (insert.table === "documents") {
-        await client.mutation(api.documents.remove, { id: insert.id as never });
+        await client.mutation(api.documents.del, { id: insert.id as never });
       }
     }
   });
@@ -1605,7 +1663,7 @@ describe("v5 real Convex vertical slice", () => {
     const first = await runPush(client, request);
     const document = first.inserts.find((insert) => insert.table === "documents");
     if (!document) throw new Error("Applied insert did not return a document ID.");
-    await client.mutation(api.documents.remove, { id: document.id as never });
+    await client.mutation(api.documents.del, { id: document.id as never });
 
     const replayed = await runPush(client, request);
 
@@ -1649,7 +1707,7 @@ describe("v5 real Convex vertical slice", () => {
     ).toBeTypeOf("number");
     for (const insert of first.inserts) {
       if (insert.table === "documents") {
-        await client.mutation(api.documents.remove, { id: insert.id as never });
+        await client.mutation(api.documents.del, { id: insert.id as never });
       }
     }
   });
@@ -1668,16 +1726,16 @@ describe("v5 real Convex vertical slice", () => {
         }),
       ),
     ).rejects.toThrow(/Only mutations created by defineEmbedded can be replayed/i);
-    expect(await client.query(api.documents.list, { prefix: slug })).toEqual([]);
+    expect(await client.query(api.documents.read, { prefix: slug })).toEqual([]);
   });
 
   test("preserves normal denial and does not disclose authorization-only reads", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const slug = `v5-denied-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, { slug, title: slug });
+    const document = await client.mutation(api.documents.write, { slug, title: slug });
 
     const pulled = await runPull(client, {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { prefix: slug },
       runtime: testRuntime,
     });
@@ -1729,23 +1787,23 @@ describe("v5 real Convex vertical slice", () => {
         runtime: testRuntime,
       }),
     ).rejects.toThrow();
-    expect(await client.query(api.documents.list, { prefix: slug })).toHaveLength(1);
-    await client.mutation(api.documents.remove, { id: document._id });
+    expect(await client.query(api.documents.read, { prefix: slug })).toHaveLength(1);
+    await client.mutation(api.documents.del, { id: document._id });
   });
 
   test("removes a row from the complete snapshot after it exits query membership", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-membership-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, { title: prefix, slug: prefix });
+    const document = await client.mutation(api.documents.write, { title: prefix, slug: prefix });
     expect(document.updatedAt).toBeGreaterThan(0);
     const request = {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { prefix },
       runtime: testRuntime,
     };
     const first = await runPull(client, request);
     expect(first.members).toContainEqual({ rowId: document._id, table: "documents" });
-    await client.mutation(api.documents.update, {
+    await client.mutation(api.documents.write, {
       id: document._id,
       title: `moved-${prefix}`,
       updatedAt: readTime(),
@@ -1755,57 +1813,57 @@ describe("v5 real Convex vertical slice", () => {
     expect(second.changes).not.toContainEqual(
       expect.objectContaining({ rowId: document._id, table: "documents" }),
     );
-    await client.mutation(api.documents.remove, { id: document._id });
+    await client.mutation(api.documents.del, { id: document._id });
   });
 
   test("includes an unchanged row when it enters a limited query window", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-window-${crypto.randomUUID()}`;
-    const older = await client.mutation(api.documents.create, {
+    const older = await client.mutation(api.documents.write, {
       title: `${prefix}-b-older`,
       slug: `${prefix}-older`,
     });
-    const newer = await client.mutation(api.documents.create, {
+    const newer = await client.mutation(api.documents.write, {
       title: `${prefix}-a-newer`,
       slug: `${prefix}-newer`,
     });
     const request = {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { limit: 1, prefix },
       runtime: testRuntime,
     };
     const first = await runPull(client, request);
     expect(first.members).toEqual([{ rowId: newer._id, table: "documents" }]);
 
-    await client.mutation(api.documents.remove, { id: newer._id });
+    await client.mutation(api.documents.del, { id: newer._id });
     const second = await runPull(client, request);
     expect(second.members).toEqual([{ rowId: older._id, table: "documents" }]);
     expect(second.changes).toContainEqual(
       expect.objectContaining({ op: "put", rowId: older._id, table: "documents" }),
     );
-    await client.mutation(api.documents.remove, { id: older._id });
+    await client.mutation(api.documents.del, { id: older._id });
   });
 
   test("makes retained-query membership transitions self-contained", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-window-reentry-${crypto.randomUUID()}`;
-    const first = await client.mutation(api.documents.create, {
+    const first = await client.mutation(api.documents.write, {
       title: `${prefix}-b-first`,
       slug: `${prefix}-first`,
     });
-    const second = await client.mutation(api.documents.create, {
+    const second = await client.mutation(api.documents.write, {
       title: `${prefix}-a-second`,
       slug: `${prefix}-second`,
     });
     const request = {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { limit: 1, prefix },
       runtime: testRuntime,
     };
     const baseline = await runPull(client, request);
     expect(baseline.members).toEqual([{ rowId: second._id, table: "documents" }]);
 
-    const replacement = await client.mutation(api.documents.create, {
+    const replacement = await client.mutation(api.documents.write, {
       title: `${prefix}-0-replacement`,
       slug: `${prefix}-replacement`,
     });
@@ -1815,7 +1873,7 @@ describe("v5 real Convex vertical slice", () => {
       expect.objectContaining({ op: "put", rowId: replacement._id, table: "documents" }),
     );
 
-    await client.mutation(api.documents.remove, { id: replacement._id });
+    await client.mutation(api.documents.del, { id: replacement._id });
     const reentered = await runPull(client, request);
     expect(reentered.members).toEqual([{ rowId: second._id, table: "documents" }]);
     expect(reentered.changes).toContainEqual(
@@ -1823,16 +1881,16 @@ describe("v5 real Convex vertical slice", () => {
     );
 
     await Promise.all(
-      [first._id, second._id].map((id) => client.mutation(api.documents.remove, { id })),
+      [first._id, second._id].map((id) => client.mutation(api.documents.del, { id })),
     );
   });
 
   test("rolls back a replay when a plain point witness moved", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-conflict-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, { title: prefix, slug: prefix });
+    const document = await client.mutation(api.documents.write, { title: prefix, slug: prefix });
     const pulled = await runPull(client, {
-      functionName: "documents:list",
+      functionName: "documents:read",
       args: { prefix },
       runtime: testRuntime,
     });
@@ -1841,7 +1899,7 @@ describe("v5 real Convex vertical slice", () => {
     );
     if (!base) throw new Error("Expected the created document in pull.");
     const hostedTitle = `hosted-${prefix}`;
-    await client.mutation(api.documents.update, {
+    await client.mutation(api.documents.write, {
       id: document._id,
       title: hostedTitle,
       updatedAt: readTime(),
@@ -1852,7 +1910,7 @@ describe("v5 real Convex vertical slice", () => {
     const localUpdatedAt = readTime();
     const request = await pushArgs({
       mutationId,
-      functionName: "documents:update",
+      functionName: "documents:write",
       args: { id: document._id, title: localTitle, updatedAt: localUpdatedAt },
       reads: [
         {
@@ -1889,23 +1947,25 @@ describe("v5 real Convex vertical slice", () => {
     expect(
       (await client.query(api.revision.list, { rowId: document._id, cursor: null })).page,
     ).toHaveLength(1);
-    expect((await client.query(api.documents.get, { id: document._id }))?.title).toBe(hostedTitle);
-    await client.mutation(api.documents.remove, { id: document._id });
+    expect((await client.query(api.documents.read, { id: document._id }))[0]?.title).toBe(
+      hostedTitle,
+    );
+    await client.mutation(api.documents.del, { id: document._id });
   });
 
   test("does not retain an equal after-image merely because its witness moved", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-equal-conflict-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, { title: prefix, slug: prefix });
+    const document = await client.mutation(api.documents.write, { title: prefix, slug: prefix });
     const title = `${prefix}-same`;
     const updatedAt = readTime();
     try {
-      await client.mutation(api.documents.update, { id: document._id, title, updatedAt });
+      await client.mutation(api.documents.write, { id: document._id, title, updatedAt });
       const settlement = await runPush(
         client,
         await pushArgs({
           mutationId: crypto.randomUUID(),
-          functionName: "documents:update",
+          functionName: "documents:write",
           args: { id: document._id, title, updatedAt },
           reads: [
             {
@@ -1933,20 +1993,20 @@ describe("v5 real Convex vertical slice", () => {
         (await client.query(api.revision.list, { rowId: document._id, cursor: null })).page,
       ).toEqual([]);
     } finally {
-      await client.mutation(api.documents.remove, { id: document._id });
+      await client.mutation(api.documents.del, { id: document._id });
     }
   });
 
   test("shares only verified conflicting after-images from a failed grouped write", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-group-${crypto.randomUUID()}`;
-    const first = await client.mutation(api.documents.create, {
+    const first = await client.mutation(api.documents.write, {
       body: "one",
       slug: `${prefix}-one`,
       title: `${prefix}-one`,
       updatedAt: 1,
     });
-    const second = await client.mutation(api.documents.create, {
+    const second = await client.mutation(api.documents.write, {
       body: "two",
       slug: `${prefix}-two`,
       title: `${prefix}-two`,
@@ -1954,7 +2014,7 @@ describe("v5 real Convex vertical slice", () => {
     });
     try {
       const hostedTitle = `${prefix}-hosted`;
-      await client.mutation(api.documents.update, {
+      await client.mutation(api.documents.write, {
         id: first._id,
         title: hostedTitle,
         updatedAt: 2,
@@ -2025,12 +2085,16 @@ describe("v5 real Convex vertical slice", () => {
           expect.objectContaining({ table: "documents", rowId: second._id }),
         ]),
       );
-      expect((await client.query(api.documents.get, { id: first._id }))?.title).toBe(hostedTitle);
-      expect((await client.query(api.documents.get, { id: second._id }))?.title).toBe(second.title);
+      expect((await client.query(api.documents.read, { id: first._id }))[0]?.title).toBe(
+        hostedTitle,
+      );
+      expect((await client.query(api.documents.read, { id: second._id }))[0]?.title).toBe(
+        second.title,
+      );
     } finally {
       await Promise.all([
-        client.mutation(api.documents.remove, { id: first._id }),
-        client.mutation(api.documents.remove, { id: second._id }),
+        client.mutation(api.documents.del, { id: first._id }),
+        client.mutation(api.documents.del, { id: second._id }),
       ]);
     }
   });
@@ -2038,20 +2102,20 @@ describe("v5 real Convex vertical slice", () => {
   test("never lets an unrelated wire witness choose correction or revision rows", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-witness-boundary-${crypto.randomUUID()}`;
-    const changed = await client.mutation(api.documents.create, {
+    const changed = await client.mutation(api.documents.write, {
       body: "changed",
       slug: `${prefix}-changed`,
       title: `${prefix}-changed`,
       updatedAt: 1,
     });
-    const unrelated = await client.mutation(api.documents.create, {
+    const unrelated = await client.mutation(api.documents.write, {
       body: "private",
       slug: `${prefix}-unrelated`,
       title: `${prefix}-unrelated`,
       updatedAt: 1,
     });
     try {
-      await client.mutation(api.documents.update, {
+      await client.mutation(api.documents.write, {
         id: unrelated._id,
         title: `${prefix}-hosted`,
         updatedAt: 2,
@@ -2061,7 +2125,7 @@ describe("v5 real Convex vertical slice", () => {
         client,
         await pushArgs({
           mutationId: crypto.randomUUID(),
-          functionName: "documents:update",
+          functionName: "documents:write",
           args: { id: changed._id, title: localTitle, updatedAt: 3 },
           reads: [
             {
@@ -2111,8 +2175,8 @@ describe("v5 real Convex vertical slice", () => {
       ).toEqual([]);
     } finally {
       await Promise.all([
-        client.mutation(api.documents.remove, { id: changed._id }),
-        client.mutation(api.documents.remove, { id: unrelated._id }),
+        client.mutation(api.documents.del, { id: changed._id }),
+        client.mutation(api.documents.del, { id: unrelated._id }),
       ]);
     }
   });
@@ -2120,19 +2184,19 @@ describe("v5 real Convex vertical slice", () => {
   test("exposes app-authorized savepoint, paging, restore, and bounded deletion", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const title = `v5-rev-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, {
+    const document = await client.mutation(api.documents.write, {
       body: "one",
       slug: title,
       title,
     });
     try {
-      const first = await client.mutation(api.documents.savepoint, { id: document._id });
-      await client.mutation(api.documents.update, {
+      const first = await client.mutation(api.rev.savepoint, { id: document._id });
+      await client.mutation(api.documents.write, {
         id: document._id,
         title: `${title}-two`,
         updatedAt: readTime(),
       });
-      const second = await client.mutation(api.documents.savepoint, { id: document._id });
+      const second = await client.mutation(api.rev.savepoint, { id: document._id });
 
       const firstPage = await client.query(api.remote.history, {
         id: document._id,
@@ -2180,24 +2244,24 @@ describe("v5 real Convex vertical slice", () => {
         ).page.map((revision) => revision.revId),
       ).toEqual([second.revId]);
     } finally {
-      await client.mutation(api.documents.remove, { id: document._id });
+      await client.mutation(api.documents.del, { id: document._id });
     }
   });
 
   test("reproduces a bounded index range and conflicts when its contents move", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `v5-range-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, {
+    const document = await client.mutation(api.documents.write, {
       title: prefix,
       slug: prefix,
       updatedAt: readTime(),
     });
-    const rows = await client.query(api.documents.list, { limit: 40 });
+    const rows = await client.query(api.documents.read, { limit: 40 });
     const membersHash = await hashValue(
       await Promise.all(rows.map(async (row) => ({ id: row._id, hash: await hashDocument(row) }))),
     );
     const hostedTitle = `hosted-${prefix}`;
-    await client.mutation(api.documents.update, {
+    await client.mutation(api.documents.write, {
       id: document._id,
       title: hostedTitle,
       updatedAt: document.updatedAt,
@@ -2208,7 +2272,7 @@ describe("v5 real Convex vertical slice", () => {
       client,
       await pushArgs({
         mutationId,
-        functionName: "documents:update",
+        functionName: "documents:write",
         args: { id: document._id, title: `local-${prefix}`, updatedAt: document.updatedAt },
         reads: [
           {
@@ -2224,8 +2288,10 @@ describe("v5 real Convex vertical slice", () => {
       }),
     );
     expect(settlement.outcome).toBe("conflict");
-    expect((await client.query(api.documents.get, { id: document._id }))?.title).toBe(hostedTitle);
-    await client.mutation(api.documents.remove, { id: document._id });
+    expect((await client.query(api.documents.read, { id: document._id }))[0]?.title).toBe(
+      hostedTitle,
+    );
+    await client.mutation(api.documents.del, { id: document._id });
   });
 });
 

@@ -83,7 +83,7 @@ export async function runBrowserLatencyBenchmark(
       "remote is disabled for all scenarios",
       "each scenario uses a fresh Playwright BrowserContext when available",
       "browserUrl includes a cache-busting query, but Vite optimized dependency caching may still affect import/setup outside the measured window",
-      "browser latency scenarios pass documents:list a benchmark limit large enough to observe seeded rows",
+      "browser latency scenarios pass documents:read a benchmark limit large enough to observe seeded rows",
       "rowCount=0 measures empty-store add latency, so observedRows reflects warmup/sample inserts after the initially empty setup",
       "measured mutation latency is the public browser client promise; totalRuntimeMs is worker runtime timing reported by embedded diagnostics",
       `browser latency gate fails when measured p90 exceeds ${options.latencyP90BudgetMs}ms`,

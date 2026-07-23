@@ -33,13 +33,13 @@ const listDocuments = makeFunctionReference<
   "query",
   { limit?: number; prefix?: string },
   unknown[]
->("documents:list");
+>("documents:read");
 const createDocument = makeFunctionReference<
   "mutation",
   { body?: string; slug?: string; title?: string; updatedAt?: number },
   { _id: string }
->("documents:create");
-const removeDocument = makeFunctionReference<"mutation", { id: string }, null>("documents:remove");
+>("documents:write");
+const removeDocument = makeFunctionReference<"mutation", { id: string }, null>("documents:del");
 
 const INITIAL_PULL_DEADLINE_MS = 20_000;
 

@@ -72,7 +72,7 @@ describe("v5 production pull contract", () => {
     const client = new ConvexHttpClient(remoteUrl);
     await expect(
       pull(client, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { limit: 1 },
         runtime: { ...runtime, protocolVersion: EMBEDDED_PROTOCOL_VERSION - 1 },
       }),
@@ -82,13 +82,13 @@ describe("v5 production pull contract", () => {
   test("derives complete membership from the app-authorized prefix query", async () => {
     const client = new ConvexHttpClient(remoteUrl);
     const prefix = `production-pull-${crypto.randomUUID()}`;
-    const document = await client.mutation(api.documents.create, {
+    const document = await client.mutation(api.documents.write, {
       slug: prefix,
       title: prefix,
     });
     try {
       const page = await pull(client, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { prefix },
         runtime,
       });
@@ -97,7 +97,7 @@ describe("v5 production pull contract", () => {
         expect.objectContaining({ op: "put", rowId: document._id, table: "documents" }),
       );
     } finally {
-      await client.mutation(api.documents.remove, { id: document._id });
+      await client.mutation(api.documents.del, { id: document._id });
     }
   });
 
@@ -113,7 +113,7 @@ describe("v5 production pull contract", () => {
       subject: `cut2-${crypto.randomUUID()}`,
     });
     const prefix = `production-auth-${crypto.randomUUID()}`;
-    const document = await anonymous.mutation(api.documents.create, {
+    const document = await anonymous.mutation(api.documents.write, {
       slug: prefix,
       title: prefix,
     });
@@ -135,14 +135,14 @@ describe("v5 production pull contract", () => {
         { _id: document._id },
       );
     } finally {
-      await anonymous.mutation(api.documents.remove, { id: document._id });
+      await anonymous.mutation(api.documents.del, { id: document._id });
     }
   });
 
   test("applies a hosted retained-query transition without a local pull", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const prefix = `production-transition-${crypto.randomUUID()}`;
-    const document = await hosted.mutation(api.documents.create, {
+    const document = await hosted.mutation(api.documents.write, {
       slug: prefix,
       title: prefix,
     });
@@ -154,21 +154,21 @@ describe("v5 production pull contract", () => {
       url: remoteUrl,
     });
     let updates = 0;
-    const stop = embedded.watchQuery(api.documents.list, { prefix }).onUpdate(() => {
+    const stop = embedded.watchQuery(api.documents.read, { prefix }).onUpdate(() => {
       updates += 1;
     });
     let unrelated: string | undefined;
     try {
       const deadline = getTimerTime() + 15_000;
-      let local = await embedded.query(api.documents.getBySlug, { slug: prefix });
+      let local = (await embedded.query(api.documents.read, { slug: prefix }))[0];
       while (!local && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await embedded.query(api.documents.getBySlug, { slug: prefix });
+        local = (await embedded.query(api.documents.read, { slug: prefix }))[0];
       }
       expect(local?.slug).toBe(prefix);
 
       const updatesBeforeUnrelatedWrite = await stableCount(() => updates);
-      const unrelatedDocument = await hosted.mutation(api.documents.create, {
+      const unrelatedDocument = await hosted.mutation(api.documents.write, {
         slug: `unrelated-${crypto.randomUUID()}`,
         title: `unrelated-${crypto.randomUUID()}`,
       });
@@ -177,7 +177,7 @@ describe("v5 production pull contract", () => {
       expect(updates).toBe(updatesBeforeUnrelatedWrite);
 
       const title = `${prefix}-hosted`;
-      await hosted.mutation(api.documents.update, {
+      await hosted.mutation(api.documents.write, {
         id: document._id,
         title,
         updatedAt: readTime(),
@@ -185,15 +185,15 @@ describe("v5 production pull contract", () => {
 
       while (local?.title !== title && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await embedded.query(api.documents.getBySlug, { slug: prefix });
+        local = (await embedded.query(api.documents.read, { slug: prefix }))[0];
       }
       expect(local?.title).toBe(title);
       expect(updates).toBeGreaterThan(updatesBeforeUnrelatedWrite);
     } finally {
       stop();
       await embedded.close();
-      if (unrelated) await hosted.mutation(api.documents.remove, { id: unrelated as never });
-      await hosted.mutation(api.documents.remove, { id: document._id });
+      if (unrelated) await hosted.mutation(api.documents.del, { id: unrelated as never });
+      await hosted.mutation(api.documents.del, { id: document._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 20_000);
@@ -201,7 +201,7 @@ describe("v5 production pull contract", () => {
   test("returns only the CRDT payload after the accepted durable head", async () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const prefix = `production-crdt-${crypto.randomUUID()}`;
-    const document = await hosted.mutation(api.documents.create, {
+    const document = await hosted.mutation(api.documents.write, {
       body: "abc",
       slug: prefix,
       title: prefix,
@@ -213,7 +213,7 @@ describe("v5 production pull contract", () => {
       schema,
       url: remoteUrl,
     });
-    const stop = embedded.watchQuery(api.documents.list, { prefix }).onUpdate(() => undefined);
+    const stop = embedded.watchQuery(api.documents.read, { prefix }).onUpdate(() => undefined);
     const reactive = new ConvexClient(remoteUrl);
     let reactiveBody: PullResult["crdt"][number] | undefined;
     const stopReactive = reactive.onUpdate(
@@ -221,7 +221,7 @@ describe("v5 production pull contract", () => {
       {
         request: {
           kind: "live",
-          functionName: "documents:list",
+          functionName: "documents:read",
           args: { prefix },
           runtime,
         },
@@ -235,27 +235,27 @@ describe("v5 production pull contract", () => {
     );
     try {
       let deadline = getTimerTime() + 15_000;
-      let local = await embedded.query(api.documents.getBySlug, { slug: prefix });
+      let local = (await embedded.query(api.documents.read, { slug: prefix }))[0];
       while (!local && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        local = await embedded.query(api.documents.getBySlug, { slug: prefix });
+        local = (await embedded.query(api.documents.read, { slug: prefix }))[0];
       }
       if (!local) throw new Error("Embedded client did not pull the production document.");
 
-      await embedded.mutation(api.documents.writeBody, {
+      await embedded.mutation(api.documents.write, {
         id: local._id,
         splices: [{ delete: 0, index: 1, insert: "X" }],
       });
       deadline = getTimerTime() + 15_000;
-      let remote = await hosted.query(api.documents.get, { id: document._id });
+      let remote = (await hosted.query(api.documents.read, { id: document._id }))[0];
       while (remote?.body !== "aXbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: document._id });
+        remote = (await hosted.query(api.documents.read, { id: document._id }))[0];
       }
       expect(remote?.body).toBe("aXbc");
 
       const first = await pull(hosted, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { prefix },
         runtime,
       });
@@ -266,20 +266,20 @@ describe("v5 production pull contract", () => {
       expect(firstBody?.checkpoint).toBeDefined();
       if (!firstBody) throw new Error("Initial pull did not contain the CRDT field.");
 
-      await embedded.mutation(api.documents.writeBody, {
+      await embedded.mutation(api.documents.write, {
         id: local._id,
         splices: [{ delete: 0, index: 2, insert: "Y" }],
       });
       deadline = getTimerTime() + 15_000;
-      remote = await hosted.query(api.documents.get, { id: document._id });
+      remote = (await hosted.query(api.documents.read, { id: document._id }))[0];
       while (remote?.body !== "aXYbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: document._id });
+        remote = (await hosted.query(api.documents.read, { id: document._id }))[0];
       }
       expect(remote?.body).toBe("aXYbc");
 
       const beforeRequest = await pull(hosted, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { prefix },
         runtime,
       });
@@ -300,7 +300,7 @@ describe("v5 production pull contract", () => {
         "official Convex component transition",
       );
       const requestedPage = await pull(hosted, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { prefix },
         runtime,
       });
@@ -335,7 +335,7 @@ describe("v5 production pull contract", () => {
       });
 
       const checkpointed = await pull(hosted, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { prefix },
         runtime,
       });
@@ -345,20 +345,20 @@ describe("v5 production pull contract", () => {
       expect(checkpointedBody?.checkpoint.seq).toBe(beforeRequestBody?.headSeq);
       expect(checkpointedBody?.payload).toBeUndefined();
 
-      await embedded.mutation(api.documents.writeBody, {
+      await embedded.mutation(api.documents.write, {
         id: local._id,
         splices: [{ delete: 0, index: 3, insert: "Z" }],
       });
       deadline = getTimerTime() + 15_000;
-      remote = await hosted.query(api.documents.get, { id: document._id });
+      remote = (await hosted.query(api.documents.read, { id: document._id }))[0];
       while (remote?.body !== "aXYZbc" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 100));
-        remote = await hosted.query(api.documents.get, { id: document._id });
+        remote = (await hosted.query(api.documents.read, { id: document._id }))[0];
       }
       expect(remote?.body).toBe("aXYZbc");
 
       const afterCheckpoint = await pull(hosted, {
-        functionName: "documents:list",
+        functionName: "documents:read",
         args: { prefix },
         runtime,
       });
@@ -372,7 +372,7 @@ describe("v5 production pull contract", () => {
       stopReactive();
       await reactive.close();
       await embedded.close();
-      await hosted.mutation(api.documents.remove, { id: document._id });
+      await hosted.mutation(api.documents.del, { id: document._id });
       await rm(directory, { recursive: true, force: true });
     }
   }, 25_000);
@@ -381,7 +381,7 @@ describe("v5 production pull contract", () => {
     const hosted = new ConvexHttpClient(remoteUrl);
     const prefix = `production-large-${crypto.randomUUID()}`;
     const body = largeBody(350_000);
-    const document = await hosted.mutation(api.documents.create, {
+    const document = await hosted.mutation(api.documents.write, {
       body,
       slug: prefix,
       title: prefix,
@@ -396,24 +396,24 @@ describe("v5 production pull contract", () => {
       schema,
       url: remoteUrl,
     });
-    const stopFirst = first.watchQuery(api.documents.list, { prefix }).onUpdate(() => undefined);
+    const stopFirst = first.watchQuery(api.documents.read, { prefix }).onUpdate(() => undefined);
     let second: ConvexEmbeddedClient | undefined;
     let stopSecond: (() => void) | undefined;
     try {
-      const local = await waitUntil(
-        () => first.query(api.documents.getBySlug, { slug: prefix }),
-        (value) => value !== null,
+      const [local] = await waitUntil(
+        () => first.query(api.documents.read, { slug: prefix }),
+        (value) => value.length > 0,
         "large checkpoint source pull",
       );
       if (!local) throw new Error("Large checkpoint source document disappeared.");
       const expectedBody = `${body.slice(0, 1)}X${body.slice(1)}`;
-      await first.mutation(api.documents.writeBody, {
+      await first.mutation(api.documents.write, {
         id: local._id,
         splices: [{ delete: 0, index: 1, insert: "X" }],
       });
       await waitUntil(
-        () => hosted.query(api.documents.get, { id: document._id }),
-        (value) => value?.body === expectedBody,
+        () => hosted.query(api.documents.read, { id: document._id }),
+        (value) => value[0]?.body === expectedBody,
         "large checkpoint hosted replay",
       );
       const field = await waitUntil(
@@ -432,10 +432,10 @@ describe("v5 production pull contract", () => {
         schema,
         url: remoteUrl,
       });
-      stopSecond = second.watchQuery(api.documents.list, { prefix }).onUpdate(() => undefined);
-      const fresh = await waitUntil(
-        () => second!.query(api.documents.getBySlug, { slug: prefix }),
-        (value) => value?.body === expectedBody,
+      stopSecond = second.watchQuery(api.documents.read, { prefix }).onUpdate(() => undefined);
+      const [fresh] = await waitUntil(
+        () => second!.query(api.documents.read, { slug: prefix }),
+        (value) => value[0]?.body === expectedBody,
         "multi-chunk checkpoint pull",
       );
       if (!fresh) throw new Error("Fresh client did not retain the large checkpoint document.");
@@ -445,7 +445,7 @@ describe("v5 production pull contract", () => {
       await second?.close();
       stopFirst();
       await first.close();
-      await hosted.mutation(api.documents.remove, { id: document._id });
+      await hosted.mutation(api.documents.del, { id: document._id });
       await Promise.all(
         directories.map((directory) => rm(directory, { recursive: true, force: true })),
       );
@@ -462,12 +462,12 @@ describe("v5 production pull contract", () => {
     let stopLive: (() => void) | undefined;
     let stopEvents: (() => void) | undefined;
     const remoteEvents: unknown[] = [];
-    let hostedDocuments: Array<FunctionReturnType<typeof api.documents.list>[number]> = [];
+    let hostedDocuments: Array<FunctionReturnType<typeof api.documents.read>[number]> = [];
     try {
       offline = new ConvexEmbeddedClient({ modules: { documents }, path, schema });
       await Promise.all(
         ["1", "2", "3"].map((suffix) =>
-          offline!.mutation(api.documents.create, {
+          offline!.mutation(api.documents.write, {
             slug: `${prefix}-${suffix}`,
             title: `${prefix}-${suffix}`,
           }),
@@ -485,7 +485,7 @@ describe("v5 production pull contract", () => {
       stopEvents = live.subscribeInternalEvents((event) => {
         if (event.type === "remote") remoteEvents.push(event);
       });
-      expect(await live.query(api.documents.list, { prefix })).toHaveLength(3);
+      expect(await live.query(api.documents.read, { prefix })).toHaveLength(3);
       const args = {
         paginationOpts: { cursor: first.continueCursor, numItems: 1 },
         prefix,
@@ -493,7 +493,7 @@ describe("v5 production pull contract", () => {
       stopLive = live.watchQuery(pageDocuments, args).onUpdate(() => undefined);
       try {
         hostedDocuments = await waitUntil(
-          () => hosted.query(api.documents.list, { prefix }),
+          () => hosted.query(api.documents.read, { prefix }),
           (value) => value.length === 3,
           "offline document replay",
         );
@@ -502,7 +502,7 @@ describe("v5 production pull contract", () => {
           `Offline replay did not settle: ${JSON.stringify({
             cause: error instanceof Error ? error.message : String(error),
             connection: live.connectionState(),
-            local: (await live.query(api.documents.list, { prefix })).length,
+            local: (await live.query(api.documents.read, { prefix })).length,
             remoteEvents,
           })}`,
         );
@@ -524,7 +524,7 @@ describe("v5 production pull contract", () => {
         );
       }
       const updatedAt = readTime() + 1_000;
-      await hosted.mutation(api.documents.update, {
+      await hosted.mutation(api.documents.write, {
         id: hostedDocuments[1]!._id,
         updatedAt,
       });
@@ -540,7 +540,7 @@ describe("v5 production pull contract", () => {
           `Retained cursor did not transition locally: ${JSON.stringify({
             cause: error instanceof Error ? error.message : String(error),
             current: await live.query(pageDocuments, args),
-            hosted: await hosted.query(api.documents.list, { prefix }),
+            hosted: await hosted.query(api.documents.read, { prefix }),
             connection: live.connectionState(),
             remoteEvents,
           })}`,
@@ -553,9 +553,7 @@ describe("v5 production pull contract", () => {
       await live?.close();
       await offline?.close();
       await Promise.all(
-        hostedDocuments.map((document) =>
-          hosted.mutation(api.documents.remove, { id: document._id }),
-        ),
+        hostedDocuments.map((document) => hosted.mutation(api.documents.del, { id: document._id })),
       );
       await rm(directory, { recursive: true, force: true });
     }

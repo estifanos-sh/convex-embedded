@@ -42,9 +42,9 @@ export const listRootDocuments = makeFunctionReference<
   "query",
   { limit?: number; prefix?: string },
   Array<{ body: string; title: string }>
->("documents:list");
+>("documents:read");
 export const createRootDocument = makeFunctionReference<
   "mutation",
   { body: string; slug: string; title: string },
   { _id: string }
->("documents:create");
+>("documents:write");

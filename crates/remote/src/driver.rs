@@ -4235,7 +4235,7 @@ mod tests {
                 "moduleGraphHash": "local",
                 "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
             },
-            "functionName": "documents:writeBody",
+            "functionName": "documents:write",
             "args": {},
             "resultHash": "result",
             "idPaths": [],
@@ -5098,7 +5098,7 @@ mod tests {
         driver
             .scope_write(RemoteScope {
                 subscriptions: vec![RemoteSubscription {
-                    pull_fn: "documents:list".to_owned(),
+                    pull_fn: "documents:read".to_owned(),
                     pull_args: serde_json::json!({}),
                     result_cache_key: None,
                     cursor: None,
@@ -5263,7 +5263,7 @@ mod tests {
         driver
             .scope_write(RemoteScope {
                 subscriptions: vec![RemoteSubscription {
-                    pull_fn: "documents:list".to_owned(),
+                    pull_fn: "documents:read".to_owned(),
                     pull_args: serde_json::json!({}),
                     result_cache_key: None,
                     cursor: None,
@@ -6379,7 +6379,7 @@ mod tests {
 
     fn documents_page_write(server_id: &str) -> storage::RemotePageWrite {
         storage::RemotePageWrite {
-            subscription: "documents:list:{}".to_owned(),
+            subscription: "documents:read:{}".to_owned(),
             members: vec![storage::RemoteMember {
                 table: "documents".to_owned(),
                 server_document_id: server_id.to_owned(),
@@ -6410,7 +6410,7 @@ mod tests {
         projection_hash: String,
     ) -> storage::RemotePageWrite {
         storage::RemotePageWrite {
-            subscription: "documents:list:{}".to_owned(),
+            subscription: "documents:read:{}".to_owned(),
             members: vec![storage::RemoteMember {
                 table: "documents".to_owned(),
                 server_document_id: server_id.to_owned(),
@@ -6451,7 +6451,7 @@ mod tests {
                 "moduleGraphHash": "local",
                 "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
             },
-            "functionName": "documents:writeBody",
+            "functionName": "documents:write",
             "args": {},
             "resultHash": "result",
             "idPaths": [],
@@ -6861,7 +6861,7 @@ mod tests {
             crdt_changes: 1,
             pull_changes: 0,
             result: Some(FunctionResult::Value(Value::Null)),
-            subscription: "documents:list:{}".to_owned(),
+            subscription: "documents:read:{}".to_owned(),
             write: RemoteWrite::Page(documents_crdt_advance_pull(
                 "srv1",
                 snapshot.bytes.clone(),
@@ -7216,7 +7216,7 @@ mod tests {
         );
         driver.connected = true;
         let descriptor = RemoteSubscription {
-            pull_fn: "documents:list".to_owned(),
+            pull_fn: "documents:read".to_owned(),
             pull_args: serde_json::json!({}),
             result_cache_key: None,
             cursor: None,
@@ -7337,7 +7337,7 @@ mod tests {
         driver.connected = true;
 
         let subscription = RemoteSubscription {
-            pull_fn: "documents:list".to_owned(),
+            pull_fn: "documents:read".to_owned(),
             pull_args: serde_json::json!({}),
             result_cache_key: None,
             cursor: None,
@@ -7634,9 +7634,9 @@ mod tests {
         );
         driver.connected = true;
         let subscription = RemoteSubscription {
-            pull_fn: "documents:get".to_owned(),
+            pull_fn: "documents:read".to_owned(),
             pull_args: serde_json::json!({ "id": "srv1" }),
-            result_cache_key: Some("documents:get:srv1".to_owned()),
+            result_cache_key: Some("documents:read:srv1".to_owned()),
             cursor: None,
         };
         let key = super::remote_subscription_key(&subscription).unwrap();
@@ -7725,9 +7725,9 @@ mod tests {
         driver.connected = true;
 
         let subscription = RemoteSubscription {
-            pull_fn: "documents:get".to_owned(),
+            pull_fn: "documents:read".to_owned(),
             pull_args: serde_json::json!({ "id": "srv1" }),
-            result_cache_key: Some("documents:get:srv1".to_owned()),
+            result_cache_key: Some("documents:read:srv1".to_owned()),
             cursor: None,
         };
         driver.scope = RemoteScope {
@@ -7782,7 +7782,7 @@ mod tests {
         driver.connected = true;
 
         let subscription = RemoteSubscription {
-            pull_fn: "documents:get".to_owned(),
+            pull_fn: "documents:read".to_owned(),
             pull_args: serde_json::json!({ "id": "srv1" }),
             result_cache_key: None,
             cursor: None,
