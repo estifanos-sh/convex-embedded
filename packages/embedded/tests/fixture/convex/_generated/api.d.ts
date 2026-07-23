@@ -20,9 +20,12 @@ import type * as migrations from "../migrations.js";
 import type * as mutation from "../mutation.js";
 import type * as replay from "../replay.js";
 import type * as remote from "../remote.js";
+import type * as rev from "../rev.js";
 import type * as revision from "../revision.js";
+import type * as schedule from "../schedule.js";
 import type * as seed from "../seed.js";
 import type * as time from "../time.js";
+import type * as upload from "../upload.js";
 
 import type { ApiFromModules, FilterApi, FunctionReference } from "convex/server";
 
@@ -39,9 +42,12 @@ declare const fullApi: ApiFromModules<{
   mutation: typeof mutation;
   replay: typeof replay;
   remote: typeof remote;
+  rev: typeof rev;
   revision: typeof revision;
+  schedule: typeof schedule;
   seed: typeof seed;
   time: typeof time;
+  upload: typeof upload;
 }>;
 
 /**

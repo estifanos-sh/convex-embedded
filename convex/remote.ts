@@ -1,8 +1,9 @@
 import { type Infer, v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { documentValidator, revisionValidator } from "./documents";
+import { documentValidator } from "./documents";
 import { embedded } from "./embedded";
+import { revisionValidator } from "./rev";
 
 export const history = embedded.remote.query({
   args: {
