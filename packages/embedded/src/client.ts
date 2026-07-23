@@ -405,6 +405,7 @@ export class EmbeddedClient {
   private remoteState: EmbeddedConnectionState["remote"] = "disabled";
   private remoteError: string | undefined;
   private remotePullError: string | undefined;
+  private remoteStart: Promise<void> | undefined;
   private remoteIncarnation: string | undefined;
   private remoteGeneration = -1;
   private remoteSequence = -1;
@@ -928,6 +929,8 @@ export class EmbeddedClient {
       remote: options.remote !== undefined,
     });
     let stopRemoteLoop: (() => void) | undefined;
+    let remoteRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    let remoteStartAttempt = 0;
     try {
       await store.setup(schema);
       const generation = this.authGeneration;
@@ -938,8 +941,9 @@ export class EmbeddedClient {
             "Native remote replication requires a storage backend with remote support.",
           );
         }
+        const remote = store.remote;
         const startRemote = async () => {
-          await store.remote!.start({
+          await remote.start({
             ...toRemoteStartOptions(
               options.remote!,
               this.auth,
@@ -959,38 +963,69 @@ export class EmbeddedClient {
           await this.refreshRunnerIdentity(runner, this.authGeneration);
           await runner.remote?.scope.write();
         };
-        await startRemote();
-        stopRemoteLoop = startRemoteLoop(
-          store.remote,
-          runner,
-          async () => {
-            if (!(await this.refreshIdentity(this.authGeneration))) {
-              throw new Error("Remote replication is waiting for identity negotiation.");
-            }
-          },
-          (event) => this.emitEvent(event),
-          async () => {
-            await store.remote!.close().catch(() => undefined);
-            this.clientId = randomId("client");
+        const launchRemoteLoop = () => {
+          stopRemoteLoop = startRemoteLoop(
+            remote,
+            runner,
+            async () => {
+              if (!(await this.refreshIdentity(this.authGeneration))) {
+                throw new Error("Remote replication is waiting for identity negotiation.");
+              }
+            },
+            (event) => this.emitEvent(event),
+            async () => {
+              await remote.close().catch(() => undefined);
+              this.clientId = randomId("client");
+              await startRemote();
+            },
+          );
+        };
+        const attemptRemoteStart = async (): Promise<void> => {
+          if (this.closed) return;
+          try {
             await startRemote();
-          },
-        );
+          } catch (error) {
+            if (this.closed) return;
+            this.remoteState = "error";
+            this.remoteError = `Embedded remote replication failed to start: ${errorMessage(error)}`;
+            await remote.close().catch(() => undefined);
+            if (this.closed || remoteRetryTimer !== undefined) return;
+            remoteStartAttempt += 1;
+            const delay = Math.min(
+              REMOTE_REPLICATE_ERROR_MAX_DELAY_MS,
+              REMOTE_REPLICATE_ERROR_DELAY_MS * 2 ** (remoteStartAttempt - 1),
+            );
+            remoteRetryTimer = setTimeout(() => {
+              remoteRetryTimer = undefined;
+              if (this.closed) return;
+              this.remoteState = "starting";
+              this.remoteError = undefined;
+              this.remoteStart = attemptRemoteStart();
+              void this.remoteStart.catch(() => undefined);
+            }, delay);
+            return;
+          }
+          if (this.closed) return;
+          remoteStartAttempt = 0;
+          launchRemoteLoop();
+        };
+        this.remoteStart = attemptRemoteStart();
+        void this.remoteStart.catch(() => undefined);
       }
     } catch (error) {
-      stopRemoteLoop?.();
       await store.remote?.close().catch(() => undefined);
       await store.close();
       throw error;
     }
-    if (this.closed) {
-      stopRemoteLoop?.();
-      await store.remote?.close().catch(() => undefined);
-      await store.close();
-    }
     return {
       close: async () => {
+        if (remoteRetryTimer !== undefined) {
+          clearTimeout(remoteRetryTimer);
+          remoteRetryTimer = undefined;
+        }
         stopRemoteLoop?.();
         await store.remote?.close().catch(() => undefined);
+        await this.remoteStart?.catch(() => undefined);
         await store.close();
       },
       remote: store.remote,
