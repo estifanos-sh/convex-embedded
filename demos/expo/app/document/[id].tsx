@@ -16,6 +16,7 @@ import { AppState, Keyboard, Pressable, StyleSheet, Text, TextInput, View } from
 import DocumentEditor from "@/src/editor";
 import { client } from "@/src/client";
 import { useEmbeddedConnectionState } from "@/src/connection";
+import { markMaterialized } from "@/src/perf";
 import { documentPreview } from "@/src/preview";
 import { openQuerySubscription } from "@/src/subscription";
 import { documentStatus, type DocumentStatusTone } from "@/src/status";
@@ -26,9 +27,12 @@ import type {
   EditorReadyPayload,
   EditorSaveState,
   EditorStatusPayload,
+  TextSplice,
 } from "@/src/types";
 
 const materializedIdPrefix = "documents|";
+const warmEditorToken = "warm-idle";
+const warmDocument: EditorDocument = { body: "", id: warmEditorToken, title: "Untitled" };
 
 function documentOpen(
   id: string,
@@ -37,11 +41,11 @@ function documentOpen(
 ): { close: () => void; result: Promise<EditorDocument> } {
   const subscription = openQuerySubscription(
     client,
-    api.documents.get,
+    api.documents.read,
     { id: id as Id<"documents"> },
     {
-      accept: (value) => value !== null && value._id.startsWith(materializedIdPrefix),
-      onUpdate: (value) => onUpdate(value ? editorDocument(value) : null),
+      accept: (value) => value[0] !== undefined && value[0]._id.startsWith(materializedIdPrefix),
+      onUpdate: (value) => onUpdate(value[0] ? editorDocument(value[0]) : null),
       signal,
       timeoutMessage: "This document could not be downloaded to embedded storage.",
       timeoutMs: 15_000,
@@ -49,7 +53,8 @@ function documentOpen(
   );
   return {
     close: subscription.close,
-    result: subscription.result.then((document) => {
+    result: subscription.result.then((documents) => {
+      const document = documents[0];
       if (!document) throw new Error("This document is no longer available.");
       return editorDocument(document);
     }),
@@ -67,9 +72,12 @@ function editorDocument(document: {
 async function documentWrite(
   write: DocumentWrite,
 ): Promise<Pick<EditorDocument, "body" | "title">> {
-  const updated = await client.mutation(api.documents.writeBody, {
+  const updated = await client.mutation(api.documents.write, {
     id: write.id as Id<"documents">,
-    splices: write.splices,
+    splices:
+      write.base === undefined
+        ? write.splices
+        : write.splices.map((splice) => ({ ...splice, base: write.base })),
     ...(write.title === undefined ? {} : { title: write.title }),
   });
   return { body: updated.body, title: updated.title };
@@ -98,7 +106,7 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
     const connection = useEmbeddedConnectionState();
     const [document, setDocument] = useState<EditorDocument | null>(null);
     const [error, setError] = useState<string | null>(null);
-    const [editorToken, setEditorToken] = useState("");
+    const [editorToken, setEditorToken] = useState(warmEditorToken);
     const [loading, setLoading] = useState(true);
     const [readyEditorToken, setReadyEditorToken] = useState("");
     const [applicationActive, setApplicationActive] = useState(AppState.currentState === "active");
@@ -183,6 +191,7 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
             subscription.close();
             return;
           }
+          markMaterialized(id);
           const token = `${value.id}:${generation}`;
           activeEditorTokenRef.current = token;
           loadedDocumentIdRef.current = value.id;
@@ -224,7 +233,7 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
     }, [applyDocumentUpdate, id]);
 
     useEffect(() => {
-      if (!active) {
+      if (!active || !id) {
         closeDocumentRead();
         return;
       }
@@ -266,24 +275,33 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
       if (payload.titleRevision < titleRevisionRef.current) return;
       setEditorStatus(payload);
     }, []);
-    const editorDocumentWrite = useCallback(async (write: DocumentWrite) => {
-      const title = write.title === latestTitlesRef.current.get(write.id) ? write.title : undefined;
-      if (write.splices.length === 0 && title === undefined) {
+    const editorDocumentWrite = useCallback(
+      async (splice: TextSplice, base: string): Promise<Pick<EditorDocument, "body" | "title">> => {
         const current = documentRef.current;
         if (!current) throw new Error("Document not found.");
-        return { body: current.body, title: current.title };
-      }
-      try {
-        return await documentWrite({
-          id: write.id,
-          splices: write.splices,
-          ...(title === undefined ? {} : { title }),
-        });
-      } catch (error: unknown) {
-        console.error("The embedded document write failed.", error);
-        throw error;
-      }
-    }, []);
+        const desiredTitle = latestTitlesRef.current.get(current.id);
+        const titleChanged = desiredTitle !== undefined && desiredTitle !== current.title;
+        try {
+          return await documentWrite({
+            id: current.id,
+            splices: [splice],
+            base,
+            ...(titleChanged ? { title: desiredTitle } : {}),
+          });
+        } catch (error: unknown) {
+          console.error("The embedded document write failed.", error);
+          throw error;
+        }
+      },
+      [],
+    );
+    const inertDocumentWrite = useCallback(
+      async (): Promise<Pick<EditorDocument, "body" | "title">> => ({
+        body: "",
+        title: "Untitled",
+      }),
+      [],
+    );
 
     useEffect(() => {
       if (!document || !editorToken || readyEditorToken === editorToken || webViewCrash) return;
@@ -448,28 +466,26 @@ export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenPro
           </View>
         ) : (
           <View style={styles.editorStage}>
-            {materializedDocument ? (
-              <View
-                accessibilityElementsHidden={showPlaceholder}
-                importantForAccessibility={showPlaceholder ? "no-hide-descendants" : "auto"}
-                style={styles.editorFrame}
-              >
-                <DocumentEditor
-                  active={editorActive}
-                  closeRequest={closeRequest}
-                  document={materializedDocument}
-                  documentWrite={editorDocumentWrite}
-                  dom={dom}
-                  editorReady={editorReady}
-                  editorStatusChanged={editorStatusChanged}
-                  editorToken={editorToken}
-                  focusBodyRequest={focusBodyRequest}
-                  retryRequest={retryRequest}
-                  title={title}
-                  titleRevision={titleRevision}
-                />
-              </View>
-            ) : null}
+            <View
+              accessibilityElementsHidden={showPlaceholder}
+              importantForAccessibility={showPlaceholder ? "no-hide-descendants" : "auto"}
+              style={styles.editorFrame}
+            >
+              <DocumentEditor
+                active={materializedDocument ? editorActive : false}
+                closeRequest={closeRequest}
+                document={materializedDocument ?? warmDocument}
+                documentWrite={materializedDocument ? editorDocumentWrite : inertDocumentWrite}
+                dom={dom}
+                editorReady={editorReady}
+                editorStatusChanged={editorStatusChanged}
+                editorToken={editorToken}
+                focusBodyRequest={focusBodyRequest}
+                retryRequest={retryRequest}
+                title={title}
+                titleRevision={titleRevision}
+              />
+            </View>
             {showPlaceholder ? (
               <View
                 accessibilityLabel="Opening the local document"

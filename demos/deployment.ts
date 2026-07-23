@@ -11,36 +11,53 @@ const deploymentNames = ["VITE_CONVEX_URL", "CONVEX_URL"] as const;
 export const embeddedGeneratedPath = "generated/embedded.ts";
 
 /**
- * Reviewed build migrations for durable demo mutations.
+ * Reviewed build migrations for durable demo mutations. Every declaration pins the one reviewed target
+ * graph so a later build fails closed until re-reviewed.
  *
- * These protocol-24 graphs differ only in generated-contract path handling and a nonsemantic
- * endpoint comment. Their authored schema and device mutation source hashes are identical. Each
- * declaration is pinned to the one reviewed protocol-25 target graph so a later build fails closed.
+ * This build renamed the document surface to the storage lexicon: the `list`/`get`/`getBySlug` queries
+ * collapsed into `documents:read`, the `create`/`update`/`writeBody`/`writeSlug` mutations into
+ * `documents:write`, `remove` into `documents:del`, and `savepoint` moved to `rev:savepoint`. The
+ * `8975…` graph is the immediately prior build (it dropped the `documents:summaries` list query). Because
+ * mutation wire names changed, a client that upgrades across this boundary while holding an unsettled
+ * durable mutation recorded under an old name replays it under that old name; confirm that transition is
+ * acceptable at deploy time before trusting it.
  */
 export const embeddedCompatiblePriorRuntimes = [
+  {
+    moduleGraphHash: "fe4d109bd5da3121",
+    protocolVersion: 25,
+    schemaHash: "fd6fd33687d90268",
+    targetModuleGraphHash: "b7a09fdaa719d405",
+  },
   {
     moduleGraphHash: "3dec910778cbead7",
     protocolVersion: 24,
     schemaHash: "fd6fd33687d90268",
-    targetModuleGraphHash: "fe4d109bd5da3121",
+    targetModuleGraphHash: "b7a09fdaa719d405",
   },
   {
     moduleGraphHash: "b8f55ea7c16f2604",
     protocolVersion: 24,
     schemaHash: "fd6fd33687d90268",
-    targetModuleGraphHash: "fe4d109bd5da3121",
+    targetModuleGraphHash: "b7a09fdaa719d405",
   },
   {
     moduleGraphHash: "fab5f6210c35cfca",
     protocolVersion: 24,
     schemaHash: "fd6fd33687d90268",
-    targetModuleGraphHash: "fe4d109bd5da3121",
+    targetModuleGraphHash: "b7a09fdaa719d405",
   },
   {
     moduleGraphHash: "fab5f6210c35cfca",
     protocolVersion: 25,
     schemaHash: "fd6fd33687d90268",
-    targetModuleGraphHash: "fe4d109bd5da3121",
+    targetModuleGraphHash: "b7a09fdaa719d405",
+  },
+  {
+    moduleGraphHash: "8975648676c532b0",
+    protocolVersion: 25,
+    schemaHash: "fd6fd33687d90268",
+    targetModuleGraphHash: "b7a09fdaa719d405",
   },
 ] as const;
 

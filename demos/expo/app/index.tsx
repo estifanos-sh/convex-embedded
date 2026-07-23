@@ -18,11 +18,18 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { client } from "@/src/client";
+import {
+  markFirstRender,
+  markListReady,
+  markOpenReady,
+  markOpenTap,
+  usePerfSnapshot,
+} from "@/src/perf";
 import { useEmbeddedQuery } from "@/src/query";
 import { colors, fontSize, radius, spacing } from "@/src/theme";
 import { DocumentScreen, type DocumentScreenHandle } from "./document/[id]";
 
-type DocumentSummary = FunctionReturnType<typeof api.documents.summaries>[number];
+type DocumentSummary = FunctionReturnType<typeof api.documents.read>[number];
 
 export default function DocumentsScreen() {
   const insets = useSafeAreaInsets();
@@ -35,7 +42,7 @@ export default function DocumentsScreen() {
     const prefix = search.trim();
     return prefix ? { limit: 40, prefix } : { limit: 40 };
   }, [search]);
-  const query = useEmbeddedQuery(api.documents.summaries, queryArgs);
+  const query = useEmbeddedQuery(api.documents.read, queryArgs);
   const [openingDocumentId, setOpeningDocumentId] = React.useState<string | null>(null);
   const [selectedDocumentId, setSelectedDocumentId] = React.useState<string | null>(
     linkedDocumentId ?? null,
@@ -59,6 +66,7 @@ export default function DocumentsScreen() {
     }
     readyDocumentIdRef.current = null;
     requestedDocumentIdRef.current = id;
+    markOpenTap(id);
     setOpeningDocumentId(id);
     setEditorVisible(false);
   }, []);
@@ -67,6 +75,7 @@ export default function DocumentsScreen() {
     readyDocumentIdRef.current = id;
     if (requestedDocumentIdRef.current !== id) return;
     requestedDocumentIdRef.current = null;
+    markOpenReady(id);
     setOpeningDocumentId(null);
     setEditorVisible(true);
   }, []);
@@ -106,7 +115,7 @@ export default function DocumentsScreen() {
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     }
     try {
-      const document = await client.mutation(api.documents.create, {});
+      const document = await client.mutation(api.documents.write, {});
       openDocument(document._id);
     } catch (error: unknown) {
       setCreateError(error instanceof Error ? error.message : "The document could not be created.");
@@ -127,11 +136,12 @@ export default function DocumentsScreen() {
   const documents: DocumentSummary[] = query.status === "ready" ? query.value : [];
 
   React.useEffect(() => {
-    if (selectedDocumentId !== null || documents.length === 0) return;
-    selectedDocumentIdRef.current = documents[0]._id;
-    readyDocumentIdRef.current = null;
-    setSelectedDocumentId(documents[0]._id);
-  }, [documents, selectedDocumentId]);
+    markFirstRender();
+  }, []);
+
+  React.useEffect(() => {
+    if (query.status === "ready") markListReady();
+  }, [query.status]);
 
   return (
     <>
@@ -144,25 +154,23 @@ export default function DocumentsScreen() {
           ]}
         />
         <View style={styles.contentArea}>
-          {selectedDocumentId ? (
-            <View
-              accessibilityElementsHidden={!editorVisible}
-              importantForAccessibility={editorVisible ? "auto" : "no-hide-descendants"}
-              onAccessibilityEscape={() => {
-                requestCloseDocument();
-              }}
-              pointerEvents={editorVisible ? "auto" : "none"}
-              style={styles.editorLayer}
-            >
-              <DocumentScreen
-                active={editorVisible || openingDocumentId === selectedDocumentId}
-                documentId={selectedDocumentId}
-                onClose={closeDocument}
-                onReady={showReadyDocument}
-                ref={documentScreenRef}
-              />
-            </View>
-          ) : null}
+          <View
+            accessibilityElementsHidden={!editorVisible}
+            importantForAccessibility={editorVisible ? "auto" : "no-hide-descendants"}
+            onAccessibilityEscape={() => {
+              requestCloseDocument();
+            }}
+            pointerEvents={editorVisible ? "auto" : "none"}
+            style={styles.editorLayer}
+          >
+            <DocumentScreen
+              active={editorVisible || openingDocumentId === selectedDocumentId}
+              documentId={selectedDocumentId ?? undefined}
+              onClose={closeDocument}
+              onReady={showReadyDocument}
+              ref={documentScreenRef}
+            />
+          </View>
           <View
             accessibilityElementsHidden={editorVisible}
             importantForAccessibility={editorVisible ? "no-hide-descendants" : "auto"}
@@ -251,9 +259,33 @@ export default function DocumentsScreen() {
               </Pressable>
             </View>
           </View>
+          {__DEV__ ? <PerfHud /> : null}
         </View>
       </View>
     </>
+  );
+}
+
+function PerfHud() {
+  const snapshot = usePerfSnapshot();
+  const open = snapshot.lastOpen;
+  return (
+    <View pointerEvents="none" style={styles.perfHud}>
+      <Text style={styles.perfText}>
+        JS→render {snapshot.jsStartToRenderMs === null ? "…" : `${snapshot.jsStartToRenderMs}ms`} ·
+        →list {snapshot.jsStartToListMs === null ? "…" : `${snapshot.jsStartToListMs}ms`}
+      </Text>
+      {open ? (
+        <Text style={styles.perfText}>
+          open {open.warm ? "(warm)" : "(cold)"} …{open.id.slice(-4)}: tap→data{" "}
+          {open.tapToMaterializedMs === null ? "?" : `${open.tapToMaterializedMs}ms`} · data→editor{" "}
+          {open.materializedToReadyMs === null ? "?" : `${open.materializedToReadyMs}ms`} · total{" "}
+          {open.totalMs}ms
+        </Text>
+      ) : (
+        <Text style={styles.perfText}>tap a document to measure open cost</Text>
+      )}
+    </View>
   );
 }
 
@@ -315,7 +347,7 @@ function QueryState({
   creating: boolean;
   onCreate: () => Promise<void>;
   onRetry: () => void;
-  state: ReturnType<typeof useEmbeddedQuery<typeof api.documents.summaries>>;
+  state: ReturnType<typeof useEmbeddedQuery<typeof api.documents.read>>;
 }) {
   if (state.status === "loading") {
     return (
@@ -393,6 +425,23 @@ function formatDate(value: number): string {
 }
 
 const styles = StyleSheet.create({
+  perfHud: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+    bottom: 8,
+    padding: 8,
+    backgroundColor: "rgba(0, 0, 0, 0.82)",
+    borderRadius: 8,
+    gap: 3,
+    zIndex: 1000,
+  },
+  perfText: {
+    color: "#69f0ae",
+    fontSize: 11,
+    lineHeight: 15,
+    fontVariant: ["tabular-nums"],
+  },
   screen: {
     flex: 1,
     backgroundColor: colors.background.primary,

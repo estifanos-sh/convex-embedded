@@ -1,6 +1,6 @@
 import type { Block, PartialBlock } from "@blocknote/core";
 
-import type { DocumentWrite, EditorDraft, TextSplice } from "./types";
+import type { EditorDraft } from "./types";
 
 export const recoveryVersion = 2;
 
@@ -59,45 +59,6 @@ export function documentBlocks(body: string, title: string): PartialBlock[] {
 
 export function normalizeDocumentDraft(draft: EditorDraft): EditorDraft {
   return { ...draft, body: JSON.stringify(documentBlocks(draft.body, draft.title)) };
-}
-
-export function textSplice(before: string, after: string): TextSplice | undefined {
-  if (before === after) return undefined;
-
-  const beforeChars = Array.from(before);
-  const afterChars = Array.from(after);
-  let prefix = 0;
-  const prefixLimit = Math.min(beforeChars.length, afterChars.length);
-  while (prefix < prefixLimit && beforeChars[prefix] === afterChars[prefix]) prefix += 1;
-
-  let suffix = 0;
-  const suffixLimit = Math.min(beforeChars.length - prefix, afterChars.length - prefix);
-  while (
-    suffix < suffixLimit &&
-    beforeChars[beforeChars.length - 1 - suffix] === afterChars[afterChars.length - 1 - suffix]
-  ) {
-    suffix += 1;
-  }
-
-  return {
-    delete: beforeChars.slice(prefix, beforeChars.length - suffix).join("").length,
-    index: beforeChars.slice(0, prefix).join("").length,
-    insert: afterChars.slice(prefix, afterChars.length - suffix).join(""),
-  };
-}
-
-export function documentWrite(
-  id: string,
-  persisted: EditorDraft,
-  desired: EditorDraft,
-): DocumentWrite | undefined {
-  if (sameDraft(persisted, desired)) return undefined;
-  const splice = textSplice(persisted.body, desired.body);
-  return {
-    id,
-    splices: splice ? [splice] : [],
-    ...(persisted.title === desired.title ? {} : { title: desired.title }),
-  };
 }
 
 export function draftFingerprint(draft: EditorDraft): string {

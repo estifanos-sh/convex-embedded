@@ -32,6 +32,8 @@ import {
   createConvexEmbeddedUploadFetch,
   type EmbeddedConnectionState,
 } from "@convex-dev/embedded/browser";
+import { createTextField } from "@convex-dev/embedded/internal/text";
+import type { TextFieldWriter } from "@convex-dev/embedded/internal/text";
 
 import { api } from "~convex/_generated/api";
 import type { Id } from "~convex/_generated/dataModel";
@@ -39,17 +41,15 @@ import { client, subscribeBrowserDebug } from "./lib/client";
 import { readQuery, type QueryState } from "./lib/query";
 
 const diffDelayMs = 90;
-const draftDebounceMs = 40;
-const draftMaxLatencyMs = 160;
-const createDocumentMutation = api.documents.create;
-const getDocument = api.documents.get;
-const listDocuments = api.documents.list;
-const writeDocumentMutation = api.documents.writeBody;
-const savepointDocumentMutation = api.documents.savepoint;
+const createDocumentMutation = api.documents.write;
+const getDocument = api.documents.read;
+const listDocuments = api.documents.read;
+const writeDocumentMutation = api.documents.write;
+const savepointDocumentMutation = api.rev.savepoint;
 const historyDocumentsQuery = api.remote.history;
 const revisionDocumentQuery = api.remote.revision;
 const restoreDocumentMutation = api.remote.restore;
-const removeDocumentMutation = api.documents.remove;
+const removeDocumentMutation = api.documents.del;
 const fileAttachMutation = api.files.attach;
 const fileUploadUrlMutation = api.files.generateUploadUrl;
 const fileHostedUrlQuery = api.remote.hostedUrl;
@@ -252,7 +252,7 @@ export function App(): ReactElement {
     listDocuments,
     useMemo(() => ({}), []),
   );
-  const selectedDocumentQuery = useEmbeddedQuery<DocumentDoc | null>(
+  const selectedDocumentQuery = useEmbeddedQuery<DocumentDoc[]>(
     getDocument,
     useMemo(() => (selectedDocumentId ? { id: selectedDocumentId } : {}), [selectedDocumentId]),
     selectedDocumentId !== null,
@@ -281,11 +281,10 @@ export function App(): ReactElement {
   const [currentDelta, setCurrentDelta] = useState<DiffResult | null>(null);
   const [historyBusy, setHistoryBusy] = useState(false);
   const diffTimerRef = useRef<number | undefined>(undefined);
-  const draftTrailingTimerRef = useRef<number | undefined>(undefined);
-  const draftMaxTimerRef = useRef<number | undefined>(undefined);
-  const draftPendingRef = useRef<{ body: string; document: DocumentDoc } | null>(null);
-  const draftBodiesRef = useRef(new Map<Id<"documents">, string>());
-  const draftWriteChainRef = useRef(Promise.resolve());
+  const fieldRef = useRef<TextFieldWriter | null>(null);
+  const settlingRef = useRef(false);
+  const queryDocsRef = useRef(new Map<Id<"documents">, { body: string; title: string }>());
+  const desiredBodyRef = useRef("");
   const baselineRef = useRef<Baseline | null>(null);
   const previewCacheRef = useRef(new Map<string, HistoryPreview>());
   const selectedHistoryRevIdRef = useRef<string | null>(null);
@@ -341,7 +340,7 @@ export function App(): ReactElement {
   );
 
   const selectedQueryDocument =
-    selectedDocumentQuery.query === "ready" ? selectedDocumentQuery.value : null;
+    selectedDocumentQuery.query === "ready" ? (selectedDocumentQuery.value[0] ?? null) : null;
   const selectedDocument =
     selectedQueryDocument?._id === selectedDocumentId
       ? selectedQueryDocument
@@ -397,15 +396,17 @@ export function App(): ReactElement {
 
   useLayoutEffect(() => {
     if (!selectedDocument) return;
+    queryDocsRef.current.set(selectedDocument._id, {
+      body: selectedDocument.body,
+      title: selectedDocument.title,
+    });
     const switchingDocuments = lastAppliedDocIdRef.current !== selectedDocument._id;
     if (!switchingDocuments && selectedDocument.body === lastAppliedBodyRef.current) return;
     if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
     applyingRemoteRef.current = true;
     editor.replaceBlocks(editor.document, parseBlocks(selectedDocument.body));
     lastAppliedBodyRef.current = selectedDocument.body;
-    if (draftPendingRef.current?.document._id !== selectedDocument._id) {
-      draftBodiesRef.current.set(selectedDocument._id, selectedDocument.body);
-    }
+    if (!switchingDocuments) fieldRef.current?.adopt(selectedDocument.body);
     lastAppliedDocIdRef.current = selectedDocument._id;
     setCurrentBody(selectedDocument.body);
     if (switchingDocuments) {
@@ -498,55 +499,48 @@ export function App(): ReactElement {
     setCurrentDelta(nonEmptyDelta(diffBodies(current.body, body)));
   }, []);
 
-  const writeDraftDocument = useCallback(async (document: DocumentDoc, body: string) => {
-    const previousBody = draftBodiesRef.current.get(document._id) ?? document.body;
-    const bodySplice = textSplice(previousBody, body);
-    if (bodySplice === undefined) return;
-    draftBodiesRef.current.set(document._id, body);
-    lastAppliedBodyRef.current = body;
-    const title = titleFromBlocks(parseBlocks(body));
-    await client.mutation(writeDocumentMutation, {
-      id: document._id,
-      splices: [bodySplice],
-      ...(title === document.title ? {} : { title }),
+  useLayoutEffect(() => {
+    if (selectedDocumentId === null) return;
+    const docId = selectedDocumentId;
+    const field = createTextField<DocumentDoc>({
+      read: () => queryDocsRef.current.get(docId)?.body ?? "",
+      write: async (splice, base) => {
+        const body = desiredBodyRef.current;
+        lastAppliedBodyRef.current = body;
+        const title = titleFromBlocks(parseBlocks(body));
+        const stored = queryDocsRef.current.get(docId);
+        return (await client.mutation(writeDocumentMutation, {
+          id: docId,
+          splices: [{ index: splice.index, delete: splice.delete, insert: splice.insert, base }],
+          ...(stored && title === stored.title ? {} : { title }),
+        })) as DocumentDoc;
+      },
+      extract: (result) => result.body,
     });
-  }, []);
-
-  const flushDraftDocument = useCallback(() => {
-    if (draftTrailingTimerRef.current !== undefined) {
-      window.clearTimeout(draftTrailingTimerRef.current);
-      draftTrailingTimerRef.current = undefined;
-    }
-    if (draftMaxTimerRef.current !== undefined) {
-      window.clearTimeout(draftMaxTimerRef.current);
-      draftMaxTimerRef.current = undefined;
-    }
-    const pending = draftPendingRef.current;
-    draftPendingRef.current = null;
-    if (!pending) return;
-    draftWriteChainRef.current = draftWriteChainRef.current
-      .then(() => writeDraftDocument(pending.document, pending.body))
-      .catch((error) => setAppError(errorMessage(error)));
-  }, [writeDraftDocument]);
+    fieldRef.current = field;
+    return () => {
+      field.flush();
+      field.close();
+      if (fieldRef.current === field) fieldRef.current = null;
+    };
+  }, [editor, selectedDocumentId]);
 
   const settleDraftDocument = useCallback(async () => {
-    flushDraftDocument();
-    await draftWriteChainRef.current;
-  }, [flushDraftDocument]);
+    await fieldRef.current?.settle();
+  }, []);
 
-  const queueDraftDocument = useCallback(
-    (document: DocumentDoc, body: string) => {
-      draftPendingRef.current = { body, document };
-      if (draftTrailingTimerRef.current !== undefined) {
-        window.clearTimeout(draftTrailingTimerRef.current);
-      }
-      draftTrailingTimerRef.current = window.setTimeout(flushDraftDocument, draftDebounceMs);
-      if (draftMaxTimerRef.current === undefined) {
-        draftMaxTimerRef.current = window.setTimeout(flushDraftDocument, draftMaxLatencyMs);
-      }
-    },
-    [flushDraftDocument],
-  );
+  const watchSettle = useCallback(() => {
+    const field = fieldRef.current;
+    if (field === null || settlingRef.current) return;
+    if (!field.isDirty && !field.isSettling) return;
+    settlingRef.current = true;
+    void field
+      .settle()
+      .catch((error: unknown) => setAppError(errorMessage(error)))
+      .finally(() => {
+        settlingRef.current = false;
+      });
+  }, []);
 
   const updateSlashPalette = useCallback(
     (currentEditor: typeof editor) => {
@@ -654,23 +648,22 @@ export function App(): ReactElement {
     if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
     diffTimerRef.current = window.setTimeout(() => updateCurrentDelta(body), diffDelayMs);
     if (body === lastAppliedBodyRef.current) return;
-    queueDraftDocument(selectedDocument, body);
+    desiredBodyRef.current = body;
+    fieldRef.current?.queue(body);
+    watchSettle();
   }, editor);
 
   useEffect(() => {
     return () => {
       if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
       if (slashFrameRef.current !== undefined) window.cancelAnimationFrame(slashFrameRef.current);
-      flushDraftDocument();
     };
-  }, [flushDraftDocument]);
-
-  useEffect(() => flushDraftDocument, [flushDraftDocument, selectedDocumentId]);
+  }, []);
 
   useEffect(() => {
-    const flush = (): void => flushDraftDocument();
+    const flush = (): void => fieldRef.current?.flush();
     const onVisibility = (): void => {
-      if (document.visibilityState === "hidden") flushDraftDocument();
+      if (document.visibilityState === "hidden") fieldRef.current?.flush();
     };
     window.addEventListener("blur", flush);
     window.addEventListener("beforeunload", flush);
@@ -680,7 +673,7 @@ export function App(): ReactElement {
       window.removeEventListener("beforeunload", flush);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [flushDraftDocument]);
+  }, []);
 
   const createDocument = useCallback(async () => {
     if (documentsQuery.query !== "ready") return;
@@ -774,7 +767,8 @@ export function App(): ReactElement {
     try {
       const body = JSON.stringify(editor.document);
       setCurrentBody(body);
-      queueDraftDocument(selectedDocument, body);
+      desiredBodyRef.current = body;
+      fieldRef.current?.queue(body);
       await settleDraftDocument();
       const revision = (await client.mutation(savepointDocumentMutation, {
         id: selectedDocument._id,
@@ -803,14 +797,7 @@ export function App(): ReactElement {
       snapshotPendingRef.current = false;
       setHistoryBusy(false);
     }
-  }, [
-    editor,
-    queueDraftDocument,
-    refreshHistory,
-    selectedDocument,
-    setBaseline,
-    settleDraftDocument,
-  ]);
+  }, [editor, refreshHistory, selectedDocument, setBaseline, settleDraftDocument]);
 
   const selectRev = useCallback(
     async (rev: EmbeddedRev) => {
@@ -2067,32 +2054,6 @@ function diffSummary(delta: DiffResult): string {
     delta.removed.length ? `${delta.removed.length} removed` : "",
   ].filter(Boolean);
   return parts.length ? parts.join(", ") : "No changes";
-}
-
-function textSplice(
-  before: string,
-  after: string,
-): { delete: number; index: number; insert: string } | undefined {
-  if (before === after) return undefined;
-  const beforeChars = Array.from(before);
-  const afterChars = Array.from(after);
-  let prefix = 0;
-  const prefixLimit = Math.min(beforeChars.length, afterChars.length);
-  while (prefix < prefixLimit && beforeChars[prefix] === afterChars[prefix]) prefix += 1;
-
-  let suffix = 0;
-  const suffixLimit = Math.min(beforeChars.length - prefix, afterChars.length - prefix);
-  while (
-    suffix < suffixLimit &&
-    beforeChars[beforeChars.length - 1 - suffix] === afterChars[afterChars.length - 1 - suffix]
-  ) {
-    suffix += 1;
-  }
-  return {
-    delete: beforeChars.length - prefix - suffix,
-    index: prefix,
-    insert: afterChars.slice(prefix, afterChars.length - suffix).join(""),
-  };
 }
 
 function titleFromBlocks(blocks: readonly (PartialBlock | Block)[]): string {

@@ -13,12 +13,16 @@ export type EditorDocument = {
 export type EditorDraft = Pick<EditorDocument, "body" | "title">;
 
 export type DocumentWrite = {
+  base?: string;
   id: string;
   splices: TextSplice[];
   title?: string;
 };
 
-export type DocumentWriteAction = (write: DocumentWrite) => Promise<EditorDraft>;
+export type DocumentWriteAction = (
+  splice: TextSplice,
+  base: string,
+) => Promise<Pick<EditorDocument, "body" | "title">>;
 
 export type EditorSaveState = "dirty" | "error" | "recovered" | "saved" | "saving";
 

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
-  documentWrite,
   documentBlocks,
   draftFingerprint,
   emptyBlocks,
@@ -13,14 +12,12 @@ import {
   recoveryDecision,
   recoveryEncode,
   recoveryRecord,
-  sameDraft,
-  textSplice,
   titleRecoveryDecision,
   titleRecoveryRecord,
   titleFromBlocks,
 } from "../src/text";
 import { documentPreview } from "../src/preview";
-import type { DocumentWrite, EditorDraft } from "../src/types";
+import type { EditorDraft } from "../src/types";
 
 void describe("editor text", () => {
   void it("recognizes only completely empty BlockNote tables", () => {
@@ -60,22 +57,6 @@ void describe("editor text", () => {
     ]);
     assert.equal(documentPreview(body), "First line\nSecond line");
     assert.equal(documentPreview("not json"), "");
-  });
-
-  void it("creates Unicode-safe UTF-16 splices", () => {
-    const samples = ["", "plain text", "🙂 alpha", "e\u0301", "雪の文書", "👨‍👩‍👧‍👦 family"];
-    for (const before of samples) {
-      for (const after of samples) {
-        const splice = textSplice(before, after);
-        const result = splice
-          ? before.slice(0, splice.index) +
-            splice.insert +
-            before.slice(splice.index + splice.delete)
-          : before;
-        assert.equal(result, after);
-      }
-    }
-    assert.deepEqual(textSplice("🙂a", "🙂b"), { delete: 1, index: 2, insert: "b" });
   });
 
   void it("falls back to a usable document for malformed or empty bodies", () => {
@@ -118,11 +99,6 @@ void describe("editor text", () => {
 
     assert.equal(titleFromBlocks(blocks), "After 🙂");
     assert.deepEqual(blocks.slice(1), body.slice(1));
-
-    const write = documentWrite("id", { body: JSON.stringify(body), title: "Before" }, next);
-    assert.ok(write);
-    assert.equal(write.title, "After 🙂");
-    assert.equal(write.splices.length, 1);
   });
 });
 
@@ -209,109 +185,3 @@ void describe("editor recovery", () => {
     });
   });
 });
-
-void describe("editor writes", () => {
-  void it("skips identical drafts and supports title-only writes", () => {
-    const base = { body: "body", title: "Before" };
-    assert.equal(documentWrite("id", base, { ...base }), undefined);
-    assert.deepEqual(documentWrite("id", base, { ...base, title: "After" }), {
-      id: "id",
-      splices: [],
-      title: "After",
-    });
-  });
-
-  void it("builds one compact body splice", () => {
-    const write = documentWrite(
-      "id",
-      { body: "hello 🙂 world", title: "Title" },
-      { body: "hello bright world", title: "Title" },
-    );
-    assert.ok(write);
-    assert.equal(write.splices.length, 1);
-    const before = "hello 🙂 world";
-    const splice = write.splices[0]!;
-    const result =
-      before.slice(0, splice.index) + splice.insert + before.slice(splice.index + splice.delete);
-    assert.equal(result, "hello bright world");
-  });
-});
-
-void describe("editor convergence", () => {
-  const blank: EditorDraft = { body: JSON.stringify(emptyBlocks), title: "Untitled" };
-  const materialized: EditorDraft = {
-    body: JSON.stringify([
-      { id: "title", type: "heading", content: "Notes" },
-      { id: "body", type: "paragraph", content: "Written on another device" },
-    ]),
-    title: "Notes",
-  };
-
-  void it("adopts a materialized body into an untouched editor without writing", () => {
-    const destructive = documentWrite("id", materialized, blank);
-    assert.ok(destructive);
-    assert.ok(destructive.splices[0]!.delete > 0);
-
-    const session = openSession(blank);
-    adoptExternal(session, materialized);
-    flushSession(session);
-
-    assert.deepEqual(session.writes, []);
-    assert.deepEqual(session.base, materialized);
-    assert.deepEqual(session.desired, materialized);
-  });
-
-  void it("ignores an external value that repeats the settled base", () => {
-    const session = openSession(materialized);
-    adoptExternal(session, { ...materialized });
-    flushSession(session);
-    assert.deepEqual(session.writes, []);
-  });
-
-  void it("splices a user edit against the adopted body", () => {
-    const session = openSession(blank);
-    adoptExternal(session, materialized);
-    session.desired = {
-      body: materialized.body.replace("another device", "another device and here"),
-      title: materialized.title,
-    };
-    flushSession(session);
-
-    assert.equal(session.writes.length, 1);
-    const splice = session.writes[0]!.splices[0]!;
-    assert.equal(splice.delete, 0);
-    assert.equal(
-      materialized.body.slice(0, splice.index) +
-        splice.insert +
-        materialized.body.slice(splice.index + splice.delete),
-      session.desired.body,
-    );
-
-    adoptExternal(session, session.desired);
-    flushSession(session);
-    assert.equal(session.writes.length, 1);
-  });
-});
-
-type EditorSession = {
-  base: EditorDraft;
-  desired: EditorDraft;
-  writes: DocumentWrite[];
-};
-
-function openSession(document: EditorDraft): EditorSession {
-  return { base: document, desired: document, writes: [] };
-}
-
-function adoptExternal(session: EditorSession, incoming: EditorDraft): void {
-  if (sameDraft(incoming, session.base)) return;
-  session.base = incoming;
-  session.desired = incoming;
-}
-
-function flushSession(session: EditorSession): void {
-  const write = documentWrite("id", session.base, session.desired);
-  if (!write) return;
-  session.writes.push(write);
-  session.base = session.desired;
-}

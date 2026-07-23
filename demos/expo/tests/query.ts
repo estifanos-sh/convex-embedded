@@ -20,8 +20,8 @@ import {
 
 void describe("embedded query subscriptions", () => {
   void it("uses Convex semantics instead of generated proxy identity", () => {
-    const first = api.documents.summaries;
-    const second = api.documents.summaries;
+    const first = api.documents.read;
+    const second = api.documents.read;
 
     assert.notEqual(first, second);
     assert.equal(queryIdentity(first, { limit: 40 }), queryIdentity(second, { limit: 40 }));
@@ -51,7 +51,7 @@ void describe("embedded query subscriptions", () => {
     };
 
     function Probe({ limit }: { limit: number }) {
-      useQuerySubscription(client, api.documents.summaries, { limit });
+      useQuerySubscription(client, api.documents.read, { limit });
       return null;
     }
 
@@ -81,9 +81,9 @@ void describe("embedded query subscriptions", () => {
   });
 
   void it("waits through an initial local miss until a remote document is materialized", async () => {
-    type Document = FunctionReturnType<typeof api.documents.get>;
+    type Document = FunctionReturnType<typeof api.documents.read>[number];
     let callback: () => void = () => undefined;
-    let value: Document | undefined = null;
+    let value: Document[] | undefined = [];
     let stops = 0;
     const client: EmbeddedQueryClient = {
       watchQuery<Query extends FunctionReference<"query">>(): EmbeddedQueryWatch<
@@ -104,41 +104,44 @@ void describe("embedded query subscriptions", () => {
     let resolved = false;
     const result = waitForQuerySubscription(
       client,
-      api.documents.get,
+      api.documents.read,
       { id },
       {
-        accept: (document) => document !== null && document._id.startsWith("documents|"),
+        accept: (documents) =>
+          documents[0] !== undefined && documents[0]._id.startsWith("documents|"),
       },
-    ).then((document) => {
+    ).then((documents) => {
       resolved = true;
-      return document;
+      return documents;
     });
 
     await Promise.resolve();
     assert.equal(resolved, false);
-    value = {
-      _creationTime: 1,
-      _id: "hosted-remote" as Id<"documents">,
-      body: "[]",
-      slug: "remote",
-      title: "Remote",
-      updatedAt: 1,
-    };
+    value = [
+      {
+        _creationTime: 1,
+        _id: "hosted-remote" as Id<"documents">,
+        body: "[]",
+        slug: "remote",
+        title: "Remote",
+        updatedAt: 1,
+      },
+    ];
     callback();
 
     await Promise.resolve();
     assert.equal(resolved, false);
-    value = { ...value, _id: id };
+    value = [{ ...value[0]!, _id: id }];
     callback();
 
-    assert.equal((await result)?.title, "Remote");
+    assert.equal((await result)[0]?.title, "Remote");
     assert.equal(stops, 1);
   });
 
   void it("retains a materialized remote document until its owner closes", async () => {
-    type Document = FunctionReturnType<typeof api.documents.get>;
+    type Document = FunctionReturnType<typeof api.documents.read>[number];
     let callback: () => void = () => undefined;
-    let value: Document | undefined = null;
+    let value: Document[] | undefined = [];
     let stops = 0;
     const client: EmbeddedQueryClient = {
       watchQuery<Query extends FunctionReference<"query">>(): EmbeddedQueryWatch<
@@ -158,22 +161,27 @@ void describe("embedded query subscriptions", () => {
     const id = "documents|remote" as Id<"documents">;
     const subscription = openQuerySubscription(
       client,
-      api.documents.get,
+      api.documents.read,
       { id },
-      { accept: (document) => document !== null && document._id.startsWith("documents|") },
+      {
+        accept: (documents) =>
+          documents[0] !== undefined && documents[0]._id.startsWith("documents|"),
+      },
     );
 
-    value = {
-      _creationTime: 1,
-      _id: id,
-      body: "[]",
-      slug: "remote",
-      title: "Remote",
-      updatedAt: 1,
-    };
+    value = [
+      {
+        _creationTime: 1,
+        _id: id,
+        body: "[]",
+        slug: "remote",
+        title: "Remote",
+        updatedAt: 1,
+      },
+    ];
     callback();
 
-    assert.equal((await subscription.result)?.title, "Remote");
+    assert.equal((await subscription.result)[0]?.title, "Remote");
     assert.equal(stops, 0);
     subscription.close();
     subscription.close();
@@ -181,10 +189,10 @@ void describe("embedded query subscriptions", () => {
   });
 
   void it("delivers retained query changes after the first materialized value", async () => {
-    type Document = FunctionReturnType<typeof api.documents.get>;
+    type Document = FunctionReturnType<typeof api.documents.read>[number];
     let callback: () => void = () => undefined;
-    let value: Document | undefined = null;
-    const updates: Document[] = [];
+    let value: Document[] | undefined = [];
+    const updates: Document[][] = [];
     const client: EmbeddedQueryClient = {
       watchQuery<Query extends FunctionReference<"query">>(): EmbeddedQueryWatch<
         FunctionReturnType<Query>
@@ -201,34 +209,37 @@ void describe("embedded query subscriptions", () => {
     const id = "documents|remote" as Id<"documents">;
     const subscription = openQuerySubscription(
       client,
-      api.documents.get,
+      api.documents.read,
       { id },
       {
-        accept: (document) => document !== null && document._id.startsWith("documents|"),
-        onUpdate: (document) => updates.push(document),
+        accept: (documents) =>
+          documents[0] !== undefined && documents[0]._id.startsWith("documents|"),
+        onUpdate: (documents) => updates.push(documents),
       },
     );
 
-    value = {
-      _creationTime: 1,
-      _id: id,
-      body: "[]",
-      slug: "remote",
-      title: "First",
-      updatedAt: 1,
-    };
+    value = [
+      {
+        _creationTime: 1,
+        _id: id,
+        body: "[]",
+        slug: "remote",
+        title: "First",
+        updatedAt: 1,
+      },
+    ];
     callback();
-    assert.equal((await subscription.result)?.title, "First");
+    assert.equal((await subscription.result)[0]?.title, "First");
     assert.equal(updates.length, 0);
 
-    value = { ...value, body: '[{"type":"paragraph","content":"peer"}]', title: "Peer" };
+    value = [{ ...value[0]!, body: '[{"type":"paragraph","content":"peer"}]', title: "Peer" }];
     callback();
-    assert.equal(updates.at(-1)?.title, "Peer");
-    assert.equal(updates.at(-1)?.body, value.body);
+    assert.equal(updates.at(-1)?.[0]?.title, "Peer");
+    assert.equal(updates.at(-1)?.[0]?.body, value[0]?.body);
 
-    value = null;
+    value = [];
     callback();
-    assert.equal(updates.at(-1), null);
+    assert.equal(updates.at(-1)?.length, 0);
     subscription.close();
   });
 
@@ -239,7 +250,7 @@ void describe("embedded query subscriptions", () => {
         FunctionReturnType<Query>
       > {
         return {
-          localQueryResult: () => null as FunctionReturnType<Query>,
+          localQueryResult: () => [] as unknown as FunctionReturnType<Query>,
           onUpdate: () => () => {
             stops += 1;
           },
@@ -249,9 +260,9 @@ void describe("embedded query subscriptions", () => {
     const abort = new AbortController();
     const result = waitForQuerySubscription(
       client,
-      api.documents.get,
+      api.documents.read,
       { id: "documents|remote" as Id<"documents"> },
-      { accept: (document) => document !== null, signal: abort.signal },
+      { accept: (documents) => documents.length > 0, signal: abort.signal },
     );
     abort.abort();
 

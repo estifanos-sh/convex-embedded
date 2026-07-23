@@ -6,9 +6,11 @@ import { useBlockNoteEditor, useCreateBlockNote, useEditorState } from "@blockno
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
+import { createTextField } from "@convex-dev/embedded/internal/text";
+import type { TextFieldWriter } from "@convex-dev/embedded/internal/text";
+
 import "./editor.css";
 import {
-  documentWrite as createDocumentWrite,
   documentBlocks,
   draftFingerprint,
   isEmptyTable,
@@ -28,8 +30,6 @@ import type {
   EditorStatusPayload,
 } from "./types";
 
-const writeDelayMs = 40;
-const writeMaxLatencyMs = 160;
 const editorDelayMs = 16;
 const editorMaxLatencyMs = 80;
 
@@ -55,9 +55,6 @@ function InteractiveDocument({
   titleRevision,
 }: DocumentEditorProps) {
   const [initial] = useState(() => readRecovery(document));
-  const [initialPersistedFingerprint] = useState(() =>
-    draftFingerprint({ body: document.body, title: document.title }),
-  );
   const [initialTitleRevision] = useState(() =>
     initial.draft.title === title ? titleRevision : titleRevision + 1,
   );
@@ -70,9 +67,6 @@ function InteractiveDocument({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [recoveryUnavailable, setRecoveryUnavailable] = useState(false);
   const [nativeTitleReady, setNativeTitleReady] = useState(false);
-  const desiredRef = useRef(initial.draft);
-  const persistedRef = useRef<EditorDraft>({ body: document.body, title: document.title });
-  const persistedFingerprintRef = useRef(initialPersistedFingerprint);
   const titleRef = useRef(initial.draft.title);
   const actionRef = useRef(documentWrite);
   const editorReadyRef = useRef(editorReady);
@@ -86,24 +80,69 @@ function InteractiveDocument({
   const previousRetryRequestRef = useRef(retryRequest);
   const lastStatusRef = useRef("");
   const statusTaskRef = useRef<Promise<void>>(Promise.resolve());
-  const trailingTimerRef = useRef<number | undefined>(undefined);
-  const maxTimerRef = useRef<number | undefined>(undefined);
   const editorCancelRef = useRef<(() => void) | undefined>(undefined);
   const editorMaxTimerRef = useRef<number | undefined>(undefined);
-  const inFlightRef = useRef<Promise<EditorDraft> | null>(null);
-  const flushAfterFlightRef = useRef(false);
   const applyingNativeRef = useRef(false);
-  const pendingExternalRef = useRef<EditorDraft | null>(null);
-  const lastWriteStartedRef = useRef(0);
-  const flushRef = useRef<() => void>(() => undefined);
+  const documentRef = useRef(document);
+  const editorBodyRef = useRef(JSON.stringify(editor.document));
+  const lastStoreDraftRef = useRef<EditorDraft>({ body: document.body, title: document.title });
+  const settlingRef = useRef(false);
   const flushRecoveryRef = useRef<() => void>(() => undefined);
   const flushEditorRef = useRef<() => void>(() => undefined);
+  const watchSettleRef = useRef<() => void>(() => undefined);
   actionRef.current = documentWrite;
+  documentRef.current = document;
   editorReadyRef.current = editorReady;
   editorStatusChangedRef.current = editorStatusChanged;
   saveStateRef.current = saveState;
   saveErrorRef.current = saveError;
   recoveryUnavailableRef.current = recoveryUnavailable;
+
+  const fieldRef = useRef<TextFieldWriter | null>(null);
+  if (fieldRef.current === null) {
+    fieldRef.current = createTextField<Pick<EditorDocument, "body" | "title">>({
+      read: () => documentRef.current.body,
+      write: (splice, base) => {
+        setSaveState("saving");
+        setSaveError(null);
+        return actionRef.current(splice, base);
+      },
+      extract: (result) => result.body,
+      delayMs: 0,
+      maxLatencyMs: 0,
+    });
+  }
+  const field = fieldRef.current;
+
+  useEffect(() => {
+    return () => {
+      field.close();
+      fieldRef.current = null;
+    };
+  }, [field]);
+
+  const watchSettle = useCallback(() => {
+    if (settlingRef.current) return;
+    if (!field.isDirty && !field.isSettling) return;
+    settlingRef.current = true;
+    void field
+      .settle()
+      .then(
+        () => {
+          setSaveState("saved");
+          setSaveError(null);
+        },
+        (error: unknown) => {
+          flushRecoveryRef.current();
+          setSaveState("error");
+          setSaveError(errorMessage(error));
+        },
+      )
+      .finally(() => {
+        settlingRef.current = false;
+      });
+  }, [field]);
+  watchSettleRef.current = watchSettle;
 
   const replaceDraft = useCallback(
     (draft: EditorDraft) => {
@@ -114,6 +153,7 @@ function InteractiveDocument({
       applyingNativeRef.current = true;
       titleRef.current = draft.title;
       editor.replaceBlocks(editor.document, documentBlocks(draft.body, draft.title));
+      editorBodyRef.current = JSON.stringify(editor.document);
       queueMicrotask(() => {
         applyingNativeRef.current = false;
       });
@@ -154,127 +194,44 @@ function InteractiveDocument({
     };
   }, [editorToken, initial.draft.title]);
 
-  const clearTimers = useCallback(() => {
-    if (trailingTimerRef.current !== undefined) window.clearTimeout(trailingTimerRef.current);
-    if (maxTimerRef.current !== undefined) window.clearTimeout(maxTimerRef.current);
-    trailingTimerRef.current = undefined;
-    maxTimerRef.current = undefined;
-  }, []);
-
-  const scheduleWrite = useCallback(() => {
-    if (trailingTimerRef.current !== undefined) window.clearTimeout(trailingTimerRef.current);
-    trailingTimerRef.current = window.setTimeout(() => flushRef.current(), writeDelayMs);
-    if (maxTimerRef.current === undefined) {
-      maxTimerRef.current = window.setTimeout(() => flushRef.current(), writeMaxLatencyMs);
-    }
-  }, []);
-
   const flushRecovery = useCallback(() => {
-    const persisted = persistedRef.current;
-    const desired = desiredRef.current;
+    const persisted = { body: documentRef.current.body, title: documentRef.current.title };
+    const desired = { body: JSON.stringify(editor.document), title: titleRef.current };
     if (sameDraft(persisted, desired)) {
       deleteRecovery(document.id);
       setRecoveryUnavailable(false);
       return;
     }
-    setRecoveryUnavailable(!writeRecovery(document.id, persistedFingerprintRef.current, desired));
-  }, [document.id]);
+    setRecoveryUnavailable(!writeRecovery(document.id, draftFingerprint(persisted), desired));
+  }, [document.id, editor]);
   flushRecoveryRef.current = flushRecovery;
-
-  const flush = useCallback(() => {
-    clearTimers();
-    flushEditorRef.current();
-    if (inFlightRef.current) {
-      flushAfterFlightRef.current = true;
-      return;
-    }
-
-    const persisted = persistedRef.current;
-    const desired = desiredRef.current;
-    if (sameDraft(persisted, desired)) {
-      deleteRecovery(document.id);
-      setRecoveryUnavailable(false);
-      setSaveState("saved");
-      setSaveError(null);
-      return;
-    }
-
-    const remainingDelay = lastWriteStartedRef.current + writeDelayMs - Date.now();
-    if (remainingDelay > 0) {
-      trailingTimerRef.current = window.setTimeout(() => flushRef.current(), remainingDelay);
-      return;
-    }
-
-    const write = createDocumentWrite(document.id, persisted, desired);
-    if (!write) return;
-
-    setSaveState("saving");
-    setSaveError(null);
-    lastWriteStartedRef.current = Date.now();
-    const written = desired;
-    const task = actionRef.current(write);
-    inFlightRef.current = task;
-    void task
-      .then(() => {
-        const external = pendingExternalRef.current;
-        pendingExternalRef.current = null;
-        const settled = external ?? written;
-        persistedRef.current = settled;
-        persistedFingerprintRef.current = draftFingerprint(settled);
-        if (external) {
-          desiredRef.current = external;
-          replaceDraft(external);
-        }
-        flushEditorRef.current();
-        if (sameDraft(desiredRef.current, settled)) {
-          deleteRecovery(document.id);
-          setRecoveryUnavailable(false);
-          setSaveState("saved");
-        } else {
-          flushRecoveryRef.current();
-          setSaveState("dirty");
-        }
-      })
-      .catch((error: unknown) => {
-        flushRecoveryRef.current();
-        setSaveState("error");
-        setSaveError(errorMessage(error));
-      })
-      .finally(() => {
-        inFlightRef.current = null;
-        const needsWrite = !sameDraft(persistedRef.current, desiredRef.current);
-        if (needsWrite && flushAfterFlightRef.current) scheduleWrite();
-        flushAfterFlightRef.current = false;
-      });
-  }, [clearTimers, document.id, replaceDraft, scheduleWrite]);
-  flushRef.current = flush;
 
   const queueDraft = useCallback(
     (draft: EditorDraft) => {
-      desiredRef.current = draft;
+      field.queue(draft.body);
       setSaveState("dirty");
       setSaveError(null);
       flushRecoveryRef.current();
-      scheduleWrite();
+      watchSettleRef.current();
     },
-    [scheduleWrite],
+    [field],
   );
 
   const queueNativeTitle = useCallback(
     (nextTitle: string) => {
-      desiredRef.current = { ...desiredRef.current, title: nextTitle };
+      titleRef.current = nextTitle;
       setSaveState("dirty");
       setSaveError(null);
-      if (!writeTitleRecovery(document.id, persistedRef.current.title, nextTitle)) {
+      if (!writeTitleRecovery(document.id, documentRef.current.title, nextTitle)) {
         setRecoveryUnavailable(true);
       }
-      scheduleWrite();
     },
-    [document.id, scheduleWrite],
+    [document.id],
   );
 
   const writeEditorDraft = useCallback(() => {
     const body = JSON.stringify(editor.document);
+    editorBodyRef.current = body;
     queueDraft({ body, title: titleRef.current });
   }, [editor, queueDraft]);
 
@@ -311,14 +268,16 @@ function InteractiveDocument({
   useEffect(() => {
     if (!nativeTitleReady || !initial.recovered) return;
     flushRecoveryRef.current();
-    scheduleWrite();
-  }, [initial.recovered, nativeTitleReady, scheduleWrite]);
+    field.queue(JSON.stringify(editor.document));
+    watchSettleRef.current();
+  }, [editor, field, initial.recovered, nativeTitleReady]);
 
   useEffect(() => {
     const flushPending = (): void => {
       flushEditorRef.current();
       flushRecoveryRef.current();
-      flushRef.current();
+      field.flush();
+      watchSettleRef.current();
     };
     const onPageHide = (): void => flushPending();
     const onVisibilityChange = (): void => {
@@ -331,7 +290,7 @@ function InteractiveDocument({
       globalThis.document.removeEventListener("visibilitychange", onVisibilityChange);
       flushPending();
     };
-  }, []);
+  }, [field]);
 
   useEffect(() => {
     if (active) return;
@@ -340,8 +299,9 @@ function InteractiveDocument({
     }
     flushEditorRef.current();
     flushRecoveryRef.current();
-    flushRef.current();
-  }, [active]);
+    field.flush();
+    watchSettleRef.current();
+  }, [active, field]);
 
   useEffect(() => {
     if (!nativeTitleReady) return;
@@ -358,21 +318,27 @@ function InteractiveDocument({
   useEffect(() => {
     if (!nativeTitleReady) return;
     const incoming = { body: document.body, title: document.title };
-    if (sameDraft(incoming, persistedRef.current)) return;
-    if (inFlightRef.current !== null) {
-      pendingExternalRef.current = incoming;
+    if (sameDraft(incoming, lastStoreDraftRef.current)) return;
+    lastStoreDraftRef.current = incoming;
+    field.adopt(incoming.body);
+    if (field.isDirty) {
+      flushRecoveryRef.current();
+      watchSettleRef.current();
       return;
     }
-
-    persistedRef.current = incoming;
-    persistedFingerprintRef.current = draftFingerprint(incoming);
-    desiredRef.current = incoming;
+    if (incoming.body === editorBodyRef.current) {
+      deleteRecovery(document.id);
+      setRecoveryUnavailable(false);
+      setSaveError(null);
+      setSaveState("saved");
+      return;
+    }
     replaceDraft(incoming);
     deleteRecovery(document.id);
     setRecoveryUnavailable(false);
     setSaveError(null);
     setSaveState("saved");
-  }, [document.body, document.id, document.title, nativeTitleReady, replaceDraft]);
+  }, [document.body, document.id, document.title, field, nativeTitleReady, replaceDraft]);
 
   useEffect(() => {
     if (!nativeTitleReady) return;
@@ -413,16 +379,18 @@ function InteractiveDocument({
     previousRetryRequestRef.current = retryRequest;
     flushEditorRef.current();
     flushRecoveryRef.current();
-    flushRef.current();
-  }, [retryRequest]);
+    field.flush();
+    watchSettleRef.current();
+  }, [field, retryRequest]);
 
   useEffect(() => {
     if (previousCloseRequestRef.current === closeRequest) return;
     previousCloseRequestRef.current = closeRequest;
     flushEditorRef.current();
     flushRecoveryRef.current();
-    flushRef.current();
-  }, [closeRequest]);
+    field.flush();
+    watchSettleRef.current();
+  }, [closeRequest, field]);
 
   const deleteEmptyTable = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -463,7 +431,14 @@ function InteractiveDocument({
     <main className="editorPage">
       <article className="documentSheet">
         {saveError ? (
-          <button className="recoveryNotice" type="button" onClick={() => flushRef.current()}>
+          <button
+            className="recoveryNotice"
+            type="button"
+            onClick={() => {
+              field.flush();
+              watchSettleRef.current();
+            }}
+          >
             <strong>
               {recoveryUnavailable
                 ? "Draft is still open in this editor."
