@@ -69,33 +69,6 @@ describe("mutationIdentityMatches", () => {
       ),
     ).toBe(false);
   });
-
-  test("accepts an exact legacy fingerprint without replay metadata", () => {
-    expect(
-      mutationIdentityMatches({ fingerprint: current.fingerprint, outcome: "rejected" }, current),
-    ).toBe(true);
-  });
-
-  test("upgrades only a rotated non-applied legacy settlement", () => {
-    expect(
-      mutationIdentityMatches({ fingerprint: "prepared-v1", outcome: "rejected" }, current),
-    ).toBe(true);
-    expect(
-      mutationIdentityMatches({ fingerprint: "prepared-v1", outcome: "applied" }, current),
-    ).toBe(false);
-    expect(
-      mutationIdentityMatches(
-        { fingerprint: "prepared-v1", outcome: "rejected" },
-        { ...current, replayId: current.mutationId },
-      ),
-    ).toBe(false);
-    expect(
-      mutationIdentityMatches(
-        { fingerprint: "prepared-v1", replayId: "replay:old", outcome: "rejected" },
-        current,
-      ),
-    ).toBe(false);
-  });
 });
 
 describe("mutationReplayMatches", () => {
@@ -143,15 +116,6 @@ describe("mutationReplayMatches", () => {
         current,
       ),
     ).toBe(false);
-  });
-
-  test("requires the exact hosted fingerprint for legacy settlements", () => {
-    expect(
-      mutationReplayMatches({ fingerprint: current.fingerprint, outcome: "applied" }, current),
-    ).toBe(true);
-    expect(mutationReplayMatches({ fingerprint: "prepared-v1", outcome: "applied" }, current)).toBe(
-      false,
-    );
   });
 });
 

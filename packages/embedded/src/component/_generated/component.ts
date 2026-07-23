@@ -204,7 +204,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
     acknowledge: FunctionReference<
       "mutation",
       "internal",
-      { clientId: string; identity?: string; replayId: string },
+      { identity?: string; replayId: string },
       null,
       Name
     >;

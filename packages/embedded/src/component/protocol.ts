@@ -525,7 +525,7 @@ export const replayWrite = mutation({
     if (prior) {
       if (
         prior.mutationId !== args.mutationId ||
-        (prior.replayId ?? prior.mutationId) !== args.replayId ||
+        prior.replayId !== args.replayId ||
         prior.fingerprint !== args.fingerprint ||
         prior.logicalFingerprint !== args.logicalFingerprint
       ) {
@@ -599,11 +599,11 @@ export const replayConsume = mutation({
       kind: replay.kind,
       clientId: replay.clientId,
       mutationId: replay.mutationId,
-      replayId: replay.replayId ?? replay.mutationId,
+      replayId: replay.replayId,
       fingerprint: replay.fingerprint,
-      logicalFingerprint: replay.logicalFingerprint ?? replay.fingerprint,
+      logicalFingerprint: replay.logicalFingerprint,
       runtime: replay.runtime,
-      acknowledgeReplayId: replay.acknowledgeReplayId ?? replay.acknowledgeMutationId,
+      acknowledgeReplayId: replay.acknowledgeReplayId,
       resultHash: replay.resultHash,
       mutationTime: replay.mutationTime,
       randomSeed: replay.randomSeed,
@@ -879,7 +879,7 @@ export const installation = query({
 });
 
 export const acknowledge = mutation({
-  args: { clientId: v.string(), replayId: v.string(), identity: v.optional(v.string()) },
+  args: { replayId: v.string(), identity: v.optional(v.string()) },
   returns: v.null(),
   handler: async (ctx, args) => {
     await acknowledgeWrite(ctx, args.replayId, args.identity);
@@ -922,21 +922,12 @@ async function mutationReplayRead(
   identity: string | undefined,
   replayId: string,
 ) {
-  const current = await ctx.db
+  return await ctx.db
     .query("mutations")
     .withIndex("by_identity_and_replayid", (q) =>
       q.eq("identity", identity).eq("replayId", replayId),
     )
     .unique();
-  if (current) return current;
-  const legacy = await ctx.db
-    .query("mutations")
-    .withIndex("by_identity_and_mutationid", (q) =>
-      q.eq("identity", identity).eq("mutationId", replayId),
-    )
-    .order("desc")
-    .first();
-  return legacy?.replayId === undefined ? legacy : null;
 }
 
 function mutationIdReuse(priorOutcome: "applied" | "conflict" | "rejected" | "rebase"): never {

@@ -405,10 +405,7 @@ export function assertReplicatedReference(
   kind: "query" | "mutation",
 ): void {
   const name = getFunctionName(reference);
-  const separator = name.indexOf(":");
-  const moduleId = separator < 0 ? name : name.slice(0, separator);
-  const exportName = separator < 0 ? "default" : name.slice(separator + 1);
-  const declared = manifest?.[moduleId]?.[exportName];
+  const declared = manifestPlacement(manifest, name);
   if (!declared) {
     throw new Error(
       `Embedded replicated functions cannot call app function ${name} without trusted placement metadata.`,
@@ -419,6 +416,35 @@ export function assertReplicatedReference(
       `Embedded replicated functions cannot call ${declared.placement} ${declared.kind} ${name}.`,
     );
   }
+}
+
+/**
+ * Rejects a client-named top-level push or pull target that the trusted manifest declares with a
+ * non-replicated placement or a mismatched kind, before the wrapper invokes it. A name the manifest
+ * does not declare is deferred to the post-invoke eligibility checks, so a deployment whose manifest
+ * omits some replicated functions still resolves them.
+ */
+export function assertReplicatedTarget(
+  manifest: FunctionManifest | undefined,
+  functionName: string,
+  kind: "query" | "mutation",
+): void {
+  const declared = manifestPlacement(manifest, functionName);
+  if (declared !== undefined && (declared.kind !== kind || declared.placement !== "replicated")) {
+    throw new Error(
+      `Embedded ${kind} replication cannot invoke ${declared.placement} ${declared.kind} ${functionName}.`,
+    );
+  }
+}
+
+function manifestPlacement(
+  manifest: FunctionManifest | undefined,
+  name: string,
+): FunctionManifest[string][string] | undefined {
+  const separator = name.indexOf(":");
+  const moduleId = separator < 0 ? name : name.slice(0, separator);
+  const exportName = separator < 0 ? "default" : name.slice(separator + 1);
+  return manifest?.[moduleId]?.[exportName];
 }
 
 export function isEmbeddedComponentReference(reference: unknown): boolean {

@@ -55,6 +55,7 @@ import {
 import { normalizeMutationResult } from "../result";
 import {
   assertReplicatedReference,
+  assertReplicatedTarget,
   buildQueryBuilder,
   completeQueryRows,
   invokeQueryCapture,
@@ -440,8 +441,8 @@ export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
       ) as unknown as LocalMutationBuilder<Device, "internal">,
     },
     upload: buildUpload(),
-    pull: buildPull(options.component),
-    push: buildPush(options.component, tableNames, crdtFields, placements),
+    pull: buildPull(options.component, options.manifest),
+    push: buildPush(options.component, tableNames, crdtFields, placements, options.manifest),
   };
 }
 
@@ -1264,7 +1265,7 @@ const pushRequestValidator = v.union(
   }),
 );
 
-function buildPull(component: EmbeddedComponent) {
+function buildPull(component: EmbeddedComponent, manifest?: FunctionManifest) {
   return queryGeneric({
     args: { request: pullRequestValidator },
     returns: v.union(
@@ -1310,6 +1311,7 @@ function buildPull(component: EmbeddedComponent) {
         };
       }
       assertRuntimeVersion(args.runtime);
+      assertReplicatedTarget(manifest, args.functionName, "query");
       if (args.kind === "cursor") {
         const queryArgs = paginationArgs(args.args, args.path, args.cursor);
         const { result, rows } = await invokeQueryCapture(
@@ -1435,6 +1437,7 @@ function buildPush(
   tableNames: string[],
   crdtFields: Map<string, Map<string, CrdtKind>>,
   placements: EmbeddedSchemaPlacements,
+  manifest?: FunctionManifest,
 ) {
   return mutationGeneric({
     args: { request: pushRequestValidator },
@@ -1443,7 +1446,6 @@ function buildPush(
       if (args.kind === "acknowledge") {
         const identity = await identityAttributeOf(ctx);
         await ctx.runMutation(component.protocol.acknowledge, {
-          clientId: args.clientId,
           replayId: args.replayId,
           ...(identity === null ? {} : { identity }),
         });
@@ -1451,6 +1453,7 @@ function buildPush(
       }
       assertRuntimeVersion(args.runtime);
       if (args.kind === "mutation") {
+        assertReplicatedTarget(manifest, args.functionName, "mutation");
         assertWireAfterImages(args.afterImages, placements);
         const identity = await identityAttributeOf(ctx);
         const { requestId } = await ctx.meta.getRequestMetadata();
@@ -1469,6 +1472,11 @@ function buildPush(
           revisionCheckpoints: args.revisionCheckpoints,
           afterImages: args.afterImages,
         });
+        const logicalFingerprint = await hashValue({
+          functionName: args.functionName,
+          args: args.args,
+          argRefs: args.argRefs,
+        });
         const prior = (await ctx.runMutation(component.protocol.replayWrite, {
           tokenHash: await hashValue({ requestId, functionName: args.functionName }),
           kind: "push",
@@ -1479,7 +1487,7 @@ function buildPush(
           mutationId: args.mutationId,
           replayId: args.replayId,
           fingerprint,
-          logicalFingerprint: args.logicalFingerprint,
+          logicalFingerprint,
           resultHash: args.resultHash,
           mutationTime: args.mutationTime,
           randomSeed: args.randomSeed,
@@ -1559,7 +1567,7 @@ function buildPush(
               clientId: args.clientId,
               replayId: args.replayId,
               fingerprint,
-              logicalFingerprint: args.logicalFingerprint,
+              logicalFingerprint,
               runtime: args.runtime,
               ...(identity === null ? {} : { identity }),
               acknowledgeReplayId: args.acknowledgeReplayId,

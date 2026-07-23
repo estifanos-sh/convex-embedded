@@ -1,7 +1,7 @@
 export type PriorMutationIdentity = {
   fingerprint: string;
-  logicalFingerprint?: string;
-  replayId?: string;
+  logicalFingerprint: string;
+  replayId: string;
   outcome: "applied" | "conflict" | "rejected" | "rebase";
 };
 
@@ -35,15 +35,7 @@ export function mutationIdentityMatches(
   prior: PriorMutationIdentity,
   current: CurrentMutationIdentity,
 ): boolean {
-  if (prior.logicalFingerprint !== undefined) {
-    return prior.logicalFingerprint === current.logicalFingerprint;
-  }
-  if (prior.fingerprint === current.fingerprint) return true;
-  return (
-    prior.replayId === undefined &&
-    prior.outcome !== "applied" &&
-    current.replayId !== current.mutationId
-  );
+  return prior.logicalFingerprint === current.logicalFingerprint;
 }
 
 /** Whether an exact replay attempt may reuse an older settlement. */
@@ -51,9 +43,6 @@ export function mutationReplayMatches(
   prior: PriorMutationIdentity,
   current: CurrentMutationIdentity,
 ): boolean {
-  if (prior.logicalFingerprint === undefined) {
-    return prior.fingerprint === current.fingerprint;
-  }
   if (prior.logicalFingerprint !== current.logicalFingerprint) return false;
   return prior.fingerprint === current.fingerprint || prior.outcome === "applied";
 }

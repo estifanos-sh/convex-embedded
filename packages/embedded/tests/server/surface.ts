@@ -206,7 +206,7 @@ describe("v5 server surface", () => {
         },
         meta: {
           getFunctionMetadata: async () => ({
-            name: "documents:list",
+            name: "documents:read",
             componentPath: "",
             type: "query" as const,
             visibility: "public" as const,
@@ -248,7 +248,7 @@ describe("v5 server surface", () => {
         },
         meta: {
           getFunctionMetadata: async () => ({
-            name: "documents:list",
+            name: "documents:read",
             componentPath: "",
             type: "query" as const,
             visibility: "public" as const,
@@ -309,7 +309,7 @@ describe("v5 server surface", () => {
         },
         meta: {
           getFunctionMetadata: async () => ({
-            name: "documents:list",
+            name: "documents:read",
             componentPath: "",
             type: "query" as const,
             visibility: "public" as const,
@@ -1400,6 +1400,149 @@ describe("v5 server surface", () => {
     );
     expect(forwarded?.value).not.toHaveProperty("secret");
     expect((result as any).value).not.toHaveProperty("secret");
+  });
+
+  const pushRuntime = {
+    schemaHash: "schema",
+    moduleGraphHash: "graph",
+    protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+  };
+  const mutationPushRequest = (functionName: string, args: unknown) => ({
+    kind: "mutation" as const,
+    functionName,
+    args,
+    afterImages: [],
+    runtime: pushRuntime,
+    clientId: "client-1",
+    mutationId: "mutation-1",
+    replayId: "replay-1",
+    logicalFingerprint: "client-supplied-forged",
+    resultHash: "result-hash",
+    mutationTime: 1,
+    randomSeed: "seed",
+    argRefs: [],
+    inserts: [],
+    reads: [],
+    schedules: [],
+    uploads: [],
+    crdt: [],
+    revisionCheckpoints: [],
+  });
+  const invokePush = (embedded: { push: unknown }, ctx: unknown, request: unknown) =>
+    (
+      embedded.push as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+    )._handler(ctx, { request });
+
+  test("recomputes the dedup logical fingerprint server-side and ignores the client value", async () => {
+    const replayWrite = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
+    };
+    const pushComponent = {
+      protocol: { installation: {}, pull: componentPullReference, replayWrite },
+    } as unknown as ComponentApi<"embedded">;
+    const embedded = defineEmbedded({ component: pushComponent, schema });
+    const captured: Array<Record<string, unknown>> = [];
+    const ctx = {
+      auth: { getUserIdentity: async () => null },
+      meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
+      runMutation: async (reference: unknown, args: Record<string, unknown>) => {
+        if (reference === replayWrite) {
+          captured.push(args);
+          return null;
+        }
+        return {
+          kind: "embeddedReplay",
+          settlement: { outcome: "applied", mutationId: "mutation-1" },
+        };
+      },
+    };
+
+    await invokePush(embedded, ctx, mutationPushRequest("documents:write", { title: "A" }));
+    await invokePush(embedded, ctx, mutationPushRequest("documents:write", { title: "B" }));
+
+    const serverA = await hashValue({
+      functionName: "documents:write",
+      args: { title: "A" },
+      argRefs: [],
+    });
+    const serverB = await hashValue({
+      functionName: "documents:write",
+      args: { title: "B" },
+      argRefs: [],
+    });
+    expect(captured.map((entry) => entry.logicalFingerprint)).toEqual([serverA, serverB]);
+    expect(captured[0]!.logicalFingerprint).not.toBe("client-supplied-forged");
+    expect(serverA).not.toBe(serverB);
+  });
+
+  test("gates a push by manifest placement, rejecting a non-replicated target before invoking it", async () => {
+    const replayWrite = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
+    };
+    const pushComponent = {
+      protocol: { installation: {}, pull: componentPullReference, replayWrite },
+    } as unknown as ComponentApi<"embedded">;
+    const embedded = defineEmbedded({
+      component: pushComponent,
+      manifest: {
+        admin: { wipe: { kind: "mutation", placement: "remote", visibility: "public" } },
+      },
+      schema,
+    });
+    let replayWrites = 0;
+    let targetInvocations = 0;
+    const ctx = {
+      auth: { getUserIdentity: async () => null },
+      meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
+      runMutation: async (reference: unknown) => {
+        if (reference === replayWrite) {
+          replayWrites += 1;
+          return null;
+        }
+        targetInvocations += 1;
+        return {
+          kind: "embeddedReplay",
+          settlement: { outcome: "applied", mutationId: "mutation-1" },
+        };
+      },
+    };
+
+    await expect(invokePush(embedded, ctx, mutationPushRequest("admin:wipe", {}))).rejects.toThrow(
+      /cannot invoke remote mutation admin:wipe/,
+    );
+    expect(replayWrites).toBe(0);
+    expect(targetInvocations).toBe(0);
+
+    await expect(
+      invokePush(embedded, ctx, mutationPushRequest("replay:insertNull", {})),
+    ).resolves.toMatchObject({ outcome: "applied" });
+    expect(targetInvocations).toBe(1);
+  });
+
+  test("gates a pull by manifest placement, rejecting a non-replicated target before invoking it", async () => {
+    const embedded = defineEmbedded({
+      component,
+      manifest: {
+        admin: { peek: { kind: "query", placement: "remote", visibility: "public" } },
+      },
+      schema,
+    });
+    let queries = 0;
+    const ctx = {
+      runQuery: async () => {
+        queries += 1;
+        return null;
+      },
+    };
+
+    await expect(
+      (
+        embedded.pull as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+      )._handler(ctx, {
+        request: { kind: "live", functionName: "admin:peek", args: {}, runtime: pushRuntime },
+      }),
+    ).rejects.toThrow(/cannot invoke remote query admin:peek/);
+    expect(queries).toBe(0);
   });
 
   test("exports exact transport request variants", () => {
