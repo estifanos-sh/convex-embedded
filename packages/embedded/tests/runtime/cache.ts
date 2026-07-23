@@ -136,8 +136,12 @@ class CacheStore implements RuntimeStorage {
 
   constructor(private readonly withRemote = true) {}
 
+  // The retained base mirrors production's `server_row`: keyed by the LOCAL id but carrying the
+  // HOSTED `_id` in its body (`crates/remote/src/codec.rs` inserts the hosted id, and there is no
+  // hosted->local translation of the base). Seeding it with the local id would mask the id-strip.
   seedDoc(doc: StoredDoc, hostedId: string): void {
     this.docs.set(doc._id, doc);
+    this.bases.set(doc._id, { ...doc, _id: hostedId });
     this.ids.set(`messages\0${doc._id}`, {
       table: "messages",
       localId: doc._id,
@@ -150,7 +154,7 @@ class CacheStore implements RuntimeStorage {
 
   dirtyDelete(localId: string, base: StoredDoc, hostedId: string): void {
     this.docs.delete(localId);
-    this.bases.set(localId, base);
+    this.bases.set(localId, { ...base, _id: hostedId });
     this.ids.set(`messages\0${localId}`, {
       table: "messages",
       localId,
@@ -715,6 +719,81 @@ describe("retained-result cache read path", () => {
     off();
   });
 
+  test("a dirty edit to a mapped row surfaces in an uncovered projection list", async () => {
+    const store = new CacheStore();
+    const id = localId("messages", "e1");
+    store.seedDoc(
+      { _id: id, _creationTime: 1, channel: "live", title: "original" } as StoredDoc,
+      "hostedE1",
+    );
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    expect(await nextUpdate(updates, 0)).toEqual([{ _id: id, channel: "live", title: "original" }]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    // The server discloses the projection with the row's pre-edit title (a hosted id in the skeleton).
+    await store.result.write(
+      makeEntry(key, [{ _id: "hostedE1", channel: "live", title: "original" }]),
+    );
+
+    // A pending local edit to the projected `title`: the uncovered projection now carries optimism the
+    // server entry would erase, so the watch serves the LOCAL edit instead of deferring to the entry.
+    store.docs.set(id, {
+      _id: id,
+      _creationTime: 1,
+      channel: "live",
+      title: "edited",
+    } as StoredDoc);
+    r.invalidate(["messages"], "local");
+
+    expect(await nextUpdate(updates, 1)).toEqual([{ _id: id, channel: "live", title: "edited" }]);
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { cacheServes?: number };
+    };
+    expect(snapshot.runtime.cacheServes).toBe(0);
+    off();
+  });
+
+  test("an optimistic local create surfaces over an uncovered projection entry", async () => {
+    const store = new CacheStore();
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    expect(await nextUpdate(updates, 0)).toEqual([]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    // A server projection carrying a row this device does not hold (hosted id, no local twin):
+    // uncovered, so a fully-clean compute would defer to it.
+    await store.result.write(
+      makeEntry(key, [{ _id: "hostedNew", channel: "live", title: "server" }]),
+    );
+
+    // A purely local create (no hosted mapping) makes the compute optimistic, so the uncovered
+    // projection serves the LOCAL list and the create is visible at once, not the server entry.
+    const created = localId("messages", "opt");
+    store.docs.set(created, {
+      _id: created,
+      _creationTime: 2,
+      channel: "live",
+      title: "fresh",
+    } as StoredDoc);
+    pullResultSkeleton(r, [key]);
+
+    expect(await nextUpdate(updates, 1)).toEqual([
+      { _id: created, channel: "live", title: "fresh" },
+    ]);
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { cacheServes?: number };
+    };
+    expect(snapshot.runtime.cacheServes).toBe(0);
+    off();
+  });
+
   test("a local delete of a disclosed member is not resurrected by a cache-serve", async () => {
     const store = new CacheStore();
     const id = localId("messages", "d4");
@@ -891,7 +970,7 @@ describe("retained-result cache read path", () => {
   });
 
   test("real tick: whole-doc point disclosure reruns a get watch on an unmapped hosted id", async () => {
-    // The Cut 7 benchmark flow: an observer subscribes documents:get{hostedId} for a row it does not
+    // The Cut 7 benchmark flow: an observer subscribes documents:read{hostedId} for a row it does not
     // hold. The server encodes the complete-document result as a root skeleton (`null`) and ships the
     // row as a member. The pull reports the applied member (changedTables) AND the rewritten entry
     // (changedResults). No manual invalidate — this is the production trigger the earlier tests faked.

@@ -1,6 +1,6 @@
 import type { JSONValue } from "convex/values";
 import type { ResultEntry, RuntimeStorageReader } from "../storage/types";
-import { canonicalJson } from "../hash";
+import { hashDocument } from "../hash";
 import { pointerPart } from "../id/path";
 import { fromJson } from "./codec";
 import { tableFromId } from "./doc";
@@ -214,6 +214,16 @@ export async function readDisclosure(
 }
 
 /**
+ * CRDT field names per table, omitted from the optimism compare. A clean row's retained base and
+ * materialized doc can disagree byte-for-byte on a CRDT field: the server never materializes one, so
+ * the base's copy is patched in — and dropped again on a projection re-pull — independently of the
+ * doc's (`crates/storage/src/store/mod.rs`). Comparing them would read a clean row as false optimism.
+ *
+ * @internal
+ */
+export type CrdtFieldsByTable = ReadonlyMap<string, ReadonlySet<string>>;
+
+/**
  * Clause B (Cut 7 §4.5): does the watch's local output agree with its disclosure, both as local ids?
  * The two directions share one predicate. Completeness — every disclosed member appears in the output,
  * or is an optimistic row whose pending local edit moved it out of range (a dirty delete or a dirty
@@ -227,31 +237,70 @@ export async function outputAgrees(
   disclosure: Disclosure,
   outputIds: ReadonlySet<string>,
   store: RuntimeStorageReader,
+  crdtFields: CrdtFieldsByTable,
 ): Promise<boolean> {
   if (disclosure.unmapped > 0) return false;
   for (const member of disclosure.members) {
-    if (!outputIds.has(member) && !(await isOptimisticRow(store, tableFromId(member), member))) {
+    if (
+      !outputIds.has(member) &&
+      !(await isOptimisticRow(store, tableFromId(member), member, crdtFields))
+    ) {
       return false;
     }
   }
   for (const id of outputIds) {
     if (disclosure.members.has(id)) continue;
-    if (!(await isOptimisticRow(store, tableFromId(id), id))) return false;
+    if (!(await isOptimisticRow(store, tableFromId(id), id, crdtFields))) return false;
   }
   return true;
 }
 
+/**
+ * Clause C variant for an uncovered projection (Cut 7 §4.5): the entry carries a server projection
+ * this device cannot reconstruct, so the local compute may stand in for it only when it holds optimism
+ * the entry would erase — a local-only or dirty-edited output row, or a disclosed member the device
+ * dirty-deleted (dropped from the projection). A fully-clean projection holds none and yields to the
+ * entry, so a server change to an unprojected field still re-discloses (no server-update loss). The
+ * pure-projection dirty-delete case (paths=∅ ⇒ no disclosed members) is unreachable here and defers,
+ * exactly as it did before this clause: a member-free projection has no dirty-deleted member to find.
+ *
+ * @internal
+ */
+export async function hasLocalOptimism(
+  disclosure: Disclosure,
+  outputIds: ReadonlySet<string>,
+  store: RuntimeStorageReader,
+  crdtFields: CrdtFieldsByTable,
+): Promise<boolean> {
+  if (disclosure.deletedMembers.size > 0) return true;
+  for (const id of outputIds) {
+    if (await isOptimisticRow(store, tableFromId(id), id, crdtFields)) return true;
+  }
+  return false;
+}
+
+/**
+ * Does a mapped output/member row carry a pending local edit the server has not re-disclosed? A row
+ * with no hosted mapping (a local-only create) or no retained base is optimistic outright. Otherwise
+ * the current materialized doc is compared to its last accepted base over app-plain fields only:
+ * {@link hashDocument} drops `_id`/`_creationTime` — the base carries the HOSTED id, the doc its local
+ * twin (`crates/remote/src/codec.rs`) — and {@link CrdtFieldsByTable} omits the table's CRDT fields,
+ * whose base and doc bytes can diverge for a clean row. Without the strip, every clean mapped row reads
+ * as optimistic and the watch serves stale local state forever instead of the newer server entry.
+ */
 async function isOptimisticRow(
   store: RuntimeStorageReader,
   table: string,
   id: string,
+  crdtFields: CrdtFieldsByTable,
 ): Promise<boolean> {
   const mapping = await store.id?.read(table, id);
   if (mapping === undefined || mapping.mapping === "local") return true;
   const base = await store.doc.base?.read(table, id);
   if (base === undefined) return true;
   const current = await store.doc.read(table, id);
-  return canonicalJson(current ?? null) !== canonicalJson(base);
+  const omitted = crdtFields.get(table) ?? [];
+  return (await hashDocument(current ?? null, omitted)) !== (await hashDocument(base, omitted));
 }
 
 function coversSkeleton(entry: ResultEntry, rows: ResultRow[]): boolean {

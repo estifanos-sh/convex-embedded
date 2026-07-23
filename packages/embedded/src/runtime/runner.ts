@@ -56,9 +56,11 @@ import {
 import { pageCursorBoundary } from "./query";
 import {
   createReadAuthority,
+  hasLocalOptimism,
   outputAgrees,
   readDisclosure,
   reconstruct,
+  type CrdtFieldsByTable,
   type ReadAuthority,
 } from "./cache";
 import {
@@ -605,6 +607,12 @@ export function createRunner(
   const deferNotify = options.deferNotify ?? ((run: () => void) => run());
   const allTables = new Set<InvalidationKey>(
     [...rootScope.schema.keys()].map((table) => invalidationKey(rootScope.instancePath, table)),
+  );
+  const crdtFieldsByTable: CrdtFieldsByTable = new Map(
+    storeSchema.tables.map((table) => [
+      table.name,
+      new Set((table.crdtFields ?? []).map((field) => field.field)),
+    ]),
   );
   const moduleCache = new Map<string, Promise<ModuleExports>>();
   const functionCache = new Map<string, Promise<RunnableFunction>>();
@@ -1698,9 +1706,14 @@ export function createRunner(
     if (foreign) cacheCounters.foreignEvaluations += 1;
     watcher.coveredMemo =
       disclosure.members.size > 0 && disclosure.covered ? entry.skeletonHash : undefined;
-    let defer = foreign || !disclosure.covered;
-    if (!defer) {
-      defer = !(await outputAgrees(disclosure, collectVisibleDocIds(value), store));
+    const outputIds = collectVisibleDocIds(value);
+    let defer: boolean;
+    if (foreign) {
+      defer = true;
+    } else if (disclosure.covered) {
+      defer = !(await outputAgrees(disclosure, outputIds, store, crdtFieldsByTable));
+    } else {
+      defer = !(await hasLocalOptimism(disclosure, outputIds, store, crdtFieldsByTable));
     }
     if (!defer) return { value, cache: false };
     cacheCounters.cacheEntries.add(entry.key);
