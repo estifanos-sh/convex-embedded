@@ -716,4 +716,67 @@ mod tests {
         );
         close_handle(handle).expect("store should close");
     }
+
+    #[test]
+    fn the_storage_worker_folds_the_wal_after_idle_and_keeps_committed_rows() {
+        let path = storage::testkit::tmp_path("mobile-idle-checkpoint.db");
+        let path_string = path.to_string_lossy().into_owned();
+        let handle = host::open_with_idle(
+            path_string.clone(),
+            None,
+            None,
+            std::time::Duration::from_millis(100),
+        )
+        .expect("store should open");
+        let schema = serde_json::json!([{
+            "tables": [{
+                "name": "issues",
+                "placement": "replicated",
+                "columns": [{"name": "status", "field": "status"}],
+                "crdtFields": [],
+                "localFields": [],
+                "indexes": [{"name": "by_status", "fields": ["status"], "columns": ["status"]}],
+            }],
+        }]);
+        assert!(response(&request_bytes(handle, &request("setup", &schema, vec![]))).ok);
+        for index in 0..40 {
+            let commit = serde_json::json!([{
+                "docWrites": [{
+                    "table": "issues",
+                    "id": format!("issues|{index:03}"),
+                    "data": format!("{{\"status\":\"open-{index}\"}}"),
+                    "cols": [{"name": "status", "text": "open"}],
+                    "creationTime": f64::from(index),
+                }],
+                "deletes": [],
+                "freshIds": [{"table": "issues", "id": format!("issues|{index:03}")}],
+                "dataOnlyIds": [],
+            }, {"source": "local", "includeChanges": false}]);
+            assert!(response(&request_bytes(handle, &request("commit", &commit, vec![]))).ok);
+        }
+        let wal = format!("{path_string}-wal");
+        let before = std::fs::metadata(&wal).map_or(0, |meta| meta.len());
+        assert!(before > 0, "the commits should have grown the WAL");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let after = std::fs::metadata(&wal).map_or(0, |meta| meta.len());
+        assert!(
+            after < before,
+            "the idle worker must fold the WAL ({before} -> {after})"
+        );
+        let read = request_bytes(
+            handle,
+            &request(
+                "docRead",
+                &serde_json::json!(["issues", "issues|000"]),
+                vec![],
+            ),
+        );
+        assert!(
+            read.windows(6).any(|window| window == b"open-0"),
+            "a committed row must survive the idle checkpoint"
+        );
+        close_handle(handle).expect("store should close");
+    }
 }

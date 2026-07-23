@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Mutex, MutexGuard, OnceLock, PoisonError,
     },
+    time::Duration,
 };
 
 use storage::{EmbeddedStore, StorageError};
@@ -11,6 +12,11 @@ use storage::{EmbeddedStore, StorageError};
 use crate::{BridgeError, BridgeResult};
 
 pub(crate) type Job = Box<dyn FnOnce(&EmbeddedStore) + Send>;
+
+/// Idle gap after the storage worker drains its last job before it folds the WAL back into the main
+/// database, so every session leaves a bounded WAL for the next cold open. Re-armed only by new
+/// work, so a quiescent store performs no periodic wakeups.
+const WAL_CHECKPOINT_IDLE: Duration = Duration::from_secs(5);
 
 pub(crate) struct StoreHost {
     store: Arc<EmbeddedStore>,
@@ -24,6 +30,7 @@ impl StoreHost {
         path: String,
         selector_key: String,
         default_identity_key: String,
+        idle: Duration,
     ) -> BridgeResult<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
@@ -44,8 +51,26 @@ impl StoreHost {
                 if ready_tx.send(Ok(store.clone())).is_err() {
                     return;
                 }
-                while let Ok(job) = jobs_rx.recv() {
-                    job(&store);
+                let mut checkpoint_armed = false;
+                loop {
+                    let received = if checkpoint_armed {
+                        jobs_rx.recv_timeout(idle)
+                    } else {
+                        jobs_rx
+                            .recv()
+                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    };
+                    match received {
+                        Ok(job) => {
+                            job(&store);
+                            checkpoint_armed = true;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            store.wal_write().ok();
+                            checkpoint_armed = false;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             })
             .map_err(|error| {
@@ -165,7 +190,12 @@ impl StoreHost {
 
     fn close(&self) -> BridgeResult<()> {
         let remote_result = self.remote_close();
-        lock(&self.jobs).take();
+        if let Some(jobs) = lock(&self.jobs).take() {
+            jobs.send(Box::new(|store| {
+                store.wal_write().ok();
+            }))
+            .ok();
+        }
         if let Some(thread) = lock(&self.thread).take() {
             thread
                 .join()
@@ -187,9 +217,23 @@ pub(crate) fn open(
     selector_key: Option<String>,
     default_identity_key: Option<String>,
 ) -> BridgeResult<u64> {
+    open_with_idle(path, selector_key, default_identity_key, WAL_CHECKPOINT_IDLE)
+}
+
+pub(crate) fn open_with_idle(
+    path: String,
+    selector_key: Option<String>,
+    default_identity_key: Option<String>,
+    idle: Duration,
+) -> BridgeResult<u64> {
     let selector_key = selector_key.unwrap_or_default();
     let default_identity_key = default_identity_key.unwrap_or_else(|| selector_key.clone());
-    let host = Arc::new(StoreHost::open(path, selector_key, default_identity_key)?);
+    let host = Arc::new(StoreHost::open(
+        path,
+        selector_key,
+        default_identity_key,
+        idle,
+    )?);
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     if handle == 0 {
         return Err(BridgeError::Host(

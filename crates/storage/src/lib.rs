@@ -34,6 +34,18 @@ pub mod types;
 #[doc(hidden)]
 pub mod testkit;
 
+/// Emit one cold-open phase duration to the iOS unified log for on-device boot profiling. Compiled
+/// into the iOS build only; a no-op on every other target so tests, wasm, and node stay silent.
+#[cfg(target_os = "ios")]
+#[inline]
+pub(crate) fn log_open_phase(phase: &str, start: std::time::Instant) {
+    eprintln!("cem.open {phase}={}us", start.elapsed().as_micros());
+}
+
+#[cfg(not(target_os = "ios"))]
+#[inline]
+pub(crate) fn log_open_phase(_phase: &str, _start: std::time::Instant) {}
+
 pub use error::StorageError;
 pub use sql::{DEFAULT_READ_PAGE, READ_CAP};
 pub use store::EmbeddedStore;

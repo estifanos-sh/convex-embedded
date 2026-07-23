@@ -1,5 +1,6 @@
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
@@ -189,13 +190,14 @@ impl EmbeddedStore {
         selector_key: &str,
         default_identity_key: &str,
     ) -> Result<Self, StorageError> {
+        let opened = Instant::now();
         let mut store = Self::open_with_identity_key(path, default_identity_key)?;
         selector_key.clone_into(&mut store.selector_key);
-        if store
-            .read_tables()?
-            .iter()
-            .any(|table| table == sql::META_TABLE)
-        {
+        let listed = Instant::now();
+        let tables = store.read_tables()?;
+        crate::log_open_phase("read_tables", listed);
+        let cached = Instant::now();
+        if tables.iter().any(|table| table == sql::META_TABLE) {
             if let Some(state) =
                 store.read_meta_for_identity_unlocked(selector_key, IDENTITY_STATE_META)?
             {
@@ -208,6 +210,8 @@ impl EmbeddedStore {
                 store.identity_write(&identity_key, identity_json.as_deref())?;
             }
         }
+        crate::log_open_phase("cached_identity", cached);
+        crate::log_open_phase("open_total", opened);
         Ok(store)
     }
 
@@ -269,6 +273,13 @@ impl EmbeddedStore {
     }
 
     pub fn setup(&self, schema: &StoreSchema) -> Result<(), StorageError> {
+        let started = Instant::now();
+        let result = self.setup_inner(schema);
+        crate::log_open_phase("setup", started);
+        result
+    }
+
+    fn setup_inner(&self, schema: &StoreSchema) -> Result<(), StorageError> {
         validate_store_schema(schema)?;
         let current_signature = schema_signature(schema);
         let schema_manifest = serde_json::to_string(schema)

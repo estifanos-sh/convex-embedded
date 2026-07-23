@@ -4,7 +4,7 @@ use std::{
     num::NonZeroUsize,
     ops::ControlFlow,
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustc_hash::FxHashMap;
@@ -64,9 +64,15 @@ impl TursoDriver {
     /// build surfaces its corruption here — where the opener can reset it — rather than escaping
     /// later from schema setup.
     fn open_tuned(path: &str, io: Arc<dyn IO>) -> Result<Self, StorageError> {
+        let opened = Instant::now();
         let driver = Self::open_with_io(path, io)?;
+        crate::log_open_phase("db_open", opened);
+        let tuned = Instant::now();
         driver.tune()?;
+        crate::log_open_phase("pragmas", tuned);
+        let probed = Instant::now();
         driver.run_rows(sql::READ_USER_VERSION, Vec::new(), |_| Ok(()))?;
+        crate::log_open_phase("first_read", probed);
         Ok(driver)
     }
 
