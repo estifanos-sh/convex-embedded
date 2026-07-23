@@ -1,6 +1,9 @@
 import type { JSONValue } from "convex/values";
 import type { ResultEntry, RuntimeStorageReader } from "../storage/types";
+import { canonicalJson } from "../hash";
+import { pointerPart } from "../id/path";
 import { fromJson } from "./codec";
+import { tableFromId } from "./doc";
 
 /**
  * One entry in a retained result's `resultRows`: the RFC-6901 pointer into the skeleton, the row's
@@ -117,38 +120,153 @@ export function splicePointer(root: unknown, pointer: string, value: unknown): u
 }
 
 /**
- * Read-authority accumulator for a local watch evaluation (Cut 7 §4.1/§4.5). Any read that steps
- * outside the watch's own authoritative disclosure sets `foreign`; the read path then cache-serves.
- * Conservative: a full-table scan, a count, a search, a range that returns a non-member row, or a
- * point read that missed all mark foreign. Present authoritative point reads and index ranges over
- * only the watch's own members stay non-foreign so their local dirty edits remain visible.
+ * Read-authority accumulator for a local watch evaluation (Cut 7 §4.1/§4.5). It records the raw read
+ * signals; the watch's disclosure — the rows the retained entry captured — decides authority after
+ * the compute (a disclosure derived from an answer can never validate that answer). `foreign` is the
+ * unconditional part: a full-table scan, an unindexed range, a count, or a point read that missed with
+ * no resolvable id. A point read that missed a known local id records that id in {@link misses}; the
+ * read path clears it only when the disclosure names that id as a locally dirty-deleted member (so a
+ * dirty-deleted row keeps answering `null` locally instead of being resurrected by a cache-serve).
  *
  * @internal
  */
 export interface ReadAuthority {
   foreign: boolean;
-  readPoint(present: boolean): void;
-  readRange(ids: readonly string[], indexed: boolean): void;
+  readonly misses: ReadonlySet<string>;
+  readPoint(present: boolean, id?: string): void;
+  readRange(indexed: boolean): void;
   readCount(): void;
-  readSearch(): void;
 }
 
-/** Builds a {@link ReadAuthority} scoped to the watch's own authoritative member set. @internal */
-export function createReadAuthority(members: ReadonlySet<string>): ReadAuthority {
+/** Builds a fresh {@link ReadAuthority} for one watch evaluation. @internal */
+export function createReadAuthority(): ReadAuthority {
+  const misses = new Set<string>();
   const authority: ReadAuthority = {
     foreign: false,
-    readPoint(present) {
-      if (!present) authority.foreign = true;
+    misses,
+    readPoint(present, id) {
+      if (present) return;
+      if (id === undefined) authority.foreign = true;
+      else misses.add(id);
     },
-    readRange(ids, indexed) {
-      if (!indexed || ids.some((id) => !members.has(id))) authority.foreign = true;
+    readRange(indexed) {
+      if (!indexed) authority.foreign = true;
     },
     readCount() {
       authority.foreign = true;
     },
-    readSearch() {
-      authority.foreign = true;
-    },
   };
   return authority;
+}
+
+/**
+ * A retained entry's disclosure as local state (Cut 7 §4.2): the members it captured resolved to
+ * local ids, the subset that resolve to a locally dirty-deleted row, a count of members with no local
+ * twin (a device that cannot reproduce them), and clause C — whether every `_id`-bearing object in
+ * the decoded skeleton is covered by a member path (an uncovered one is a server projection this
+ * device cannot reconstruct).
+ *
+ * @internal
+ */
+export interface Disclosure {
+  members: Set<string>;
+  deletedMembers: Set<string>;
+  unmapped: number;
+  covered: boolean;
+}
+
+/** Reads an entry's {@link Disclosure} against local id state. @internal */
+export async function readDisclosure(
+  entry: ResultEntry,
+  store: RuntimeStorageReader,
+): Promise<Disclosure> {
+  const rows = decodePaths(entry.paths);
+  const members = new Set<string>();
+  const deletedMembers = new Set<string>();
+  let unmapped = 0;
+  const localByTable = new Map<string, Map<string, { localId: string; deleted: boolean }>>();
+  for (const row of rows) {
+    if (!localByTable.has(row.table)) {
+      const reverse = new Map<string, { localId: string; deleted: boolean }>();
+      for (const mapping of (await store.id?.page.read(row.table)) ?? []) {
+        const convexId =
+          mapping.mapping === "mapped" || mapping.mapping === "deleted"
+            ? mapping.convexId
+            : undefined;
+        if (convexId !== undefined) {
+          reverse.set(convexId, {
+            localId: mapping.localId,
+            deleted: mapping.mapping === "deleted",
+          });
+        }
+      }
+      localByTable.set(row.table, reverse);
+    }
+    const local = localByTable.get(row.table)?.get(row.rowId);
+    if (local === undefined) {
+      unmapped += 1;
+      continue;
+    }
+    members.add(local.localId);
+    if (local.deleted) deletedMembers.add(local.localId);
+  }
+  return { members, deletedMembers, unmapped, covered: coversSkeleton(entry, rows) };
+}
+
+/**
+ * Clause B (Cut 7 §4.5): does the watch's local output agree with its disclosure, both as local ids?
+ * The two directions share one predicate. Completeness — every disclosed member appears in the output,
+ * or is an optimistic row whose pending local edit moved it out of range (a dirty delete or a dirty
+ * field edit); an unmapped member can never appear, so any breaks agreement. Soundness — every output
+ * id is a disclosed member, a local-only row (no hosted mapping), or a row with a pending local edit; a
+ * clean mapped row the server did not disclose means the entry is stale and the watch must defer.
+ *
+ * @internal
+ */
+export async function outputAgrees(
+  disclosure: Disclosure,
+  outputIds: ReadonlySet<string>,
+  store: RuntimeStorageReader,
+): Promise<boolean> {
+  if (disclosure.unmapped > 0) return false;
+  for (const member of disclosure.members) {
+    if (!outputIds.has(member) && !(await isOptimisticRow(store, tableFromId(member), member))) {
+      return false;
+    }
+  }
+  for (const id of outputIds) {
+    if (disclosure.members.has(id)) continue;
+    if (!(await isOptimisticRow(store, tableFromId(id), id))) return false;
+  }
+  return true;
+}
+
+async function isOptimisticRow(
+  store: RuntimeStorageReader,
+  table: string,
+  id: string,
+): Promise<boolean> {
+  const mapping = await store.id?.read(table, id);
+  if (mapping === undefined || mapping.mapping === "local") return true;
+  const base = await store.doc.base?.read(table, id);
+  if (base === undefined) return true;
+  const current = await store.doc.read(table, id);
+  return canonicalJson(current ?? null) !== canonicalJson(base);
+}
+
+function coversSkeleton(entry: ResultEntry, rows: ResultRow[]): boolean {
+  const covered = new Set(rows.map((row) => row.path));
+  return !uncoveredId(decodeSkeleton(entry.skeleton), "", covered);
+}
+
+function uncoveredId(value: unknown, pointer: string, covered: ReadonlySet<string>): boolean {
+  if (value === null || typeof value !== "object" || value instanceof ArrayBuffer) return false;
+  if (Array.isArray(value)) {
+    return value.some((child, index) => uncoveredId(child, `${pointer}/${index}`, covered));
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record._id === "string") return !covered.has(pointer);
+  return Object.entries(record).some(([key, child]) =>
+    uncoveredId(child, `${pointer}/${pointerPart(key)}`, covered),
+  );
 }

@@ -277,7 +277,7 @@ export function createReader<DM extends GenericDataModel>(
       const readPoint = async (localId: string): Promise<Doc<DM, T> | null> => {
         tracker?.doc?.(localId);
         const stored = await store.doc.read(table, localId);
-        tracker?.authority?.readPoint(stored !== undefined && stored !== null);
+        tracker?.authority?.readPoint(stored !== undefined && stored !== null, localId);
         const version = stored ? ((await store.doc.version.read(table, localId)) ?? 0) : 0;
         tracker?.point?.({
           table,

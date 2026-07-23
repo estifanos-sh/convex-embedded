@@ -84,6 +84,16 @@ const functions = {
       return rows.map((row) => ({ _id: row._id, channel: row.channel, title: row.title }));
     },
   }),
+  // A whole-document filtered list: rows are captured verbatim, so the entry is member-based and the
+  // authority reaches clause B (the projected `list` above defers at clause C first).
+  docs: query({
+    args: { channel: v.string() },
+    handler: async (ctx, { channel }) =>
+      await ctx.db
+        .query("messages")
+        .withIndex("by_channel", (q) => q.eq("channel", channel))
+        .collect(),
+  }),
   byId: query({
     args: { id: v.string() },
     handler: async (ctx, { id }) => ctx.db.get("messages", id as never),
@@ -122,6 +132,7 @@ class CacheStore implements RuntimeStorage {
   readonly ids = new Map<string, IdMapping>();
   readonly results = new Map<string, ResultEntry>();
   scope: RemoteScope | undefined;
+  resultReads = 0;
 
   constructor(private readonly withRemote = true) {}
 
@@ -208,7 +219,10 @@ class CacheStore implements RuntimeStorage {
   };
 
   readonly result = {
-    read: (key: string): Promise<ResultEntry | undefined> => Promise.resolve(this.results.get(key)),
+    read: (key: string): Promise<ResultEntry | undefined> => {
+      this.resultReads += 1;
+      return Promise.resolve(this.results.get(key));
+    },
     write: (entry: ResultEntry): Promise<boolean> => {
       this.results.set(entry.key, entry);
       return Promise.resolve(true);
@@ -518,6 +532,292 @@ describe("retained-result cache read path", () => {
     off();
   });
 
+  test("a projection entry serves over a non-foreign local compute on a cold store", async () => {
+    const store = new CacheStore();
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    expect(await nextUpdate(updates, 0)).toEqual([]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    // A server-authoritative projection: the skeleton still carries the row (a HOSTED id the server
+    // sends, never a local twin) and captures no member path, so clause C defers to the entry.
+    const rows = [{ _id: "hostedS1", channel: "live", title: "server" }];
+    await store.result.write(makeEntry(key, rows));
+    pullResultSkeleton(r, [key]);
+
+    expect(await nextUpdate(updates, 1)).toEqual(rows);
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { foreignEvaluations?: number; cacheServes?: number };
+    };
+    expect(snapshot.runtime.foreignEvaluations).toBe(0);
+    expect(snapshot.runtime.cacheServes).toBe(1);
+    off();
+  });
+
+  test("a projection entry is served even when a local row shares its id", async () => {
+    const store = new CacheStore();
+    const id = localId("messages", "l1");
+    store.seedDoc(
+      { _id: id, _creationTime: 1, channel: "live", title: "local" } as StoredDoc,
+      "hostedL1",
+    );
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    expect(await nextUpdate(updates, 0)).toEqual([{ _id: id, channel: "live", title: "local" }]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    const rows = [{ _id: id, channel: "live", title: "server" }];
+    await store.result.write(makeEntry(key, rows));
+    pullResultSkeleton(r, [key]);
+
+    expect(await nextUpdate(updates, 1)).toEqual(rows);
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { foreignEvaluations?: number; cacheServes?: number };
+    };
+    // The disclosure never validates its own answer, so the local compute is no longer spuriously
+    // foreign; clause C alone drives the deferral to the projection entry.
+    expect(snapshot.runtime.foreignEvaluations).toBe(0);
+    expect(snapshot.runtime.cacheServes).toBe(1);
+    off();
+  });
+
+  test("a member-based entry never displaces the local compute of a non-foreign evaluation", async () => {
+    const store = new CacheStore();
+    const id = localId("messages", "l2");
+    store.seedDoc(
+      { _id: id, _creationTime: 1, channel: "live", title: "local", body: "hidden" } as StoredDoc,
+      "hostedL2",
+    );
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    expect(await nextUpdate(updates, 0)).toEqual([{ _id: id, channel: "live", title: "local" }]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    await store.result.write(
+      makeEntry(key, [null], [{ path: "/0", table: "messages", rowId: "hostedL2" }]),
+    );
+    pullResultSkeleton(r, [key]);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(updates.length).toBe(1);
+    const reads = store.resultReads;
+
+    store.docs.set(id, {
+      _id: id,
+      _creationTime: 1,
+      channel: "live",
+      title: "edited",
+      body: "hidden",
+    } as StoredDoc);
+    r.invalidate(["messages"], "local");
+    expect(await nextUpdate(updates, 1)).toEqual([{ _id: id, channel: "live", title: "edited" }]);
+    expect(store.resultReads).toBe(reads);
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { cacheServes?: number };
+    };
+    expect(snapshot.runtime.cacheServes).toBe(0);
+    off();
+  });
+
+  test("a genuinely-empty list answers [] locally and a local create appears at once", async () => {
+    const store = new CacheStore();
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    expect(await nextUpdate(updates, 0)).toEqual([]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    // The server confirms the list is genuinely empty: an empty skeleton with no captured rows. The
+    // new rule serves this from the local compute, never the entry, so optimistic state is not masked.
+    await store.result.write(makeEntry(key, []));
+    pullResultSkeleton(r, [key]);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(updates.length).toBe(1);
+    expect(updates[0]).toEqual([]);
+
+    // A purely local create (no hosted mapping) appears immediately, with no server round-trip.
+    const created = localId("messages", "fresh");
+    store.docs.set(created, {
+      _id: created,
+      _creationTime: 2,
+      channel: "live",
+      title: "fresh",
+    } as StoredDoc);
+    r.invalidate(["messages"], "local");
+    expect(await nextUpdate(updates, 1)).toEqual([
+      { _id: created, channel: "live", title: "fresh" },
+    ]);
+
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { cacheServes?: number };
+    };
+    expect(snapshot.runtime.cacheServes).toBe(0);
+    off();
+  });
+
+  test("a projection watch defers to the entry on a cold store", async () => {
+    const store = new CacheStore();
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    // A cold store computes an empty indexed range. The old rule read that as "fully covered" and
+    // served [] forever; the new rule sees the uncovered projected rows and defers to the entry.
+    expect(await nextUpdate(updates, 0)).toEqual([]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    const projected = [
+      { _id: "hostedP2a", channel: "live", title: "one" },
+      { _id: "hostedP2b", channel: "live", title: "two" },
+    ];
+    await store.result.write(makeEntry(key, projected));
+    pullResultSkeleton(r, [key]);
+
+    expect(await nextUpdate(updates, 1)).toEqual(projected);
+    off();
+  });
+
+  test("a projection watch that served a local compute still serves the newer entry", async () => {
+    const store = new CacheStore();
+    const seeded = localId("messages", "self");
+    store.seedDoc(
+      { _id: seeded, _creationTime: 1, channel: "live", title: "stale-local" } as StoredDoc,
+      "hostedSelf",
+    );
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:list", { channel: "live" }, (value) => updates.push(value));
+
+    // First answer is the local compute (no entry yet). Under the old circular rule this output became
+    // the watch's own member set and it self-certified forever; the newer entry never showed.
+    expect(await nextUpdate(updates, 0)).toEqual([
+      { _id: seeded, channel: "live", title: "stale-local" },
+    ]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    const projected = [{ _id: "hostedSelf", channel: "live", title: "server-fresh" }];
+    await store.result.write(makeEntry(key, projected));
+    pullResultSkeleton(r, [key]);
+
+    expect(await nextUpdate(updates, 1)).toEqual(projected);
+    off();
+  });
+
+  test("a local delete of a disclosed member is not resurrected by a cache-serve", async () => {
+    const store = new CacheStore();
+    const id = localId("messages", "d4");
+    store.seedDoc(
+      { _id: id, _creationTime: 1, channel: "live", title: "present" } as StoredDoc,
+      "hostedD4",
+    );
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:byId", { id: "hostedD4" }, (value) => updates.push(value));
+
+    const first = (await nextUpdate(updates, 0)) as StoredDoc;
+    expect(first._id).toBe(id);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    // The server discloses this row as the whole-document member (root skeleton null).
+    await store.result.write(
+      makeEntry(key, null, [{ path: "", table: "messages", rowId: "hostedD4" }]),
+    );
+    pullResultSkeleton(r, [key]);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    // A local dirty-delete makes the point read miss. The entry still discloses the member and its
+    // retained base could resurrect it — the deleted-member exemption keeps the local null authoritative.
+    store.dirtyDelete(
+      id,
+      { _id: id, _creationTime: 1, channel: "live", title: "present" } as StoredDoc,
+      "hostedD4",
+    );
+    r.invalidate(["messages"], "local");
+    expect(await nextUpdate(updates, 1)).toBeNull();
+
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { cacheServes?: number };
+    };
+    expect(snapshot.runtime.cacheServes).toBe(0);
+    off();
+  });
+
+  test("a dirty-edited member that moved out of range drops locally without deferring", async () => {
+    const store = new CacheStore();
+    const id = localId("messages", "mv");
+    store.seedDoc(
+      { _id: id, _creationTime: 1, channel: "live", title: "here" } as StoredDoc,
+      "hostedMv",
+    );
+    const r = runner(store);
+    const updates: unknown[] = [];
+    const off = r.onUpdate("cache:docs", { channel: "live" }, (value) => updates.push(value));
+
+    const first = (await nextUpdate(updates, 0)) as StoredDoc[];
+    expect(first.map((row) => row._id)).toEqual([id]);
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+
+    // The server discloses the row as a member of the "live" list (covered, non-empty paths).
+    await store.result.write(
+      makeEntry(key, [null], [{ path: "/0", table: "messages", rowId: "hostedMv" }]),
+    );
+
+    // A pending local edit moves the row OUT of the "live" filter before the entry is ever read: the
+    // last accepted base still says "live", the optimistic current says "other". Completeness must
+    // exempt this dirty member exactly as soundness exempts a dirty member that moved into range, so
+    // the watch serves the local list WITHOUT the row instead of deferring to the stale entry.
+    store.bases.set(id, { _id: id, _creationTime: 1, channel: "live", title: "here" } as StoredDoc);
+    store.docs.set(id, { _id: id, _creationTime: 1, channel: "other", title: "here" } as StoredDoc);
+    pullResultSkeleton(r, [key]);
+
+    const moved = (await nextUpdate(updates, 1)) as StoredDoc[];
+    expect(moved.map((row) => row._id)).toEqual([]);
+    const snapshot = (await r.devtools({ kind: "snapshot" })) as {
+      runtime: { cacheServes?: number };
+    };
+    expect(snapshot.runtime.cacheServes).toBe(0);
+    off();
+  });
+
+  test("stopping one of two watches that share a result key leaves the entry for the survivor", async () => {
+    const store = new CacheStore();
+    const id = localId("messages", "shared");
+    store.seedDoc(
+      { _id: id, _creationTime: 1, channel: "live", title: "shared" } as StoredDoc,
+      "hostedShared",
+    );
+    const r = runner(store);
+    const hosted = r.onUpdate("cache:point", { id: "hostedShared" }, () => {});
+    const local = r.onUpdate("cache:point", { id }, () => {});
+    await waitFor(() => store.scope !== undefined, "scope not published");
+    expect(store.scope!.subscriptions.length).toBe(1);
+    const key = store.scope!.subscriptions[0]!.resultCacheKey;
+    await store.result.write(
+      makeEntry(key, null, [{ path: "", table: "messages", rowId: "hostedShared" }]),
+    );
+
+    hosted();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(store.results.has(key)).toBe(true);
+
+    local();
+    await waitFor(() => !store.results.has(key), "the last watch never dropped the shared entry");
+  });
+
   test("the native result binding round-trips an Int64/Bytes skeleton (S3 FFI)", async () => {
     const store = await NativeStore.openWith(
       nativeModule().Store,
@@ -655,12 +955,12 @@ describe("retained-result cache read path", () => {
       const points: string[] = [];
       const authority: ReadAuthority = {
         foreign: false,
+        misses: new Set<string>(),
         readPoint(present) {
           if (!present) authority.foreign = true;
         },
         readRange() {},
         readCount() {},
-        readSearch() {},
       };
       return {
         authority,

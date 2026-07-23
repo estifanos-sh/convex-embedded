@@ -626,10 +626,7 @@ export class QueryBuilder<
         resumeAfterKey: cursor === undefined ? resumeAfterKey : undefined,
       });
       for (const doc of page.docs) this.tracker?.doc?.(doc._id);
-      this.tracker?.authority?.readRange(
-        page.docs.map((doc) => doc._id),
-        this.indexName !== undefined,
-      );
+      this.tracker?.authority?.readRange(this.indexName !== undefined);
       await this.captureRange(bounds, page.docs, page.versions);
       const docs = this.deviceDocs(page.docs, page.deviceFields);
       if (docs.length) yield docs;
@@ -654,10 +651,7 @@ export class QueryBuilder<
         pageSize: limit,
       });
       for (const doc of page.docs) this.tracker?.doc?.(doc._id);
-      this.tracker?.authority?.readRange(
-        page.docs.map((doc) => doc._id),
-        this.indexName !== undefined,
-      );
+      this.tracker?.authority?.readRange(this.indexName !== undefined);
       await this.captureRange(bounds, page.docs, page.versions);
       return this.deviceDocs(page.docs, page.deviceFields);
     }
@@ -675,10 +669,7 @@ export class QueryBuilder<
         cursor,
       });
       for (const doc of page.docs) this.tracker?.doc?.(doc._id);
-      this.tracker?.authority?.readRange(
-        page.docs.map((doc) => doc._id),
-        this.indexName !== undefined,
-      );
+      this.tracker?.authority?.readRange(this.indexName !== undefined);
       await this.captureRange(bounds, page.docs, page.versions);
       docs.push(...this.deviceDocs(page.docs, page.deviceFields));
       cursor = page.cursor ?? undefined;

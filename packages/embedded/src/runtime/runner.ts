@@ -54,7 +54,13 @@ import {
   normalizeCopy,
 } from "./codec";
 import { pageCursorBoundary } from "./query";
-import { createReadAuthority, reconstruct, type ReadAuthority } from "./cache";
+import {
+  createReadAuthority,
+  outputAgrees,
+  readDisclosure,
+  reconstruct,
+  type ReadAuthority,
+} from "./cache";
 import {
   createReader,
   createWriter,
@@ -1516,7 +1522,7 @@ export function createRunner(
           // so `foreign` stays false and the results table is never consulted.
           const authority: ReadAuthority | undefined =
             store.remote?.scope !== undefined && watcher.remoteScope()
-              ? createReadAuthority(watcher.docIds)
+              ? createReadAuthority()
               : undefined;
           try {
             const value = await runQuery(
@@ -1537,7 +1543,6 @@ export function createRunner(
             const changedDocIds = changedDocIdsForWatcher(watcher, notification);
             watcher.tables = tables;
             watcher.readDocIds = readDocIds;
-            watcher.docIds = collectVisibleDocIds(served.value);
             void publishRemoteScope();
             if (watcher.last?.kind !== "value" || !equals(watcher.last.value, served.value)) {
               watcher.last = { kind: "value", value: served.value };
@@ -1661,22 +1666,43 @@ export function createRunner(
     }
   };
 
-  // Cut 7 §4.2-4.6: a non-foreign eval serves its local compute (dirty edits visible); a foreign eval
-  // with a stored entry cache-serves the reconstruction (never local-computes a foreign result); a
-  // foreign eval with no entry falls back to local compute as initialization and marks a cache-miss.
+  // Cut 7 §4.2-4.6: the watch defers to its retained entry unless the local compute reproduced the
+  // server's answer — foreign = !(A && B && C). A: every read stayed inside the disclosure (no scan,
+  // count, unindexed range, or unexplained point miss). B: the local output agrees with the disclosed
+  // members. C: the entry's skeleton carries no server projection this device cannot reconstruct.
+  // Only a covered member-based entry may skip the lookup (its clause-C classification is stable per
+  // query+args); the skip is safe only when the reads left no ambiguity, so a point miss or a hard
+  // foreign forces the entry read even for a memoized watch. An unexplained foreign with no entry
+  // local-computes as initialization and marks a cache-miss.
   const serveWatch = async (
     watcher: Watcher,
     value: unknown,
     authority: ReadAuthority | undefined,
   ): Promise<{ value: unknown; cache: boolean }> => {
-    if (authority === undefined || !authority.foreign) return { value, cache: false };
-    cacheCounters.foreignEvaluations += 1;
+    if (authority === undefined) return { value, cache: false };
+    if (watcher.coveredMemo !== undefined && !authority.foreign && authority.misses.size === 0) {
+      return { value, cache: false };
+    }
     const key = (await subscriptionDescriptor(watcher))?.resultCacheKey;
     const entry = key === undefined ? undefined : await store.result?.read(key);
     if (!entry) {
-      cacheCounters.cacheMisses += 1;
+      if (authority.foreign || authority.misses.size > 0) {
+        cacheCounters.foreignEvaluations += 1;
+        cacheCounters.cacheMisses += 1;
+      }
       return { value, cache: false };
     }
+    const disclosure = await readDisclosure(entry, store);
+    const foreign =
+      authority.foreign || [...authority.misses].some((id) => !disclosure.deletedMembers.has(id));
+    if (foreign) cacheCounters.foreignEvaluations += 1;
+    watcher.coveredMemo =
+      disclosure.members.size > 0 && disclosure.covered ? entry.skeletonHash : undefined;
+    let defer = foreign || !disclosure.covered;
+    if (!defer) {
+      defer = !(await outputAgrees(disclosure, collectVisibleDocIds(value), store));
+    }
+    if (!defer) return { value, cache: false };
     cacheCounters.cacheEntries.add(entry.key);
     cacheCounters.cacheServes += 1;
     return { value: await reconstruct(entry, store), cache: true };
@@ -1904,7 +1930,7 @@ export function createRunner(
           dirty: false,
           missed: false,
           last: undefined,
-          docIds: new Set(),
+          coveredMemo: undefined,
           readDocIds: new Set(),
         };
         watchers.set(key, watcher);
@@ -1941,13 +1967,22 @@ export function createRunner(
   // restart orphan deletion (`result_stale_delete`) is the durable backstop for crashes and rotation.
   // Item-7 guard: a rapid resubscribe can mint a fresh same-key entry while this fire-and-forget
   // delete is still in flight; skip the delete unless the watcher is truly gone (`!watchers.has`).
+  // The watch key is over LOCAL args while the entry key is over HOSTED args, so distinct live
+  // watchers can share one entry; deleting it would strand the survivor on a permanent cache-miss.
   async function deleteWatchResult(watcher: Watcher): Promise<void> {
     if (store.remote?.scope === undefined || !watcher.remoteScope() || store.result === undefined) {
       return;
     }
     try {
       const key = (await subscriptionDescriptor(watcher))?.resultCacheKey;
-      if (key !== undefined && !watchers.has(watcher.key)) await store.result.delete(key);
+      if (key === undefined || watchers.has(watcher.key)) return;
+      const live = await Promise.all(
+        [...watchers.values()].map(async (other) =>
+          other.remoteScope() ? (await subscriptionDescriptor(other))?.resultCacheKey : undefined,
+        ),
+      );
+      if (live.includes(key)) return;
+      await store.result.delete(key);
     } catch {
       /* best-effort: restart deletion reclaims a stranded entry. */
     }
@@ -2296,7 +2331,14 @@ interface Watcher {
   /** A commit landed mid-run outside the in-flight read set; only matters if the run fails. */
   missed: boolean;
   last: { kind: "value"; value: unknown } | { kind: "error"; error: unknown } | undefined;
-  docIds: Set<string>;
+  /**
+   * Clause-C memo: the `skeletonHash` of the last entry this watch read that was a covered
+   * member-based disclosure. Set, it lets an unambiguously local eval (no foreign read, no point
+   * miss) serve the local compute without re-reading the entry; it never overrides the rule, since
+   * any foreign read or point miss forces the read regardless. `undefined` when unclassified or when
+   * the last entry was a projection or genuinely empty.
+   */
+  coveredMemo: string | undefined;
   readDocIds: Set<string>;
 }
 
