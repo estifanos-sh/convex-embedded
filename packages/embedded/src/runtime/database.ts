@@ -19,6 +19,7 @@ import { cloneTree, equals } from "./codec";
 import {
   assertFiniteDelta,
   assertIntentField,
+  assertTextBase,
   hasUnpairedSurrogate,
   isHighSurrogate,
   isLowSurrogate,
@@ -132,7 +133,7 @@ export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseRea
       table: T,
       id: Id<T>,
       field: string,
-      change: { delete: number; index: number; insert: string },
+      change: { delete: number; index: number; insert: string; base?: string },
     ): Promise<void>;
   };
   delete(id: Id<TableNamesInDataModel<DM>>): Promise<void>;
@@ -688,7 +689,7 @@ export function createWriter<DM extends GenericDataModel>(
         table: TableNamesInDataModel<DM>,
         id: Id<TableNamesInDataModel<DM>>,
         field: string,
-        change: { delete: number; index: number; insert: string },
+        change: { delete: number; index: number; insert: string; base?: string },
       ): Promise<void> {
         if (view === "device")
           throw new Error("Local functions cannot write replicated CRDT fields.");
@@ -697,6 +698,7 @@ export function createWriter<DM extends GenericDataModel>(
         assertCrdtField(def, field, "text");
         const current = await read(id);
         const source = validateTextSplice(table, id, field, current, change);
+        await assertTextBase(table, field, source, change.base);
         const end = change.index + change.delete;
         const next = source.slice(0, change.index) + change.insert + source.slice(end);
         stage(def, id, dataOf(withValueAtPath(current!, field, next)), current!._creationTime, {

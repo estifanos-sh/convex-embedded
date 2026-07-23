@@ -47,6 +47,8 @@ import { NativeStore } from "../../src/node/native";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
 import { e } from "../../src/values";
+import { base as textBase } from "../../src/text";
+import { createTextField } from "../../src/text/field";
 import { nativeModule } from "../testkit/native";
 
 const appSchema = defineSchema({
@@ -1365,6 +1367,231 @@ describe("runtime", () => {
       "replace cannot write embedded CRDT fields on docs",
     );
   });
+
+  test("text.splice enforces an optional whole-base fingerprint", { timeout: 30_000 }, async () => {
+    const crdtSchema = defineSchema({
+      docs: defineTable({ body: e.text(), title: v.string() }),
+    });
+    type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
+    const { mutation: crdtMutation, query: crdtQuery } =
+      defineFunctions<CrdtDataModel>().replicated;
+    const docs = {
+      seed: crdtMutation({
+        args: {},
+        handler: (ctx) => ctx.db.insert("docs", { body: "hello", title: "t" }),
+      }),
+      splice: crdtMutation({
+        args: { id: v.id("docs"), base: v.optional(v.string()) },
+        handler: (ctx, args) =>
+          ctx.db.text.splice("docs", args.id, "body", {
+            delete: 0,
+            index: 5,
+            insert: " world",
+            base: args.base,
+          }),
+      }),
+      get: crdtQuery({ args: { id: v.id("docs") }, handler: (ctx, args) => ctx.db.get(args.id) }),
+    };
+    const storeSchema = toStoreSchema(crdtSchema);
+    const store = await NativeStore.openWith(nativeModule().Store, tmp("rt_text_base.db"));
+    await store.setup(storeSchema);
+    const r = createRunner({ docs }, store, storeSchema);
+
+    const id = (await r.runMutation("docs:seed", {})) as string;
+    await expect(
+      r.runMutation("docs:splice", { id, base: await textBase("goodbye") }),
+    ).rejects.toThrow(/docs\.body changed since this edit was computed/);
+    expect(await r.runQuery("docs:get", { id })).toMatchObject({ body: "hello" });
+
+    await r.runMutation("docs:splice", { id, base: await textBase("hello") });
+    expect(await r.runQuery("docs:get", { id })).toMatchObject({ body: "hello world" });
+
+    await r.runMutation("docs:splice", { id });
+    expect(await r.runQuery("docs:get", { id })).toMatchObject({ body: "hello world world" });
+  });
+
+  test(
+    "createTextField's clean write carries the materialized body's base and never false-rejects",
+    { timeout: 30_000 },
+    async () => {
+      const crdtSchema = defineSchema({
+        docs: defineTable({ body: e.text(), title: v.string() }),
+      });
+      type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
+      const { mutation: crdtMutation, query: crdtQuery } =
+        defineFunctions<CrdtDataModel>().replicated;
+      const docs = {
+        seed: crdtMutation({
+          args: { body: v.string() },
+          handler: (ctx, args) => ctx.db.insert("docs", { body: args.body, title: "t" }),
+        }),
+        write: crdtMutation({
+          args: {
+            id: v.id("docs"),
+            title: v.optional(v.string()),
+            splices: v.array(
+              v.object({
+                base: v.optional(v.string()),
+                delete: v.number(),
+                index: v.number(),
+                insert: v.string(),
+              }),
+            ),
+          },
+          handler: async (ctx, args) => {
+            for (const s of args.splices) {
+              await ctx.db.text.splice("docs", args.id, "body", {
+                delete: s.delete,
+                index: s.index,
+                insert: s.insert,
+                base: s.base,
+              });
+            }
+            if (args.title !== undefined) await ctx.db.patch(args.id, { title: args.title });
+            const doc = await ctx.db.get(args.id);
+            if (!doc) throw new Error("document not found");
+            return doc;
+          },
+        }),
+        get: crdtQuery({ args: { id: v.id("docs") }, handler: (ctx, args) => ctx.db.get(args.id) }),
+      };
+      const storeSchema = toStoreSchema(crdtSchema);
+      const store = await NativeStore.openWith(nativeModule().Store, tmp("rt_text_field_clean.db"));
+      await store.setup(storeSchema);
+      const r = createRunner({ docs }, store, storeSchema);
+
+      const seeded = "hello world";
+      const id = (await r.runMutation("docs:seed", { body: seeded })) as string;
+      const readBody = async () =>
+        ((await r.runQuery("docs:get", { id })) as { body: string }).body;
+
+      let materialized = await readBody();
+      expect(materialized).toBe(seeded);
+      expect(await textBase(materialized)).toBe(await textBase(seeded));
+
+      let writes = 0;
+      const field = createTextField<{ body: string; title: string }>({
+        read: () => materialized,
+        write: async (splice, base) => {
+          writes += 1;
+          const doc = (await r.runMutation("docs:write", {
+            id,
+            splices: [{ ...splice, base }],
+          })) as { body: string; title: string };
+          materialized = await readBody();
+          return doc;
+        },
+        extract: (result) => result.body,
+        delayMs: 1,
+        maxLatencyMs: 4,
+      });
+
+      const desired = "hello brave world";
+      field.queue(desired);
+      field.flush();
+      await field.settle();
+
+      expect(writes).toBe(1);
+      expect(field.isDirty).toBe(false);
+      expect(await readBody()).toBe(desired);
+      field.close();
+    },
+  );
+
+  test(
+    "createTextField rebases once when the store diverges under a pending write",
+    { timeout: 30_000 },
+    async () => {
+      const crdtSchema = defineSchema({
+        docs: defineTable({ body: e.text(), title: v.string() }),
+      });
+      type CrdtDataModel = DataModelFromSchemaDefinition<typeof crdtSchema>;
+      const { mutation: crdtMutation, query: crdtQuery } =
+        defineFunctions<CrdtDataModel>().replicated;
+      const docs = {
+        seed: crdtMutation({
+          args: { body: v.string() },
+          handler: (ctx, args) => ctx.db.insert("docs", { body: args.body, title: "t" }),
+        }),
+        write: crdtMutation({
+          args: {
+            id: v.id("docs"),
+            splices: v.array(
+              v.object({
+                base: v.optional(v.string()),
+                delete: v.number(),
+                index: v.number(),
+                insert: v.string(),
+              }),
+            ),
+          },
+          handler: async (ctx, args) => {
+            for (const s of args.splices) {
+              await ctx.db.text.splice("docs", args.id, "body", {
+                delete: s.delete,
+                index: s.index,
+                insert: s.insert,
+                base: s.base,
+              });
+            }
+            const doc = await ctx.db.get(args.id);
+            if (!doc) throw new Error("document not found");
+            return doc;
+          },
+        }),
+        get: crdtQuery({ args: { id: v.id("docs") }, handler: (ctx, args) => ctx.db.get(args.id) }),
+      };
+      const storeSchema = toStoreSchema(crdtSchema);
+      const store = await NativeStore.openWith(
+        nativeModule().Store,
+        tmp("rt_text_field_rebase.db"),
+      );
+      await store.setup(storeSchema);
+      const r = createRunner({ docs }, store, storeSchema);
+
+      const seeded = "hello world";
+      const id = (await r.runMutation("docs:seed", { body: seeded })) as string;
+      const readBody = async () =>
+        ((await r.runQuery("docs:get", { id })) as { body: string }).body;
+
+      let materialized = await readBody();
+      let writes = 0;
+      let injected = false;
+      const field = createTextField<{ body: string; title: string }>({
+        read: () => materialized,
+        write: async (splice, base) => {
+          writes += 1;
+          if (!injected) {
+            injected = true;
+            await r.runMutation("docs:write", {
+              id,
+              splices: [{ delete: 0, index: seeded.length, insert: "!" }],
+            });
+            materialized = await readBody();
+          }
+          const doc = (await r.runMutation("docs:write", {
+            id,
+            splices: [{ ...splice, base }],
+          })) as { body: string; title: string };
+          materialized = await readBody();
+          return doc;
+        },
+        extract: (result) => result.body,
+        delayMs: 1,
+        maxLatencyMs: 4,
+      });
+
+      const desired = "hello brave world";
+      field.queue(desired);
+      field.flush();
+      await field.settle();
+
+      expect(writes).toBe(2);
+      expect(field.isDirty).toBe(false);
+      expect(await readBody()).toBe(desired);
+      field.close();
+    },
+  );
 
   test(
     "count.add enforces finite deltas, results, and a zero no-op",

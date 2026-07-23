@@ -1,4 +1,7 @@
+import { hashValue } from "../hash";
 import type { EmbeddedCrdtKind } from "../meta";
+
+const STALE_TEXT_BASE_ERROR_NAME = "ConvexEmbeddedStaleTextBaseError";
 
 export function fieldValue(document: unknown, field: string): unknown {
   let cursor: unknown = document;
@@ -123,4 +126,48 @@ export function validateTextSplice(
     throw new Error("text.splice: insert is not valid Unicode (contains an unpaired surrogate)");
   }
   return source;
+}
+
+/** A positional {@link validateTextSplice} was computed against a value that has since changed. */
+export class StaleTextBaseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = STALE_TEXT_BASE_ERROR_NAME;
+  }
+}
+
+/**
+ * Whole-base precondition for a positional splice. `base` is the {@link hashValue} fingerprint of the
+ * entire pre-splice value the edit was computed against; an undefined `base` is the raw-primitive
+ * escape hatch that opts a caller out of the check.
+ */
+export async function assertTextBase(
+  table: string,
+  field: string,
+  source: string,
+  base: string | undefined,
+): Promise<void> {
+  if (base === undefined) return;
+  if ((await hashValue(source)) !== base) {
+    throw new StaleTextBaseError(
+      `text.splice: ${table}.${field} changed since this edit was computed; rebase and retry`,
+    );
+  }
+}
+
+/** True when `error` is a {@link StaleTextBaseError}, including one rehydrated across the wire. */
+export function isStaleTextBaseError(error: unknown): boolean {
+  return (
+    error instanceof StaleTextBaseError ||
+    (typeof error === "object" &&
+      error !== null &&
+      (error as { name?: unknown }).name === STALE_TEXT_BASE_ERROR_NAME)
+  );
+}
+
+/** True when `error` is the out-of-range failure {@link validateTextSplice} raises for a moved value. */
+export function isSpliceRangeError(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message.includes("change range is outside the current value")
+  );
 }

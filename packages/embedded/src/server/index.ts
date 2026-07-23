@@ -30,6 +30,7 @@ import { embeddedFieldMeta } from "../meta";
 import {
   assertFiniteDelta,
   assertIntentField,
+  assertTextBase,
   validateCountAdd,
   validateSetField,
   validateTextSplice,
@@ -220,7 +221,7 @@ type CrdtIntentWriter = {
       table: string,
       id: string,
       field: string,
-      change: { index: number; delete: number; insert: string },
+      change: { index: number; delete: number; insert: string; base?: string },
     ): Promise<void>;
   };
   count: {
@@ -2239,10 +2240,17 @@ class EffectCursor {
           table: string,
           id: string,
           field: string,
-          change: { delete: number; index: number; insert: string },
+          change: { delete: number; index: number; insert: string; base?: string },
         ) => {
           assertIntentField(table, field, "text", this.crdtFields.get(table)?.get(field));
-          validateTextSplice(table, id, field, await this.current(table, id), change);
+          const source = validateTextSplice(
+            table,
+            id,
+            field,
+            await this.current(table, id),
+            change,
+          );
+          await assertTextBase(table, field, source, change.base);
           await this.consume("text", table, id, field);
         },
       },

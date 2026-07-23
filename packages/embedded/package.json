@@ -123,6 +123,10 @@
       "types": "./dist/server.d.mts",
       "import": "./dist/server.mjs"
     },
+    "./internal/text": {
+      "types": "./dist/internal/text.d.mts",
+      "import": "./dist/internal/text.mjs"
+    },
     "./unplugin": {
       "types": "./dist/unplugin.d.mts",
       "import": "./dist/unplugin.mjs"
