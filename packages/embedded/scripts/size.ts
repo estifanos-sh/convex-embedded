@@ -4,6 +4,8 @@ import { dirname, join, relative, resolve } from "node:path";
 import { brotliCompressSync, constants, gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 
+import { sizeBrotliQuality } from "../../../config/build.ts";
+
 interface SizeEntry {
   brotli: number;
   gzip: number;
@@ -30,9 +32,9 @@ const writeJson = readArg("--out");
 const comparePath = readArg("--compare");
 const printJson = args.includes("--json");
 const includeCargo = !args.includes("--no-cargo");
-const brotliQuality = Number(
-  readArg("--brotli-quality") ?? process.env.CONVEX_EMBEDDED_SIZE_BROTLI_QUALITY ?? "1",
-);
+const brotliQualityArg = readArg("--brotli-quality");
+const brotliQuality =
+  brotliQualityArg === undefined ? sizeBrotliQuality() : Number(brotliQualityArg);
 
 const report = buildReport();
 if (writeJson) writeFileSync(writeJson, `${JSON.stringify(report, null, 2)}\n`);

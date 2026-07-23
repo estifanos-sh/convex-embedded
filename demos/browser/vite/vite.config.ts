@@ -11,7 +11,7 @@ import {
   embeddedCompatiblePriorRuntimes,
   embeddedGeneratedPath,
   requireDeploymentUrl,
-} from "../../deployment";
+} from "../../../config";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const convexDir = fileURLToPath(new URL("../../../convex", import.meta.url));

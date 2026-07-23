@@ -3,6 +3,9 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { benchDefaults } from "../../../config/bench.ts";
+import { benchSkipNativeBuild } from "../../../config/build.ts";
+
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
 const args = process.argv.slice(2);
@@ -201,7 +204,7 @@ if (args.includes("--scale-stress")) {
 if (args.includes("--scale")) {
   env.EMBEDDED_BENCH_SCALE = "1";
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (process.env.CONVEX_EMBEDDED_BENCH_SKIP_NATIVE_BUILD !== "1") {
+  if (!benchSkipNativeBuild()) {
     run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   }
   const result = spawnSync(
@@ -226,7 +229,7 @@ if (args.includes("--scale")) {
 
 if (usesNativeLayers(args)) {
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (process.env.CONVEX_EMBEDDED_BENCH_SKIP_NATIVE_BUILD !== "1") {
+  if (!benchSkipNativeBuild()) {
     run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   }
 }
@@ -258,7 +261,7 @@ function runNodeScaleMatrix(env: NodeJS.ProcessEnv, manual: boolean): void {
       ]
     : quickScaleCases(2_000, 300_000);
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (process.env.CONVEX_EMBEDDED_BENCH_SKIP_NATIVE_BUILD !== "1") {
+  if (!benchSkipNativeBuild()) {
     run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   }
   for (const entry of cases) {
@@ -268,7 +271,7 @@ function runNodeScaleMatrix(env: NodeJS.ProcessEnv, manual: boolean): void {
 
 function runNodeScaleGoalMatrix(env: NodeJS.ProcessEnv): void {
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (process.env.CONVEX_EMBEDDED_BENCH_SKIP_NATIVE_BUILD !== "1") {
+  if (!benchSkipNativeBuild()) {
     run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   }
   runAdaptiveScaleCases(env, goalScaleCases(5_000, 300_000), "scale");
@@ -276,7 +279,7 @@ function runNodeScaleGoalMatrix(env: NodeJS.ProcessEnv): void {
 
 function runNodeScaleStressMatrix(env: NodeJS.ProcessEnv, manual: boolean): void {
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (process.env.CONVEX_EMBEDDED_BENCH_SKIP_NATIVE_BUILD !== "1") {
+  if (!benchSkipNativeBuild()) {
     run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   }
   for (const entry of stressScaleCases(2_000, 300_000, manual)) {
@@ -448,11 +451,13 @@ function runScaleCase(
     out,
   ];
   if (mode === "metal-scale") {
-    args.push("--writes", String(entry.writes ?? 50));
+    args.push("--writes", String(entry.writes ?? benchDefaults.metal.writes));
   } else {
     args.push("--duration-ms", String(entry.durationMs));
   }
-  if (mode === "scale") args.push("--operations", String(entry.writes ?? 1_000));
+  if (mode === "scale") {
+    args.push("--operations", String(entry.writes ?? benchDefaults.node.scale.operations));
+  }
   if (entry.timeoutMs !== undefined) {
     args.push("--timeout-ms", String(entry.timeoutMs));
   }

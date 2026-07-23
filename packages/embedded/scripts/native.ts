@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { cargoTarget } from "./cargo.ts";
+import { cargoTargetDir } from "../../../config/build.ts";
 import { EMBEDDED_PROTOCOL_VERSION } from "../src/protocol.ts";
 import { EMBEDDED_STORAGE_ABI_VERSION } from "../src/abi.ts";
 
@@ -14,13 +14,13 @@ const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
 const require = createRequire(import.meta.url);
 const target = nativeTarget();
-const cargoTargetDir = cargoTarget(repoRoot);
+const targetDir = cargoTargetDir();
 const destinationDir = resolve(packageDir, "dist/native", target);
 const destination = resolve(destinationDir, "convex-embedded.node");
 
 execFileSync("cargo", ["build", "-p", "node", "--release", "--locked"], {
   cwd: repoRoot,
-  env: { ...process.env, CARGO_TARGET_DIR: cargoTargetDir },
+  env: { ...process.env, CARGO_TARGET_DIR: targetDir },
   stdio: "inherit",
 });
 const source = nativeSource();
@@ -52,12 +52,12 @@ function nativeSourceCandidates(): string[] {
         ? "release/node.dll"
         : "release/libnode.so";
   return [
-    resolve(cargoTargetDir, platformArtifact),
-    resolve(cargoTargetDir, "release/convex-embedded.node"),
-    resolve(cargoTargetDir, "release/node.node"),
-    resolve(cargoTargetDir, "release/libnode.dylib"),
-    resolve(cargoTargetDir, "release/libnode.so"),
-    resolve(cargoTargetDir, "release/node.dll"),
+    resolve(targetDir, platformArtifact),
+    resolve(targetDir, "release/convex-embedded.node"),
+    resolve(targetDir, "release/node.node"),
+    resolve(targetDir, "release/libnode.dylib"),
+    resolve(targetDir, "release/libnode.so"),
+    resolve(targetDir, "release/node.dll"),
   ];
 }
 

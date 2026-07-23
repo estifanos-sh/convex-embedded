@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { cargoTarget } from "./cargo.ts";
+import { cargoTargetDir, skipWasmOpt } from "../../../config/build.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
@@ -11,7 +11,7 @@ const artifact = resolve(packageDir, "dist/wasm/index.wasm");
 const debugArtifact = resolve(packageDir, "dist/wasm/index.debug.wasm");
 const generatedTypes = resolve(packageDir, "dist/wasm/index.d.ts");
 const manifest = resolve(repoRoot, "crates/node/Cargo.toml");
-const cargoTargetDir = cargoTarget(repoRoot);
+const targetDir = cargoTargetDir();
 const binName = (name: string) => (process.platform === "win32" ? `${name}.cmd` : name);
 const outputDir = resolve(packageDir, "dist/wasm");
 const rustc = execFileSync("rustup", ["which", "rustc"], {
@@ -55,7 +55,7 @@ execFileSync(
   ],
   {
     cwd: repoRoot,
-    env: { ...process.env, CARGO_TARGET_DIR: cargoTargetDir, RUSTC: rustc },
+    env: { ...process.env, CARGO_TARGET_DIR: targetDir, RUSTC: rustc },
     stdio: "inherit",
   },
 );
@@ -87,7 +87,7 @@ if (wasmOpt) {
     },
   );
   console.log(`Optimized WASM artifact with wasm-opt -Oz: ${artifact}`);
-} else if (process.env.CONVEX_EMBEDDED_SKIP_WASM_OPT === "1") {
+} else if (skipWasmOpt()) {
   console.log("Skipping wasm-opt -Oz step: CONVEX_EMBEDDED_SKIP_WASM_OPT=1.");
 } else {
   throw new Error(

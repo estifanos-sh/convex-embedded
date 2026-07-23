@@ -1,9 +1,9 @@
 import { playwright } from "vite-plus/test/browser/providers/playwright";
 import type { TestProjectInlineConfiguration } from "vitest/config";
 
+import { metalBench } from "../../../config/bench.js";
 import { convexEmbedded } from "../src/vite.js";
 import { metalCommands } from "../tests/bench/harness/commands.js";
-import { readNumberEnvValue } from "../tests/bench/harness/env.js";
 import {
   browserDistPath,
   convexBrowserPath,
@@ -16,6 +16,8 @@ import {
 } from "../tests/bench/harness/paths.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
 import schema from "../tests/metal/convex/schema.js";
+
+const bench = metalBench();
 
 export const metalProject = {
   test: {
@@ -38,25 +40,17 @@ export const metalProject = {
     __CONVEX_EMBEDDED_METAL_BENCH_RECONNECT_VOLUME__: JSON.stringify(
       process.env.EMBEDDED_METAL_BENCH_RECONNECT_VOLUME === "1",
     ),
-    __CONVEX_EMBEDDED_METAL_BENCH_CLIENTS__: JSON.stringify(
-      readNumberEnvValue("EMBEDDED_METAL_BENCH_CLIENTS", 5),
-    ),
+    __CONVEX_EMBEDDED_METAL_BENCH_CLIENTS__: JSON.stringify(bench.clients),
     __CONVEX_EMBEDDED_METAL_BENCH_DEPLOYMENT__: JSON.stringify(
       process.env.EMBEDDED_METAL_BENCH_DEPLOYMENT ?? hostedDeployment ?? null,
     ),
-    __CONVEX_EMBEDDED_METAL_BENCH_WRITES__: JSON.stringify(
-      readNumberEnvValue("EMBEDDED_METAL_BENCH_WRITES", 50),
-    ),
+    __CONVEX_EMBEDDED_METAL_BENCH_WRITES__: JSON.stringify(bench.writes),
     __CONVEX_EMBEDDED_METAL_BENCH_OUT__: JSON.stringify(process.env.EMBEDDED_METAL_BENCH_OUT),
-    __CONVEX_EMBEDDED_METAL_BENCH_REVS__: JSON.stringify(
-      readNumberEnvValue("EMBEDDED_METAL_BENCH_REVS", 2_000),
-    ),
+    __CONVEX_EMBEDDED_METAL_BENCH_REVS__: JSON.stringify(bench.scaleRevs),
     __CONVEX_EMBEDDED_METAL_BENCH_SKIP_REV_LIST__: JSON.stringify(
       process.env.EMBEDDED_METAL_BENCH_SKIP_REV_LIST === "1",
     ),
-    __CONVEX_EMBEDDED_METAL_BENCH_TIMEOUT_MS__: JSON.stringify(
-      Math.min(300_000, readNumberEnvValue("EMBEDDED_METAL_BENCH_TIMEOUT_MS", 120_000)),
-    ),
+    __CONVEX_EMBEDDED_METAL_BENCH_TIMEOUT_MS__: JSON.stringify(Math.min(300_000, bench.timeoutMs)),
   },
   plugins: [convexEmbedded({ convexDir: metalConvexDir, schema }), browserRuntimeLog()],
   resolve: {

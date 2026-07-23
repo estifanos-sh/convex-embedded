@@ -5,6 +5,7 @@ import { performance } from "node:perf_hooks";
 import { makeFunctionReference } from "convex/server";
 import { expect, test } from "vite-plus/test";
 
+import { benchDefaults } from "../../../../config/bench.js";
 import {
   benchModules,
   benchSchema,
@@ -283,13 +284,17 @@ function createWatchTracker(expected: number): {
 
 function parseOptions(): ScaleOptions {
   const smoke = process.env.EMBEDDED_BENCH_SMOKE === "1";
+  const scale = benchDefaults.node.scale;
   return {
-    clients: readNumber("EMBEDDED_BENCH_CLIENTS") ?? (smoke ? 2 : 8),
-    durationMs: readNumber("EMBEDDED_BENCH_DURATION_MS") ?? (smoke ? 100 : 2_000),
-    operations: readNumber("EMBEDDED_BENCH_OPERATIONS") ?? (smoke ? 20 : 1_000),
+    clients: readNumber("EMBEDDED_BENCH_CLIENTS") ?? (smoke ? scale.smokeClients : scale.clients),
+    durationMs:
+      readNumber("EMBEDDED_BENCH_DURATION_MS") ??
+      (smoke ? scale.smokeDurationMs : scale.durationMs),
+    operations:
+      readNumber("EMBEDDED_BENCH_OPERATIONS") ?? (smoke ? scale.smokeOperations : scale.operations),
     out: process.env.EMBEDDED_BENCH_OUT,
-    rows: readCount("EMBEDDED_BENCH_ROWS") ?? (smoke ? 1_000 : 100_000),
-    seedBatchSize: readNumber("EMBEDDED_BENCH_SEED_BATCH") ?? 10_000,
+    rows: readCount("EMBEDDED_BENCH_ROWS") ?? (smoke ? scale.smokeRows : scale.rows),
+    seedBatchSize: readNumber("EMBEDDED_BENCH_SEED_BATCH") ?? scale.seedBatchSize,
     smoke,
   };
 }

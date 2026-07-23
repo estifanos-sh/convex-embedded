@@ -2,7 +2,10 @@ import { fileURLToPath } from "node:url";
 
 import { makeFunctionReference } from "convex/server";
 
-import { readEnvValue, readHostedRemoteUrl } from "./env.js";
+import {
+  convexDeployment,
+  hostedRemoteUrl as resolveHostedRemoteUrl,
+} from "../../../../../config/env.js";
 
 const packageRootUrl = new URL("../../../", import.meta.url);
 
@@ -36,8 +39,8 @@ export const convexBrowserPath = fileURLToPath(import.meta.resolve("convex/brows
 export const convexBrowserWebPath = convexBrowserPath.replace(/index-node\.js$/, "index.js");
 export const convexServerPath = fileURLToPath(import.meta.resolve("convex/server"));
 export const convexValuesPath = fileURLToPath(import.meta.resolve("convex/values"));
-export const hostedRemoteUrl = readHostedRemoteUrl();
-export const hostedDeployment = readEnvValue("CONVEX_DEPLOYMENT");
+export const hostedRemoteUrl = resolveHostedRemoteUrl();
+export const hostedDeployment = convexDeployment();
 export const listRootDocuments = makeFunctionReference<
   "query",
   { limit?: number; prefix?: string },

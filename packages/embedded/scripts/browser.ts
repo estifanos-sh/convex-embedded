@@ -7,7 +7,7 @@ import { verifyDeployment } from "./deployment.ts";
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const testConfig = ["--config", "vite/tests.ts"];
 
-await verifyDeployment(packageDir);
+await verifyDeployment();
 run("vp", ["pack"]);
 run("node", ["scripts/wasm.ts"]);
 run("vp", ["test", "run", ...testConfig, "--project", "browser", "tests/browser/runtime.ts"]);

@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseEnv } from "node:util";
+import { pathToFileURL } from "node:url";
+
+import { parseEnvFile } from "./read.ts";
 
 export type DeploymentEnvironment = Readonly<Record<string, string | undefined>>;
 export type MutableDeploymentEnvironment = Record<string, string | undefined>;
@@ -94,7 +95,7 @@ export function requireDeploymentUrl(
     `Missing Convex deployment URL. Set VITE_CONVEX_URL in ${join(
       workspaceRoot,
       ".env.local",
-    )} or in the build environment.`,
+    )} or the build environment.`,
   );
 }
 
@@ -109,16 +110,5 @@ export function exposeExpoDeployment(
 }
 
 function readRootEnvironment(workspaceRoot: string): DeploymentEnvironment {
-  try {
-    return parseEnv(readFileSync(join(workspaceRoot, ".env.local"), "utf8"));
-  } catch (error) {
-    if (isMissingFile(error)) return {};
-    throw error;
-  }
-}
-
-function isMissingFile(error: unknown): boolean {
-  return (
-    error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"
-  );
+  return parseEnvFile(pathToFileURL(join(workspaceRoot, ".env.local")));
 }

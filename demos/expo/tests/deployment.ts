@@ -10,7 +10,7 @@ import {
   exposeExpoDeployment,
   requireDeploymentUrl,
   resolveDeploymentUrl,
-} from "../../deployment";
+} from "../../../config";
 
 void describe("demo deployment configuration", () => {
   void it("keeps browser and Metro generation outside Convex-owned output", () => {

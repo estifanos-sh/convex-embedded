@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { benchDefaults, readTabs } from "../../../../../config/bench.js";
+import { readList, readNumber } from "../../../../../config/read.js";
 import { writeRevisionVolume } from "../../../scripts/volume.js";
-import { readNumberEnvValue, readNumberListEnvValue, readTabsEnvValue } from "./env.js";
 import { browserBenchOutPath, hostedDeployment, metalFixtureDir, packageRoot } from "./paths.js";
 import type {
   BrowserLatencyBenchOptions,
@@ -45,10 +46,13 @@ export function readBrowserLatencyBenchOptions(
   fallback: BrowserLatencyBenchOptions,
 ): BrowserLatencyBenchOptions {
   return {
-    iterations: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_ITERATIONS", fallback.iterations || 10),
-    latencyP90BudgetMs: readNumberEnvValue(
+    iterations: readNumber(
+      "EMBEDDED_BROWSER_BENCH_ITERATIONS",
+      fallback.iterations || benchDefaults.browser.iterations,
+    ),
+    latencyP90BudgetMs: readNumber(
       "EMBEDDED_BROWSER_BENCH_LATENCY_P90_BUDGET_MS",
-      fallback.latencyP90BudgetMs || 10,
+      fallback.latencyP90BudgetMs || benchDefaults.browser.latencyP90BudgetMs,
     ),
     out: process.env.EMBEDDED_BROWSER_BENCH_OUT ?? fallback.out,
     profile:
@@ -57,9 +61,12 @@ export function readBrowserLatencyBenchOptions(
         : process.env.EMBEDDED_BROWSER_BENCH_PROFILE === "smoke"
           ? "smoke"
           : fallback.profile,
-    rowCounts: readNumberListEnvValue("EMBEDDED_BROWSER_BENCH_ROWS", fallback.rowCounts),
-    tabs: readTabsEnvValue("EMBEDDED_BROWSER_BENCH_TABS", fallback.tabs),
-    warmups: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_WARMUPS", fallback.warmups || 3),
+    rowCounts: readList("EMBEDDED_BROWSER_BENCH_ROWS", fallback.rowCounts),
+    tabs: readTabs("EMBEDDED_BROWSER_BENCH_TABS", fallback.tabs),
+    warmups: readNumber(
+      "EMBEDDED_BROWSER_BENCH_WARMUPS",
+      fallback.warmups || benchDefaults.browser.warmups,
+    ),
   };
 }
 
@@ -67,9 +74,15 @@ export function readBrowserStartupBenchOptions(
   fallback: BrowserStartupBenchOptions,
 ): BrowserStartupBenchOptions {
   return {
-    iterations: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_ITERATIONS", fallback.iterations || 10),
+    iterations: readNumber(
+      "EMBEDDED_BROWSER_BENCH_ITERATIONS",
+      fallback.iterations || benchDefaults.browser.iterations,
+    ),
     out: process.env.EMBEDDED_BROWSER_BENCH_OUT ?? fallback.out,
-    warmups: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_WARMUPS", fallback.warmups || 3),
+    warmups: readNumber(
+      "EMBEDDED_BROWSER_BENCH_WARMUPS",
+      fallback.warmups || benchDefaults.browser.warmups,
+    ),
   };
 }
 
@@ -77,14 +90,20 @@ export function readBrowserRemoteBenchOptions(
   fallback: BrowserRemoteBenchOptions,
 ): BrowserRemoteBenchOptions {
   return {
-    iterations: readNumberEnvValue("EMBEDDED_BROWSER_REMOTE_ITERATIONS", fallback.iterations || 20),
+    iterations: readNumber(
+      "EMBEDDED_BROWSER_REMOTE_ITERATIONS",
+      fallback.iterations || benchDefaults.browser.remoteIterations,
+    ),
     out: process.env.EMBEDDED_BROWSER_REMOTE_OUT ?? fallback.out,
     remoteUrl: process.env.EMBEDDED_BROWSER_REMOTE_URL ?? fallback.remoteUrl,
-    timeoutMs: readNumberEnvValue(
+    timeoutMs: readNumber(
       "EMBEDDED_BROWSER_REMOTE_TIMEOUT_MS",
-      fallback.timeoutMs || 15_000,
+      fallback.timeoutMs || benchDefaults.browser.remoteTimeoutMs,
     ),
-    warmups: readNumberEnvValue("EMBEDDED_BROWSER_REMOTE_WARMUPS", fallback.warmups || 3),
+    warmups: readNumber(
+      "EMBEDDED_BROWSER_REMOTE_WARMUPS",
+      fallback.warmups || benchDefaults.browser.remoteWarmups,
+    ),
   };
 }
 
@@ -92,13 +111,19 @@ export function readBrowserScaleBenchOptions(
   fallback: BrowserScaleBenchOptions,
 ): BrowserScaleBenchOptions {
   return {
-    clients: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_CLIENTS", fallback.clients || 2),
-    durationMs: readNumberEnvValue(
+    clients: readNumber(
+      "EMBEDDED_BROWSER_BENCH_CLIENTS",
+      fallback.clients || benchDefaults.browser.scaleClients,
+    ),
+    durationMs: readNumber(
       "EMBEDDED_BROWSER_BENCH_DURATION_MS",
-      fallback.durationMs || 250,
+      fallback.durationMs || benchDefaults.browser.scaleDurationMs,
     ),
     out: process.env.EMBEDDED_BROWSER_BENCH_OUT ?? fallback.out,
-    rows: readNumberEnvValue("EMBEDDED_BROWSER_BENCH_SCALE_ROWS", fallback.rows || 1_000),
+    rows: readNumber(
+      "EMBEDDED_BROWSER_BENCH_SCALE_ROWS",
+      fallback.rows || benchDefaults.browser.scaleRows,
+    ),
   };
 }
 
@@ -106,17 +131,26 @@ export function readMetalScaleBenchOptions(
   fallback: MetalScaleBenchOptions,
 ): MetalScaleBenchOptions {
   return {
-    clients: readNumberEnvValue("EMBEDDED_METAL_BENCH_CLIENTS", fallback.clients || 5),
+    clients: readNumber(
+      "EMBEDDED_METAL_BENCH_CLIENTS",
+      fallback.clients || benchDefaults.metal.clients,
+    ),
     out: process.env.EMBEDDED_METAL_BENCH_OUT ?? fallback.out,
     remoteUrl: fallback.remoteUrl,
-    revs: readNumberEnvValue("EMBEDDED_METAL_BENCH_REVS", fallback.revs || 2_000),
+    revs: readNumber("EMBEDDED_METAL_BENCH_REVS", fallback.revs || benchDefaults.metal.scaleRevs),
     skipRevList:
       process.env.EMBEDDED_METAL_BENCH_SKIP_REV_LIST === "1" || fallback.skipRevList === true,
     timeoutMs: Math.min(
       300_000,
-      readNumberEnvValue("EMBEDDED_METAL_BENCH_TIMEOUT_MS", fallback.timeoutMs ?? 120_000),
+      readNumber(
+        "EMBEDDED_METAL_BENCH_TIMEOUT_MS",
+        fallback.timeoutMs ?? benchDefaults.metal.timeoutMs,
+      ),
     ),
-    writes: readNumberEnvValue("EMBEDDED_METAL_BENCH_WRITES", fallback.writes || 50),
+    writes: readNumber(
+      "EMBEDDED_METAL_BENCH_WRITES",
+      fallback.writes || benchDefaults.metal.writes,
+    ),
   };
 }
 
@@ -124,7 +158,10 @@ export function readMetalReconnectVolumeBenchOptions(
   fallback: MetalReconnectVolumeBenchOptions,
 ): MetalReconnectVolumeBenchOptions {
   return {
-    clients: readNumberEnvValue("EMBEDDED_METAL_BENCH_CLIENTS", fallback.clients || 5),
+    clients: readNumber(
+      "EMBEDDED_METAL_BENCH_CLIENTS",
+      fallback.clients || benchDefaults.metal.clients,
+    ),
     deployment:
       process.env.EMBEDDED_METAL_BENCH_DEPLOYMENT ??
       process.env.CONVEX_DEPLOYMENT ??
@@ -132,10 +169,16 @@ export function readMetalReconnectVolumeBenchOptions(
       fallback.deployment,
     out: process.env.EMBEDDED_METAL_BENCH_OUT ?? fallback.out,
     remoteUrl: fallback.remoteUrl,
-    revs: readNumberEnvValue("EMBEDDED_METAL_BENCH_REVS", fallback.revs || 5),
+    revs: readNumber(
+      "EMBEDDED_METAL_BENCH_REVS",
+      fallback.revs || benchDefaults.metal.reconnectRevs,
+    ),
     skipRevList:
       process.env.EMBEDDED_METAL_BENCH_SKIP_REV_LIST === "1" || fallback.skipRevList === true,
-    timeoutMs: readNumberEnvValue("EMBEDDED_METAL_BENCH_TIMEOUT_MS", fallback.timeoutMs || 120_000),
+    timeoutMs: readNumber(
+      "EMBEDDED_METAL_BENCH_TIMEOUT_MS",
+      fallback.timeoutMs || benchDefaults.metal.timeoutMs,
+    ),
   };
 }
 

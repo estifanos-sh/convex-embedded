@@ -8,7 +8,7 @@ import {
   embeddedCompatiblePriorRuntimes,
   embeddedGeneratedPath,
   exposeExpoDeployment,
-} from "../deployment";
+} from "../../config";
 
 const projectRoot = __dirname;
 const workspaceRoot = path.resolve(projectRoot, "../..");

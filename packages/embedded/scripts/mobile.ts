@@ -15,11 +15,11 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { cargoTarget } from "./cargo.ts";
+import { androidNdk, cargoTargetDir } from "../../../config/build.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
-const targetDir = cargoTarget(repoRoot);
+const targetDir = cargoTargetDir();
 const nativeDir = resolve(packageDir, "native");
 const header = resolve(repoRoot, "crates/mobile/include/convex_embedded_mobile.h");
 const command = process.argv[2] ?? "verify";
@@ -351,12 +351,6 @@ function verifyAndroidToolchain(): void {
   if (!properties.includes(`Pkg.Revision = ${ndkVersion}`)) {
     throw new Error(`Android NDK ${ndkVersion} is required.`);
   }
-}
-
-function androidNdk(): string {
-  const path = process.env.ANDROID_NDK_HOME ?? process.env.ANDROID_NDK_ROOT;
-  if (!path) throw new Error("ANDROID_NDK_HOME must point to the pinned Android NDK.");
-  return path;
 }
 
 function androidTool(name: "llvm-nm" | "llvm-readelf"): string {

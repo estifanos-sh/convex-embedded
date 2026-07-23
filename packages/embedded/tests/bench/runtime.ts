@@ -5,6 +5,7 @@ import { performance } from "node:perf_hooks";
 import { makeFunctionReference } from "convex/server";
 import { expect, test } from "vite-plus/test";
 
+import { benchDefaults } from "../../../../config/bench.js";
 import {
   adapterWrite,
   benchModules,
@@ -2017,19 +2018,22 @@ function bindingCommitOneDocWrite(
 
 function parseOptions(): BenchOptions {
   const smoke = process.env.EMBEDDED_BENCH_SMOKE === "1";
-  const iterations = readNumber("EMBEDDED_BENCH_ITERATIONS") ?? (smoke ? 25 : 1_000);
+  const runtime = benchDefaults.node.runtime;
+  const iterations =
+    readNumber("EMBEDDED_BENCH_ITERATIONS") ??
+    (smoke ? runtime.smokeIterations : runtime.iterations);
   const requestedWarmups =
-    readNumber("EMBEDDED_BENCH_WARMUPS") ?? readNumber("EMBEDDED_BENCH_WARMUP") ?? 100;
+    readNumber("EMBEDDED_BENCH_WARMUPS") ?? readNumber("EMBEDDED_BENCH_WARMUP") ?? runtime.warmups;
   return {
     compare: process.env.EMBEDDED_BENCH_COMPARE,
     iterations,
     layers: parseLayers(process.env.EMBEDDED_BENCH_LAYER ?? "all"),
     out: process.env.EMBEDDED_BENCH_OUT,
-    rows: readNumber("EMBEDDED_BENCH_ROWS") ?? (smoke ? 250 : 10_000),
+    rows: readNumber("EMBEDDED_BENCH_ROWS") ?? (smoke ? runtime.smokeRows : runtime.rows),
     smoke,
     split: process.env.EMBEDDED_BENCH_SPLIT === "1",
     warmups: Math.min(iterations, requestedWarmups),
-    watcherFanout: readNonNegativeNumber("EMBEDDED_BENCH_WATCHERS") ?? 0,
+    watcherFanout: readNonNegativeNumber("EMBEDDED_BENCH_WATCHERS") ?? runtime.watcherFanout,
   };
 }
 
