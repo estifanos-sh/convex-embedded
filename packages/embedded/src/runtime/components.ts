@@ -14,8 +14,7 @@ export function invalidationKey(instancePath: ComponentInstancePath, table: stri
 /** Physical storage table for a logical table in a component instance. @internal */
 function physicalTable(instancePath: ComponentInstancePath, table: string): string {
   if (instancePath === ROOT_INSTANCE) return table;
-  if (instancePath === "embedded") return `__e_${table}`;
-  return `__c_${encodeInstancePath(instancePath)}__${table}`;
+  return `__e_${table}`;
 }
 
 /** Creates a logical view of storage for one component instance. @internal */
@@ -124,12 +123,4 @@ export function batchInvalidationKeys(
       ),
     ]),
   ];
-}
-
-function encodeInstancePath(path: string): string {
-  let encoded = "";
-  for (let i = 0; i < path.length; i += 1) {
-    encoded += path.charCodeAt(i).toString(16).padStart(2, "0");
-  }
-  return encoded;
 }

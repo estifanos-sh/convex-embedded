@@ -1,4 +1,5 @@
 import { cloneTree, encode, freezeNormalizedTreeWithEstimate, reviveDoc } from "../runtime/codec";
+import { remoteTickTables } from "../rev";
 import type {
   BlobSurface,
   Bound,
@@ -1749,8 +1750,4 @@ function freezeCached<T>(value: T): CachedValue<T> {
     shareable: frozen.shareable,
     value,
   };
-}
-
-function remoteTickTables(tick: RemoteTick): string[] {
-  return [...tick.changedTables, ...tick.retainedRevisions.map((revision) => revision.table)];
 }

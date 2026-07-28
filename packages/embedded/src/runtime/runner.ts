@@ -2636,9 +2636,7 @@ function createRootScope(modules: ModuleMap, storeSchema: StoreSchema): RuntimeS
     modules,
     schema: toSchema({
       ...storeSchema,
-      tables: storeSchema.tables.filter(
-        (table) => !table.name.startsWith("__c_") && !table.name.startsWith("__e_"),
-      ),
+      tables: storeSchema.tables.filter((table) => !table.name.startsWith("__e_")),
     }),
   };
 }

@@ -26,13 +26,14 @@ import {
   readWitnessValidator,
   revisionCheckpointValidator,
   revisionInputValidator,
+  revisionKey,
   rowInputValidator,
   settlementValidator,
 } from "./model";
 import schema from "./schema";
 import { read as readTime } from "./time";
 import { write as retentionWrite } from "./crdt/retention";
-import { hashDocument, hashValue } from "../hash";
+import { bytesHash, hashDocument, hashValue } from "../hash";
 import {
   EMBEDDED_CLIENT_RETIRED,
   EMBEDDED_PROTOCOL_MISMATCH,
@@ -1394,11 +1395,6 @@ async function blobResolve(
   return blob;
 }
 
-async function bytesHash(bytes: ArrayBuffer): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 function concatBytes(chunks: Array<ArrayBuffer>): ArrayBuffer {
   const bytes = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
   let offset = 0;
@@ -1477,10 +1473,6 @@ function assertRuntime(runtime: {
 
 function memberKey(table: string, rowId: string): string {
   return `${table}\u0000${rowId}`;
-}
-
-function revisionKey(createdAt: number, revId: string): string {
-  return `${String(Math.trunc(createdAt)).padStart(16, "0")}:${revId}`;
 }
 
 export async function replayTokenHash(requestId: string, functionName: string): Promise<string> {

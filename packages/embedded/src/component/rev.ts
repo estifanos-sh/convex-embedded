@@ -15,11 +15,11 @@ import {
 import { ConvexError, v } from "convex/values";
 import { paginator } from "convex-helpers/server/pagination";
 
-import { crdtKindValidator, deleteResult, deleteResultValidator } from "./model";
+import { crdtKindValidator, deleteResult, deleteResultValidator, revisionKey } from "./model";
 import schema from "./schema";
 import { read as readTime } from "./time";
 import { write as retentionWrite } from "./crdt/retention";
-import { hashValue } from "../hash";
+import { bytesHash, hashValue } from "../hash";
 
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
 type QueryCtx = GenericQueryCtx<DataModel>;
@@ -583,10 +583,6 @@ function revisionPageLimit(value: number): number {
   return Math.min(clamp(value), MAX_REVISION_PAGE);
 }
 
-function revisionKey(createdAt: number, revId: string): string {
-  return `${String(Math.trunc(createdAt)).padStart(16, "0")}:${revId}`;
-}
-
 async function revisionInsert(
   ctx: MutationCtx,
   args: {
@@ -890,9 +886,4 @@ function valueAtPath(value: unknown, path: string): unknown {
     cursor = (cursor as Record<string, unknown>)[segment];
   }
   return cursor;
-}
-
-async function bytesHash(bytes: ArrayBuffer): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

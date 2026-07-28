@@ -205,6 +205,10 @@ export const revisionInputValidator = v.union(
   }),
 );
 
+export function revisionKey(createdAt: number, revId: string): string {
+  return `${String(Math.trunc(createdAt)).padStart(16, "0")}:${revId}`;
+}
+
 export const fileInputValidator = v.object({
   storageId: v.string(),
   delta: v.number(),
