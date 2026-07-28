@@ -57,6 +57,9 @@ jobs:
       - name: Check
         run: vp check
 
+      - name: Build the node native addon
+        run: vp run @convex-dev/embedded#native
+
       - name: Test embedded
         run: |
           vp run @convex-dev/embedded#test:unit
