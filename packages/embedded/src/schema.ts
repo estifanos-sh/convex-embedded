@@ -348,14 +348,6 @@ export function projectWireDoc(
   ]);
 }
 
-export function projectServerWrite(
-  placements: EmbeddedSchemaPlacements,
-  table: string,
-  document: Record<string, unknown>,
-): Record<string, unknown> {
-  return omitFields(document, fieldPlacements(placements, table).local);
-}
-
 interface ExportedSchema {
   tables: ExportedTable[];
 }

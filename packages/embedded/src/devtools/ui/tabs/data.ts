@@ -516,7 +516,7 @@ export function mountDataTab(host: HTMLElement, source: EmbeddedDevtoolsSource):
       : `${listWidth}px 7px minmax(0,1fr)`;
   }
 
-  function selectTable(table: string | null, keepId?: string): void {
+  function selectTable(table: string | null): void {
     if (state.table === table) return;
     state.table = table;
     state.rows = [];
@@ -525,7 +525,7 @@ export function mountDataTab(host: HTMLElement, source: EmbeddedDevtoolsSource):
     state.done = true;
     state.rowsStatus = "idle";
     state.rowsError = null;
-    state.selectedRowId = keepId ?? null;
+    state.selectedRowId = null;
     state.editing = false;
     state.editError = "";
     state.pendingRefresh = false;

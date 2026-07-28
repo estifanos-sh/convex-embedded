@@ -40,6 +40,7 @@ import { validatorIdReferences, validatorIdValues } from "../id/path";
 import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../protocol";
 import { withEntropy } from "../entropy";
 import { read as readTime } from "../component/time";
+import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../component/model";
 import {
   analyzeEmbeddedSchema,
   embeddedSchemaMeta,
@@ -406,24 +407,16 @@ export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
       ) as EmbeddedMutationBuilder<Replicated, "internal">,
     },
     remote: {
-      query: buildRemoteBuilder(queryGeneric, "query", "public") as EmbeddedQueryBuilder<
+      query: buildRemoteBuilder(queryGeneric) as EmbeddedQueryBuilder<Server, "public">,
+      mutation: buildRemoteBuilder(mutationGeneric) as RemoteMutationBuilder<Server, "public">,
+      internalQuery: buildRemoteBuilder(internalQueryGeneric) as EmbeddedQueryBuilder<
         Server,
-        "public"
+        "internal"
       >,
-      mutation: buildRemoteBuilder(mutationGeneric, "mutation", "public") as RemoteMutationBuilder<
+      internalMutation: buildRemoteBuilder(internalMutationGeneric) as RemoteMutationBuilder<
         Server,
-        "public"
+        "internal"
       >,
-      internalQuery: buildRemoteBuilder(
-        internalQueryGeneric,
-        "query",
-        "internal",
-      ) as EmbeddedQueryBuilder<Server, "internal">,
-      internalMutation: buildRemoteBuilder(
-        internalMutationGeneric,
-        "mutation",
-        "internal",
-      ) as RemoteMutationBuilder<Server, "internal">,
     },
     local: {
       query: buildLocalBuilder("query", "public") as unknown as LocalQueryBuilder<Device, "public">,
@@ -446,11 +439,7 @@ export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
   };
 }
 
-function buildRemoteBuilder(
-  base: QueryBuilder<any, any> | MutationBuilder<any, any>,
-  kind: "query" | "mutation",
-  visibility: "public" | "internal",
-) {
+function buildRemoteBuilder(base: QueryBuilder<any, any> | MutationBuilder<any, any>) {
   return (definition: {
     args?: PropertyValidators | GenericValidator;
     returns?: PropertyValidators | GenericValidator;
@@ -459,10 +448,6 @@ function buildRemoteBuilder(
     const registered = base(definition as never) as unknown as EmbeddedRegisteredFunction;
     registered.__embeddedHandler = definition.handler;
     registered.__embeddedPlacement = "remote";
-    Object.assign(registered, {
-      __embeddedKind: kind,
-      __embeddedVisibility: visibility,
-    });
     return registered;
   };
 }
@@ -487,7 +472,6 @@ function buildLocalBuilder(kind: "query" | "mutation", visibility: "public" | "i
 function buildUpload() {
   return mutationGeneric({
     args: {
-      contentType: v.optional(v.string()),
       localStorageId: v.string(),
       sha256: v.string(),
       size: v.number(),
@@ -840,53 +824,6 @@ const settlementValidator = v.union(
   v.object({ ...settlementFields, outcome: v.literal("rejected"), error: v.any() }),
   v.object({ ...settlementFields, outcome: v.literal("rebase"), error: v.any() }),
 );
-
-const pullChangeValidator = v.union(
-  v.object({
-    op: v.literal("put"),
-    plainHash: v.string(),
-    table: v.string(),
-    rowId: v.string(),
-    fields: v.any(),
-  }),
-  v.object({
-    op: v.literal("del"),
-    plainHash: v.string(),
-    table: v.string(),
-    rowId: v.string(),
-  }),
-);
-
-const pullCrdtValidator = v.object({
-  table: v.string(),
-  rowId: v.string(),
-  field: v.string(),
-  kind: v.union(v.literal("text"), v.literal("count"), v.literal("set")),
-  epoch: v.number(),
-  checkpoint: v.object({
-    id: v.string(),
-    seq: v.number(),
-    bytes: v.number(),
-    hash: v.string(),
-  }),
-  headSeq: v.number(),
-  projectionHash: v.string(),
-  checkpointRequest: v.optional(
-    v.object({
-      checkpointId: v.string(),
-      responseToken: v.string(),
-      throughSeq: v.number(),
-      projectionHash: v.string(),
-    }),
-  ),
-  payload: v.optional(v.object({ seq: v.number(), bytes: v.bytes(), hash: v.string() })),
-});
-
-const resultRowValidator = v.object({
-  path: v.string(),
-  table: v.string(),
-  rowId: v.string(),
-});
 
 type RevisionRunMutation = (
   ref: FunctionReference<

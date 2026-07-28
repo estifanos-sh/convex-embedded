@@ -12,7 +12,7 @@ export function invalidationKey(instancePath: ComponentInstancePath, table: stri
 }
 
 /** Physical storage table for a logical table in a component instance. @internal */
-export function physicalTable(instancePath: ComponentInstancePath, table: string): string {
+function physicalTable(instancePath: ComponentInstancePath, table: string): string {
   if (instancePath === ROOT_INSTANCE) return table;
   if (instancePath === "embedded") return `__e_${table}`;
   return `__c_${encodeInstancePath(instancePath)}__${table}`;

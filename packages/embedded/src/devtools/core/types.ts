@@ -62,11 +62,6 @@ export interface EmbeddedDevtoolsRuntime {
   role: string;
   status: "error" | "loading" | "ready";
   tableCount: number;
-  /** Retained-result cache observability (Cut 7 §7). */
-  cacheEntries?: number;
-  cacheServes?: number;
-  cacheMisses?: number;
-  foreignEvaluations?: number;
 }
 
 /** Full devtools snapshot. @public */

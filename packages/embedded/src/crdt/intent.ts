@@ -21,7 +21,7 @@ export function isLowSurrogate(unit: number): boolean {
 }
 
 /** A UTF-16 offset splits a surrogate pair when it lands between a high and its low unit. */
-export function splitsSurrogatePair(text: string, offset: number): boolean {
+function splitsSurrogatePair(text: string, offset: number): boolean {
   return (
     offset > 0 &&
     offset < text.length &&

@@ -496,7 +496,6 @@ export interface ReadCacheStats {
   keyEntries: number;
   misses: Record<ReadCacheKind, number>;
   pageEntries: number;
-  tableEpochs: Record<string, number>;
   queryTableEpochs: Record<string, number>;
   unshareableReturns: number;
 }
@@ -982,7 +981,7 @@ export class StoreAdapter implements StorageBackend {
       order: spec.order,
       pageSize: spec.pageSize,
       cursor: spec.cursor,
-      resumeAfterKey: spec.resumeAfterKey && this.toBindingKey(spec, spec.resumeAfterKey),
+      resumeAfterKey: spec.resumeAfterKey && spec.resumeAfterKey.map(toBindingValue),
     };
   }
 
@@ -1045,11 +1044,6 @@ export class StoreAdapter implements StorageBackend {
       return found ? fromBindingScheduledJob(found) : undefined;
     }
     return fromBindingScheduledJob(row);
-  }
-
-  /** Tag a resume key tuple. Order keys carry no affinity — the value type drives the tag. */
-  private toBindingKey(_spec: ReadSpec, key: ColValue[]): BindingTaggedValue[] {
-    return key.map(toBindingValue);
   }
 
   private toBindingBounds(
@@ -1672,7 +1666,6 @@ class ReadCache {
       keyEntries: this.key.size,
       misses: { ...this.misses },
       pageEntries: this.page.size,
-      tableEpochs: Object.fromEntries(this.queryTableEpochs),
       queryTableEpochs: Object.fromEntries(this.queryTableEpochs),
       unshareableReturns: this.unshareableReturns,
     };

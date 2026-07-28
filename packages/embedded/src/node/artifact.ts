@@ -22,7 +22,7 @@ export interface NativeModule {
   };
 }
 
-export const NATIVE_API_VERSION = EMBEDDED_STORAGE_ABI_VERSION;
+const NATIVE_API_VERSION = EMBEDDED_STORAGE_ABI_VERSION;
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 

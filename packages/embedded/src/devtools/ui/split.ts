@@ -4,7 +4,6 @@ import { el } from "./dom";
 
 export interface SplitHandleOptions {
   container: HTMLElement;
-  cursor?: string;
   label: string;
   max: number;
   min: number;
@@ -48,7 +47,7 @@ export function handleSplitPointerDown(event: PointerEvent, options: SplitHandle
   const startX = event.clientX;
   const start = options.read();
   document.body.classList.add("ce-resizing");
-  document.body.style.cursor = options.cursor ?? "col-resize";
+  document.body.style.cursor = "col-resize";
 
   const move = (next: PointerEvent) => {
     const delta = next.clientX - startX;

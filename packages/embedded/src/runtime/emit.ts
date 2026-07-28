@@ -15,7 +15,7 @@ import type {
 import { getTimerTime } from "../time";
 import { normalizeCopy } from "./codec";
 
-export function commitRowChanges(commit: CommitResult, batch: WriteBatch): StorageRowChange[] {
+function commitRowChanges(commit: CommitResult, batch: WriteBatch): StorageRowChange[] {
   const changes = commit.changes.length ? [...commit.changes] : batchRowChanges(batch);
   for (const mapping of batch.idMappings ?? []) {
     changes.push({
@@ -28,7 +28,7 @@ export function commitRowChanges(commit: CommitResult, batch: WriteBatch): Stora
   return changes;
 }
 
-export function batchRowChanges(batch: WriteBatch): StorageRowChange[] {
+function batchRowChanges(batch: WriteBatch): StorageRowChange[] {
   return [
     ...batch.docWrites.map(
       (docWrite): StorageRowChange => ({
@@ -121,7 +121,7 @@ export function emitCommit(
   }
 }
 
-export function isStorageTable(table: string): boolean {
+function isStorageTable(table: string): boolean {
   return table === "_storage" || table === "_pending_uploads" || table === "_id_mappings";
 }
 

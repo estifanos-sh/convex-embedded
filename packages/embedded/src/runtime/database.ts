@@ -992,19 +992,6 @@ function writeArgs(
   return { table: tableFromId(tableOrId), id: tableOrId };
 }
 
-function unsupportedSystemReader<DM extends GenericDataModel>(): DatabaseReader<DM> {
-  const fail = () => {
-    throw new Error("Convex embedded runtime does not support system tables yet.");
-  };
-  return {
-    get: fail,
-    normalizeId: fail,
-    query: fail,
-    system: undefined as never,
-    table: fail,
-  };
-}
-
 function systemReader<DM extends GenericDataModel>(
   store: RuntimeStorageReader & Partial<{ file: FileSurface }>,
 ): DatabaseReader<DM> {
@@ -1033,7 +1020,9 @@ function systemReader<DM extends GenericDataModel>(
     normalizeId<T extends TableNamesInDataModel<DM>>(table: T, id: string): Id<T> | null {
       return table === "_storage" && isLocalIdForTable(table, id) ? (id as Id<T>) : null;
     },
-    query: (table) => unsupportedSystemReader<DM>().query(table),
+    query: () => {
+      throw new Error("Convex embedded runtime does not support system tables yet.");
+    },
     get system(): DatabaseReader<DM> {
       return this;
     },

@@ -2,7 +2,6 @@
 
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
 
-import { newestOperations } from "../../core/operations";
 import type { EmbeddedDevtoolsOperation, EmbeddedDevtoolsSource } from "../../core/types";
 import { statusBadge, valuePreview } from "../components";
 import { time } from "../dom";
@@ -17,12 +16,14 @@ export function ActivityTab(props: { source: EmbeddedDevtoolsSource }) {
   const [kind, setKind] = createSignal("all");
   const [selectedId, setSelectedId] = createSignal<string | null>(null);
   const operations = createMemo(() =>
-    newestOperations(snapshot().activity.operations).filter((operation) => {
-      if (kind() !== "all" && operation.kind !== kind()) return false;
-      return `${operation.kind} ${operation.name} ${valuePreview(operation.args)}`
-        .toLowerCase()
-        .includes(filter().toLowerCase());
-    }),
+    [...snapshot().activity.operations]
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .filter((operation) => {
+        if (kind() !== "all" && operation.kind !== kind()) return false;
+        return `${operation.kind} ${operation.name} ${valuePreview(operation.args)}`
+          .toLowerCase()
+          .includes(filter().toLowerCase());
+      }),
   );
   const selected = createMemo(() =>
     operations().find((operation) => String(operation.id) === selectedId()),

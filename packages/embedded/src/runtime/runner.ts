@@ -659,14 +659,13 @@ export function createRunner(
     const id = `runner:${nextSpanId}`;
     nextSpanId += 1;
     const startedAt = getTimerTime();
-    const startedTimerAt = getTimerTime();
     emit({ at: startedAt, id, name, phase: "start", type: "span" });
     try {
       const result = await run();
       const endedAt = getTimerTime();
       emit({
         at: endedAt,
-        durationMs: getElapsedTime(startedTimerAt),
+        durationMs: getElapsedTime(startedAt),
         id,
         name,
         phase: "finish",
@@ -677,7 +676,7 @@ export function createRunner(
       const endedAt = getTimerTime();
       emit({
         at: endedAt,
-        durationMs: getElapsedTime(startedTimerAt),
+        durationMs: getElapsedTime(startedAt),
         error: error instanceof Error ? error.message : String(error),
         id,
         name,

@@ -170,7 +170,7 @@ export function createSchedulerPump(
   };
 }
 
-export async function runScheduledDue(
+async function runScheduledDue(
   store: RuntimeStorageWriter,
   calls: RuntimeCalls,
   emit: EmbeddedInternalEventListener,
@@ -198,7 +198,7 @@ export async function runScheduledDue(
   }
 }
 
-export async function nextSchedulerDelay(
+async function nextSchedulerDelay(
   schedule: NonNullable<ServiceStore["schedule"]>,
 ): Promise<number | undefined> {
   const now = getTimerTime();
@@ -213,7 +213,7 @@ export async function nextSchedulerDelay(
   return nextAt === Number.POSITIVE_INFINITY ? undefined : Math.max(0, nextAt - now);
 }
 
-export function clampSchedulerDelay(delayMs: number): number {
+function clampSchedulerDelay(delayMs: number): number {
   if (!Number.isFinite(delayMs)) return MAX_SCHEDULER_TIMER_MS;
   return Math.max(0, Math.min(MAX_SCHEDULER_TIMER_MS, Math.ceil(delayMs)));
 }

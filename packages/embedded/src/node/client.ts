@@ -113,7 +113,7 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
       modules: options.modules,
       store: openStore(native, options.path),
       authState,
-      remote: toRemoteOptions(options),
+      remote: options.url === undefined ? undefined : { url: options.url },
     });
   }
 }
@@ -123,10 +123,6 @@ function openStore(native: NativeModule, path: string): Promise<NativeStore> {
     defaultIdentityKey: EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY,
     selectorKey: path,
   });
-}
-
-function toRemoteOptions(options: ConvexEmbeddedClientOptions): { url: string } | undefined {
-  return options.url === undefined ? undefined : { url: options.url };
 }
 
 /**
