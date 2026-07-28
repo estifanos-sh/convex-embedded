@@ -284,8 +284,7 @@ export function defineEmbeddedSchema<Tables extends GenericSchema>(
  *
  * @example
  * ```ts
- * import schema from "../convex/schema";
- *
+ * // `schema` is your app's Convex schema definition
  * const client = new ConvexEmbeddedClient({ schema, modules, path: "local.db" });
  * ```
  *
