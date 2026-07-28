@@ -1,6 +1,6 @@
 const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
 const { createHash } = require("node:crypto") as typeof import("node:crypto");
-const { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } =
+const { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } =
   require("node:fs") as typeof import("node:fs");
 const os = require("node:os") as typeof import("node:os");
 const path = require("node:path") as typeof import("node:path");
@@ -174,6 +174,14 @@ function prepareAndroid(channel: string, env: NodeJS.ProcessEnv): void {
       "ANDROID_HOME or ANDROID_SDK_ROOT must point to the Android SDK before building native artifacts.",
     );
   }
+
+  const cmdlineTools = path.join(sdkRoot, "cmdline-tools");
+  const sdkBinDirs = existsSync(cmdlineTools)
+    ? readdirSync(cmdlineTools)
+        .map((entry) => path.join(cmdlineTools, entry, "bin"))
+        .filter((dir) => existsSync(dir))
+    : [];
+  env.PATH = [...sdkBinDirs, env.PATH].filter(Boolean).join(path.delimiter);
 
   run("sdkmanager", ["--install", `ndk;${ANDROID_NDK_VERSION}`], env);
   if (!dryRun && !isPinnedNdk(pinnedNdk)) {
