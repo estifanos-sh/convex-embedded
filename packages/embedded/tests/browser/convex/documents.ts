@@ -1,8 +1,67 @@
-import { v } from "convex/values";
+import { v, type Infer } from "convex/values";
 
 import { embedded } from "./embedded";
+import {
+  del as documentsDel,
+  documentValidator,
+  read as documentsRead,
+  write as documentsWrite,
+} from "../../../../../convex/documents";
 
-export * from "../../../../../convex/documents";
+type DocumentRow = Infer<typeof documentValidator>;
+
+/**
+ * The static bundler manifest lists only inline `embedded.<placement>.<builder>` registrations and
+ * never follows `export *`, yet the packaged browser worker gates every root call on that manifest.
+ * Re-declare the demo's `read`/`write`/`del` as canonical registrations that delegate to the demo's
+ * own handlers, so the browser build carries first-class `documents:read`/`documents:write`/
+ * `documents:del` manifest entries while exercising the demo's real behavior rather than a copy.
+ */
+function delegate<Ctx, Args, Result>(registration: unknown, ctx: Ctx, args: Args): Result {
+  const handler = (registration as { __embeddedHandler?: (ctx: Ctx, args: Args) => Result })
+    .__embeddedHandler;
+  if (handler === undefined) {
+    throw new Error("Embedded registration is missing its captured handler.");
+  }
+  return handler(ctx, args);
+}
+
+const textSpliceValidator = v.object({
+  base: v.optional(v.string()),
+  delete: v.number(),
+  index: v.number(),
+  insert: v.string(),
+});
+
+export const read = embedded.replicated.query({
+  args: {
+    id: v.optional(v.id("documents")),
+    slug: v.optional(v.string()),
+    limit: v.optional(v.number()),
+    prefix: v.optional(v.string()),
+  },
+  returns: v.array(documentValidator),
+  handler: (ctx, args): Promise<DocumentRow[]> => delegate(documentsRead, ctx, args),
+});
+
+export const write = embedded.replicated.mutation({
+  args: {
+    id: v.optional(v.id("documents")),
+    body: v.optional(v.string()),
+    slug: v.optional(v.string()),
+    title: v.optional(v.string()),
+    updatedAt: v.optional(v.number()),
+    splices: v.optional(v.array(textSpliceValidator)),
+  },
+  returns: documentValidator,
+  handler: (ctx, args): Promise<DocumentRow> => delegate(documentsWrite, ctx, args),
+});
+
+export const del = embedded.replicated.mutation({
+  args: { id: v.id("documents") },
+  returns: v.null(),
+  handler: (ctx, args): Promise<null> => delegate(documentsDel, ctx, args),
+});
 
 const summaryValidator = v.object({
   _id: v.id("documents"),
