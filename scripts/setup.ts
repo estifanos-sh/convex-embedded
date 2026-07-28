@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 
-import { convexUrl, requireConvexUrl } from "../config/env.ts";
+import { deploymentUrl, requireDeploymentUrl } from "../config/deployment.ts";
 import { parseEnvFile, repoRoot, rootEnvFile } from "../config/read.ts";
 
 const args = process.argv.slice(2);
@@ -19,7 +19,7 @@ await setup();
 async function setup(): Promise<void> {
   ensureEnvLocal();
 
-  const resolved = convexUrl();
+  const resolved = deploymentUrl(repoRoot);
   if (resolved) {
     persistToEnvLocal(resolved);
     console.log(`Convex deployment configured: ${resolved}`);
@@ -35,7 +35,7 @@ async function setup(): Promise<void> {
     await promptForUrl();
   }
 
-  printNextSteps(requireConvexUrl());
+  printNextSteps(requireDeploymentUrl(repoRoot));
 }
 
 /** Seed `.env.local` from the checked-in example, with the values blanked out. */

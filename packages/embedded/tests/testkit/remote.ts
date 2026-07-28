@@ -1,10 +1,12 @@
 import { ConvexHttpClient } from "convex/browser";
 import { makeFunctionReference } from "convex/server";
 
-import { convexUrl, fixtureAdminKey } from "../../../../config/env.js";
+import { deploymentUrl } from "../../../../config/deployment.js";
+import { fixtureAdminKey } from "../../../../config/env.js";
+import { repoRoot } from "../../../../config/read.js";
 
 export function fixtureRemoteUrl(): string {
-  const url = convexUrl();
+  const url = deploymentUrl(repoRoot);
   if (!url) {
     throw new Error("Set VITE_CONVEX_URL in the root .env.local before running remote tests.");
   }

@@ -95,7 +95,6 @@ export function metalBench() {
     clients: readNumber("EMBEDDED_METAL_BENCH_CLIENTS", defaults.clients),
     writes: readNumber("EMBEDDED_METAL_BENCH_WRITES", defaults.writes),
     scaleRevs: readNumber("EMBEDDED_METAL_BENCH_REVS", defaults.scaleRevs),
-    reconnectRevs: readNumber("EMBEDDED_METAL_BENCH_REVS", defaults.reconnectRevs),
     timeoutMs: readNumber("EMBEDDED_METAL_BENCH_TIMEOUT_MS", defaults.timeoutMs),
   };
 }

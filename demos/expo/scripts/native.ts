@@ -7,6 +7,12 @@ const path = require("node:path") as typeof import("node:path");
 
 type MobilePlatform = "android" | "ios";
 
+/**
+ * `IOS_TARGETS`, `ANDROID_NDK_VERSION`, and `CARGO_NDK_VERSION` mirror `iosTargetTriples`,
+ * `androidNdkVersion`, and `cargoNdkVersion` in `config/build.ts` and must stay in sync. This
+ * `eas-build-pre-install` hook runs as a bare-node CommonJS script before `node_modules` and the
+ * ESM `config` package exist, so it cannot import them.
+ */
 const IOS_TARGETS = ["aarch64-apple-ios", "aarch64-apple-ios-sim", "x86_64-apple-ios"] as const;
 const ANDROID_TARGETS = [
   "aarch64-linux-android",

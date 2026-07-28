@@ -1,7 +1,9 @@
 import { ConvexHttpClient } from "convex/browser";
 import { makeFunctionReference } from "convex/server";
 
-import { convexDeployment, convexUrl } from "../../../config/env.ts";
+import { deploymentUrl } from "../../../config/deployment.ts";
+import { convexDeployment } from "../../../config/env.ts";
+import { repoRoot } from "../../../config/read.ts";
 import { EMBEDDED_PROTOCOL_VERSION } from "../src/protocol.ts";
 
 const pull = makeFunctionReference<
@@ -11,7 +13,7 @@ const pull = makeFunctionReference<
 >("embedded:pull");
 
 export async function verifyDeployment(): Promise<void> {
-  const remoteUrl = convexUrl();
+  const remoteUrl = deploymentUrl(repoRoot);
   if (!remoteUrl) {
     throw new Error("VITE_CONVEX_URL must select the deployment used by hosted browser tests.");
   }

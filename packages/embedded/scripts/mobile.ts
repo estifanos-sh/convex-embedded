@@ -15,7 +15,13 @@ import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { androidNdk, cargoTargetDir } from "../../../config/build.ts";
+import {
+  androidNdk,
+  androidNdkVersion,
+  cargoNdkVersion,
+  cargoTargetDir,
+  iosTargetTriples,
+} from "../../../config/build.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
@@ -24,8 +30,6 @@ const nativeDir = resolve(packageDir, "native");
 const header = resolve(repoRoot, "crates/mobile/include/convex_embedded_mobile.h");
 const command = process.argv[2] ?? "verify";
 const androidAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] as const;
-const cargoNdkVersion = "3.5.4";
-const ndkVersion = "28.1.13356709";
 const iosDeploymentTarget = "15.1";
 const cSymbols = [
   "cem_api_version",
@@ -52,8 +56,7 @@ else throw new Error(`Unknown mobile artifact command: ${command}`);
 
 function buildIos(): void {
   requirePlatform("darwin", "iOS XCFrameworks require Xcode on macOS");
-  const triples = ["aarch64-apple-ios", "aarch64-apple-ios-sim", "x86_64-apple-ios"];
-  for (const triple of triples) cargoBuild(triple);
+  for (const triple of iosTargetTriples) cargoBuild(triple);
 
   const work = resolve(targetDir, "mobile-xcframework");
   const headers = resolve(work, "headers");
@@ -348,8 +351,8 @@ function verifyAndroidToolchain(): void {
     throw new Error(`cargo-ndk ${cargoNdkVersion} is required; received ${version.trim()}`);
   }
   const properties = readFileSync(resolve(androidNdk(), "source.properties"), "utf8");
-  if (!properties.includes(`Pkg.Revision = ${ndkVersion}`)) {
-    throw new Error(`Android NDK ${ndkVersion} is required.`);
+  if (!properties.includes(`Pkg.Revision = ${androidNdkVersion}`)) {
+    throw new Error(`Android NDK ${androidNdkVersion} is required.`);
   }
 }
 

@@ -4,7 +4,6 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { benchDefaults } from "../../../config/bench.ts";
-import { benchSkipNativeBuild } from "../../../config/build.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
@@ -204,9 +203,7 @@ if (args.includes("--scale-stress")) {
 if (args.includes("--scale")) {
   env.EMBEDDED_BENCH_SCALE = "1";
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (!benchSkipNativeBuild()) {
-    run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
-  }
+  run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   const result = spawnSync(
     "vp",
     [
@@ -229,9 +226,7 @@ if (args.includes("--scale")) {
 
 if (usesNativeLayers(args)) {
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (!benchSkipNativeBuild()) {
-    run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
-  }
+  run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
 }
 
 const result = spawnSync(
@@ -261,9 +256,7 @@ function runNodeScaleMatrix(env: NodeJS.ProcessEnv, manual: boolean): void {
       ]
     : quickScaleCases(2_000, 300_000);
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (!benchSkipNativeBuild()) {
-    run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
-  }
+  run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   for (const entry of cases) {
     runScaleCase(env, entry, "scale");
   }
@@ -271,17 +264,13 @@ function runNodeScaleMatrix(env: NodeJS.ProcessEnv, manual: boolean): void {
 
 function runNodeScaleGoalMatrix(env: NodeJS.ProcessEnv): void {
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (!benchSkipNativeBuild()) {
-    run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
-  }
+  run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   runAdaptiveScaleCases(env, goalScaleCases(5_000, 300_000), "scale");
 }
 
 function runNodeScaleStressMatrix(env: NodeJS.ProcessEnv, manual: boolean): void {
   env.CONVEX_EMBEDDED_DEV_NATIVE ??= "1";
-  if (!benchSkipNativeBuild()) {
-    run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
-  }
+  run("cargo", ["build", "-p", "node", "--release", "--locked"], repoRoot);
   for (const entry of stressScaleCases(2_000, 300_000, manual)) {
     runScaleCase(env, entry, "scale");
   }

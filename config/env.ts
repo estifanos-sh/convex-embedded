@@ -1,21 +1,8 @@
-import { fileURLToPath, URL } from "node:url";
+import { URL } from "node:url";
 
 import { readValue, rootEnvFile } from "./read.ts";
 
 const fixtureEnvFile = new URL("packages/embedded/tests/fixture/.env.local", rootEnvFile);
-
-/** The client-safe Convex URL shared by every demo and test surface. */
-export function convexUrl(): string | undefined {
-  return readValue("VITE_CONVEX_URL") ?? readValue("CONVEX_URL");
-}
-
-export function requireConvexUrl(): string {
-  const value = convexUrl();
-  if (value) return value;
-  throw new Error(
-    `Missing Convex deployment URL. Set VITE_CONVEX_URL in ${fileURLToPath(rootEnvFile)} or the build environment.`,
-  );
-}
 
 /** The deployment slug written by the Convex CLI, cross-checked against the URL. */
 export function convexDeployment(): string | undefined {
