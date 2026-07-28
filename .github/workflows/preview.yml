@@ -54,6 +54,16 @@ jobs:
       - name: Test Expo editor helpers
         run: vp run @convex-dev/embedded-demo-expo#test
 
+      # Bundling the demo validates the @convex-dev/embedded metro and expo entrypoints.
+      # The demo's metro config wires its own client-safe deployment URL into the bundle;
+      # a build-only value satisfies it since an export never connects to a backend.
+      - name: Export Expo bundles
+        env:
+          VITE_CONVEX_URL: https://embedded-ci.convex.cloud
+        run: |
+          vp run @convex-dev/embedded-demo-expo#export:ios
+          vp run @convex-dev/embedded-demo-expo#export:android
+
       - name: Check
         run: vp check
 
@@ -182,12 +192,6 @@ jobs:
 
       - name: Build embedded TypeScript
         run: vp run @convex-dev/embedded#build:ts
-
-      - name: Export Expo iOS bundle
-        run: vp run @convex-dev/embedded-demo-expo#export:ios
-
-      - name: Export Expo Android bundle
-        run: vp run @convex-dev/embedded-demo-expo#export:android
 
       - name: Publish preview package
         run: >
