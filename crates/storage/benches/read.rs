@@ -4,13 +4,15 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use storage::{
     Bound, ColValue, ColumnDef, CommitOptions, CountSpec, DocWrite, EmbeddedStore, IndexDef, Order,
-    ReadSpec, StoreSchema, TableDef, WriteBatch,
+    ReadSpec, StoreSchema, TableDef, TablePlacement, WriteBatch,
 };
 
 fn schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "vals".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "v".into(),
                 field: None,
@@ -50,6 +52,8 @@ fn seeded(rows: usize) -> EmbeddedStore {
                 crdt_ops: Vec::new(),
                 crdt_restores: vec![],
                 doc_writes,
+                local_field_writes: vec![],
+                local_field_deletes: vec![],
                 deletes: vec![],
                 fresh_ids: vec![],
                 data_only_ids: vec![],

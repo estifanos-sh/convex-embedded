@@ -367,18 +367,6 @@ pub struct PushResponse {
     pub authoritative: Vec<AuthoritativeChange>,
 }
 
-/// One index range the optimistic query read — the read-set scope element (§4, rangescope). A
-/// full-table scan carries `index: None` with unbounded bounds; the honest "cannot scope smaller
-/// than the table" signal.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReadRange {
-    pub table: String,
-    pub index: Option<String>,
-    pub lower: Option<ReadBound>,
-    pub upper: Option<ReadBound>,
-    pub order: Order,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitSource {
     Local,

@@ -106,7 +106,6 @@ impl Default for RemoteTiming {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Default)]
 pub enum RemoteAuth {
     #[default]

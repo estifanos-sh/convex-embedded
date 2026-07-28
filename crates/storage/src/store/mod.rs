@@ -2783,25 +2783,9 @@ impl EmbeddedStore {
         )
     }
 
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn peer_read(&self) -> Result<Option<Vec<u8>>, StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.driver.run_row(
-            sql::read_peer(),
-            vec![text_value(self.identity_key.clone())],
-            |row| blob_at(row, 0),
-        )
-    }
-
     pub fn rev_write(&self, state: &RevState) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
         self.rev_write_unlocked(state, state.updated_time)
-    }
-
-    pub fn rev_state_read(&self, key: &RevKey) -> Result<Option<RevState>, StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.materialize_dirty_heads_unlocked()?;
-        self.read_rev_unlocked(key)
     }
 
     /// Apply a local CRDT intent to one collaborative field (§8-A). Reads the field's stored
@@ -3237,13 +3221,6 @@ impl EmbeddedStore {
         validate_ident(table)?;
         let _guard = lock(&self.operation_lock);
         self.remote_doc_read_unlocked(table, local_document_id)
-    }
-
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn remote_doc_write(&self, state: &RowHead) -> Result<(), StorageError> {
-        validate_ident(&state.table)?;
-        let _guard = lock(&self.operation_lock);
-        self.remote_doc_write_unlocked(state)
     }
 
     fn remote_settle_rejected_dirty_unlocked(
@@ -5276,27 +5253,6 @@ impl EmbeddedStore {
             },
         )?;
         Ok(heads)
-    }
-
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn crdt_ops_debug_read(&self) -> Result<usize, StorageError> {
-        let _guard = lock(&self.operation_lock);
-        let mut count = 0usize;
-        self.driver.run_rows(
-            sql::read_crdt_ops_debug(),
-            vec![text_value(self.identity_key.clone())],
-            |_| {
-                count += 1;
-                Ok(())
-            },
-        )?;
-        Ok(count)
-    }
-
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn rev_state_debug_read(&self, key: &RevKey) -> Result<Option<RevState>, StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.read_rev_unlocked(key)
     }
 
     fn materialize_dirty_heads_unlocked(&self) -> Result<(), StorageError> {

@@ -1,7 +1,5 @@
 mod row;
 
-#[cfg(any(test, feature = "testkit"))]
-pub(crate) use row::canonical_json;
 pub use row::crdt_checkpoint_response;
 pub(crate) use row::{
     archive_rev_id, crdt_field_accept, crdt_field_accept_incremental, crdt_field_intent_write,

@@ -292,18 +292,14 @@ impl RowChangeOp {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "write" | "doc_write" => Some(Self::Write),
+            "write" => Some(Self::Write),
             "delete" => Some(Self::Delete),
-            legacy if legacy == concat!("up", "sert") => Some(Self::Write),
             _ => None,
         }
     }
 }
 
 /// Durable mapping between a locally-created id and the eventual Convex server id.
-///
-/// TODO(sync): add translation operations that can walk encoded mutation args/results and replace
-/// local ids with mapped Convex ids at remote replay boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdMapping {
     pub table: String,

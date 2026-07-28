@@ -59,7 +59,7 @@ pub use types::{
     IdMapping, IdMappingContent, IndexDef, InsertRef, LocalFieldDef, LocalFieldDelete,
     LocalFieldWrite, MembershipRange, MutationCall, MutationRecord, MutationStatus, Order, Page,
     PendingUpload, PushEnvelope, PushOutcome, PushResponse, RangeVersion, ReadBound, ReadEquality,
-    ReadRange, ReadSpec, RemoteBlob, RemoteCrdtChange, RemoteIdMapping, RemoteMember,
+    ReadSpec, RemoteBlob, RemoteCrdtChange, RemoteIdMapping, RemoteMember,
     RemotePageWrite, RemotePageWriteResult, RemotePending, RemoteRowTarget, RemoteScheduleMapping,
     RemoteSettlementOutcome, RemoteSettlementWrite, RemoteSettlementWriteResult, ResultEntry,
     RetainedRevision, RevFrontier, RevKey, RevLifecycle, RevState, RevWriteResult,

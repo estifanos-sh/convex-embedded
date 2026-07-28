@@ -795,9 +795,6 @@ static WRITE_CRDT_OP: LazyLock<String> = LazyLock::new(|| {
         false,
     )
 });
-#[cfg(any(test, feature = "testkit"))]
-static READ_CRDT_OPS_DEBUG: LazyLock<String> =
-    LazyLock::new(|| select_where(CRDT_OPS, [Expr::cust("1")], [eq(IDENTITY_KEY)]));
 static DELETE_CRDT_OPS_FOR_ROW: LazyLock<String> = LazyLock::new(|| {
     delete_where(
         CRDT_OPS,
@@ -1907,11 +1904,6 @@ pub(crate) fn create_crdt_ops() -> &'static str {
 
 pub(crate) fn write_crdt_op() -> &'static str {
     &WRITE_CRDT_OP
-}
-
-#[cfg(any(test, feature = "testkit"))]
-pub(crate) fn read_crdt_ops_debug() -> &'static str {
-    &READ_CRDT_OPS_DEBUG
 }
 
 pub(crate) fn delete_crdt_ops_for_row() -> &'static str {

@@ -4,13 +4,15 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use storage::{
     ColValue, ColumnDef, CommitOptions, DocWrite, EmbeddedStore, IndexDef, StoreSchema, TableDef,
-    WriteBatch,
+    TablePlacement, WriteBatch,
 };
 
 fn schema() -> StoreSchema {
     StoreSchema {
         tables: vec![TableDef {
             name: "vals".into(),
+            placement: TablePlacement::Replicated,
+            local_fields: vec![],
             columns: vec![ColumnDef {
                 name: "v".into(),
                 field: None,
@@ -48,6 +50,8 @@ fn batch_from(store: &EmbeddedStore, rows: usize, start: usize) -> WriteBatch {
         crdt_ops: Vec::new(),
         crdt_restores: vec![],
         doc_writes,
+        local_field_writes: vec![],
+        local_field_deletes: vec![],
         deletes: vec![],
         fresh_ids: vec![],
         data_only_ids: vec![],
@@ -90,6 +94,8 @@ fn rewrite_batch(store: &EmbeddedStore, value: usize, data_only: bool) -> WriteB
             cols: vec![("v".into(), ColValue::Integer(value as i64))],
             creation_time: store.clock_read().unwrap(),
         }],
+        local_field_writes: vec![],
+        local_field_deletes: vec![],
         deletes: vec![],
         fresh_ids: vec![],
         data_only_ids: if data_only {

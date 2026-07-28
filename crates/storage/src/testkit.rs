@@ -8,47 +8,16 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::invariant::{check_id_mappings, check_rev_set};
 use crate::{
     ColValue, ColumnDef, CommitOptions, CommitResult, CountSpec, DocWrite, EmbeddedStore, IndexDef,
-    Page, ReadSpec, RevKey, RevState, RowKey, StorageError, StoreSchema, TableDef, TablePlacement,
-    WriteBatch,
+    Page, ReadSpec, RevState, StorageError, StoreSchema, TableDef, TablePlacement, WriteBatch,
 };
 
-/// Run the structural rev-graph + id-mapping oracle over the whole store: every row's rev set is
-/// discovered through the rev frontiers, and `tables` names the id-map tables to check. Returns the
-/// first violation as a human-readable string. The simulator and integration tests call this after
-/// every mutating step.
 /// A logical clock far above any wall-minted HLC value, for records that must win LWW in tests.
 pub const DOMINATING_CLOCK: f64 = 4.0e15;
 
 pub fn dominating_clock() -> Option<f64> {
     Some(DOMINATING_CLOCK)
-}
-
-pub fn check_store(store: &EmbeddedStore, tables: &[&str]) -> Result<(), String> {
-    let frontiers = store.rev_frontiers_read().map_err(|e| e.to_string())?;
-    let mut seen: std::collections::HashSet<RowKey> = std::collections::HashSet::new();
-    for frontier in &frontiers {
-        if !seen.insert(frontier.key.row.clone()) {
-            continue;
-        }
-        let revs = store
-            .rev_read(&frontier.key.row)
-            .map_err(|e| e.to_string())?;
-        check_rev_set(&revs).map_err(|v| v.to_string())?;
-    }
-    for &table in tables {
-        let mappings = store.id_page_read(table).map_err(|e| e.to_string())?;
-        check_id_mappings(table, &mappings).map_err(|v| v.to_string())?;
-    }
-    Ok(())
-}
-
-/// The pure rev-set check, exposed so negative tests can construct a rev set by hand and confirm the
-/// oracle actually rejects a broken one (a green oracle only means something if it can go red).
-pub fn check_revs(revs: &[RevState]) -> Result<(), String> {
-    check_rev_set(revs).map_err(|v| v.to_string())
 }
 
 /// A unique temp db path, with any stale WAL/SHM sidecar files removed first. The process id plus a
@@ -212,17 +181,6 @@ pub fn doc_ids(page: &Page) -> Vec<String> {
         .collect()
 }
 
-/// The `main` rev key for a row.
-pub fn rev_key(table: &str, document_id: &str) -> RevKey {
-    RevKey {
-        rev_id: "main".to_owned(),
-        row: RowKey {
-            document_id: document_id.to_owned(),
-            table: table.to_owned(),
-        },
-    }
-}
-
 /// Read a single document as JSON.
 pub fn read_doc(store: &EmbeddedStore, table: &str, id: &str) -> Option<serde_json::Value> {
     store
@@ -331,11 +289,6 @@ pub fn fail_next_commit() {
 /// Materialize the document a rev projects to, or `None` for a tombstone (crdt internals).
 pub fn rev_doc_read(state: &RevState, document_id: &str) -> Result<Option<String>, StorageError> {
     crate::crdt::rev_doc_read(state, document_id)
-}
-
-/// Canonicalize JSON using the row/rev codec's canonicalization rule.
-pub fn canonical_json_text(value: &serde_json::Value) -> String {
-    serde_json::to_string(&crate::crdt::canonical_json(value)).unwrap()
 }
 
 /// Decode a keyset cursor against an expected scan shape (sql internals).
