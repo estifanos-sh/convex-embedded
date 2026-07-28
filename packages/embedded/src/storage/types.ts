@@ -883,8 +883,6 @@ export interface RemoteReroot {
 export interface RemoteStartOptions {
   auth?: (args: { forceRefreshToken: boolean }) => Promise<string | null> | string | null;
   clientId?: string;
-  /** Exact prior runtime identities approved for transport-only replay by this build. */
-  compatiblePriorRuntimes?: readonly RemoteRuntimeIdentity[];
   moduleGraphHash: string;
   /** Receives native actor transitions after their local transaction commits. */
   notify?: (tick: RemoteTick) => void;

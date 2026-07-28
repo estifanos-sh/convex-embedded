@@ -2,8 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
-import type { EmbeddedBundleResult, EmbeddedCompatibleRuntimeIdentity } from "./index";
+import type { EmbeddedBundleResult } from "./index";
 
 export const VIRTUAL_MODULE_ID = "virtual:convex-embedded";
 export const VIRTUAL_IDENTITY_MODULE_ID = "virtual:convex-embedded/identity";
@@ -44,10 +43,7 @@ ${moduleEntries}
 `;
 }
 
-export async function renderEmbeddedIdentity(
-  bundle: EmbeddedBundleResult,
-  compatiblePriorRuntimes: readonly EmbeddedCompatibleRuntimeIdentity[] = [],
-): Promise<string> {
+export async function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): Promise<string> {
   const schemaHash = bundle.runtimeSchemaHash;
   if (schemaHash === undefined) {
     throw new Error("Embedded identity requires a generated runtime storage schema hash");
@@ -56,60 +52,12 @@ export async function renderEmbeddedIdentity(
     manifest: bundle.manifest,
     sources: await Promise.all(bundle.sourceFiles.map(fileHash)),
   });
-  const compatible = validateCompatiblePriorRuntimes(
-    compatiblePriorRuntimes,
-    moduleGraphHash,
-    schemaHash,
-  );
 
   return `export const embeddedIdentity = ${JSON.stringify({
-    compatiblePriorRuntimes: compatible,
     moduleGraphHash,
     schemaHash,
   })};
 `;
-}
-
-function validateCompatiblePriorRuntimes(
-  values: readonly EmbeddedCompatibleRuntimeIdentity[],
-  moduleGraphHash: string,
-  schemaHash: string,
-): Array<Omit<EmbeddedCompatibleRuntimeIdentity, "targetModuleGraphHash">> {
-  const seen = new Set<string>();
-  return values.map((value) => {
-    if (!Number.isInteger(value.protocolVersion) || value.protocolVersion < 1) {
-      throw new Error("compatiblePriorRuntimes protocolVersion must be a positive integer");
-    }
-    if (value.protocolVersion > EMBEDDED_PROTOCOL_VERSION) {
-      throw new Error(
-        `compatiblePriorRuntimes protocolVersion cannot be newer than ${EMBEDDED_PROTOCOL_VERSION}`,
-      );
-    }
-    if (value.schemaHash.length === 0) {
-      throw new Error("compatiblePriorRuntimes schemaHash must be non-empty");
-    }
-    if (value.schemaHash !== schemaHash) {
-      throw new Error(
-        `compatiblePriorRuntimes schemaHash ${JSON.stringify(value.schemaHash)} does not match the current runtime schemaHash ${JSON.stringify(schemaHash)}`,
-      );
-    }
-    if (value.moduleGraphHash.length === 0 || value.moduleGraphHash === moduleGraphHash) {
-      throw new Error("compatiblePriorRuntimes must name a non-current moduleGraphHash");
-    }
-    if (value.targetModuleGraphHash !== moduleGraphHash) {
-      throw new Error(
-        `compatiblePriorRuntimes targetModuleGraphHash ${JSON.stringify(value.targetModuleGraphHash)} does not match the current moduleGraphHash ${JSON.stringify(moduleGraphHash)}`,
-      );
-    }
-    const key = `${value.protocolVersion}\u0000${value.schemaHash}\u0000${value.moduleGraphHash}`;
-    if (seen.has(key)) throw new Error("compatiblePriorRuntimes contains a duplicate identity");
-    seen.add(key);
-    return {
-      moduleGraphHash: value.moduleGraphHash,
-      protocolVersion: value.protocolVersion,
-      schemaHash: value.schemaHash,
-    };
-  });
 }
 
 function objectKey(value: string): string {

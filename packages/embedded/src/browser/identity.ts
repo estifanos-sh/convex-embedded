@@ -3,7 +3,6 @@ import { browserStorageId } from "./storage";
 import { WASM_API_VERSION } from "./artifact";
 import { EMBEDDED_STORE_FORMAT_VERSION } from "../abi";
 import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
-import type { RemoteRuntimeIdentity } from "../storage/types";
 
 /**
  * Replaced with the real package version at build time (see `tsdown.config.ts` `define`). Falls
@@ -16,7 +15,6 @@ let embeddedIdentity:
   | {
       moduleGraphHash: string;
       schemaHash: string;
-      compatiblePriorRuntimes: readonly RemoteRuntimeIdentity[];
     }
   | undefined;
 
@@ -26,25 +24,13 @@ let embeddedIdentity:
  * @internal
  */
 export function setEmbeddedIdentity(identity: {
-  compatiblePriorRuntimes?: readonly RemoteRuntimeIdentity[];
   moduleGraphHash: string;
   schemaHash: string;
 }): void {
   embeddedIdentity = {
-    compatiblePriorRuntimes: identity.compatiblePriorRuntimes ?? [],
     moduleGraphHash: identity.moduleGraphHash,
     schemaHash: identity.schemaHash,
   };
-}
-
-/** Exact prior runtime identities reviewed for this generated browser build. @internal */
-export function embeddedCompatiblePriorRuntimes(): readonly RemoteRuntimeIdentity[] {
-  if (!embeddedIdentity) {
-    throw new Error(
-      "ConvexEmbeddedClient requires the @convex-dev/embedded Vite or unplugin adapter to provide runtime identity.",
-    );
-  }
-  return embeddedIdentity.compatiblePriorRuntimes;
 }
 
 /**

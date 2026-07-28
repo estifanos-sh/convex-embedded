@@ -79,7 +79,6 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
     }
     super({
       authState: createEmbeddedAuthState(),
-      compatiblePriorRuntimes: embeddedIdentity.compatiblePriorRuntimes,
       manifest: embeddedManifest,
       moduleGraphHash: embeddedIdentity.moduleGraphHash,
       modules,

@@ -70,15 +70,6 @@ export interface EmbeddedBundleInput {
   generatedPath?: string;
 }
 
-/** An exact prior runtime identity approved by the current build. @public */
-export interface EmbeddedCompatibleRuntimeIdentity {
-  moduleGraphHash: string;
-  protocolVersion: number;
-  schemaHash: string;
-  /** Module graph of the one current build this compatibility review applies to. */
-  targetModuleGraphHash: string;
-}
-
 export interface GenerateEmbeddedInput extends EmbeddedBundleInput {
   analysis: EmbeddedSchemaAnalysis;
 }

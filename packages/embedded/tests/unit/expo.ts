@@ -141,44 +141,6 @@ describe("Expo native bridge", () => {
     expect(operations).toEqual(["remoteStart", "remoteNext", "remoteClose"]);
   });
 
-  test("forwards exact compatible prior runtimes to the native remote", async () => {
-    let finishNext: ((value: Uint8Array) => void) | undefined;
-    let startOptions: unknown;
-    const native: NativeStoreObject = {
-      call: async (bytes) => {
-        const request = decodeRequest(bytes);
-        if (request.operation === "remoteStart") {
-          [startOptions] = JSON.parse(request.json) as [unknown];
-        }
-        if (request.operation === "remoteNext") {
-          return await new Promise<Uint8Array>((resolve) => {
-            finishNext = resolve;
-          });
-        }
-        if (request.operation === "remoteClose") finishNext?.(response("[]", []));
-        return response("null", []);
-      },
-      clockRead: () => 0,
-      close: async () => undefined,
-      release: () => undefined,
-    };
-    const binding = new ExpoStoreBinding(native);
-    const compatiblePriorRuntimes = [
-      { moduleGraphHash: "prior", protocolVersion: 24, schemaHash: "schema" },
-    ];
-
-    await binding.remoteStart({
-      compatiblePriorRuntimes,
-      moduleGraphHash: "current",
-      protocolVersion: 25,
-      schemaHash: "schema",
-      url: "https://example.convex.cloud",
-    });
-    await binding.remoteClose();
-
-    expect(startOptions).toMatchObject({ compatiblePriorRuntimes });
-  });
-
   test("remote close does not wait for an unresolved auth callback", async () => {
     let next = 0;
     const operations: string[] = [];

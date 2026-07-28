@@ -227,8 +227,6 @@ interface EmbeddedClientBaseOptions {
   store: StorageBackend | Promise<StorageBackend>;
   /** Mutable auth state shared with the remote driver. */
   authState?: EmbeddedAuthState;
-  /** Reviewed build migrations that may replay exact prior runtime envelopes. */
-  compatiblePriorRuntimes?: readonly import("./storage/types").RemoteRuntimeIdentity[];
   /** Optional native remote replication configuration. */
   remote?: ConvexEmbeddedRemoteOptions;
 }
@@ -935,17 +933,11 @@ export class EmbeddedClient {
         const remote = store.remote;
         const startRemote = async () => {
           await remote.start({
-            ...toRemoteStartOptions(
-              options.remote!,
-              this.auth,
-              this.clientId,
-              {
-                schemaHash: schema.hash ?? "local",
-                moduleGraphHash,
-                protocolVersion: EMBEDDED_PROTOCOL_VERSION,
-              },
-              options.compatiblePriorRuntimes,
-            ),
+            ...toRemoteStartOptions(options.remote!, this.auth, this.clientId, {
+              schemaHash: schema.hash ?? "local",
+              moduleGraphHash,
+              protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+            }),
             notify: (tick) => {
               consumeRemoteTick(tick, runner, (event) => this.emitEvent(event));
               this.emitEvent(remoteTickEvent(tick));
@@ -1473,13 +1465,11 @@ function toRemoteStartOptions(
   auth: EmbeddedAuthState,
   clientId: string,
   runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number },
-  compatiblePriorRuntimes?: readonly import("./storage/types").RemoteRuntimeIdentity[],
 ): RemoteStartOptions {
   return {
     auth: async (request) =>
       (await auth.fetchToken?.({ forceRefreshToken: request?.forceRefreshToken ?? false })) ?? null,
     clientId,
-    compatiblePriorRuntimes,
     moduleGraphHash: runtime.moduleGraphHash,
     operationTimeoutMs: options.operationTimeoutMs,
     protocolVersion: runtime.protocolVersion,

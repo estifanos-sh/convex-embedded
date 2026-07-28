@@ -4,11 +4,7 @@ import { withConvexEmbedded } from "@convex-dev/embedded/metro";
 import { getDefaultConfig } from "expo/metro-config";
 
 import schema from "../../convex/schema";
-import {
-  embeddedCompatiblePriorRuntimes,
-  embeddedGeneratedPath,
-  exposeExpoDeployment,
-} from "../../config";
+import { embeddedGeneratedPath, exposeExpoDeployment } from "../../config";
 
 const projectRoot = __dirname;
 const workspaceRoot = path.resolve(projectRoot, "../..");
@@ -22,7 +18,6 @@ config.watchFolders = [
 ];
 
 export default withConvexEmbedded(config, {
-  compatiblePriorRuntimes: embeddedCompatiblePriorRuntimes,
   generatedPath: embeddedGeneratedPath,
   root: workspaceRoot,
   schema,

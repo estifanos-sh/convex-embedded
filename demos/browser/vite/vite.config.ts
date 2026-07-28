@@ -7,11 +7,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { embeddedDevtools } from "@convex-dev/embedded/devtools/vite";
 import schema from "../../../convex/schema";
-import {
-  embeddedCompatiblePriorRuntimes,
-  embeddedGeneratedPath,
-  requireDeploymentUrl,
-} from "../../../config";
+import { embeddedGeneratedPath, requireDeploymentUrl } from "../../../config";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const convexDir = fileURLToPath(new URL("../../../convex", import.meta.url));
@@ -165,7 +161,6 @@ export default defineConfig(async () => {
       react(),
       tailwindcss(),
       convexEmbedded({
-        compatiblePriorRuntimes: embeddedCompatiblePriorRuntimes,
         convexDir,
         generatedPath: embeddedGeneratedPath,
         schema,

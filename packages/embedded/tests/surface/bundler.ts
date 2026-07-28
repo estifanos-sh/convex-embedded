@@ -364,41 +364,6 @@ describe("embedded bundler core", () => {
     });
   });
 
-  test("embeds only reviewed prior runtime identities", async () => {
-    await withFixture(async ({ convexDir, root }) => {
-      await file(convexDir, "schema.ts", "export default {};\n");
-      await embeddedEntrypoint(convexDir);
-      await file(convexDir, "feed.ts", canonical("replicated", "query", "list"));
-      const bundle = await createFixtureBundle(root);
-      const currentSource = await renderEmbeddedIdentity(bundle);
-      const currentIdentity = JSON.parse(
-        currentSource.slice(currentSource.indexOf("= ") + 2, currentSource.lastIndexOf(";")),
-      );
-      const prior = {
-        moduleGraphHash: "prior-module-graph",
-        protocolVersion: 24,
-        schemaHash: bundle.runtimeSchemaHash!,
-        targetModuleGraphHash: currentIdentity.moduleGraphHash as string,
-      };
-
-      const source = await renderEmbeddedIdentity(bundle, [prior]);
-      const { targetModuleGraphHash: _, ...transportIdentity } = prior;
-      expect(source).toContain(`"compatiblePriorRuntimes":[${JSON.stringify(transportIdentity)}]`);
-      await expect(renderEmbeddedIdentity(bundle, [{ ...prior, schemaHash: "" }])).rejects.toThrow(
-        "schemaHash must be non-empty",
-      );
-      await expect(
-        renderEmbeddedIdentity(bundle, [{ ...prior, protocolVersion: 26 }]),
-      ).rejects.toThrow("cannot be newer than 25");
-      await expect(
-        renderEmbeddedIdentity(bundle, [{ ...prior, protocolVersion: 25 }]),
-      ).resolves.toContain('"protocolVersion":25');
-      await expect(
-        renderEmbeddedIdentity(bundle, [{ ...prior, targetModuleGraphHash: "another-build" }]),
-      ).rejects.toThrow("does not match the current moduleGraphHash");
-    });
-  });
-
   test("rejects non-canonical embedded registrations", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");

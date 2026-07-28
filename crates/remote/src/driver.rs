@@ -1856,26 +1856,16 @@ where
                 envelope.mutation_id, queued.protocol_version, current.protocol_version
             )));
         }
-        if queued.schema_hash != current.schema_hash
-            || !self.config.compatible_prior_runtimes.contains(queued)
-        {
-            return Err(RemoteError::DeploymentMismatch(format!(
-                "queued mutation {} uses embedded protocol {} with schemaHash={} and moduleGraphHash={}, but this app uses protocol {} with schemaHash={} and moduleGraphHash={} and did not declare that exact prior runtime compatible; local data was preserved and the legacy envelope was not upgraded—rebuild with explicit compatible-prior-runtime migration metadata before replaying it",
-                envelope.mutation_id,
-                queued.protocol_version,
-                queued.schema_hash,
-                queued.module_graph_hash,
-                current.protocol_version,
-                current.schema_hash,
-                current.module_graph_hash
-            )));
-        }
-
-        // This is a transport-only compatibility projection. The exact prior identity was
-        // declared compatible by the current build. The durable envelope keeps the identity under
-        // which its logical mutation was authored; mutation and replay fingerprints remain stable.
-        envelope.runtime = current.clone();
-        Ok(())
+        Err(RemoteError::DeploymentMismatch(format!(
+            "queued mutation {} uses embedded protocol {} with schemaHash={} and moduleGraphHash={}, but this app uses protocol {} with schemaHash={} and moduleGraphHash={}; local data was preserved and not upgraded",
+            envelope.mutation_id,
+            queued.protocol_version,
+            queued.schema_hash,
+            queued.module_graph_hash,
+            current.protocol_version,
+            current.schema_hash,
+            current.module_graph_hash
+        )))
     }
 
     fn speculative_crdt_prefixes(
@@ -6525,98 +6515,6 @@ mod tests {
             .count()
     }
 
-    fn sent_mutation_request(trace: &Arc<Mutex<TransportTrace>>) -> serde_json::Value {
-        let trace = trace
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let args = trace
-            .sent
-            .iter()
-            .find_map(|message| match message {
-                ClientMessage::Mutation { args, .. } => Some(args.get()),
-                _ => None,
-            })
-            .expect("a mutation frame was sent");
-        let args: serde_json::Value = serde_json::from_str(args).unwrap();
-        args.as_array().unwrap()[0]["request"].clone()
-    }
-
-    #[tokio::test]
-    async fn compatible_legacy_envelope_uses_current_protocol_only_on_the_wire() {
-        let trace = Arc::new(Mutex::new(TransportTrace::default()));
-        let transport = TraceTransport {
-            trace: Arc::clone(&trace),
-        };
-        let store = test_store("remote-legacy-envelope-upgrade.db");
-        let mut legacy: serde_json::Value =
-            serde_json::from_str(&replay_envelope_json("legacy", 1)).unwrap();
-        legacy["clientRuntime"]["protocolVersion"] =
-            serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION - 1);
-        legacy["clientRuntime"]["moduleGraphHash"] =
-            serde_json::Value::String("legacy-modules".to_owned());
-        let decoded_legacy = crate::push::decode_envelope(&legacy.to_string()).unwrap();
-        store
-            .remote_push_envelope_write("legacy", 1, &legacy.to_string(), 1)
-            .unwrap();
-        let mut config = RemoteConfig::new("https://example.convex.cloud".parse().unwrap());
-        config
-            .compatible_prior_runtimes
-            .push(decoded_legacy.runtime.clone());
-        let mut driver = RemoteDriver::open_with_store(
-            config,
-            Arc::clone(&store),
-            transport,
-            SystemRemoteClock::default(),
-        );
-        driver.connected = true;
-
-        let tick = driver.dispatch_ready_remote_pushes().await.unwrap();
-        assert_eq!(tick.push_attempted, 1);
-        let request = sent_mutation_request(&trace);
-        assert_eq!(
-            request["runtime"]["protocolVersion"].as_f64(),
-            Some(crate::config::EMBEDDED_PROTOCOL_VERSION as f64)
-        );
-        assert_eq!(request["runtime"]["moduleGraphHash"], "local");
-        assert_eq!(request["runtime"]["schemaHash"], "local");
-        assert_eq!(request["mutationId"], "legacy");
-        assert_eq!(request["replayId"], decoded_legacy.replay_id);
-        assert_eq!(
-            request["logicalFingerprint"],
-            decoded_legacy.logical_fingerprint
-        );
-
-        let inflight = match &driver.inflight_remote_push[0].kind {
-            InflightRemotePushKind::Mutation { envelope, .. } => envelope,
-            InflightRemotePushKind::Blob | InflightRemotePushKind::Checkpoint { .. } => {
-                panic!("expected an inflight mutation")
-            }
-        };
-        assert_eq!(
-            inflight.runtime.protocol_version,
-            crate::config::EMBEDDED_PROTOCOL_VERSION
-        );
-        assert_eq!(inflight.mutation_id, "legacy");
-        assert_eq!(inflight.replay_id, decoded_legacy.replay_id);
-        assert_eq!(
-            inflight.logical_fingerprint,
-            decoded_legacy.logical_fingerprint
-        );
-
-        let durable = store.remote_push_envelope_read(1).unwrap();
-        let durable = crate::push::decode_envelope(&durable[0]).unwrap();
-        assert_eq!(
-            durable.runtime.protocol_version,
-            crate::config::EMBEDDED_PROTOCOL_VERSION - 1
-        );
-        assert_eq!(durable.runtime.module_graph_hash, "legacy-modules");
-        assert_eq!(durable.replay_id, decoded_legacy.replay_id);
-        assert_eq!(
-            durable.logical_fingerprint,
-            decoded_legacy.logical_fingerprint
-        );
-    }
-
     #[tokio::test]
     async fn incompatible_legacy_envelope_is_preserved_and_not_sent() {
         for (name, schema_hash, module_graph_hash) in [
@@ -6652,49 +6550,13 @@ mod tests {
                 error,
                 RemoteError::DeploymentMismatch(message)
                     if message.contains("local data was preserved")
-                        && message.contains("legacy envelope was not upgraded")
+                        && message.contains("not upgraded")
             ));
             assert_eq!(sent_mutation_frames(&trace), 0);
             assert!(driver.inflight_remote_push.is_empty());
             let durable = store.remote_push_envelope_read(1).unwrap();
             assert_eq!(durable, vec![legacy.to_string()]);
         }
-    }
-
-    #[tokio::test]
-    async fn declared_legacy_envelope_with_a_different_schema_is_preserved_and_not_sent() {
-        let trace = Arc::new(Mutex::new(TransportTrace::default()));
-        let transport = TraceTransport {
-            trace: Arc::clone(&trace),
-        };
-        let store = test_store("remote-declared-legacy-schema-mismatch.db");
-        let mut legacy: serde_json::Value =
-            serde_json::from_str(&replay_envelope_json("legacy", 1)).unwrap();
-        legacy["clientRuntime"]["protocolVersion"] =
-            serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION - 1);
-        legacy["clientRuntime"]["schemaHash"] =
-            serde_json::Value::String("legacy-schema".to_owned());
-        let decoded = crate::push::decode_envelope(&legacy.to_string()).unwrap();
-        store
-            .remote_push_envelope_write("legacy", 1, &legacy.to_string(), 1)
-            .unwrap();
-        let mut config = RemoteConfig::new("https://example.convex.cloud".parse().unwrap());
-        config.compatible_prior_runtimes.push(decoded.runtime);
-        let mut driver = RemoteDriver::open_with_store(
-            config,
-            Arc::clone(&store),
-            transport,
-            SystemRemoteClock::default(),
-        );
-        driver.connected = true;
-
-        let error = driver.dispatch_ready_remote_pushes().await.unwrap_err();
-        assert!(matches!(error, RemoteError::DeploymentMismatch(_)));
-        assert_eq!(sent_mutation_frames(&trace), 0);
-        assert_eq!(
-            store.remote_push_envelope_read(1).unwrap(),
-            vec![legacy.to_string()]
-        );
     }
 
     #[tokio::test]
@@ -6726,41 +6588,6 @@ mod tests {
             store.remote_push_envelope_read(1).unwrap(),
             vec![queued.to_string()]
         );
-    }
-
-    #[tokio::test]
-    async fn declared_same_protocol_envelope_from_a_different_module_graph_is_sent() {
-        let trace = Arc::new(Mutex::new(TransportTrace::default()));
-        let transport = TraceTransport {
-            trace: Arc::clone(&trace),
-        };
-        let store = test_store("remote-declared-same-protocol-module-mismatch.db");
-        let mut queued: serde_json::Value =
-            serde_json::from_str(&replay_envelope_json("queued", 1)).unwrap();
-        queued["clientRuntime"]["moduleGraphHash"] =
-            serde_json::Value::String("prior-modules".to_owned());
-        let decoded = crate::push::decode_envelope(&queued.to_string()).unwrap();
-        store
-            .remote_push_envelope_write("queued", 1, &queued.to_string(), 1)
-            .unwrap();
-        let mut config = RemoteConfig::new("https://example.convex.cloud".parse().unwrap());
-        config.compatible_prior_runtimes.push(decoded.runtime);
-        let mut driver = RemoteDriver::open_with_store(
-            config,
-            Arc::clone(&store),
-            transport,
-            SystemRemoteClock::default(),
-        );
-        driver.connected = true;
-
-        let tick = driver.dispatch_ready_remote_pushes().await.unwrap();
-        assert_eq!(tick.push_attempted, 1);
-        assert_eq!(sent_mutation_frames(&trace), 1);
-        let request = sent_mutation_request(&trace);
-        assert_eq!(request["runtime"]["moduleGraphHash"], "local");
-        let durable = store.remote_push_envelope_read(1).unwrap();
-        let durable = crate::push::decode_envelope(&durable[0]).unwrap();
-        assert_eq!(durable.runtime.module_graph_hash, "prior-modules");
     }
 
     #[tokio::test]

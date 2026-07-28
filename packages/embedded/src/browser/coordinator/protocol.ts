@@ -255,24 +255,12 @@ function isRemoteInit(value: unknown): value is NonNullable<InitRequest["remote"
   return (
     isRecord(value) &&
     typeof value.authFetchToken === "boolean" &&
-    (value.compatiblePriorRuntimes === undefined ||
-      (Array.isArray(value.compatiblePriorRuntimes) &&
-        value.compatiblePriorRuntimes.every(isRemoteRuntimeIdentity))) &&
     typeof value.moduleGraphHash === "string" &&
     (value.operationTimeoutMs === undefined || typeof value.operationTimeoutMs === "number") &&
     (value.receiveTimeoutMs === undefined || typeof value.receiveTimeoutMs === "number") &&
     typeof value.protocolVersion === "number" &&
     typeof value.schemaHash === "string" &&
     typeof value.url === "string"
-  );
-}
-
-function isRemoteRuntimeIdentity(value: unknown): boolean {
-  return (
-    isRecord(value) &&
-    typeof value.moduleGraphHash === "string" &&
-    typeof value.protocolVersion === "number" &&
-    typeof value.schemaHash === "string"
   );
 }
 

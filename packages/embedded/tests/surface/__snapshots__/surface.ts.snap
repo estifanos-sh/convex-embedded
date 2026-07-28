@@ -44,7 +44,6 @@ exports[`public package surface > bundler entry exports only its intended surfac
   "EMBEDDED_GENERATED_FORMAT_VERSION",
   "EmbeddedBundleInput",
   "EmbeddedBundleResult",
-  "EmbeddedCompatibleRuntimeIdentity",
   "EmbeddedFunctionKind",
   "EmbeddedFunctionManifest",
   "EmbeddedFunctionManifestEntry",

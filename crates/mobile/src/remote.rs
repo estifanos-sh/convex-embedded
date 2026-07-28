@@ -26,31 +26,11 @@ const EVENT_CAPACITY: usize = 64;
 pub(crate) struct StartOptions {
     url: String,
     client_id: Option<String>,
-    #[serde(default)]
-    compatible_prior_runtimes: Vec<RuntimeIdentityInput>,
     module_graph_hash: String,
     operation_timeout_ms: Option<u64>,
     protocol_version: i64,
     receive_timeout_ms: Option<u64>,
     schema_hash: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeIdentityInput {
-    module_graph_hash: String,
-    protocol_version: i64,
-    schema_hash: String,
-}
-
-impl From<RuntimeIdentityInput> for storage::RuntimeWireIdentity {
-    fn from(value: RuntimeIdentityInput) -> Self {
-        Self {
-            schema_hash: value.schema_hash,
-            module_graph_hash: value.module_graph_hash,
-            protocol_version: value.protocol_version,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -231,11 +211,6 @@ impl RemoteHost {
         }
         let events = RemoteEvents::new();
         config.auth = events.auth();
-        config.compatible_prior_runtimes = options
-            .compatible_prior_runtimes
-            .into_iter()
-            .map(Into::into)
-            .collect();
         config.runtime = storage::RuntimeWireIdentity {
             schema_hash: options.schema_hash,
             module_graph_hash: options.module_graph_hash,

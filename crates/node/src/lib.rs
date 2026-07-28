@@ -436,7 +436,6 @@ pub struct JsScheduledJob {
 pub struct JsRemoteStartOptions {
     pub auth: Option<JsFunction>,
     pub client_id: Option<String>,
-    pub compatible_prior_runtimes: Option<Vec<JsRuntimeWireIdentity>>,
     pub module_graph_hash: String,
     pub notify: Option<JsFunction>,
     pub operation_timeout_ms: Option<u32>,
@@ -445,13 +444,6 @@ pub struct JsRemoteStartOptions {
     pub schema_hash: String,
     pub transport: Option<JsObject>,
     pub url: String,
-}
-
-#[napi(object)]
-pub struct JsRuntimeWireIdentity {
-    pub module_graph_hash: String,
-    pub protocol_version: i64,
-    pub schema_hash: String,
 }
 
 #[napi(object)]
@@ -3039,16 +3031,6 @@ fn remote_config(options: JsRemoteStartOptions) -> napi::Result<RemoteConfig> {
     if let Some(auth) = options.auth {
         config.auth = remote_auth_fetcher(&auth)?;
     }
-    config.compatible_prior_runtimes = options
-        .compatible_prior_runtimes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|runtime| storage::RuntimeWireIdentity {
-            schema_hash: runtime.schema_hash,
-            module_graph_hash: runtime.module_graph_hash,
-            protocol_version: runtime.protocol_version,
-        })
-        .collect();
     config.runtime = storage::RuntimeWireIdentity {
         schema_hash: options.schema_hash,
         module_graph_hash: options.module_graph_hash,
