@@ -91,7 +91,8 @@ try {
       throw new Error("Compiled Expo app is missing the Convex Embedded native storage symbols.");
     }
   } else {
-    run(resolve(work, "android", "gradlew"), [":app:assembleDebug", "--no-daemon"], work);
+    const android = resolve(work, "android");
+    run(resolve(android, "gradlew"), [":app:assembleDebug", "--no-daemon"], android);
   }
 } finally {
   rmSync(work, { recursive: true, force: true });
