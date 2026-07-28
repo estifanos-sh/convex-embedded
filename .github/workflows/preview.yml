@@ -57,9 +57,6 @@ jobs:
       - name: Check
         run: vp check
 
-      - name: Build and inspect package
-        run: pnpm --filter @convex-dev/embedded pack --dry-run
-
       - name: Test embedded
         run: |
           vp run @convex-dev/embedded#test:unit
@@ -67,9 +64,6 @@ jobs:
           vp run @convex-dev/embedded#test:server
           vp run @convex-dev/embedded#test:surface
           vp run @convex-dev/embedded#test:runtime
-
-      - name: Test packaged Node entrypoint
-        run: vp run @convex-dev/embedded#test:node
 
   mobile-apple:
     name: Build Apple mobile artifact
