@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 import { parseEnv } from "node:util";
 
 export const rootEnvFile = new URL("../.env.local", import.meta.url);
