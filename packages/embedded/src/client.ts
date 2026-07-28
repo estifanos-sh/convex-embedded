@@ -55,8 +55,8 @@ import { randomId } from "./id/random";
 import { REMOTE_CLIENT_RETIRED_PREFIX, RotationBreaker } from "./retirement";
 import { EMBEDDED_PROTOCOL_VERSION, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "./protocol";
 import type {
-  EmbeddedInternalEvent,
-  EmbeddedInternalEventListener,
+  EmbeddedEvent as EmbeddedInternalEvent,
+  EmbeddedEventListener as EmbeddedInternalEventListener,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedPublicEventListener,
@@ -279,8 +279,6 @@ export interface EmbeddedRuntimeClientOptions {
   hosted?: ConvexEmbeddedRemoteOptions;
   /** Whether the prebuilt runtime owns a configured remote replication lifecycle. */
   remoteConfigured?: boolean;
-  /** Optional native remote replication configuration. */
-  remote?: ConvexEmbeddedRemoteOptions;
 }
 
 interface ClientState {
@@ -891,13 +889,6 @@ export class EmbeddedClient {
       const runner = await options.runner;
       const unsubscribeEvents =
         eagerUnsubscribe ?? runner.subscribeEvents?.((event) => this.emitEvent(event));
-      if (options.remote) {
-        unsubscribeEvents?.();
-        await options.close?.();
-        throw new Error(
-          "Native remote replication requires a storage backend with remote support.",
-        );
-      }
       if (this.closed) {
         unsubscribeEvents?.();
         await options.close?.();

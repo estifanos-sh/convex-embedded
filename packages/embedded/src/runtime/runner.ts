@@ -23,8 +23,8 @@ import type {
   WriteBatch,
 } from "../storage/types";
 import type {
-  EmbeddedInternalEvent,
-  EmbeddedInternalEventListener,
+  EmbeddedEvent,
+  EmbeddedEventListener,
   EmbeddedMutationTiming,
   EmbeddedSpanEvent,
 } from "../events";
@@ -202,7 +202,7 @@ export interface RunOptions {
 /** Options for the local Convex runner. @internal */
 export interface RunnerOptions {
   deferNotify?(this: void, run: () => void): void;
-  emit?: EmbeddedInternalEventListener;
+  emit?: EmbeddedEventListener;
   hasEventListeners?(): boolean;
   moduleGraphHash?: string;
   /** Trusted build-time placement metadata, including hosted-only functions. */
@@ -357,7 +357,7 @@ export interface Runner {
       subscribe(listener: () => void): StopOnUpdate;
     };
   };
-  subscribeEvents?(listener: EmbeddedInternalEventListener): StopOnUpdate;
+  subscribeEvents?(listener: EmbeddedEventListener): StopOnUpdate;
   onUpdate(
     ref: FunctionReference,
     args: Record<string, unknown>,
@@ -619,7 +619,7 @@ export function createRunner(
   const watchers = new Map<string, Watcher>();
   const uploadUrls = new Map<string, UploadUrl>();
   const objectUrls = new Map<string, string>();
-  const eventListeners = new Set<EmbeddedInternalEventListener>();
+  const eventListeners = new Set<EmbeddedEventListener>();
   const remoteWakeListeners = new Set<() => void>();
   let nextSpanId = 1;
   let mutationQueue: Promise<void> | null = null;
@@ -641,7 +641,7 @@ export function createRunner(
     options.hasEventListeners?.() === true ||
     (options.hasEventListeners === undefined && options.emit !== undefined);
 
-  const emit = (event: EmbeddedInternalEvent): void => {
+  const emit = (event: EmbeddedEvent): void => {
     if (!hasEventListeners()) return;
     options.emit?.(event);
     for (const listener of Array.from(eventListeners)) {

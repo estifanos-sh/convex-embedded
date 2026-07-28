@@ -693,12 +693,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     });
     if (this.isClosedOrClosing()) return leader;
     leader.addLocalClient(this.state.resources.localClient);
-    const {
-      abandonWorkerRemote,
-      closeWorkerRemoteSocket,
-      ensureWorkerRemoteStarted,
-      stopWorkerRemote,
-    } = await import("./runtime");
+    const { closeWorkerRemoteSocket, ensureWorkerRemoteStarted } = await import("./runtime");
     const startRemote = () => {
       if (this.init.remote === undefined) return;
       runtime.remoteReady = ensureWorkerRemoteStarted(
@@ -710,13 +705,6 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     };
     if (this.init.remote !== undefined) startRemote();
     leader.enableRecovery({
-      abandonRemote: () => {
-        if (this.init.remote !== undefined) abandonWorkerRemote(runtime);
-      },
-      restartRemote: () => startRemote(),
-      stopRemote: () => {
-        if (this.init.remote !== undefined) void stopWorkerRemote(runtime).catch(() => undefined);
-      },
       closeRemoteSocket: () => {
         if (this.init.remote !== undefined) closeWorkerRemoteSocket(runtime);
       },

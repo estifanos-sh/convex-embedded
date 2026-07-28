@@ -1,6 +1,5 @@
 import { convexToJson, type Value } from "convex/values";
 import type { EmbeddedEvent } from "../../events";
-import { deferred, type Deferred } from "../../promise";
 import { getTimerTime } from "../../time";
 import { rejectMutationsForRebuild, StoreRecovery, type RecoveryHost } from "../recovery";
 import { assertSameRuntimeIdentity, RuntimeIdentityMismatchError } from "../identity";
@@ -44,11 +43,8 @@ interface RunningMutation {
   timing?: RunMutationTiming;
 }
 
-/** Hooks the coordinator wires so recovery can restart or abandon the remote loop and lease. */
+/** Hooks the coordinator wires so recovery can close the remote socket and release the lease. */
 export interface LeaderRecoveryHooks {
-  abandonRemote(): void;
-  restartRemote(): void;
-  stopRemote(): void;
   closeRemoteSocket(): void;
   onDeadInstance(error: Error): void;
 }
@@ -69,8 +65,6 @@ export interface LeaderState {
   identity: import("../protocol").RuntimeIdentity;
   leaderEpoch: string;
   mutations: Map<string, RunningMutation>;
-  /** When present, new leader requests queue behind an in-progress store-instance rebuild. */
-  rebuildGate?: Deferred<void>;
   /** Serializes a last-client remote stop with a concurrently attaching remote client. */
   remoteIdleStop?: Promise<void>;
   recoveryHooks?: LeaderRecoveryHooks;
@@ -151,10 +145,7 @@ export class LeaderRuntime {
     const host: RecoveryHost = {
       now: () => getTimerTime(),
       emitDegraded: (error) => postEvent(this.state, degradedEvent(error)),
-      emitReady: () => postEvent(this.state, readyEvent()),
       emitRemoteError: (error) => emitWorkerRemoteError(this.state.runtime, error),
-      rebuild: () => this.rebuild(),
-      stopRemote: () => hooks.stopRemote(),
       closeRemoteSocket: () => hooks.closeRemoteSocket(),
       deadInstance: (error) => this.deadInstance(error),
       walWrite: () => this.state.runtime.store.wal.write(),
@@ -167,11 +158,6 @@ export class LeaderRuntime {
       postEvent(this.state, event);
     });
     return recovery;
-  }
-
-  /** Terminates the wedged instance and grafts a fresh store/runner into the retained runtime. */
-  rebuild(): Promise<void> {
-    return rebuildLeaderInstance(this.state);
   }
 
   private deadInstance(error: Error): void {
@@ -276,60 +262,10 @@ export async function handleLeaderRequest(
   client: ClientState,
   request: WorkerRequest,
 ): Promise<void> {
-  // The ACK is already sent by handlePeerRequest, so gating here queues the request behind an
-  // in-progress rebuild without letting a follower's ack-timeout fire.
-  if (leader.rebuildGate) await leader.rebuildGate.promise.catch(() => undefined);
   try {
     await leaderRequestHandlers[request.op](leader, client, request as never);
   } catch (error) {
     client.post({ error: serializeError(error), id: request.id, op: WorkerEvent.Result });
-  }
-}
-
-/**
- * The graft: quiesce the leader, terminate the wedged instance, reopen a store/runner over the
- * retained OPFS directory, and re-wire watches, events, and the remote loop in place. Never awaits
- * a promise of the suspect instance (spec §2).
- */
-async function rebuildLeaderInstance(leader: LeaderState): Promise<void> {
-  if (leader.rebuildGate) return leader.rebuildGate.promise;
-  const gate = deferred();
-  gate.promise.catch(() => undefined);
-  leader.rebuildGate = gate;
-  try {
-    for (const watch of leader.watches.values()) {
-      try {
-        watch.stop();
-      } catch {}
-    }
-    rejectMutationsForRebuild(leader.mutations);
-    leader.eventStop?.();
-    leader.eventStop = undefined;
-    leader.recoveryHooks?.abandonRemote();
-    for (const stop of leader.runtime.stops.values()) stop();
-    leader.runtime.stops.clear();
-    await leader.runtime.rebuild!();
-    const recovery = leader.runtime.recovery;
-    leader.eventStop = leader.runtime.runner.subscribeEvents?.((event) => {
-      if (event.type === "data" && event.source === "local") recovery?.onLocalCommit();
-      postEvent(leader, event);
-    });
-    leader.runtime.emit = (event) => postEvent(leader, event);
-    rewireWatches(leader);
-    leader.recoveryHooks?.restartRemote();
-  } finally {
-    leader.rebuildGate = undefined;
-    gate.resolve();
-  }
-}
-
-/** Re-establishes every shared watch's onUpdate against the freshly grafted runner and re-fans. */
-function rewireWatches(leader: LeaderState): void {
-  for (const watch of leader.watches.values()) {
-    watch.error = undefined;
-    watch.hasValue = false;
-    watch.value = undefined;
-    watch.stop = startSharedWatch(leader, watch);
   }
 }
 
@@ -342,10 +278,6 @@ function abandonedInstanceError(leader: LeaderState): Error {
 
 function degradedEvent(error: string): EmbeddedEvent {
   return { at: getTimerTime(), degradation: "failed", error, type: "runtime" };
-}
-
-function readyEvent(): EmbeddedEvent {
-  return { at: getTimerTime(), phase: "ready", type: "runtime" };
 }
 
 export function attachFollower(
@@ -494,7 +426,6 @@ export async function closeLeader(leader: LeaderState): Promise<void> {
   leader.eventStop?.();
   leader.runtime.closed = true;
   leader.runtime.recovery?.dispose();
-  if (leader.rebuildGate) leader.rebuildGate.resolve();
   if (leader.runtime.remoteStartTimer !== undefined) {
     clearTimeout(leader.runtime.remoteStartTimer);
     leader.runtime.remoteStartTimer = undefined;

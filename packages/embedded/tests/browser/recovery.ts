@@ -99,7 +99,7 @@ async function recover(request: RecoverRequest): Promise<RecoverResult> {
   });
 
   let degraded = false;
-  let ready = false;
+  const ready = false;
   let dead = false;
   const readyGate = deferred();
   const host: RecoveryHost = {
@@ -107,13 +107,7 @@ async function recover(request: RecoverRequest): Promise<RecoverResult> {
     emitDegraded: () => {
       degraded = true;
     },
-    emitReady: () => {
-      ready = true;
-      readyGate.resolve();
-    },
     emitRemoteError: () => undefined,
-    rebuild: () => state.rebuild!(),
-    stopRemote: () => undefined,
     deadInstance: () => {
       dead = true;
       readyGate.resolve();

@@ -2,15 +2,10 @@ import { describe, expect, test } from "vite-plus/test";
 
 import {
   WAL_WRITE_IDLE_MS,
-  CrashBreaker,
-  REBUILD_MAX,
-  REBUILD_WINDOW_MS,
   StoreRecovery,
   Watchdog,
   WATCHDOG_IDLE_MS,
   walWriteDue,
-  classifyTrip,
-  laneClassOf,
   rebuildIndeterminateMutationError,
   rejectMutationsForRebuild,
   type RecoveryHost,
@@ -153,47 +148,6 @@ describe("Watchdog", () => {
   });
 });
 
-describe("CrashBreaker", () => {
-  test("tolerates REBUILD_MAX rebuilds and trips on the next inside the window", () => {
-    const breaker = new CrashBreaker();
-    for (let index = 0; index < REBUILD_MAX; index += 1) {
-      expect(breaker.record(index * 1_000, "remote")).toBe(false);
-    }
-    expect(breaker.record(REBUILD_MAX * 1_000, "remote")).toBe(true);
-  });
-
-  test("deletes rebuilds older than the window so an old burst does not trip", () => {
-    const breaker = new CrashBreaker();
-    breaker.record(0, "remote");
-    breaker.record(0, "remote");
-    breaker.record(0, "remote");
-    // The three-rebuild burst at t=0 ages out beyond the window; a fresh burst does not trip.
-    expect(breaker.record(REBUILD_WINDOW_MS + 1, "remote")).toBe(false);
-    expect(breaker.record(REBUILD_WINDOW_MS + 1, "remote")).toBe(false);
-    expect(breaker.record(REBUILD_WINDOW_MS + 1, "remote")).toBe(false);
-    expect(breaker.record(REBUILD_WINDOW_MS + 1, "remote")).toBe(true);
-  });
-
-  test("classifies a remote-only window with a healthy last rebuild as lane-only", () => {
-    expect(classifyTrip(["remote", "remote", "remote", "remote"], true)).toBe("lane-only");
-  });
-
-  test("classifies any instance-lane fault as dead", () => {
-    expect(classifyTrip(["remote", "instance", "remote", "remote"], true)).toBe("dead");
-  });
-
-  test("classifies a failed last rebuild as dead even for remote lanes", () => {
-    expect(classifyTrip(["remote", "remote", "remote", "remote"], false)).toBe("dead");
-  });
-
-  test("maps only push and pull lanes to the remote class", () => {
-    expect(laneClassOf("push")).toBe("remote");
-    expect(laneClassOf("pull")).toBe("remote");
-    expect(laneClassOf("remote-start")).toBe("instance");
-    expect(laneClassOf("wal-write")).toBe("instance");
-  });
-});
-
 describe("walWriteDue", () => {
   const base = { lastActivityAt: 0, lastWalWriteAt: 0, now: 0, remoteBusy: false };
 
@@ -251,12 +205,7 @@ function recordingHost(timer: FakeTimer, overrides: Partial<RecoveryHost> = {}) 
   const host: RecoveryHost = {
     now: () => timer.now(),
     emitDegraded: () => calls.push("degraded"),
-    emitReady: () => calls.push("ready"),
     emitRemoteError: () => calls.push("remote-error"),
-    rebuild: async () => {
-      calls.push("rebuild");
-    },
-    stopRemote: () => calls.push("stop-remote"),
     closeRemoteSocket: () => calls.push("close-socket"),
     deadInstance: () => calls.push("dead"),
     walWrite: async () => {
@@ -280,8 +229,6 @@ describe("StoreRecovery", () => {
     await drainMicrotasks();
 
     expect(calls).toEqual(["degraded", "dead"]);
-    expect(calls).not.toContain("rebuild");
-    expect(calls).not.toContain("ready");
     expect(calls).not.toContain("close-socket");
     recovery.dispose();
   });
@@ -304,7 +251,6 @@ describe("StoreRecovery", () => {
     await drainMicrotasks();
     expect(calls).toContain("degraded");
     expect(calls).toContain("dead");
-    expect(calls).not.toContain("rebuild");
     recovery.dispose();
   });
 
@@ -319,7 +265,6 @@ describe("StoreRecovery", () => {
 
     expect(calls).toContain("close-socket");
     expect(calls).toContain("remote-error");
-    expect(calls).not.toContain("rebuild");
     expect(calls).not.toContain("degraded");
     expect(calls).not.toContain("dead");
     recovery.dispose();
@@ -337,7 +282,6 @@ describe("StoreRecovery", () => {
     await drainMicrotasks();
 
     expect(calls).toContain("dead");
-    expect(calls).not.toContain("rebuild");
     expect(calls).not.toContain("close-socket");
     recovery.dispose();
   });
@@ -354,7 +298,6 @@ describe("StoreRecovery", () => {
     recovery.reportThreadError(recovery.remoteGeneration);
     await drainMicrotasks();
     expect(calls).toContain("dead");
-    expect(calls).not.toContain("rebuild");
     recovery.dispose();
   });
 
@@ -653,9 +596,6 @@ describe("stale-generation start continuation", () => {
 
 describe("dead-instance fast-fail", () => {
   const idleHooks: LeaderRecoveryHooks = {
-    abandonRemote: () => undefined,
-    restartRemote: () => undefined,
-    stopRemote: () => undefined,
     closeRemoteSocket: () => undefined,
     onDeadInstance: () => undefined,
   };
@@ -686,9 +626,6 @@ describe("dead-instance fast-fail", () => {
       storagePath: "documents.db",
     });
     const recovery = leader.enableRecovery(idleHooks);
-    runtime.rebuild = async () => {
-      throw new Error("emnapi pthread pool crashed");
-    };
     recovery.reportThreadError();
     return { leader, ran, runtime };
   }
@@ -697,7 +634,6 @@ describe("dead-instance fast-fail", () => {
     const order: string[] = [];
     const runtime = {
       opfs: { closeAll: () => undefined },
-      rebuild: async () => Promise.reject(new Error("store terminal")),
       runner: { subscribeEvents: () => () => undefined },
       stops: new Map(),
       store: { close: async () => undefined },

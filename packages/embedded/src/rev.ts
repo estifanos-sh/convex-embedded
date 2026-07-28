@@ -1,4 +1,4 @@
-import type { EmbeddedConflictEvent, EmbeddedInternalEvent } from "./events";
+import type { EmbeddedConflictEvent, EmbeddedEvent } from "./events";
 import type { Runner } from "./runtime/runner";
 import type { RemotePending, RemoteReroot, RemoteTick } from "./storage/types";
 import { getTimerTime } from "./time";
@@ -10,7 +10,7 @@ export const REMOTE_PULL_DIAGNOSTIC_ERROR =
 export function consumeRemoteTick(
   tick: RemoteTick,
   runner: Runner,
-  emit: (event: EmbeddedInternalEvent) => void,
+  emit: (event: EmbeddedEvent) => void,
 ): void {
   const changedTables = remoteTickTables(tick);
   if (changedTables.length) runner.invalidate(changedTables, "remote");

@@ -1,6 +1,6 @@
 import type {
   EmbeddedDataEvent,
-  EmbeddedInternalEventListener,
+  EmbeddedEventListener,
   EmbeddedSchedulerEvent,
   EmbeddedStorageEvent,
 } from "../events";
@@ -49,7 +49,7 @@ function batchRowChanges(batch: WriteBatch): StorageRowChange[] {
 }
 
 export function emitDeletes(
-  emit: EmbeddedInternalEventListener,
+  emit: EmbeddedEventListener,
   deletes: { id: string; table: string }[],
   source: "local" | "remote",
 ): void {
@@ -75,7 +75,7 @@ export function emitDeletes(
 }
 
 export function emitCommit(
-  emit: EmbeddedInternalEventListener,
+  emit: EmbeddedEventListener,
   commit: CommitResult,
   batch: WriteBatch,
   source: "local" | "remote",
@@ -125,7 +125,7 @@ function isStorageTable(table: string): boolean {
   return table === "_storage" || table === "_pending_uploads" || table === "_id_mappings";
 }
 
-export function emitFileStore(emit: EmbeddedInternalEventListener, metadata: FileMetadata): void {
+export function emitFileStore(emit: EmbeddedEventListener, metadata: FileMetadata): void {
   const now = metadata.updatedTime;
   const mapping = {
     createdTime: metadata.createdTime,
@@ -162,7 +162,7 @@ export function emitFileStore(emit: EmbeddedInternalEventListener, metadata: Fil
   emit({ at, deletes: [], type: "storage", docWrites });
 }
 
-export function emitSchedulerUpsert(emit: EmbeddedInternalEventListener, job: ScheduledJob): void {
+export function emitSchedulerUpsert(emit: EmbeddedEventListener, job: ScheduledJob): void {
   const row = normalizeCopy(job) as Record<string, unknown>;
   const docWrites = [{ id: job.jobId, row, table: "_scheduled_jobs" }];
   const at = getTimerTime();

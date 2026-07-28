@@ -15,18 +15,11 @@
 export const WATCHDOG_IDLE_MS = 20_000;
 /** How often the watchdog re-evaluates armed lanes. */
 export const WATCHDOG_POLL_MS = 1_000;
-/** Rebuilds tolerated inside {@link REBUILD_WINDOW_MS} before the breaker trips. */
-export const REBUILD_MAX = 3;
-/** Sliding window the breaker counts rebuilds over. */
-export const REBUILD_WINDOW_MS = 300_000;
 /** Idle time after the last drain before a WAL write is paced. */
 export const WAL_WRITE_IDLE_MS = 30_000;
 
 /** Progress-guarded lanes the watchdog covers. `wal-write` is an instance-lane fault. */
 export type WatchdogLane = "push" | "pull" | "remote-start" | "wal-write";
-
-/** A rebuild triggered by a remote-only lane may keep the last good instance; anything else is fatal. */
-export type RebuildLaneClass = "remote" | "instance";
 
 /** Clock and timer seam so the watchdog and WAL-write pacing are deterministic under test. */
 export interface RecoveryTimer {
@@ -131,53 +124,6 @@ export class Watchdog {
   }
 }
 
-/**
- * Sliding-window crash-loop breaker. {@link record} returns whether the rebuild about to run would
- * exceed {@link REBUILD_MAX} within {@link REBUILD_WINDOW_MS}; the caller then reads
- * {@link windowLaneClasses} through {@link classifyTrip} to choose the terminal state.
- */
-export class CrashBreaker {
-  private readonly events: Array<{ at: number; laneClass: RebuildLaneClass }> = [];
-
-  constructor(
-    private readonly max: number = REBUILD_MAX,
-    private readonly windowMs: number = REBUILD_WINDOW_MS,
-  ) {}
-
-  record(now: number, laneClass: RebuildLaneClass): boolean {
-    this.expiredDelete(now);
-    this.events.push({ at: now, laneClass });
-    return this.events.length > this.max;
-  }
-
-  windowLaneClasses(): RebuildLaneClass[] {
-    return this.events.map((event) => event.laneClass);
-  }
-
-  private expiredDelete(now: number): void {
-    const cutoff = now - this.windowMs;
-    while (this.events.length > 0 && this.events[0]!.at <= cutoff) this.events.shift();
-  }
-}
-
-/**
- * Chooses the breaker's terminal state: keep-last-good (`lane-only`) only when the last rebuild
- * succeeded and every fault in the window came from a remote lane; otherwise the instance is DEAD.
- */
-export function classifyTrip(
-  laneClasses: readonly RebuildLaneClass[],
-  lastRebuildSucceeded: boolean,
-): "lane-only" | "dead" {
-  return lastRebuildSucceeded && laneClasses.every((laneClass) => laneClass === "remote")
-    ? "lane-only"
-    : "dead";
-}
-
-/** Maps a suspect lane to its breaker class: only the two push/pull lanes are remote-recoverable. */
-export function laneClassOf(lane: WatchdogLane): RebuildLaneClass {
-  return lane === "push" || lane === "pull" ? "remote" : "instance";
-}
-
 /** Inputs to the WAL-write pacing decision. */
 export interface WalWriteDecision {
   now: number;
@@ -236,10 +182,7 @@ export function rejectMutationsForRebuild(
 export interface RecoveryHost {
   now(): number;
   emitDegraded(error: string): void;
-  emitReady(): void;
   emitRemoteError(error: string): void;
-  rebuild(): Promise<void>;
-  stopRemote(): void;
   closeRemoteSocket?(): void;
   deadInstance(error: Error): void;
   walWrite(): Promise<void>;
@@ -248,8 +191,6 @@ export interface RecoveryHost {
 export interface StoreRecoveryOptions {
   idleMs?: number;
   pollMs?: number;
-  rebuildMax?: number;
-  rebuildWindowMs?: number;
   walWriteIdleMs?: number;
   walWritePollMs?: number;
   timer?: RecoveryTimer;
@@ -264,7 +205,7 @@ export class StoreRecovery {
   private readonly walWriteIdleMs: number;
   private readonly idleMs: number;
   private readonly walWriteTicker: unknown;
-  private rebuilding = false;
+  private terminating = false;
   private remoteBusy = false;
   private disposed = false;
   private generation = 0;
@@ -358,7 +299,7 @@ export class StoreRecovery {
   }
 
   private onSuspect(lane: WatchdogLane): void {
-    if (this.rebuilding || this.disposed) return;
+    if (this.terminating || this.disposed) return;
     if ((lane === "push" || lane === "pull" || lane === "remote-start") && this.transportSilent()) {
       const retries = (this.silentRetries.get(lane) ?? 0) + 1;
       this.silentRetries.set(lane, retries);
@@ -371,7 +312,7 @@ export class StoreRecovery {
         return;
       }
     }
-    this.rebuilding = true;
+    this.terminating = true;
     this.host.emitDegraded(`embedded store instance wedged on ${lane} lane`);
     this.generation += 1;
     this.silentRetries.clear();
@@ -384,7 +325,7 @@ export class StoreRecovery {
   }
 
   private async walWrite(): Promise<void> {
-    if (this.rebuilding || this.disposed) return;
+    if (this.terminating || this.disposed) return;
     if (
       !walWriteDue({
         idleMs: this.walWriteIdleMs,

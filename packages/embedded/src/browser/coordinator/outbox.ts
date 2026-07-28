@@ -10,15 +10,12 @@ import type { Timer } from "./protocol";
 
 export type WatchStartRequest = Extract<WorkerRequest, { op: typeof WorkerCommand.WatchStart }>;
 
-export interface OutboxEntry {
+interface StoredEntry {
   accepted: boolean;
+  ackTimer?: Timer;
   confirmed: boolean;
   request: WorkerRequest;
   sent: boolean;
-}
-
-interface StoredEntry extends OutboxEntry {
-  ackTimer?: Timer;
   settled: Deferred<void>;
 }
 
@@ -34,7 +31,7 @@ export class RequestOutbox {
 
   constructor(private readonly options: RequestOutboxOptions) {}
 
-  record(request: WorkerRequest): OutboxEntry | undefined {
+  record(request: WorkerRequest): void {
     if (request.op === WorkerCommand.WatchStart) {
       this.desired.set(request.watchId, request);
     }
@@ -42,8 +39,7 @@ export class RequestOutbox {
       this.desired.delete(request.watchId);
       this.cancelPendingWatchStart(request.watchId);
     }
-    const entry = this.ensureEntry(request);
-    return publicEntry(entry);
+    this.ensureEntry(request);
   }
 
   markSent(requestId: number): void {
@@ -144,10 +140,6 @@ export class RequestOutbox {
     this.desired.clear();
   }
 
-  onSettled(requestId: number): Promise<void> {
-    return this.entries.get(requestId)?.settled.promise ?? Promise.resolve();
-  }
-
   private ensureEntry(request: WorkerRequest): StoredEntry {
     const existing = this.entries.get(request.id);
     if (existing) return existing;
@@ -222,13 +214,4 @@ function isOwnershipReplaySafe(request: WorkerRequest): boolean {
     case WorkerCommand.StorageOwnerWrite:
       return false;
   }
-}
-
-function publicEntry(entry: StoredEntry): OutboxEntry {
-  return {
-    accepted: entry.accepted,
-    confirmed: entry.confirmed,
-    request: entry.request,
-    sent: entry.sent,
-  };
 }

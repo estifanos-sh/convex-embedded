@@ -124,11 +124,6 @@ export interface WorkerState {
   recovery?: StoreRecovery;
   /** Bounds retired-client rotation churn; a tripped breaker surfaces the terminal retirement signal. */
   rotationBreaker?: RotationBreaker;
-  /**
-   * Terminates the wedged instance and grafts a fresh store/runner in place over the retained OPFS
-   * directory. Leader re-wiring of watches and the remote loop happens after this resolves.
-   */
-  rebuild?: () => Promise<void>;
 }
 
 interface RemoteAuthPending {
@@ -1478,30 +1473,6 @@ export async function initRuntime(options: {
       wasmApiVersion: opened.wasmApiVersion,
     };
     holder.state = state;
-    let activeStoragePath = opened.storagePath;
-    state.rebuild = async () => {
-      state.pthreads?.terminateAll();
-      opfs.closeAll();
-      const reopened = await openStoreInstance(opfs, {
-        debug: instanceDebug(state.recovery?.remoteGeneration ?? 0),
-        setupSchema: options.setupSchema,
-        storagePath: activeStoragePath,
-        wasm: options.wasm,
-      });
-      activeStoragePath = reopened.storagePath;
-      state.store = reopened.store;
-      state.pthreads = reopened.pthreads;
-      state.wasmApiVersion = reopened.wasmApiVersion;
-      state.runner = createRunner(options.modules, reopened.store, options.storeSchema, {
-        deferNotify: (run) => {
-          setTimeout(run, 0);
-        },
-        emit: options.emit,
-        moduleGraphHash: options.moduleGraphHash,
-        manifest: options.manifest,
-        remote: options.remote,
-      });
-    };
     return state;
   } catch (error) {
     if (slowOpenTimer !== undefined) clearTimeout(slowOpenTimer);

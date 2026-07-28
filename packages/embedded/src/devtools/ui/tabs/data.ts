@@ -7,7 +7,7 @@ import type {
   EmbeddedDevtoolsSource,
   EmbeddedDevtoolsTable,
 } from "../../core/types";
-import type { EmbeddedInternalEvent } from "../../../events";
+import type { EmbeddedEvent } from "../../../events";
 import { copyButton, rowId, valuePreview } from "../components";
 import { button, el, empty, setStatus } from "../dom";
 import { json, parseObject, stringify } from "../json";
@@ -546,7 +546,7 @@ export function mountDataTab(host: HTMLElement, source: EmbeddedDevtoolsSource):
     if (table) await loadRows(true, state.selectedRowId ?? undefined);
   }
 
-  function applyDataEvent(event: EmbeddedInternalEvent | undefined): boolean {
+  function applyDataEvent(event: EmbeddedEvent | undefined): boolean {
     if (event?.type !== "data" || !state.table || !event.changedTables.includes(state.table)) {
       return false;
     }

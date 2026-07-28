@@ -250,14 +250,8 @@ export type EmbeddedEvent =
   | EmbeddedSpanEvent
   | EmbeddedStorageEvent;
 
-/** Rich internal observability event; alias of {@link EmbeddedEvent}. @internal */
-export type EmbeddedInternalEvent = EmbeddedEvent;
-
 /** Listener over the rich internal event channel. @internal */
 export type EmbeddedEventListener = (event: EmbeddedEvent) => void;
-
-/** Listener over the rich internal event channel; alias of {@link EmbeddedEventListener}. @internal */
-export type EmbeddedInternalEventListener = EmbeddedEventListener;
 
 /**
  * The public embedded observability event stream: a stable discriminated union with core fields.

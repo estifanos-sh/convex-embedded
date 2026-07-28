@@ -1,5 +1,5 @@
 import type { EmbeddedClient } from "../../client";
-import type { EmbeddedInternalEvent } from "../../events";
+import type { EmbeddedEvent } from "../../events";
 import type {
   RunnerDevtoolsRequest,
   RunnerDevtoolsRows,
@@ -29,7 +29,7 @@ export function createEmbeddedDevtoolsSource(client: EmbeddedClient): EmbeddedDe
 class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
   private readonly listeners = new Map<
     EmbeddedDevtoolsView,
-    Set<(event?: EmbeddedInternalEvent) => void>
+    Set<(event?: EmbeddedEvent) => void>
   >();
   private runtime: RunnerDevtoolsSnapshot | undefined;
   private runtimeError: string | null = null;
@@ -41,7 +41,7 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private eventTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingClientRebuild = false;
-  private readonly pendingViewEvents = new Map<EmbeddedDevtoolsView, EmbeddedInternalEvent[]>();
+  private readonly pendingViewEvents = new Map<EmbeddedDevtoolsView, EmbeddedEvent[]>();
   private readonly unsubscribe: () => void;
 
   constructor(private readonly client: EmbeddedDevtoolsClient) {
@@ -58,10 +58,7 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
     return this.snapshot;
   }
 
-  subscribe(
-    view: EmbeddedDevtoolsView,
-    callback: (event?: EmbeddedInternalEvent) => void,
-  ): () => void {
+  subscribe(view: EmbeddedDevtoolsView, callback: (event?: EmbeddedEvent) => void): () => void {
     let set = this.listeners.get(view);
     if (!set) {
       set = new Set();
@@ -198,7 +195,7 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
     }, 0);
   }
 
-  private queueView(view: EmbeddedDevtoolsView, event: EmbeddedInternalEvent): void {
+  private queueView(view: EmbeddedDevtoolsView, event: EmbeddedEvent): void {
     if (!this.hasViewListeners(view)) return;
     this.pendingClientRebuild = true;
     let events = this.pendingViewEvents.get(view);
@@ -249,15 +246,15 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
     this.snapshot = mergeSnapshots(client, this.runtime, this.runtimeStatus, this.runtimeError);
   }
 
-  private emit(view: EmbeddedDevtoolsView, event?: EmbeddedInternalEvent): void {
+  private emit(view: EmbeddedDevtoolsView, event?: EmbeddedEvent): void {
     for (const listener of this.listeners.get(view) ?? []) listener(event);
   }
 
-  private emitAll(event?: EmbeddedInternalEvent): void {
+  private emitAll(event?: EmbeddedEvent): void {
     for (const view of this.listeners.keys()) this.emit(view, event);
   }
 
-  private queueEvent(event: EmbeddedInternalEvent): void {
+  private queueEvent(event: EmbeddedEvent): void {
     if (event.type === "operation" || event.type === "span") this.queueView("activity", event);
     if (event.type === "data") {
       this.queueView("data", event);

@@ -4,7 +4,7 @@ import type {
   EmbeddedClientDebugSnapshot,
   EmbeddedClientDebugUpload,
 } from "../../client";
-import type { EmbeddedInternalEvent, EmbeddedInternalEventListener } from "../../events";
+import type { EmbeddedEvent, EmbeddedEventListener } from "../../events";
 import type {
   RunnerDevtoolsFunction,
   RunnerDevtoolsRequest,
@@ -99,10 +99,7 @@ export interface EmbeddedDevtoolsSource {
   ): Promise<EmbeddedDevtoolsRows>;
   patchDocument(table: string, id: string, fields: Record<string, unknown>): Promise<void>;
   runFunction(input: EmbeddedDevtoolsRunFunctionInput): Promise<unknown>;
-  subscribe(
-    view: EmbeddedDevtoolsView,
-    callback: (event?: EmbeddedInternalEvent) => void,
-  ): () => void;
+  subscribe(view: EmbeddedDevtoolsView, callback: (event?: EmbeddedEvent) => void): () => void;
 }
 
 /** Client hooks consumed by the source implementation. @internal */
@@ -115,7 +112,7 @@ export interface EmbeddedDevtoolsClient {
   ): Promise<unknown>;
   __devtoolsRuntime?(request: RunnerDevtoolsRequest): Promise<unknown>;
   __devtoolsSnapshot?(): EmbeddedClientDebugSnapshot;
-  subscribeInternalEvents?(listener: EmbeddedInternalEventListener): () => void;
+  subscribeInternalEvents?(listener: EmbeddedEventListener): () => void;
 }
 
 /** Empty snapshot used before the runtime has answered. @internal */

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 
 import { startRemoteLoop } from "../../src/client";
-import type { EmbeddedInternalEvent } from "../../src/events";
+import type { EmbeddedEvent } from "../../src/events";
 import type { Runner } from "../../src/runtime/runner";
 import type { RemoteSurface, RemoteTick } from "../../src/storage/types";
 
@@ -47,7 +47,7 @@ const emptyPending = {
 
 describe("node remote loop status", () => {
   test("reports idle when a productive native turn drains every pending lane", async () => {
-    const events: EmbeddedInternalEvent[] = [];
+    const events: EmbeddedEvent[] = [];
     const remote = {
       pull: async () => ({
         ...emptyTick(),
@@ -75,7 +75,7 @@ describe("node remote loop status", () => {
 
 describe("node remote loop client retirement", () => {
   test("rotates a retired client once with a fresh id, then resumes", async () => {
-    const events: EmbeddedInternalEvent[] = [];
+    const events: EmbeddedEvent[] = [];
     let clientId = "client_0";
     let retired = true;
     let pulls = 0;
@@ -115,7 +115,7 @@ describe("node remote loop client retirement", () => {
   });
 
   test("trips the breaker on the fourth rapid retirement and stops rotating", async () => {
-    const events: EmbeddedInternalEvent[] = [];
+    const events: EmbeddedEvent[] = [];
     let rotations = 0;
     const remote = {
       pull: async () => {

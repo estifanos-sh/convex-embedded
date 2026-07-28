@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 
 import type {
-  EmbeddedInternalEvent,
+  EmbeddedEvent,
   EmbeddedOperationEvent,
   EmbeddedRemoteEvent,
   EmbeddedRuntimeEvent,
@@ -130,7 +130,7 @@ describe("public event mapping", () => {
   });
 
   test("internal-only events are not surfaced publicly", () => {
-    const internalOnly: EmbeddedInternalEvent[] = [
+    const internalOnly: EmbeddedEvent[] = [
       { at: 1, deletes: [], type: "storage", docWrites: [] },
       { at: 1, deletes: [], type: "scheduler", docWrites: [] },
       { at: 1, id: "s", name: "span", phase: "start", type: "span" },
