@@ -1,8 +1,25 @@
-import { expect, test } from "vite-plus/test";
+import { v } from "convex/values";
+import { describe, expect, expectTypeOf, test } from "vite-plus/test";
 
+import { defineLocal, isLocalFunction, local, type LocalBuilders } from "../../src/local";
+import { NativeStore } from "../../src/node/native";
 import { createWriter, toSchema } from "../../src/runtime/database";
-import { createRunner } from "../../src/runtime/runner";
+import { defineFunctions } from "../../src/runtime/functions";
+import { createRunner, type LocalModuleMap, type Runner } from "../../src/runtime/runner";
+import {
+  defineEmbeddedSchema,
+  localTable,
+  replicatedTable,
+  toRuntimeStoreSchema,
+  type DeviceDataModel,
+  type EmbeddedSchemaDefinition,
+  type ReplicatedDataModel,
+} from "../../src/schema";
 import type { RuntimeStorageWriter, StoreSchema } from "../../src/storage/types";
+import { getTimerTime } from "../../src/time";
+import { e } from "../../src/values";
+import { nativeModule } from "../testkit/native";
+import { temporaryPath } from "../testkit/runtime";
 
 const schema: StoreSchema = {
   tables: [
@@ -88,6 +105,315 @@ test("routes a remote function from the trusted manifest without loading a devic
     args: {},
   });
 });
+
+test("the devtools snapshot reads id mappings only for replicated tables", async () => {
+  const runner = createRunner({ docs }, await deviceStore(), deviceStoreSchema);
+
+  const snapshot = (await runner.devtools({ kind: "snapshot" })) as {
+    storage: { idMappings: unknown[] };
+  };
+
+  expect(snapshot.storage.idMappings).toEqual([]);
+});
+
+describe("device-only function modules", () => {
+  test("names every registration and dispatches it by that name", async () => {
+    const module = draftsModule();
+    const runner = await localRunner({ "local/sync/drafts": () => Promise.resolve(module) });
+
+    expect((module.setCompact as unknown as Record<string, unknown>).__embeddedLocalReference).toBe(
+      "local/sync/drafts:setCompact",
+    );
+    expect(
+      (module.readCompact as unknown as Record<string, unknown>).__embeddedLocalReference,
+    ).toBe("local/sync/drafts:readCompact");
+    await expect(runner.route(module.setCompact, { compact: true }, "mutation")).resolves.toEqual({
+      execution: "local",
+      placement: "local",
+    });
+    await runner.runMutation(module.setCompact, { compact: true });
+    await expect(runner.runQuery(module.readCompact, {})).resolves.toEqual([true]);
+    await expect(runner.runQuery("local/sync/drafts:readCompact", {})).resolves.toEqual([true]);
+  });
+
+  test("ignores non-registration exports", async () => {
+    const helper = () => 1;
+    const module = { ...draftsModule(), helper, label: "drafts" };
+    const runner = await localRunner({ "local/sync/drafts": () => Promise.resolve(module) });
+
+    expect(module.helper).toBe(helper);
+    expect(module.label).toBe("drafts");
+    expect((module.helper as unknown as Record<string, unknown>).__embeddedLocalReference).toBe(
+      undefined,
+    );
+    await runner.runMutation(module.setCompact, { compact: true });
+    await expect(runner.runQuery(module.readCompact, {})).resolves.toEqual([true]);
+    await expect(runner.runQuery("local/sync/drafts:label", {})).rejects.toThrow(
+      "local/sync/drafts:label is not registered under the configured local directories.",
+    );
+  });
+
+  test("imports every configured module at once instead of one after another", async () => {
+    const started = new Set<string>();
+    let bothStarted!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      bothStarted = resolve;
+    });
+    const load = (moduleId: string) => async () => {
+      started.add(moduleId);
+      if (started.size === 2) bothStarted();
+      await barrier;
+      return draftsModule();
+    };
+    const runner = createRunner({}, fakeStore(), deviceStoreSchema, {
+      localModules: {
+        "local/sync/drafts": load("local/sync/drafts"),
+        "local/sync/notes": load("local/sync/notes"),
+      },
+    });
+
+    await runner.localReady;
+    expect(started.size).toBe(2);
+    await expect(runner.route("local/sync/notes:readCompact", {}, "query")).resolves.toEqual({
+      execution: "local",
+      placement: "local",
+    });
+  });
+
+  test("rejects a module whose top level throws", async () => {
+    const runner = createRunner({}, await deviceStore(), deviceStoreSchema, {
+      localModules: {
+        "local/sync/drafts": () => Promise.reject(new Error("drafts module failed to load")),
+      },
+    });
+
+    await expect(runner.localReady).rejects.toThrow("drafts module failed to load");
+  });
+
+  test("refuses an internal registration at the app surface and allows it from a local caller", async () => {
+    const module = draftsModule();
+    const runner = await localRunner({ "local/sync/drafts": () => Promise.resolve(module) });
+
+    await expect(runner.route(module.clear, {}, "mutation")).rejects.toThrow(
+      "Internal local functions are only callable from other local functions.",
+    );
+    await expect(runner.runMutation(module.clear, {})).rejects.toThrow(
+      "Internal local functions are only callable from other local functions.",
+    );
+    await runner.runMutation(module.setCompact, { compact: true });
+    await runner.runMutation(module.reset, {});
+    await expect(runner.runQuery(module.readCompact, {})).resolves.toEqual([]);
+  });
+
+  test("refuses file storage in a local query and a local mutation", async () => {
+    const module = {
+      read: device.query({
+        args: {},
+        handler: async (ctx) => Boolean((ctx as unknown as { storage: unknown }).storage),
+      }),
+      write: device.mutation({
+        args: {},
+        handler: async (ctx) => Boolean((ctx as unknown as { storage: unknown }).storage),
+      }),
+    };
+    const runner = await localRunner({ "local/sync/files": () => Promise.resolve(module) });
+
+    await expect(runner.runQuery(module.read, {})).rejects.toThrow(
+      "Local functions cannot access file storage.",
+    );
+    await expect(runner.runMutation(module.write, {})).rejects.toThrow(
+      "Local functions cannot access file storage.",
+    );
+  });
+
+  test("reports the kind a registration actually has", async () => {
+    const module = draftsModule();
+    const runner = await localRunner({ "local/sync/drafts": () => Promise.resolve(module) });
+
+    await expect(runner.route(module.readCompact, {}, "mutation")).rejects.toThrow(
+      "local/sync/drafts:readCompact is a local query and cannot be called as a mutation.",
+    );
+    await expect(runner.route(module.setCompact, { compact: true }, "query")).rejects.toThrow(
+      "local/sync/drafts:setCompact is a local mutation and cannot be called as a query.",
+    );
+  });
+
+  test("refuses a name no configured module registered", async () => {
+    const runner = await localRunner({
+      "local/sync/drafts": () => Promise.resolve(draftsModule()),
+    });
+
+    await expect(runner.route("local/sync/missing:read", {}, "query")).rejects.toThrow(
+      "local/sync/missing:read is not registered under the configured local directories.",
+    );
+  });
+
+  test("separates an unconfigured local directory from an unregistered name", async () => {
+    const unconfigured = createRunner({}, await deviceStore(), deviceStoreSchema);
+    const empty = createRunner({}, await deviceStore(), deviceStoreSchema, { localModules: {} });
+
+    for (const runner of [unconfigured, empty]) {
+      await expect(runner.route("local/sync/drafts:readCompact", {}, "query")).rejects.toThrow(
+        "No local directory is configured; pass the local option to the bundler adapter.",
+      );
+    }
+  });
+});
+
+describe("device overlay reactivity", () => {
+  test("reruns a watching local query when a local mutation patches an overlay field", async () => {
+    const module = viewModule();
+    const runner = await localRunner({ "local/view": () => Promise.resolve(module) });
+    const documentId = (await runner.runMutation("docs:seed", { title: "wire" })) as string;
+    const updates: string[][] = [];
+    const off = runner.onUpdate(module.expanded, {}, (value) => updates.push(value as string[]));
+    expect(await nextUpdate(updates, 0)).toEqual([]);
+
+    await runner.runMutation(module.toggleExpanded, { documentId });
+
+    expect(await nextUpdate(updates, 1)).toEqual([documentId]);
+    off();
+  });
+
+  test("reruns the overlay watcher when the same batch also writes a device row", async () => {
+    const module = viewModule();
+    const runner = await localRunner({ "local/view": () => Promise.resolve(module) });
+    const documentId = (await runner.runMutation("docs:seed", { title: "wire" })) as string;
+    const updates: string[][] = [];
+    const off = runner.onUpdate(module.expanded, {}, (value) => updates.push(value as string[]));
+    expect(await nextUpdate(updates, 0)).toEqual([]);
+
+    await runner.runMutation(module.expandWithPreference, { compact: true, documentId });
+
+    expect(await nextUpdate(updates, 1)).toEqual([documentId]);
+    off();
+  });
+});
+
+describe("device-only namespace typing", () => {
+  test("demands the schema declaration before any builder accepts a definition", () => {
+    expectTypeOf(local.query).parameter(0).toEqualTypeOf<UnregisteredSchema>();
+    expectTypeOf(local.mutation).parameter(0).toEqualTypeOf<UnregisteredSchema>();
+    expectTypeOf(local.internalQuery).parameter(0).toEqualTypeOf<UnregisteredSchema>();
+    expectTypeOf(local.internalMutation).parameter(0).toEqualTypeOf<UnregisteredSchema>();
+    expectTypeOf(local.query).returns.toBeNever();
+    expect(Object.keys(local)).toEqual(["query", "mutation", "internalQuery", "internalMutation"]);
+  });
+
+  test("binds a declared schema to builders over its device data model", () => {
+    expectTypeOf<typeof deviceSchema>().toExtend<EmbeddedSchemaDefinition>();
+    expectTypeOf(device).toEqualTypeOf<LocalBuilders<DeviceDataModel<typeof deviceSchema>>>();
+
+    const registered = local as unknown as LocalBuilders<DeviceDataModel<typeof deviceSchema>>;
+    const setCompact = registered.mutation({
+      args: { compact: v.boolean() },
+      handler: async (ctx, args) => {
+        await ctx.db.insert("preferences", { compact: args.compact });
+      },
+    });
+    expect(isLocalFunction(setCompact)).toBe(true);
+  });
+});
+
+type UnregisteredSchema =
+  'Declare your schema in convex/schema.ts: declare module "@convex-dev/embedded/local" { interface Register { schema: typeof schema } }';
+
+const deviceSchema = defineEmbeddedSchema({
+  documents: replicatedTable({
+    expanded: e.local(v.boolean()),
+    title: v.string(),
+  }),
+  preferences: localTable({ compact: v.boolean() }),
+});
+const deviceStoreSchema = toRuntimeStoreSchema(deviceSchema);
+const device = defineLocal(deviceSchema);
+
+const docs = {
+  seed: defineFunctions<ReplicatedDataModel<typeof deviceSchema>>().replicated.mutation({
+    args: { title: v.string() },
+    handler: async (ctx, args) => await ctx.db.insert("documents", { title: args.title }),
+  }),
+};
+
+function viewModule() {
+  return {
+    expanded: device.query({
+      args: {},
+      handler: async (ctx) =>
+        (await ctx.db.query("documents").collect())
+          .filter((document) => document.expanded === true)
+          .map((document) => document._id),
+    }),
+    expandWithPreference: device.mutation({
+      args: { compact: v.boolean(), documentId: v.id("documents") },
+      handler: async (ctx, args) => {
+        await ctx.db.insert("preferences", { compact: args.compact });
+        await ctx.db.patch("documents", args.documentId, { expanded: true });
+      },
+    }),
+    toggleExpanded: device.mutation({
+      args: { documentId: v.id("documents") },
+      handler: async (ctx, args) => {
+        const document = await ctx.db.get("documents", args.documentId);
+        await ctx.db.patch("documents", args.documentId, { expanded: document?.expanded !== true });
+      },
+    }),
+  };
+}
+
+async function nextUpdate<T>(updates: T[], seen: number): Promise<T> {
+  const started = getTimerTime();
+  while (updates.length <= seen) {
+    if (getTimerTime() - started > 1_000) {
+      throw new Error(`timed out waiting for update ${seen + 1}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return updates[seen] as T;
+}
+
+function draftsModule() {
+  const clear = device.internalMutation({
+    args: {},
+    handler: async (ctx) => {
+      for (const row of await ctx.db.query("preferences").collect()) {
+        await ctx.db.delete("preferences", row._id);
+      }
+    },
+  });
+  return {
+    clear,
+    readCompact: device.query({
+      args: {},
+      handler: async (ctx) =>
+        (await ctx.db.query("preferences").collect()).map((row) => row.compact),
+    }),
+    reset: device.mutation({
+      args: {},
+      handler: async (ctx) => {
+        await ctx.runMutation(clear, {});
+      },
+    }),
+    setCompact: device.mutation({
+      args: { compact: v.boolean() },
+      handler: async (ctx, args) => {
+        await ctx.db.insert("preferences", { compact: args.compact });
+      },
+    }),
+  };
+}
+
+async function deviceStore(): Promise<RuntimeStorageWriter> {
+  const store = await NativeStore.openWith(nativeModule().Store, temporaryPath("placement"));
+  await store.setup(deviceStoreSchema);
+  return store;
+}
+
+async function localRunner(localModules: LocalModuleMap): Promise<Runner> {
+  const runner = createRunner({ docs }, await deviceStore(), deviceStoreSchema, { localModules });
+  await runner.localReady;
+  return runner;
+}
 
 function fakeStore(): RuntimeStorageWriter {
   const id = "documents|00000000000040008000000000000001";

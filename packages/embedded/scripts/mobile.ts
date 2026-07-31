@@ -16,11 +16,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  androidAbis,
   androidNdk,
   androidNdkVersion,
   cargoNdkVersion,
   cargoTargetDir,
   iosTargetTriples,
+  mobileSlices,
 } from "../../../config/build.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,7 +31,10 @@ const targetDir = cargoTargetDir();
 const nativeDir = resolve(packageDir, "native");
 const header = resolve(repoRoot, "crates/mobile/include/convex_embedded_mobile.h");
 const command = process.argv[2] ?? "verify";
-const androidAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] as const;
+const appleArchitectures = {
+  "aarch64-apple-ios": "arm64",
+  "aarch64-apple-ios-sim": "arm64",
+} as const;
 const iosDeploymentTarget = "15.1";
 const cSymbols = [
   "cem_api_version",
@@ -56,54 +61,66 @@ else throw new Error(`Unknown mobile artifact command: ${command}`);
 
 function buildIos(): void {
   requirePlatform("darwin", "iOS XCFrameworks require Xcode on macOS");
-  for (const triple of iosTargetTriples) cargoBuild(triple);
+  const slices = appleSlices();
+  for (const slice of slices) cargoBuild(slice.triple);
 
   const work = resolve(targetDir, "mobile-xcframework");
   const headers = resolve(work, "headers");
-  const simulator = resolve(work, "simulator", "libconvex_embedded_mobile.a");
   const destination = resolve(nativeDir, "apple", "ConvexEmbedded.xcframework");
   rmSync(work, { recursive: true, force: true });
   rmSync(destination, { recursive: true, force: true });
   mkdirSync(headers, { recursive: true });
-  mkdirSync(dirname(simulator), { recursive: true });
   copyFileSync(header, resolve(headers, "convex_embedded_mobile.h"));
   writeFileSync(
     resolve(headers, "module.modulemap"),
     'module ConvexEmbeddedMobile { header "convex_embedded_mobile.h" export * }\n',
   );
-  exec("lipo", [
-    artifact("aarch64-apple-ios-sim", "a"),
-    artifact("x86_64-apple-ios", "a"),
-    "-create",
-    "-output",
-    simulator,
+  const libraries = slices.flatMap((slice) => [
+    "-library",
+    artifact(slice.triple),
+    "-headers",
+    headers,
   ]);
   mkdirSync(dirname(destination), { recursive: true });
-  exec("xcodebuild", [
-    "-create-xcframework",
-    "-library",
-    artifact("aarch64-apple-ios", "a"),
-    "-headers",
-    headers,
-    "-library",
-    simulator,
-    "-headers",
-    headers,
-    "-output",
-    destination,
-  ]);
+  exec("xcodebuild", ["-create-xcframework", ...libraries, "-output", destination]);
   verifyApple();
+}
+
+/**
+ * Describe the selected Apple triples as the device and simulator slices `xcodebuild` packages,
+ * naming each one the way `-create-xcframework` does so build and verify agree on the layout.
+ * Every shipping triple is arm64, so a slice is always one triple and one architecture.
+ */
+function appleSlices(): AppleSlice[] {
+  return mobileSlices(iosTargetTriples).map((triple) => {
+    const architecture = appleArchitectures[triple];
+    const variant = triple === "aarch64-apple-ios" ? undefined : "simulator";
+    return {
+      architecture,
+      identifier: `ios-${architecture}${variant ? `-${variant}` : ""}`,
+      triple,
+      variant,
+    };
+  });
+}
+
+interface AppleSlice {
+  architecture: string;
+  identifier: string;
+  triple: (typeof iosTargetTriples)[number];
+  variant: "simulator" | undefined;
 }
 
 function buildAndroid(): void {
   verifyAndroidToolchain();
+  const abis = mobileSlices(androidAbis);
   const output = resolve(targetDir, "mobile-android");
   rmSync(output, { recursive: true, force: true });
   exec("cargo", [
     "ndk",
     "--platform",
     "24",
-    ...androidAbis.flatMap((abi) => ["--target", abi]),
+    ...abis.flatMap((abi) => ["--target", abi]),
     "--output-dir",
     output,
     "build",
@@ -112,7 +129,7 @@ function buildAndroid(): void {
     "--release",
     "--locked",
   ]);
-  for (const abi of androidAbis) {
+  for (const abi of abis) {
     const source = resolve(output, abi, "libconvex_embedded_mobile.so");
     const destination = resolve(nativeDir, "android", abi, "libconvex_embedded_mobile.so");
     assertArtifact(source);
@@ -134,14 +151,7 @@ function verifyApple(): void {
   if (!existsSync(apple)) throw new Error(`Missing mobile Apple artifact: ${apple}`);
   const info = resolve(apple, "Info.plist");
   assertArtifact(info);
-  const expected = [
-    { architectures: ["arm64"], identifier: "ios-arm64", variant: undefined },
-    {
-      architectures: ["arm64", "x86_64"],
-      identifier: "ios-arm64_x86_64-simulator",
-      variant: "simulator",
-    },
-  ] as const;
+  const expected = appleSlices();
   if (process.platform !== "darwin") {
     const plist = readFileSync(info, "utf8");
     for (const entry of expected) {
@@ -157,7 +167,11 @@ function verifyApple(): void {
     AvailableLibraries?: AppleLibrary[];
   };
   if (plist.AvailableLibraries?.length !== expected.length) {
-    throw new Error("Apple XCFramework must declare exactly one device and one simulator slice.");
+    throw new Error(
+      `Apple XCFramework must declare exactly these slices: ${expected
+        .map((slice) => slice.identifier)
+        .join(", ")}.`,
+    );
   }
   for (const wanted of expected) {
     const entry = plist.AvailableLibraries.find(
@@ -167,9 +181,7 @@ function verifyApple(): void {
       !entry ||
       entry.SupportedPlatform !== "ios" ||
       entry.SupportedPlatformVariant !== wanted.variant ||
-      entry.SupportedArchitectures.toSorted((left, right) => left.localeCompare(right)).join(
-        ",",
-      ) !== wanted.architectures.toSorted((left, right) => left.localeCompare(right)).join(",") ||
+      entry.SupportedArchitectures.join(",") !== wanted.architecture ||
       entry.BinaryPath !== "libconvex_embedded_mobile.a"
     ) {
       throw new Error(`Apple XCFramework has an invalid ${wanted.identifier} declaration.`);
@@ -180,7 +192,7 @@ function verifyApple(): void {
       entry.LibraryPath,
       entry.HeadersPath,
     );
-    verifyAppleSymbols(library, wanted.architectures);
+    verifyAppleSymbols(library, wanted.architecture);
   }
 }
 
@@ -220,39 +232,27 @@ function verifyAppleFiles(
   return library;
 }
 
-function verifyAppleSymbols(library: string, expectedArchitectures: readonly string[]): void {
+function verifyAppleSymbols(library: string, expectedArchitecture: string): void {
+  const architecture = execText("xcrun", ["lipo", "-archs", library]).trim();
+  if (architecture !== expectedArchitecture) {
+    throw new Error(`${library} has unexpected architectures: ${architecture}`);
+  }
   const work = mkdtempSync(resolve(tmpdir(), "convex-embedded-mobile-"));
   try {
-    const architectures = execText("xcrun", ["lipo", "-archs", library]).trim().split(/\s+/);
-    if (
-      architectures.toSorted((left, right) => left.localeCompare(right)).join(",") !==
-      expectedArchitectures.toSorted((left, right) => left.localeCompare(right)).join(",")
-    ) {
-      throw new Error(`${library} has unexpected architectures: ${architectures.join(", ")}`);
+    const members = execText("xcrun", ["ar", "-t", library])
+      .split("\n")
+      .filter((member) => member.startsWith("convex_embedded_mobile") && member.endsWith(".o"));
+    if (members.length === 0) throw new Error(`${library} has no ${architecture} object files.`);
+    let symbols = "";
+    for (const member of members) {
+      execText("xcrun", ["ar", "-x", library, member], work);
+      symbols += execText("xcrun", ["nm", "-gUj", resolve(work, member)], work);
     }
-    for (const architecture of architectures) {
-      const directory = resolve(work, architecture);
-      mkdirSync(directory, { recursive: true });
-      const archive =
-        architectures.length === 1 ? library : resolve(directory, "libconvex_embedded_mobile.a");
-      if (architectures.length > 1) {
-        execText("xcrun", ["lipo", library, "-thin", architecture, "-output", archive]);
-      }
-      const members = execText("xcrun", ["ar", "-t", archive])
-        .split("\n")
-        .filter((member) => member.startsWith("convex_embedded_mobile") && member.endsWith(".o"));
-      if (members.length === 0) throw new Error(`${library} has no ${architecture} object files.`);
-      let symbols = "";
-      for (const member of members) {
-        execText("xcrun", ["ar", "-x", archive, member], directory);
-        symbols += execText("xcrun", ["nm", "-gUj", resolve(directory, member)], directory);
-      }
-      assertSymbols(symbols, cSymbols, `${library} (${architecture})`);
-      verifyAppleDeploymentTargets(archive);
-    }
+    assertSymbols(symbols, cSymbols, `${library} (${architecture})`);
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
+  verifyAppleDeploymentTargets(library);
 }
 
 function verifyAppleDeploymentTargets(library: string): void {
@@ -309,6 +309,7 @@ function compareVersion(left: string, right: string): number {
 
 function verifyAndroid(): void {
   verifyHeader();
+  const abis = mobileSlices(androidAbis);
   const readelf = androidTool("llvm-readelf");
   const nm = androidTool("llvm-nm");
   const machines: Record<(typeof androidAbis)[number], RegExp> = {
@@ -317,7 +318,7 @@ function verifyAndroid(): void {
     x86: /Intel 80386/,
     x86_64: /Advanced Micro Devices X86-64/,
   };
-  for (const abi of androidAbis) {
+  for (const abi of abis) {
     const library = resolve(nativeDir, "android", abi, "libconvex_embedded_mobile.so");
     assertArtifact(library);
     const header = execText(readelf, ["-hW", library]);
@@ -387,8 +388,8 @@ function cargoBuild(triple: string): void {
   });
 }
 
-function artifact(triple: string, extension: "a"): string {
-  const path = resolve(targetDir, triple, "release", `libconvex_embedded_mobile.${extension}`);
+function artifact(triple: string): string {
+  const path = resolve(targetDir, triple, "release", "libconvex_embedded_mobile.a");
   assertArtifact(path);
   return path;
 }

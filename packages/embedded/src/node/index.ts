@@ -33,6 +33,7 @@ export type {
   ConvexEmbeddedClientOptions,
   ConvexEmbeddedMutationOptions,
   ConvexEmbeddedSchema,
+  ConvexLocalModules,
   ConvexModules,
   EmbeddedDataDelete,
   EmbeddedDataEvent,

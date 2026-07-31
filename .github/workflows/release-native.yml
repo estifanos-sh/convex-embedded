@@ -1,0 +1,129 @@
+name: Release native
+
+# CI (preview.yml) builds one Apple triple and one Android ABI per push, which is all the
+# autolinking smoke apps consume. This workflow is the only place the shippable artifacts are
+# produced: both Apple triples packaged into a device + simulator XCFramework, and every Android
+# ABI. It shares the `apple` and `android` rust-cache keys with CI, so a release starts from the
+# warm cache CI saved on main and only pays for the slices CI skipped.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags: ["v*"]
+  # Tags are cut rarely, so the nightly run of this same full matrix is what catches ABI-specific
+  # breakage — a triple or ABI the per-push smoke never compiles — before release day. 07:27 UTC
+  # is off the hour and outside working hours, and because a scheduled run reports
+  # `refs/heads/main` it also refreshes the shared `apple` and `android` caches for every slice.
+  schedule:
+    - cron: "27 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Every Rust entrypoint routes through config/build.ts, which defaults the target directory to
+  # the OS temp dir. Pin it inside the workspace so Swatinem/rust-cache actually caches the
+  # compiled artifacts instead of an empty directory.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mobile-apple:
+    name: Build iOS
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Node setup
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      # Leaving CONVEX_EMBEDDED_MOBILE_SLICES unset builds every triple in `iosTargetTriples`.
+      # mobile.ts verifies the assembled XCFramework's slices, architectures, exported symbols,
+      # and deployment targets before this job can pass.
+      - name: Prepare Rust and build the XCFramework through the Expo hook
+        env:
+          EAS_BUILD_PLATFORM: ios
+        run: node demos/expo/scripts/native.ts eas
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v7
+        with:
+          name: embedded-mobile-apple
+          path: packages/embedded/native/apple
+          if-no-files-found: error
+
+  mobile-android:
+    name: Build Android
+    runs-on: large-runner
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The Expo hook shells out to sdkmanager for the pinned NDK, and the large-runner pool
+      # images default to JDK 11. No Gradle runs here, so the CI build-cache setup is not needed.
+      - name: Java setup
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Node setup
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      # Leaving CONVEX_EMBEDDED_MOBILE_SLICES unset builds every ABI in `androidAbis`. mobile.ts
+      # verifies each library's machine type, 16 KiB page alignment, and JNI exports before this
+      # job can pass.
+      - name: Prepare Rust and build Android libraries through the Expo hook
+        env:
+          EAS_BUILD_PLATFORM: android
+        run: node demos/expo/scripts/native.ts eas
+
+      - name: Upload Android libraries
+        uses: actions/upload-artifact@v7
+        with:
+          name: embedded-mobile-android
+          path: packages/embedded/native/android
+          if-no-files-found: error

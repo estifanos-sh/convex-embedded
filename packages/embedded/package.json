@@ -18,6 +18,8 @@
     "dist/expo",
     "dist/internal",
     "dist/native",
+    "dist/local.d.mts",
+    "dist/local.mjs",
     "dist/node.d.mts",
     "dist/node.mjs",
     "dist/metro.cjs",
@@ -122,6 +124,10 @@
     "./server": {
       "types": "./dist/server.d.mts",
       "import": "./dist/server.mjs"
+    },
+    "./local": {
+      "types": "./dist/local.d.mts",
+      "import": "./dist/local.mjs"
     },
     "./internal/text": {
       "types": "./dist/internal/text.d.mts",

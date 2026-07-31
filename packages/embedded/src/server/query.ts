@@ -37,7 +37,7 @@ export type FunctionManifest = Record<
     string,
     {
       kind: "query" | "mutation";
-      placement: "replicated" | "remote" | "local";
+      placement: "replicated" | "remote";
       visibility: "public" | "internal";
     }
   >

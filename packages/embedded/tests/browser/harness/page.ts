@@ -497,11 +497,7 @@ export async function installMetalDevicePage(
           await currentClient().mutation("documents:write", { id, splices: [body] });
         },
         writeDraft: async (id, title) => {
-          await currentClient().mutation("documents:write", {
-            id,
-            title,
-            updatedAt: performance.now(),
-          });
+          await currentClient().mutation("documents:write", { id, title });
         },
         close,
         create: async (title) => {
@@ -509,7 +505,6 @@ export async function installMetalDevicePage(
             body: bodyFor(title),
             slug: title,
             title,
-            updatedAt: performance.now(),
           })) as MetalDocument;
           return doc._id;
         },
@@ -549,7 +544,7 @@ export async function installMetalDevicePage(
         projections,
         remoteTickTotals,
         restoreSnapshot: async (id, revId) => {
-          const restored = (await currentClient().mutation("documents:restore", {
+          const restored = (await currentClient().mutation("remote:restore", {
             id,
             revId,
           })) as { document: MetalDocument; revision: Record<string, unknown> };
@@ -559,7 +554,7 @@ export async function installMetalDevicePage(
           const revisions: MetalRevEntry["rev"][] = [];
           let cursor: string | null = null;
           do {
-            const result = (await currentClient().query("documents:history", {
+            const result = (await currentClient().query("remote:history", {
               id,
               cursor,
               numItems: 100,

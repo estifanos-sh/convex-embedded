@@ -7,7 +7,12 @@
  *
  * @packageDocumentation
  */
-import { createEmbeddedAuthState, EmbeddedClient, type ConvexModules } from "../client";
+import {
+  createEmbeddedAuthState,
+  EmbeddedClient,
+  type ConvexLocalModules,
+  type ConvexModules,
+} from "../client";
 import type { ConvexEmbeddedSchema } from "../schema";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { loadNativeModule, validateNativeModule, type NativeModule } from "./artifact";
@@ -16,6 +21,7 @@ import { NativeStore } from "./native";
 export type {
   ConvexEmbeddedMutationOptions,
   AuthTokenFetcher,
+  ConvexLocalModules,
   ConvexModules,
   EmbeddedDataDelete,
   EmbeddedDataEvent,
@@ -69,6 +75,20 @@ export interface ConvexEmbeddedClientOptions {
   modules: ConvexModules;
 
   /**
+   * Device-only function modules, imported when the client starts.
+   *
+   * @remarks
+   * Keys are module paths relative to the app's local function directory, without an extension;
+   * values are lazy module loaders. Exports that are not registrations are left alone.
+   *
+   * @example
+   * ```ts
+   * const local = { "sync/drafts": () => import("./local/sync/drafts.js") };
+   * ```
+   */
+  local?: Record<string, () => Promise<unknown>>;
+
+  /**
    * Filesystem path for the embedded database.
    *
    * @remarks
@@ -111,11 +131,20 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
     super({
       schema: options.schema,
       modules: options.modules,
+      localModules: options.local && namespaceLocalModules(options.local),
       store: openStore(native, options.path),
       authState,
       remote: options.url === undefined ? undefined : { url: options.url },
     });
   }
+}
+
+function namespaceLocalModules(
+  local: NonNullable<ConvexEmbeddedClientOptions["local"]>,
+): ConvexLocalModules {
+  return Object.fromEntries(
+    Object.entries(local).map(([modulePath, load]) => [`local/${modulePath}`, load]),
+  );
 }
 
 function openStore(native: NativeModule, path: string): Promise<NativeStore> {

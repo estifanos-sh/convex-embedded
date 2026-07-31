@@ -8,9 +8,9 @@ import {
   defineEmbeddedSchema,
   type DeviceModel,
   type DeviceDataModel,
-  embeddedTable,
   localTable,
   type ReplicatedDataModel,
+  replicatedTable,
   type ServerDataModel,
   type ServerModel,
   type WireModel,
@@ -18,9 +18,9 @@ import {
 import { e } from "../../src/values";
 
 const schema = defineEmbeddedSchema({
-  documents: embeddedTable({
+  documents: replicatedTable({
     expanded: e.local(v.boolean()),
-    secret: e.omit(v.string()),
+    secret: e.remote(v.string()),
     title: v.string(),
   })
     .index("by_title", ["title"])
@@ -69,10 +69,12 @@ describe("embedded schema placement", () => {
   test("rejects local-field indexes and nested annotations", () => {
     expect(() =>
       defineEmbeddedSchema({
-        docs: embeddedTable({ expanded: e.local(v.boolean()) }).index("by_expanded", ["expanded"]),
+        docs: replicatedTable({ expanded: e.local(v.boolean()) }).index("by_expanded", [
+          "expanded",
+        ]),
       }),
     ).toThrow("cannot contain local field");
-    expect(() => embeddedTable({ nested: v.object({ secret: e.omit(v.string()) }) })).toThrow(
+    expect(() => replicatedTable({ nested: v.object({ secret: e.remote(v.string()) }) })).toThrow(
       "must be top-level",
     );
   });
@@ -109,8 +111,8 @@ describe("embedded schema placement", () => {
 
   test("preserves placement metadata through asOptional at type and runtime", () => {
     const optionalSchema = defineEmbeddedSchema({
-      docs: embeddedTable({
-        secret: e.omit(v.string()).asOptional(),
+      docs: replicatedTable({
+        secret: e.remote(v.string()).asOptional(),
         title: e.text().asOptional(),
       }),
     });
@@ -127,12 +129,12 @@ describe("embedded schema placement", () => {
   });
 
   test("includes placement metadata in the local schema identity", () => {
-    const replicated = defineEmbeddedSchema({ docs: embeddedTable({ value: v.string() }) });
+    const replicated = defineEmbeddedSchema({ docs: replicatedTable({ value: v.string() }) });
     const remote = defineEmbeddedSchema({
-      docs: embeddedTable({ value: e.omit(v.string()) }),
+      docs: replicatedTable({ value: e.remote(v.string()) }),
     });
     const local = defineEmbeddedSchema({
-      docs: embeddedTable({ value: e.local(v.string()) }),
+      docs: replicatedTable({ value: e.local(v.string()) }),
     });
 
     const hashes = [replicated, remote, local].map(
@@ -143,9 +145,9 @@ describe("embedded schema placement", () => {
 
   test("keeps hosted-only search and vector indexes out of the local contract", () => {
     const hostedIndexes = defineEmbeddedSchema({
-      docs: embeddedTable({
-        embedding: e.omit(v.array(v.float64())),
-        text: e.omit(v.string()),
+      docs: replicatedTable({
+        embedding: e.remote(v.array(v.float64())),
+        text: e.remote(v.string()),
         title: v.string(),
       })
         .searchIndex("search_text", { searchField: "text" })

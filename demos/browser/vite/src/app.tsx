@@ -11,6 +11,8 @@ import {
 import type { FunctionReference } from "convex/server";
 import {
   ArrowLeft,
+  ChevronDown,
+  ChevronRight,
   CircleCheck,
   Clock3,
   Cloud,
@@ -19,6 +21,7 @@ import {
   History,
   Loader2,
   Paperclip,
+  Pin,
   Plus,
   RotateCcw,
   Save,
@@ -37,6 +40,11 @@ import type { TextFieldWriter } from "@convex-dev/embedded/internal/text";
 
 import { api } from "~convex/_generated/api";
 import type { Id } from "~convex/_generated/dataModel";
+import { pinned as pinnedDocumentsQuery, toggle as togglePinMutation } from "~local/pins";
+import {
+  expanded as expandedDocumentsQuery,
+  toggleExpanded as toggleExpandedMutation,
+} from "~local/view";
 import { client, subscribeBrowserDebug } from "./lib/client";
 import { readQuery, type QueryState } from "./lib/query";
 
@@ -257,6 +265,30 @@ export function App(): ReactElement {
     useMemo(() => (selectedDocumentId ? { id: selectedDocumentId } : {}), [selectedDocumentId]),
     selectedDocumentId !== null,
   );
+  const pinnedQuery = usePinnedDocumentIds();
+  const pinnedIds = useMemo(
+    () => new Set(pinnedQuery.query === "ready" ? pinnedQuery.value : []),
+    [pinnedQuery],
+  );
+  const togglePin = useCallback(async (documentId: Id<"documents">) => {
+    try {
+      await client.mutation(togglePinMutation, { documentId });
+    } catch (error) {
+      setAppError(errorMessage(error));
+    }
+  }, []);
+  const expandedQuery = useExpandedDocumentIds();
+  const expandedIds = useMemo(
+    () => new Set(expandedQuery.query === "ready" ? expandedQuery.value : []),
+    [expandedQuery],
+  );
+  const toggleExpanded = useCallback(async (documentId: Id<"documents">) => {
+    try {
+      await client.mutation(toggleExpandedMutation, { documentId });
+    } catch (error) {
+      setAppError(errorMessage(error));
+    }
+  }, []);
   const connection = useConnectionState();
   const bootError =
     connection.local === "failed"
@@ -293,6 +325,13 @@ export function App(): ReactElement {
   const lastAppliedDocIdRef = useRef<Id<"documents"> | null>(null);
   const applyingRemoteRef = useRef(false);
   const documents = queriedDocuments;
+  const orderedDocuments = useMemo(() => {
+    if (pinnedIds.size === 0) return documents;
+    return [
+      ...documents.filter((document) => pinnedIds.has(document._id)),
+      ...documents.filter((document) => !pinnedIds.has(document._id)),
+    ];
+  }, [documents, pinnedIds]);
 
   useEffect(
     () =>
@@ -386,9 +425,9 @@ export function App(): ReactElement {
       ) {
         return current;
       }
-      return documents[0]?._id ?? createdFallback?._id ?? null;
+      return orderedDocuments[0]?._id ?? createdFallback?._id ?? null;
     });
-  }, [createdFallback, documents]);
+  }, [createdFallback, documents, orderedDocuments]);
 
   useLayoutEffect(() => {
     editor.isEditable = selectedDocument !== null;
@@ -883,9 +922,10 @@ export function App(): ReactElement {
 
   const filteredDocuments = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    if (!query) return documents;
-    return documents.filter((document) => document.title.toLowerCase().includes(query));
-  }, [documents, searchQuery]);
+    return query
+      ? orderedDocuments.filter((document) => document.title.toLowerCase().includes(query))
+      : orderedDocuments;
+  }, [orderedDocuments, searchQuery]);
   const uploadBusy = uploadNotice?.phase === "saving";
 
   return (
@@ -928,6 +968,12 @@ export function App(): ReactElement {
                   <Plus size={16} />
                 </button>
               </div>
+              {pinnedIds.size > 0 ? (
+                <div className="pinnedCount">
+                  <Pin className="shrink-0" size={12} />
+                  {pinnedIds.size} pinned on this device
+                </div>
+              ) : null}
             </div>
 
             <div className="documentList">
@@ -943,11 +989,15 @@ export function App(): ReactElement {
                     key={document._id}
                     active={document._id === selectedDocumentId}
                     document={document}
+                    expanded={expandedIds.has(document._id)}
+                    pinned={pinnedIds.has(document._id)}
                     onSelect={() => {
                       if (uploadBusy) return;
                       setSelectedDocumentId(document._id);
                       setMobilePane("editor");
                     }}
+                    onToggleExpanded={() => void toggleExpanded(document._id)}
+                    onTogglePin={() => void togglePin(document._id)}
                   />
                 ))
               )}
@@ -1204,6 +1254,34 @@ function useEmbeddedQuery<T>(
   return state;
 }
 
+function usePinnedDocumentIds(): QueryState<Id<"documents">[]> {
+  const [state, setState] = useState<QueryState<Id<"documents">[]>>({ query: "loading" });
+
+  useEffect(() => {
+    const watch = client.watchQuery(pinnedDocumentsQuery, {});
+    const read = () => setState(readQuery(() => watch.localQueryResult()));
+    const unsubscribe = watch.onUpdate(read);
+    read();
+    return unsubscribe;
+  }, []);
+
+  return state;
+}
+
+function useExpandedDocumentIds(): QueryState<Id<"documents">[]> {
+  const [state, setState] = useState<QueryState<Id<"documents">[]>>({ query: "loading" });
+
+  useEffect(() => {
+    const watch = client.watchQuery(expandedDocumentsQuery, {});
+    const read = () => setState(readQuery(() => watch.localQueryResult()));
+    const unsubscribe = watch.onUpdate(read);
+    read();
+    return unsubscribe;
+  }, []);
+
+  return state;
+}
+
 function useConnectionState(): EmbeddedConnectionState {
   const [state, setState] = useState<EmbeddedConnectionState>(() => client.connectionState());
   useEffect(() => {
@@ -1379,23 +1457,54 @@ function RemoteStatus(props: { connection: EmbeddedConnectionState }): ReactElem
 function DocumentRow(props: {
   active: boolean;
   document: DocumentSummary;
+  expanded: boolean;
+  pinned: boolean;
   onSelect: () => void;
+  onToggleExpanded: () => void;
+  onTogglePin: () => void;
 }): ReactElement {
   return (
-    <button
-      className={["documentRow", props.active ? "active" : ""].join(" ")}
-      type="button"
-      onClick={props.onSelect}
-      title={props.document.title}
-    >
-      <FileText className="shrink-0 text-content-tertiary" size={15} />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate">{props.document.title}</span>
-        <span className="block truncate text-xs text-content-tertiary">
-          {formatTime(props.document.updatedAt)}
+    <div className={["documentRow", props.active ? "active" : ""].join(" ")}>
+      <button
+        className="documentRowSelect"
+        type="button"
+        onClick={props.onSelect}
+        title={props.document.title}
+      >
+        <FileText className="shrink-0 text-content-tertiary" size={15} />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate">{props.document.title}</span>
+          <span className="block truncate text-xs text-content-tertiary">
+            {formatTime(props.document.updatedAt)}
+          </span>
+          {props.expanded ? (
+            <span className="block truncate text-xs text-content-tertiary">
+              /{props.document.slug}
+            </span>
+          ) : null}
         </span>
-      </span>
-    </button>
+      </button>
+      <button
+        className={["documentRowExpand", props.expanded ? "active" : ""].join(" ")}
+        type="button"
+        aria-label={props.expanded ? "Collapse document details" : "Expand document details"}
+        aria-expanded={props.expanded}
+        title={props.expanded ? "Hide details on this device" : "Show details on this device"}
+        onClick={props.onToggleExpanded}
+      >
+        {props.expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+      </button>
+      <button
+        className={["documentRowPin", props.pinned ? "active" : ""].join(" ")}
+        type="button"
+        aria-label={props.pinned ? "Unpin document" : "Pin document"}
+        aria-pressed={props.pinned}
+        title={props.pinned ? "Unpin from this device" : "Pin to this device"}
+        onClick={props.onTogglePin}
+      >
+        <Pin size={14} />
+      </button>
+    </div>
   );
 }
 

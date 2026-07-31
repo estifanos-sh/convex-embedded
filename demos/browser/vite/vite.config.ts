@@ -7,10 +7,11 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { embeddedDevtools } from "@convex-dev/embedded/devtools/vite";
 import schema from "../../../convex/schema";
-import { embeddedGeneratedPath, requireDeploymentUrl } from "../../../config";
+import { embeddedGeneratedPath, embeddedLocalPath, requireDeploymentUrl } from "../../../config";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const convexDir = fileURLToPath(new URL("../../../convex", import.meta.url));
+const localDir = join(repoRoot, embeddedLocalPath);
 const embeddedViteEntry = fileURLToPath(
   new URL("../../../packages/embedded/dist/vite.mjs", import.meta.url),
 );
@@ -147,6 +148,7 @@ export default defineConfig(async () => {
     resolve: {
       alias: {
         "~convex": convexDir,
+        "~local": localDir,
       },
     },
     server: {
@@ -163,6 +165,7 @@ export default defineConfig(async () => {
       convexEmbedded({
         convexDir,
         generatedPath: embeddedGeneratedPath,
+        local: localDir,
         schema,
       }),
       embeddedDevtools(),

@@ -244,6 +244,7 @@ export async function initFromMessage(
       options.events === false
         ? undefined
         : (event) => postResponse({ event, op: WorkerEvent.Event }),
+    localModules: embedded.localModules,
     modules: embedded.modules,
     manifest: embedded.embeddedManifest,
     moduleGraphHash: request.identity?.moduleGraphHash,
@@ -1403,6 +1404,7 @@ export function consumeWorkerRemoteTick(state: WorkerState, tick: RemoteTick): v
 export async function initRuntime(options: {
   debug?: boolean;
   emit?: EmbeddedEventListener;
+  localModules?: import("../runtime/runner").LocalModuleMap;
   modules: ConvexModules;
   manifest?: import("../runtime/runner").RuntimeFunctionManifest;
   moduleGraphHash?: string;
@@ -1456,10 +1458,12 @@ export async function initRuntime(options: {
         setTimeout(run, 0);
       },
       emit: options.emit,
+      localModules: options.localModules,
       moduleGraphHash: options.moduleGraphHash,
       manifest: options.manifest,
       remote: options.remote,
     });
+    await runner.localReady;
     if (slowOpenTimer !== undefined) clearTimeout(slowOpenTimer);
     runtimeEvent?.({ at: getTimerTime(), phase: "ready", type: "runtime" });
     const state: WorkerState = {

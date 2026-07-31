@@ -3,14 +3,15 @@ import { defineTable } from "convex/server";
 import { v } from "convex/values";
 import { describe, expect, test } from "vite-plus/test";
 
-import { defineEmbeddedSchema, embeddedTable, localTable } from "../../src/schema";
+import { defineLocal } from "../../src/local";
+import { defineEmbeddedSchema, localTable, replicatedTable } from "../../src/schema";
 import { defineEmbedded } from "../../src/server";
 import { e } from "../../src/values";
 
 const schema = defineEmbeddedSchema({
-  documents: embeddedTable({
+  documents: replicatedTable({
     title: v.string(),
-    secret: e.omit(v.string()),
+    secret: e.remote(v.string()),
     expanded: e.local(v.boolean()),
   }),
   serverNotes: defineTable({ note: v.string() }),
@@ -25,7 +26,6 @@ describe("explicit function placement", () => {
   test("exposes placement namespaces without boolean routing", () => {
     const embedded = defineEmbedded({ component, schema });
     expect(Object.keys(embedded).sort()).toEqual([
-      "local",
       "pull",
       "push",
       "remote",
@@ -35,7 +35,7 @@ describe("explicit function placement", () => {
 
     const replicated = embedded.replicated.query({ args: {}, handler: async () => null });
     const remote = embedded.remote.query({ args: {}, handler: async () => null });
-    const local = embedded.local.query({ args: {}, handler: async () => null });
+    const local = defineLocal(schema).query({ args: {}, handler: async () => null });
     expect((replicated as unknown as { __embeddedPlacement: string }).__embeddedPlacement).toBe(
       "replicated",
     );
@@ -78,7 +78,7 @@ describe("explicit function placement", () => {
       },
     });
 
-    embedded.local.query({
+    defineLocal(schema).query({
       args: { id: v.id("documents") },
       handler: async (ctx, { id }) => {
         const document = await ctx.db.get("documents", id);

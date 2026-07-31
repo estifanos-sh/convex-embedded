@@ -2258,7 +2258,12 @@ describe("v5 real Convex vertical slice", () => {
     });
     const rows = await client.query(api.documents.read, { limit: 40 });
     const membersHash = await hashValue(
-      await Promise.all(rows.map(async (row) => ({ id: row._id, hash: await hashDocument(row) }))),
+      await Promise.all(
+        rows.map(async (row: Record<string, unknown> & { _id: string }) => ({
+          id: row._id,
+          hash: await hashDocument(row),
+        })),
+      ),
     );
     const hostedTitle = `hosted-${prefix}`;
     await client.mutation(api.documents.write, {

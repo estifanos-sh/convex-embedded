@@ -6,11 +6,13 @@ import { convexEmbedded } from "../src/vite.js";
 import {
   browserConvexDir,
   browserDistPath,
+  browserLocalDir,
   convexBrowserPath,
   convexPath,
   convexServerPath,
   convexValuesPath,
   hostedRemoteUrl,
+  localEntryPath,
 } from "../tests/bench/harness/paths.js";
 import { browserCommands } from "../tests/browser/harness/commands.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
@@ -44,7 +46,10 @@ export const browserProject = {
     __CONVEX_EMBEDDED_BROWSER_BENCH_WARMUPS__: JSON.stringify(bench.warmups),
     __CONVEX_EMBEDDED_HOSTED_URL__: JSON.stringify(hostedRemoteUrl ?? null),
   },
-  plugins: [convexEmbedded({ convexDir: browserConvexDir, schema }), browserRuntimeLog()],
+  plugins: [
+    convexEmbedded({ convexDir: browserConvexDir, local: browserLocalDir, schema }),
+    browserRuntimeLog(),
+  ],
   optimizeDeps: {
     include: [
       "@codemirror/lang-json",
@@ -60,6 +65,7 @@ export const browserProject = {
     dedupe: ["solid-js"],
     alias: [
       { find: "@convex-dev/embedded/browser", replacement: browserDistPath },
+      { find: "@convex-dev/embedded/local", replacement: localEntryPath },
       { find: "convex/browser", replacement: convexBrowserPath },
       { find: "convex/server", replacement: convexServerPath },
       { find: "convex/values", replacement: convexValuesPath },

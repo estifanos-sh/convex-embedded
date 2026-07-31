@@ -13,8 +13,8 @@ import {
 } from "../../../config";
 
 void describe("demo deployment configuration", () => {
-  void it("keeps browser and Metro generation outside Convex-owned output", () => {
-    assert.equal(embeddedGeneratedPath, "generated/embedded.ts");
+  void it("keeps the placement lockfile on a basename the Convex CLI skips", () => {
+    assert.equal(embeddedGeneratedPath, "embedded.generated.ts");
   });
 
   void it("uses process overrides before the shared root environment", () => {

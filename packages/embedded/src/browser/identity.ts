@@ -1,7 +1,7 @@
 import type { RuntimeIdentity } from "./protocol";
 import { browserStorageId } from "./storage";
 import { WASM_API_VERSION } from "./artifact";
-import { EMBEDDED_STORE_FORMAT_VERSION } from "../abi";
+import { EMBEDDED_EPOCH } from "../abi";
 import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
 
 /**
@@ -50,7 +50,7 @@ export function createRuntimeIdentity(storageId = browserStorageId()): RuntimeId
     protocolVersion: EMBEDDED_PROTOCOL_VERSION,
     schemaHash: embeddedIdentity.schemaHash,
     storageId,
-    storeFormatVersion: EMBEDDED_STORE_FORMAT_VERSION,
+    storeFormatVersion: EMBEDDED_EPOCH,
     wasmAbiVersion: WASM_API_VERSION,
   };
 }

@@ -37,13 +37,16 @@ Create one Embedded server definition and export its protocol functions:
 import { defineEmbedded } from "@convex-dev/embedded/server";
 
 import { components } from "./_generated/api";
+import { embeddedManifest } from "./embedded.generated";
 import schema from "./schema";
 
 export const embedded = defineEmbedded({
   component: components.embedded,
+  manifest: embeddedManifest,
   schema,
 });
 
+export const { remote, replicated } = embedded;
 export const { upload, pull, push } = embedded;
 ```
 
@@ -54,9 +57,9 @@ database APIs:
 // convex/documents.ts
 import { ConvexError, v } from "convex/values";
 
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 
-export const list = embedded.replicated.query({
+export const list = replicated.query({
   args: {},
   handler: async (ctx) => {
     const identity = await ctx.auth.getUserIdentity();
@@ -68,7 +71,7 @@ export const list = embedded.replicated.query({
   },
 });
 
-export const create = embedded.replicated.mutation({
+export const create = replicated.mutation({
   args: { body: v.string() },
   handler: async (ctx, args) => {
     const identity = await ctx.auth.getUserIdentity();
@@ -81,9 +84,9 @@ export const create = embedded.replicated.mutation({
 });
 ```
 
-Use `embedded.remote` for hosted-only queries and mutations and `embedded.local` for device-only
-operations. Replicated functions see only replicated fields, remote functions see the hosted
-document, and local functions see replicated fields plus device overlays.
+Use `remote` for hosted-only queries and mutations, and the `local` namespace (below) for
+device-only operations. Replicated functions see only replicated fields, remote functions see the
+hosted document, and local functions see replicated fields plus device overlays.
 
 ### Placement model
 
@@ -91,37 +94,56 @@ Tables, fields, indexes, and functions use the same three placements:
 
 | Schema declaration                                       | Hosted server | Replication wire | Device                  |
 | -------------------------------------------------------- | ------------- | ---------------- | ----------------------- |
-| `embeddedTable({...})`                                   | Yes           | Yes              | Yes                     |
+| `replicatedTable({...})`                                 | Yes           | Yes              | Yes                     |
 | Plain `defineTable({...})` inside `defineEmbeddedSchema` | Yes           | No               | No                      |
 | `localTable({...})`                                      | No            | No               | Yes                     |
-| Unannotated field in an `embeddedTable`                  | Yes           | Yes              | Yes                     |
-| `e.omit(validator)`                                      | Yes           | No               | No                      |
+| Unannotated field in a `replicatedTable`                 | Yes           | Yes              | Yes                     |
+| `e.remote(validator)`                                    | Yes           | No               | No                      |
 | `e.local(validator)`                                     | No            | No               | Optional device overlay |
 
 An `e.local` field is stored separately from its replicated document. Pull, membership exit, and a
 server deletion do not erase the overlay; if the row returns, the overlay is visible again. A local
 mutation clears it by patching the field to `undefined`. Local overlays are scoped to the current
 device identity and validated by the validator passed to `e.local`. Local functions may patch these
-fields, but cannot insert, replace, or delete the replicated row.
+fields, but cannot insert, replace, or delete the replicated row. A device read merges the
+overlay into the row it belongs to, so a local function reading a replicated table sees that
+table's `e.local` fields; a `returns` validator on such a function must declare them, or return
+only the fields it needs.
 
 A `localTable` owns complete device-only documents. Those rows are durable local state and change
 only through local functions (or when the table is removed from the schema); they are never pushed,
 pulled, or deployed to Convex.
 
 Index placement follows its fields. A normal index containing only replicated fields exists on both
-the server and device. If any indexed field uses `e.omit`, the index is hosted-only. An index may not
-contain an `e.local` field. Search, vector, and staged indexes are supported on an `embeddedTable`
+the server and device. If any indexed field uses `e.remote`, the index is hosted-only. An index may not
+contain an `e.local` field. Search, vector, and staged indexes are supported on a `replicatedTable`
 only when they are hosted-only; the embedded store does not implement those index kinds.
 
-Device-only functions live in a `*.local.ts` module and are referenced through the generated local
-API rather than Convex's hosted `_generated/api`:
+Device-only functions live in directories the app names with the bundler `local` option, use the
+`local` namespace, and are referenced by importing the function value directly. The schema file
+registers itself as the type source once:
 
 ```ts
-// convex/preferences.local.ts
-import { v } from "convex/values";
-import { embedded } from "./embedded";
+// convex/schema.ts
+import type {} from "@convex-dev/embedded/local";
 
-export const setCompact = embedded.local.mutation({
+const schema = defineEmbeddedSchema({ ... });
+export default schema;
+
+declare module "@convex-dev/embedded/local" {
+  interface Register { schema: typeof schema }
+}
+```
+
+The type-only import brings the augmented module into programs that compile only `convex/`; it is
+erased at compile time and never deploys.
+
+```ts
+// local/preferences.ts — an ordinary TypeScript module
+import { local } from "@convex-dev/embedded/local";
+import { v } from "convex/values";
+
+export const setCompact = local.mutation({
   args: { compact: v.boolean() },
   handler: async (ctx, { compact }) => {
     const current = await ctx.db.query("preferences").first();
@@ -133,15 +155,76 @@ export const setCompact = embedded.local.mutation({
 
 ```ts
 // application code
-import { localApi } from "./convex/generated/embedded";
+import { setCompact } from "../local/preferences";
 
-await client.mutation(localApi["preferences.local"].setCompact, { compact: true });
+await client.mutation(setCompact, { compact: true });
 ```
 
-The build plugin regenerates `generated/embedded.ts` from the schema and function graph. Keep this
-contract outside Convex CLI-owned `_generated`, which codegen replaces. Treat it like other
-generated Convex output: do not edit it by hand, and always pass the imported schema and matching
-`generatedPath` to every bundler adapter so stale placement metadata cannot enter a device build.
+Pass the directories as `local` (a path or list of paths; there is no default). Every module under
+those roots is bundled into the device runtime and imported at startup, which names each exported
+registration; other exports — constants, helpers, anything — are untouched, so the roots hold
+ordinary modules with no file conventions. Application imports of these modules are real imports:
+values, types, and handlers behave like any other TypeScript. Modules under `convex/` cannot
+register local functions or import anything from a local root; that boundary is what keeps
+device-only code out of the hosted deployment, and the roots should hold device logic rather than
+UI code, since the worker loads everything inside them.
+
+### Composing device state with replicated data
+
+Device state and replicated data compose in one direction only. A replicated function cannot read
+a `localTable` or an `e.local` overlay, and `ctx.runQuery` does not cross placements, so a
+replicated query can never consult device state from inside itself. Read the device state in a
+local query and hand it to the replicated query as arguments.
+
+Which channel you need depends on what the device state changes:
+
+- If it changes how rows you already have are displayed — pinned documents sorted to the top of a
+  list, a collapsed row, a local highlight — compose it in your view code. Watch the replicated
+  query for the rows, watch the local query for the device state, and combine the two where you
+  render. The demos do exactly this: `api.documents.read` returns the list, `local/pins.ts` returns
+  the pinned ids, and the list puts the pinned rows first.
+- If it changes which rows the device must hold — pinned documents that stay synced even when they
+  fall outside the list you are watching — pass the ids as arguments to a second replicated query:
+
+```ts
+// convex/documents.ts
+export const byIds = replicated.query({
+  args: { ids: v.array(v.id("documents")) },
+  returns: v.array(documentValidator),
+  handler: async (ctx, args) => {
+    const documents = await Promise.all(args.ids.map((id) => ctx.db.get(id)));
+    return documents.filter((document) => document !== null);
+  },
+});
+```
+
+```ts
+// application code
+const pinned = client.watchQuery(pinnedIds, {});
+const documents = client.watchQuery(api.documents.byIds, {
+  ids: [...(pinned.localQueryResult() ?? [])].sort(),
+});
+```
+
+Arguments are the subscription's identity, so each distinct id set gets its own pull subscription
+and its own cached result. Toggling a pin retires one subscription and starts another and leaves
+every other watch alone, including the main list. Sort the ids so an unchanged set never produces
+new arguments, keep the array bounded, and expect a document created offline to join the
+subscription only after its insert is accepted, because arguments reach the server as server ids.
+
+Do not use a local query to re-create a replicated query's result. A local query sees only the rows
+some replicated subscription already delivered, publishes no subscription of its own, and is never
+served from the server's retained answer, so re-sorting or re-paging a replicated list in one shows
+a list the server never returned.
+
+The build plugin writes `convex/embedded.generated.ts`, a small checked-in lockfile holding the
+function manifest and the identity hashes of the schema source and that manifest. The device schema
+is not in it: every adapter analyzes the live schema and inlines the result into the virtual
+registry, so the file stays about a kilobyte. Its multi-dot name is load-bearing — the Convex CLI
+skips those modules, so the lockfile never deploys as a hosted function while `convex/embedded.ts`
+still imports `embeddedManifest` from it and esbuild bundles it into the deployment. Treat it like
+other generated Convex output: do not edit it by hand, and pass the imported schema to every bundler
+adapter so stale placement metadata cannot enter a device build.
 
 ## 2. Configure the browser build
 
@@ -165,7 +248,7 @@ import { defineConfig } from "vite";
 import schema from "./convex/schema";
 
 export default defineConfig({
-  plugins: [convexEmbedded({ generatedPath: "generated/embedded.ts", schema })],
+  plugins: [convexEmbedded({ schema })],
 });
 ```
 
@@ -186,15 +269,17 @@ The plugin options are relative to the Vite project root:
 ```ts
 convexEmbedded({
   convexDir: "convex",
-  generatedPath: "generated/embedded.ts",
+  generatedPath: "embedded.generated.ts",
+  local: "local",
   schema,
   schemaPath: "schema.ts",
 });
 ```
 
-`convexDir` and `schemaPath` above are the defaults. Set `generatedPath` to a checked-in path outside
-`_generated` when `convex/embedded.ts` imports the contract. `schema` is required so every build
-regenerates and verifies the device contract. Files in `convex/` with a top-level `"use node"`
+`convexDir`, `generatedPath`, and `schemaPath` above are the defaults. Keep a multi-dot basename for
+`generatedPath` so the Convex CLI never deploys the lockfile as a function module. `schema` is
+required so every build rewrites and verifies the placement lockfile. `local` names the device-only directories — one path
+or a list — and is omitted when the application has none. Files in `convex/` with a top-level `"use node"`
 directive are hosted-only and are intentionally excluded from the local registry.
 
 ### Rollup, Rolldown, Webpack, Rspack, and esbuild
@@ -278,14 +363,12 @@ import { getDefaultConfig } from "expo/metro-config";
 import schema from "./convex/schema";
 
 module.exports = withConvexEmbedded(getDefaultConfig(__dirname), {
-  generatedPath: "generated/embedded.ts",
   schema,
 });
 ```
 
-Passing `schema` makes Metro regenerate and validate `convex/generated/embedded.ts` before
-materializing its registry. If `schema` is omitted, Metro requires that generated contract to
-already exist and be current.
+Metro analyzes `schema` and rewrites `convex/embedded.generated.ts` before materializing its
+registry, exactly as the Vite and Unplugin adapters do.
 
 Metro builds its registry when the configuration loads. Restart Metro after changing the schema or
 any device function source. The Expo client supports local storage, local functions, and native
@@ -352,7 +435,9 @@ authorize revision access.
 
 Node applications import `ConvexEmbeddedClient` from `@convex-dev/embedded/node`. The Node entry
 does not need a browser bundler plugin or cross-origin isolation, but it does require a native binary
-for the current operating system and architecture.
+for the current operating system and architecture. Device-only modules are passed programmatically:
+the constructor's `local` option takes a record of import thunks keyed by module path relative to
+the application's local directory, mirroring how `modules` supplies the Convex function graph.
 
 ### Browser storage
 
@@ -394,9 +479,9 @@ normal `ctx.db` operations in the same transaction.
 import { v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { mutation } from "./embedded";
+import { replicated } from "./embedded";
 
-export const savepoint = mutation({
+export const savepoint = replicated.mutation({
   args: { id: v.id("documents") },
   handler: async (ctx, { id }) => {
     const document = await requireOwnedDocument(ctx, id);
@@ -410,7 +495,7 @@ export const savepoint = mutation({
   },
 });
 
-export const restore = mutation({
+export const restore = replicated.mutation({
   args: { id: v.id("documents"), revId: v.string() },
   handler: async (ctx, { id, revId }) => {
     await requireOwnedDocument(ctx, id);
@@ -451,15 +536,15 @@ materialized values.
 
 ```ts
 // convex/schema.ts
-import { defineEmbeddedSchema, embeddedTable } from "@convex-dev/embedded/schema";
+import { defineEmbeddedSchema, replicatedTable } from "@convex-dev/embedded/schema";
 import { e } from "@convex-dev/embedded/values";
 import { v } from "convex/values";
 
 export default defineEmbeddedSchema({
-  documents: embeddedTable({
+  documents: replicatedTable({
     owner: v.string(),
     body: e.text(),
-    serverLabel: e.omit(v.optional(v.string())),
+    serverLabel: e.remote(v.optional(v.string())),
     expanded: e.local(v.boolean()),
   }).index("by_owner", ["owner"]),
 });
@@ -469,9 +554,9 @@ export default defineEmbeddedSchema({
 // convex/documents.ts
 import { v } from "convex/values";
 
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 
-export const insertText = embedded.replicated.mutation({
+export const insertText = replicated.mutation({
   args: { id: v.id("documents"), index: v.number(), value: v.string() },
   handler: async (ctx, { id, index, value }) => {
     await ctx.db.text.splice("documents", id, "body", {

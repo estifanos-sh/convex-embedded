@@ -1,7 +1,7 @@
 /** Public schema-definition surface for Embedded Convex. */
 export {
   defineEmbeddedSchema,
-  embeddedTable,
+  replicatedTable,
   localTable,
   type DeviceModel,
   type DeviceDataModel,

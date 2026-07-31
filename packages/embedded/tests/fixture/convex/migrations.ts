@@ -2,10 +2,10 @@ import { Migrations } from "@convex-dev/migrations";
 import { v } from "convex/values";
 
 import { components, internal } from "./_generated/api";
-import { embedded } from "./embedded";
+import { remote } from "./embedded";
 import schema from "./schema";
 
-const { internalMutation } = embedded.remote;
+const { internalMutation } = remote;
 const migrations = new Migrations(components.migrations, { internalMutation, schema });
 
 export const normalizeUpdatedAt = migrations.define({
@@ -17,7 +17,7 @@ export const normalizeUpdatedAt = migrations.define({
   }),
 });
 
-export const run = embedded.remote.mutation({
+export const run = remote.mutation({
   args: {},
   returns: v.null(),
   handler: async (ctx): Promise<null> => {

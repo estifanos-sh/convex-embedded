@@ -38,6 +38,7 @@ const main = defineConfig({
     "expo/index": "src/expo/index.ts",
     "internal/client": "src/client.ts",
     "internal/storage": "src/storage/binding.ts",
+    local: "src/local.ts",
     node: "src/node/index.ts",
     schema: "src/tables.ts",
     server: "src/server/index.ts",

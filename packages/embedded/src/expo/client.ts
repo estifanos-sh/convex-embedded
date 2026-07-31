@@ -3,7 +3,7 @@
  *
  * @packageDocumentation
  */
-import { embeddedManifest, embeddedSchema, modules } from "virtual:convex-embedded";
+import { embeddedManifest, embeddedSchema, localModules, modules } from "virtual:convex-embedded";
 import { embeddedIdentity } from "virtual:convex-embedded/identity";
 
 import { createEmbeddedAuthState, EmbeddedClient } from "../client";
@@ -79,6 +79,7 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
     }
     super({
       authState: createEmbeddedAuthState(),
+      localModules,
       manifest: embeddedManifest,
       moduleGraphHash: embeddedIdentity.moduleGraphHash,
       modules,

@@ -4,6 +4,8 @@ import { dirname, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { androidAbis, mobileSlices } from "../../../config/build.ts";
+
 const platform = process.argv[2];
 if (platform !== "ios" && platform !== "android") {
   throw new Error("Native compile smoke requires an ios or android platform argument.");
@@ -92,7 +94,15 @@ try {
     }
   } else {
     const android = resolve(work, "android");
-    run(resolve(android, "gradlew"), [":app:assembleDebug", "--no-daemon"], android);
+    run(
+      resolve(android, "gradlew"),
+      [
+        ":app:assembleDebug",
+        `-PreactNativeArchitectures=${mobileSlices(androidAbis).join(",")}`,
+        "--no-daemon",
+      ],
+      android,
+    );
   }
 } finally {
   rmSync(work, { recursive: true, force: true });

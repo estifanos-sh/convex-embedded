@@ -121,6 +121,7 @@ export class LeaderRuntime {
     follower?.channel.postMessage({
       leaderEpoch: this.epoch,
       leaderId,
+      localConfigured: this.state.runtime.runner.localConfigured,
       op: PeerOp.Attached,
       protocol: CoordinatorProtocol,
     } satisfies PeerMessage);

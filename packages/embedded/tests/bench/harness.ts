@@ -37,13 +37,13 @@ import { getTimerTime } from "../../src/time";
 import { createRunner, type Runner } from "../../src/runtime/runner";
 import {
   defineEmbeddedSchema,
-  embeddedTable,
+  replicatedTable,
   toRuntimeStoreSchema,
   toStoreSchema,
 } from "../../src/schema";
 
 export const benchSchema = defineEmbeddedSchema({
-  messages: embeddedTable({
+  messages: replicatedTable({
     channel: v.string(),
     body: v.string(),
     sequence: v.number(),

@@ -32,7 +32,7 @@ function set<T extends Validator<any, "required", any>>(
   }) as unknown as EmbeddedAnnotatedValidator<Validator<Infer<T>[]>, "replicated">;
 }
 
-function omit<T extends Validator<any, any, any>>(member: T): EmbeddedValue<T, "remote"> {
+function remote<T extends Validator<any, any, any>>(member: T): EmbeddedValue<T, "remote"> {
   return withEmbeddedFieldMeta(member, { placement: "remote" }) as EmbeddedAnnotatedValidator<
     T,
     "remote"
@@ -47,4 +47,4 @@ function local<T extends Validator<any, any, any>>(member: T): EmbeddedValue<T, 
 }
 
 /** Embedded-aware value constructors and field placement annotations. */
-export const e = Object.freeze({ count, local, omit, set, text });
+export const e = Object.freeze({ count, local, remote, set, text });

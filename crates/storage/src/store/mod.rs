@@ -287,7 +287,7 @@ impl EmbeddedStore {
         let _guard = lock(&self.operation_lock);
         let stored_version = self.read_user_version()?;
         let existing_tables = self.read_tables()?;
-        if existing_tables.is_empty() || stored_version != sql::STORAGE_FORMAT_VERSION {
+        if existing_tables.is_empty() || stored_version != sql::EMBEDDED_EPOCH {
             self.replace_store_unlocked(
                 schema,
                 &current_signature,
@@ -359,7 +359,7 @@ impl EmbeddedStore {
         existing_tables: &[String],
     ) -> Result<Option<String>, StorageError> {
         let has_meta = existing_tables.iter().any(|name| name == sql::META_TABLE);
-        if stored_version == sql::STORAGE_FORMAT_VERSION && has_meta {
+        if stored_version == sql::EMBEDDED_EPOCH && has_meta {
             self.read_meta_unlocked(SCHEMA_SIGNATURE_KEY)
         } else {
             Ok(None)
@@ -395,7 +395,7 @@ impl EmbeddedStore {
             self.create_doc_schema_unlocked(schema)?;
             self.write_meta_unlocked(SCHEMA_SIGNATURE_KEY, schema_signature)?;
             self.write_meta_unlocked(SCHEMA_MANIFEST_KEY, schema_manifest)?;
-            if stored_version != sql::STORAGE_FORMAT_VERSION {
+            if stored_version != sql::EMBEDDED_EPOCH {
                 self.driver
                     .execute(&sql::write_user_version(), Vec::new())?;
             }
@@ -6812,13 +6812,20 @@ fn validate_schema_transition(
             )));
         }
         for field in &table.local_fields {
-            if !previous_table
+            if previous_table
                 .local_fields
                 .iter()
                 .any(|previous| previous.field == field.field)
             {
+                continue;
+            }
+            if previous_table
+                .columns
+                .iter()
+                .any(|column| column.field.as_deref().unwrap_or(&column.name) == field.field)
+            {
                 return Err(StorageError::IncompatibleStore(format!(
-                    "field {}.{} changed to device-only placement in place",
+                    "indexed field {}.{} changed to device-only placement in place",
                     table.name, field.field
                 )));
             }

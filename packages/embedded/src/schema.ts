@@ -69,7 +69,7 @@ export type LocalTableDefinition<
 
 type EmbeddedFields = Record<string, GenericValidator>;
 
-export function embeddedTable<DocumentSchema extends EmbeddedFields>(
+export function replicatedTable<DocumentSchema extends EmbeddedFields>(
   documentSchema: DocumentSchema,
 ): EmbeddedTableDefinition<VObject<ObjectType<DocumentSchema>, DocumentSchema>> {
   return markTable(defineTable(documentSchema), "replicated") as EmbeddedTableDefinition<
@@ -417,7 +417,7 @@ function sourceTables(schema: AnalyzableSchema): GenericSchema {
   return meta?.tables ?? schema.tables;
 }
 
-function hasEmbeddedSchemaMeta(schema: AnalyzableSchema): boolean {
+export function hasEmbeddedSchemaMeta(schema: AnalyzableSchema): boolean {
   return (
     (schema as unknown as { [EMBEDDED_SCHEMA]?: EmbeddedSchemaRuntimeMeta })[EMBEDDED_SCHEMA] !==
     undefined
@@ -495,7 +495,7 @@ function projectTableForServer(name: string, table: TableDefinition): TableDefin
 }
 
 function validateTableFields(table: TableDefinition, placement: EmbeddedTablePlacement): void {
-  const fields = objectFields(table, placement === "local" ? "localTable" : "embeddedTable");
+  const fields = objectFields(table, placement === "local" ? "localTable" : "replicatedTable");
   for (const [field, validator] of Object.entries(fields)) {
     const meta = embeddedFieldMeta(validator);
     if (placement === "local" && meta !== null) {

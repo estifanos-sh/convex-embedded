@@ -61,6 +61,10 @@ export class BrowserLifecycleRunner implements Runner {
     return this.initial;
   }
 
+  get localConfigured(): boolean {
+    return this.active?.eagerRunner.localConfigured === true;
+  }
+
   readonly identity = {
     read: async (): Promise<{ identity: UserIdentity | null; identityKey: string } | undefined> =>
       await (await this.current()).identity.read(),

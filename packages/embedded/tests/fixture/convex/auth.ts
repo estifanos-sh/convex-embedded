@@ -1,9 +1,9 @@
 import { ConvexError, v } from "convex/values";
 
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 import { read as readTime } from "./time";
 
-export const read = embedded.replicated.query({
+export const read = replicated.query({
   args: { id: v.id("documents") },
   returns: v.any(),
   handler: async (ctx, args) => {
@@ -14,7 +14,7 @@ export const read = embedded.replicated.query({
   },
 });
 
-export const deniedQuery = embedded.replicated.query({
+export const deniedQuery = replicated.query({
   args: { id: v.id("documents") },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -26,7 +26,7 @@ export const deniedQuery = embedded.replicated.query({
   },
 });
 
-export const deniedMutation = embedded.replicated.mutation({
+export const deniedMutation = replicated.mutation({
   args: { slug: v.string() },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -43,7 +43,7 @@ export const deniedMutation = embedded.replicated.mutation({
   },
 });
 
-export const deniedUpdate = embedded.replicated.mutation({
+export const deniedUpdate = replicated.mutation({
   args: { id: v.id("documents"), title: v.string(), updatedAt: v.number() },
   returns: v.null(),
   handler: async (ctx, args) => {

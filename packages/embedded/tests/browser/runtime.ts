@@ -3,8 +3,12 @@ import { afterEach, describe, expect, test } from "vite-plus/test";
 import { commands } from "vitest/browser";
 
 import type { EmbeddedEvent, EmbeddedOperationEvent, EmbeddedRemoteEvent } from "../../src/events";
+import { defineLocal, localReferenceName } from "../../src/local";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
+import schema from "./convex/schema";
+import { documentCount } from "./local/insights";
+import { documentTitles, scope } from "./local/mixed";
 
 declare const __CONVEX_EMBEDDED_HOSTED_URL__: string | null;
 declare const __CONVEX_EMBEDDED_BROWSER_BENCH__: boolean;
@@ -81,6 +85,26 @@ interface DocumentClient extends RuntimeClient {
 interface RuntimeClient {
   close(): Promise<void>;
   subscribeInternalEvents?(listener: (event: EmbeddedEvent) => void): () => void;
+}
+
+interface OrphanClient {
+  query(fn: unknown, args: Record<string, never>): Promise<unknown>;
+}
+
+interface LocalInsightsClient extends RuntimeClient {
+  mutation(
+    name: typeof createDocument,
+    args: { body?: string; slug?: string; title?: string; updatedAt?: number },
+  ): Promise<DocumentRow>;
+  query(name: typeof documentCount, args: Record<string, never>): Promise<number>;
+  query(name: typeof documentTitles, args: Record<string, never>): Promise<string[]>;
+  watchQuery(
+    name: typeof documentCount,
+    args: Record<string, never>,
+  ): {
+    localQueryResult(): number | undefined;
+    onUpdate(onUpdate: () => void, onError?: (error: unknown) => void): () => void;
+  };
 }
 
 interface DebugEvent {
@@ -653,6 +677,52 @@ describe("browser runtime", () => {
       size: 5,
     });
     await expect(convex.query(fileUrl, { storageId })).resolves.toMatch(/^blob:/);
+  });
+
+  test("executes a device-only module through a direct import", async () => {
+    useIsolatedBrowserStorage("local-direct");
+    expect(typeof (documentCount as unknown as { handler?: unknown }).handler).toBe("function");
+    expect(scope).toBe("device");
+    expect(localReferenceName(documentCount)).toBe("local/insights:documentCount");
+    expect(localReferenceName(documentTitles)).toBe("local/mixed:documentTitles");
+    const { ConvexEmbeddedClient } = await withTimeout(
+      import("@convex-dev/embedded/browser"),
+      "browser package import",
+    );
+    const convex = track(new ConvexEmbeddedClient()) as unknown as LocalInsightsClient;
+    await expect(withTimeout(convex.query(documentCount, {}), "local query")).resolves.toBe(0);
+    const watch = convex.watchQuery(documentCount, {});
+    const updated = new Promise<void>((resolve) => {
+      const stop = watch.onUpdate(() => {
+        if (watch.localQueryResult() === 1) {
+          stop();
+          resolve();
+        }
+      });
+    });
+    await withTimeout(
+      convex.mutation(createDocument, {
+        body: "direct",
+        slug: `local-direct-${getTimerTime()}`,
+        title: "direct",
+      }),
+      "create document",
+    );
+    await withTimeout(updated, "local watch update");
+    await expect(
+      withTimeout(convex.query(documentCount, {}), "local query after write"),
+    ).resolves.toBe(1);
+    await expect(
+      withTimeout(convex.query(documentTitles, {}), "mixed module local query"),
+    ).resolves.toEqual(["direct"]);
+
+    const orphan = defineLocal(schema).query({ args: {}, handler: async () => 0 });
+    await expect(
+      withTimeout(
+        (convex as unknown as OrphanClient).query(orphan, {}),
+        "unregistered local query",
+      ),
+    ).rejects.toThrow("is not registered under the configured local directories");
   });
 
   test("auto-drains a staged upload during a worker replication tick", async () => {

@@ -1,14 +1,14 @@
 import { v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 
 const checkpointValidator = v.object({
   checkpointId: v.string(),
   state: v.union(v.literal("requested"), v.literal("ready")),
 });
 
-export const checkpoint = embedded.replicated.mutation({
+export const checkpoint = replicated.mutation({
   args: { rowId: v.id("documents"), field: v.string() },
   returns: checkpointValidator,
   handler: async (ctx, args) => {
@@ -21,7 +21,7 @@ export const checkpoint = embedded.replicated.mutation({
   },
 });
 
-export const field = embedded.replicated.query({
+export const field = replicated.query({
   args: { rowId: v.id("documents"), field: v.string() },
   returns: v.any(),
   handler: async (ctx, args) => {

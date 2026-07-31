@@ -41,6 +41,7 @@ export interface ActionCtx<_DM extends GenericDataModel> {
 /** Function reference accepted by the Embedded runner. @internal */
 export type FunctionReference =
   | string
+  | { kind: "query" | "mutation"; placement: "local" }
   | import("convex/server").FunctionReference<"query" | "mutation" | "action", any, any, any, any>;
 
 /** Public/internal visibility for runtime functions. @internal */
@@ -111,7 +112,6 @@ interface MutationBuilder<DM extends GenericDataModel> {
 /** Placement-first registration helpers used by generated modules and runtime tests. @internal */
 export interface Functions<DM extends GenericDataModel> {
   replicated: { query: QueryBuilder<DM>; mutation: MutationBuilder<DM> };
-  local: { query: QueryBuilder<DM>; mutation: MutationBuilder<DM> };
   remote: {
     query: QueryBuilder<DM>;
     mutation: MutationBuilder<DM>;
@@ -145,7 +145,6 @@ export function defineFunctions<DM extends GenericDataModel>(): Functions<DM> {
     });
   return {
     replicated: { query: query("replicated"), mutation: mutation("replicated") },
-    local: { query: query("local"), mutation: mutation("local") },
     remote: {
       query: query("remote"),
       mutation: mutation("remote"),

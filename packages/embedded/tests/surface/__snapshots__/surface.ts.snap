@@ -48,13 +48,13 @@ exports[`public package surface > bundler entry exports only its intended surfac
   "EmbeddedFunctionManifest",
   "EmbeddedFunctionManifestEntry",
   "EmbeddedFunctionVisibility",
-  "EmbeddedGeneratedInput",
+  "EmbeddedGeneratedIdentity",
   "EmbeddedGeneratedSchema",
   "FunctionPlacement",
-  "GenerateEmbeddedInput",
   "GenerateEmbeddedResult",
   "createEmbeddedBundle",
   "generateEmbedded",
+  "readLocalExportNames",
   "renderEmbeddedGenerated",
   "toModuleId",
 ]
@@ -116,6 +116,28 @@ exports[`public package surface > expo entry exports only its intended surface 1
 ]
 `;
 
+exports[`public package surface > local entry exports only its intended surface 1`] = `
+[
+  "EMBEDDED_LOCAL_REFERENCE",
+  "LocalBuilders",
+  "LocalFunction",
+  "LocalFunctionArgs",
+  "LocalFunctionReturns",
+  "LocalMutation",
+  "LocalMutationBuilder",
+  "LocalMutationCtx",
+  "LocalQuery",
+  "LocalQueryBuilder",
+  "LocalQueryCtx",
+  "Register",
+  "defineLocal",
+  "isLocalFunction",
+  "local",
+  "localReferenceName",
+  "stampLocal",
+]
+`;
+
 exports[`public package surface > metro entry exports only its intended surface 1`] = `
 [
   "ConvexEmbeddedMetroOptions",
@@ -132,6 +154,7 @@ exports[`public package surface > node entry exports only its intended surface 1
   "ConvexEmbeddedSchema",
   "ConvexEmbeddedUploadFetch",
   "ConvexEmbeddedUploadFetchOptions",
+  "ConvexLocalModules",
   "ConvexModules",
   "EMBEDDED_UPLOAD_PATH",
   "EmbeddedConnectionState",
@@ -167,8 +190,8 @@ exports[`public package surface > schema entry exports only its intended surface
   "ServerModel",
   "WireModel",
   "defineEmbeddedSchema",
-  "embeddedTable",
   "localTable",
+  "replicatedTable",
 ]
 `;
 

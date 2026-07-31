@@ -1,5 +1,6 @@
 import { getFunctionName } from "convex/server";
 import type { RuntimeStorageWriter, ScheduledFunctionKind, StorageBackend } from "../storage/types";
+import { localReferenceName } from "../local";
 import type { FunctionReference } from "./functions";
 
 export interface RuntimeCalls {
@@ -29,5 +30,8 @@ export function fullStore(store: RuntimeStorageWriter): ServiceStore {
 }
 
 export function functionName(ref: FunctionReference): string {
-  return typeof ref === "string" ? ref : getFunctionName(ref);
+  const local = localReferenceName(ref);
+  if (local !== undefined) return local;
+  if (typeof ref === "string") return ref;
+  return getFunctionName(ref as Parameters<typeof getFunctionName>[0]);
 }

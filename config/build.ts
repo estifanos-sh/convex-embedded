@@ -27,8 +27,26 @@ export const androidNdkVersion = "28.1.13356709";
 export const cargoNdkVersion = "3.5.4";
 
 /** The Apple target triples the iOS XCFramework is assembled from. */
-export const iosTargetTriples = [
-  "aarch64-apple-ios",
-  "aarch64-apple-ios-sim",
-  "x86_64-apple-ios",
-] as const;
+export const iosTargetTriples = ["aarch64-apple-ios", "aarch64-apple-ios-sim"] as const;
+
+/** The Android ABIs the mobile shared libraries are built for. */
+export const androidAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] as const;
+
+/**
+ * Narrow a mobile build to the slices named by `CONVEX_EMBEDDED_MOBILE_SLICES` — Apple target
+ * triples for iOS, ABI names for Android. Per-push CI requests one slice per platform; local and
+ * release builds leave it unset and produce the whole set.
+ */
+export function mobileSlices<Slice extends string>(all: readonly Slice[]): Slice[] {
+  const requested = readValue("CONVEX_EMBEDDED_MOBILE_SLICES");
+  if (!requested) return [...all];
+  const selected = requested.split(",").map((part) => part.trim());
+  const slices = all.filter((slice) => selected.includes(slice));
+  if (slices.length !== selected.length) {
+    throw new Error(
+      `CONVEX_EMBEDDED_MOBILE_SLICES must name distinct slices from ${all.join(", ")}; ` +
+        `received ${requested}.`,
+    );
+  }
+  return slices;
+}

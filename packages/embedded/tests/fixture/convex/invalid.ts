@@ -1,10 +1,10 @@
 import { v } from "convex/values";
 
-import { embedded } from "./embedded";
+import { remote } from "./embedded";
 import { read as readTime } from "./time";
 
 /** Deliberately remote so rollback can be verified against an invalid replay target. */
-export const rawMutationTarget = embedded.remote.mutation({
+export const rawMutationTarget = remote.mutation({
   args: { slug: v.string() },
   returns: v.null(),
   handler: async (ctx, args) => {

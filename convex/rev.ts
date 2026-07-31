@@ -1,6 +1,6 @@
 import { type Infer, v } from "convex/values";
 import { components } from "./_generated/api";
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 
 export const revisionValidator = v.object({
   revId: v.string(),
@@ -28,7 +28,7 @@ export const revisionValidator = v.object({
   ),
 });
 
-export const savepoint = embedded.replicated.mutation({
+export const savepoint = replicated.mutation({
   args: { id: v.id("documents") },
   returns: revisionValidator,
   handler: async (ctx, args) => {

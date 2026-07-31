@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { EmbeddedBundleResult } from "./index";
@@ -32,29 +30,54 @@ export function renderEmbeddedBundle(bundle: EmbeddedBundleResult): string {
         `  ${objectKey(moduleId)}: () => import(${JSON.stringify(toVirtualSourceId(filePath))}),`,
     )
     .join("\n");
+  const localEntries = Object.entries(bundle.localModules)
+    .map(
+      ([moduleId, module]) =>
+        `  ${objectKey(moduleId)}: () => import(${JSON.stringify(
+          toVirtualSourceId(module.file),
+        )}),`,
+    )
+    .join("\n");
 
-  return `import { embeddedSchema } from ${JSON.stringify(toVirtualSourceId(bundle.generatedPath))};
-
-export { embeddedSchema };
+  return `export const embeddedSchema = ${JSON.stringify(bundle.embeddedSchema)};
 export const embeddedManifest = ${JSON.stringify(bundle.manifest)};
 export const modules = {
 ${moduleEntries}
 };
+export const localModules = {
+${localEntries}
+};
 `;
 }
 
-export async function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): Promise<string> {
-  const schemaHash = bundle.runtimeSchemaHash;
+/**
+ * Renders the append-only stamp that names a device module's registrations in every graph that
+ * bundles its source. Returns an empty string when the module exports nothing to name.
+ */
+export function renderLocalStamp(
+  moduleId: string,
+  source: string,
+  exports: Array<[string, string]>,
+): string {
+  if (exports.length === 0) return "";
+  let stamp = "__embeddedStampLocal";
+  while (source.includes(stamp)) stamp += "$";
+  const named = exports
+    .map(([exported, binding]) => (exported === binding ? exported : `${exported}: ${binding}`))
+    .join(", ");
+  return `
+import { stampLocal as ${stamp} } from "@convex-dev/embedded/local";
+${stamp}(${JSON.stringify(moduleId)}, { ${named} });
+`;
+}
+
+export function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): string {
+  const schemaHash = bundle.embeddedSchema.runtimeStoreSchema.hash;
   if (schemaHash === undefined) {
     throw new Error("Embedded identity requires a generated runtime storage schema hash");
   }
-  const moduleGraphHash = await hashJson({
-    manifest: bundle.manifest,
-    sources: await Promise.all(bundle.sourceFiles.map(fileHash)),
-  });
-
   return `export const embeddedIdentity = ${JSON.stringify({
-    moduleGraphHash,
+    moduleGraphHash: bundle.moduleGraphHash,
     schemaHash,
   })};
 `;
@@ -62,13 +85,4 @@ export async function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): Prom
 
 function objectKey(value: string): string {
   return /^[$A-Z_a-z][$\w]*$/.test(value) ? value : JSON.stringify(value);
-}
-
-async function fileHash(file: string): Promise<string> {
-  const bytes = await readFile(file);
-  return createHash("sha256").update(bytes).digest("hex").slice(0, 16);
-}
-
-async function hashJson(value: unknown): Promise<string> {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
 }

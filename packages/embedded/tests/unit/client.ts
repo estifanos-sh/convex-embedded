@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 import { makeFunctionReference } from "convex/server";
 
-import { EMBEDDED_STORE_FORMAT_VERSION } from "../../src/abi";
+import { EMBEDDED_EPOCH } from "../../src/abi";
 import { EmbeddedClient } from "../../src/client";
 import { WASM_API_VERSION } from "../../src/browser/artifact";
 import {
@@ -26,7 +26,7 @@ function identity(storageId: string): RuntimeIdentity {
     protocolVersion: EMBEDDED_PROTOCOL_VERSION,
     schemaHash: "schema",
     storageId,
-    storeFormatVersion: EMBEDDED_STORE_FORMAT_VERSION,
+    storeFormatVersion: EMBEDDED_EPOCH,
     wasmAbiVersion: WASM_API_VERSION,
   };
 }

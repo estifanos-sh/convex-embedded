@@ -1,11 +1,11 @@
 import { v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { embedded } from "./embedded";
+import { remote } from "./embedded";
 
 const deleteResultValidator = v.object({ deleted: v.number(), isDone: v.boolean() });
 
-export const field = embedded.remote.query({
+export const field = remote.query({
   args: { rowId: v.id("documents"), field: v.string() },
   returns: v.any(),
   handler: async (ctx, args) => {
@@ -19,7 +19,7 @@ export const field = embedded.remote.query({
   },
 });
 
-export const checkpoint = embedded.remote.mutation({
+export const checkpoint = remote.mutation({
   args: { rowId: v.id("documents"), field: v.string() },
   returns: v.object({
     checkpointId: v.string(),
@@ -36,7 +36,7 @@ export const checkpoint = embedded.remote.mutation({
   },
 });
 
-export const payloadDelete = embedded.remote.mutation({
+export const payloadDelete = remote.mutation({
   args: { checkpointId: v.string(), numItems: v.number() },
   returns: deleteResultValidator,
   handler: async (ctx, args) => {
@@ -44,7 +44,7 @@ export const payloadDelete = embedded.remote.mutation({
   },
 });
 
-export const clear = embedded.remote.mutation({
+export const clear = remote.mutation({
   args: { fieldId: v.string(), expectedEpoch: v.number(), numItems: v.number() },
   returns: deleteResultValidator,
   handler: async (ctx, args) => {
@@ -52,7 +52,7 @@ export const clear = embedded.remote.mutation({
   },
 });
 
-export const revisionDelete = embedded.remote.mutation({
+export const revisionDelete = remote.mutation({
   args: { rowId: v.id("documents"), revId: v.string(), numItems: v.number() },
   returns: deleteResultValidator,
   handler: async (ctx, args) => {

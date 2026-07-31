@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 import { read as readTime } from "./time";
 
 export const documentValidator = v.object({
@@ -31,7 +31,7 @@ const emptyBody = JSON.stringify([
 ]);
 const MAX_DOCUMENTS = 1_024;
 
-export const read = embedded.replicated.query({
+export const read = replicated.query({
   args: {
     id: v.optional(v.id("documents")),
     slug: v.optional(v.string()),
@@ -77,7 +77,7 @@ function documentLimit(value: number | undefined): number {
  * rather than silently dropping the extra fields, and an `id` that names no intent throws too —
  * a deliberate timestamp bump is a `title`/`updatedAt` patch, not a bare `id`.
  */
-export const write = embedded.replicated.mutation({
+export const write = replicated.mutation({
   args: {
     id: v.optional(v.id("documents")),
     body: v.optional(v.string()),
@@ -142,7 +142,7 @@ export const write = embedded.replicated.mutation({
   },
 });
 
-export const del = embedded.replicated.mutation({
+export const del = replicated.mutation({
   args: { id: v.id("documents") },
   returns: v.null(),
   handler: async (ctx, args) => {

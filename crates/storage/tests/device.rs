@@ -317,7 +317,7 @@ fn replicated_base_rows_reject_declared_device_fields() {
 }
 
 #[test]
-fn setup_rejects_table_and_field_placement_changes_in_place() {
+fn setup_rejects_table_placement_changes_in_place() {
     let path = tmp_path("device_table_flip.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     let current = schema();
@@ -338,13 +338,6 @@ fn setup_rejects_table_and_field_placement_changes_in_place() {
         field: None,
     }];
     assert!(store.setup(&replicated).is_err());
-
-    let path = tmp_path("device_field_reclassification.db");
-    let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
-    let mut without_overlay = schema();
-    without_overlay.tables[0].local_fields.clear();
-    store.setup(&without_overlay).unwrap();
-    assert!(store.setup(&schema()).is_err());
 }
 
 #[test]
@@ -460,5 +453,75 @@ fn pull_id_adoption_rekeys_the_overlay_in_the_same_transaction() {
     assert_eq!(
         store.local_fields_read("issues", LOCAL_ID).unwrap()["expanded"],
         true
+    );
+}
+
+#[test]
+fn adding_a_device_field_preserves_an_existing_store() {
+    let path = tmp_path("device_additive_field.db");
+    let p = path.to_str().unwrap();
+    {
+        let store = EmbeddedStore::open(p).unwrap();
+        let mut before = schema();
+        before.tables[0].local_fields.clear();
+        store.setup(&before).unwrap();
+        store
+            .commit(
+                doc_writes(vec![issue(&store, "i1", "first", "open")]),
+                &CommitOptions::remote(),
+            )
+            .unwrap();
+    }
+
+    let store = EmbeddedStore::open(p).expect("an existing store reopens");
+    store
+        .setup(&schema())
+        .expect("adding a device-only field is an additive transition");
+
+    assert!(store.doc_read("issues", "i1").unwrap().is_some());
+    store
+        .commit(
+            WriteBatch {
+                local_field_writes: vec![LocalFieldWrite {
+                    table: "issues".into(),
+                    id: "i1".into(),
+                    field: "expanded".into(),
+                    value: serde_json::json!(true),
+                }],
+                ..WriteBatch::default()
+            },
+            &device_options(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.local_fields_read("issues", "i1").unwrap()["expanded"],
+        serde_json::json!(true)
+    );
+}
+
+#[test]
+fn converting_an_indexed_field_to_device_only_preserves_the_store() {
+    let path = tmp_path("device_indexed_conversion.db");
+    let p = path.to_str().unwrap();
+    {
+        let store = EmbeddedStore::open(p).unwrap();
+        let mut before = schema();
+        before.tables[0].local_fields.clear();
+        store.setup(&before).unwrap();
+    }
+
+    let store = EmbeddedStore::open(p).unwrap();
+    let mut after = schema();
+    let indexed = after.tables[0].columns[0].clone();
+    let field = indexed.field.clone().unwrap_or(indexed.name.clone());
+    after.tables[0].local_fields = vec![LocalFieldDef {
+        field: field.clone(),
+    }];
+    let error = store
+        .setup(&after)
+        .expect_err("an indexed field cannot become device-only in place");
+    assert!(
+        error.to_string().contains(&format!("issues.{field}")),
+        "{error}"
     );
 }

@@ -34,12 +34,12 @@ describe("embedded Metro adapter", () => {
   test("materializes deterministic modules and chains the existing resolver", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
-      await file(convexDir, "embedded.ts", "export const pull = null; export const push = null;\n");
+      await file(convexDir, "embedded.ts", embeddedEntrypoint());
       await file(convexDir, "helper.ts", "export const helper = true;\n");
       await file(
         convexDir,
         "messages.ts",
-        `import "./helper";\ndeclare const embedded: any;\nexport const list = embedded.replicated.query({});\n`,
+        `import "./helper";\n${canonical("replicated", "query", "list")}`,
       );
       const previous = vi.fn((_context, moduleName: string, _platform: string | null) => ({
         moduleName,
@@ -68,9 +68,13 @@ describe("embedded Metro adapter", () => {
       const dependency = path.join(convexDir, "helper.ts");
       first.resolver.resolveRequest(context, toVirtualSourceId(dependency), "ios");
       expect(previous).toHaveBeenLastCalledWith(context, dependency, "ios");
-      const generated = path.join(convexDir, "_generated", "embedded.ts");
-      first.resolver.resolveRequest(context, toVirtualSourceId(generated), "android");
-      expect(previous).toHaveBeenLastCalledWith(context, generated, "android");
+      expect(() =>
+        first.resolver.resolveRequest(
+          context,
+          toVirtualSourceId(path.join(convexDir, "embedded.generated.ts")),
+          "android",
+        ),
+      ).toThrow("outside the generated module graph");
       expect(fallback).not.toHaveBeenCalled();
 
       expect(first.resolver.resolveRequest(context, "react", "ios")).toEqual({
@@ -81,19 +85,67 @@ describe("embedded Metro adapter", () => {
     });
   });
 
+  test("materializes device-only modules from every root and resolves their sources", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await file(convexDir, "embedded.ts", embeddedEntrypoint());
+      const localDir = path.join(root, "local");
+      const deviceDir = path.join(root, "device");
+      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(deviceDir, "prefs.ts", localFunctions());
+      const previous = vi.fn((_context, moduleName: string, _platform: string | null) => ({
+        moduleName,
+        source: "previous",
+      }));
+      const config: TestMetroConfig = { projectRoot: root, resolver: { resolveRequest: previous } };
+
+      const resolved = await withConvexEmbedded(config, {
+        local: [localDir, deviceDir],
+        schema: fixtureSchema,
+      });
+      const registry = await readFile(
+        path.join(root, "node_modules", ".cache", "convex-embedded", "registry.js"),
+        "utf8",
+      );
+
+      expect(registry).toContain(
+        `"local/sync/drafts": () => import("${toVirtualSourceId(
+          path.join(localDir, "sync/drafts.ts"),
+        )}")`,
+      );
+      expect(registry).toContain(
+        `"local/prefs": () => import("${toVirtualSourceId(path.join(deviceDir, "prefs.ts"))}")`,
+      );
+      expect(registry).not.toContain("stampLocal");
+
+      const fallback = vi.fn((_context, moduleName: string) => ({ moduleName, source: "default" }));
+      const context = { resolveRequest: fallback };
+      for (const source of [
+        path.join(localDir, "sync/drafts.ts"),
+        path.join(deviceDir, "prefs.ts"),
+      ]) {
+        resolved.resolver.resolveRequest(context, toVirtualSourceId(source), "ios");
+        expect(previous).toHaveBeenLastCalledWith(context, source, "ios");
+      }
+    });
+  });
+
   test("rejects encoded source paths outside the discovered graph", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
-      await file(convexDir, "embedded.ts", "export const pull = null; export const push = null;\n");
+      await file(convexDir, "embedded.ts", embeddedEntrypoint());
       await file(root, "secret.ts", "export const secret = true;\n");
       await generateFixture(root);
-      const config = await withConvexEmbedded<TestMetroConfig>({
-        projectRoot: root,
-        resolver: {
-          resolveRequest: (context, moduleName, platform) =>
-            context.resolveRequest(context, moduleName, platform),
+      const config = await withConvexEmbedded<TestMetroConfig>(
+        {
+          projectRoot: root,
+          resolver: {
+            resolveRequest: (context, moduleName, platform) =>
+              context.resolveRequest(context, moduleName, platform),
+          },
         },
-      });
+        { schema: fixtureSchema },
+      );
       const context = { resolveRequest: () => ({}) };
 
       expect(() =>
@@ -109,14 +161,14 @@ describe("embedded Metro adapter", () => {
   test("forwards a custom generated contract path", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
-      await file(convexDir, "embedded.ts", "export const pull = null; export const push = null;\n");
+      await file(convexDir, "embedded.ts", embeddedEntrypoint());
       const generatedPath = "generated/device.ts";
 
       await expect(
         withConvexEmbedded({ projectRoot: root }, { generatedPath, schema: fixtureSchema }),
       ).resolves.toBeDefined();
       await expect(readFile(path.join(convexDir, generatedPath), "utf8")).resolves.toContain(
-        "embeddedSchema",
+        "embeddedManifest",
       );
     });
   });
@@ -125,7 +177,9 @@ describe("embedded Metro adapter", () => {
     const root = await mkdtemp(path.join(tmpdir(), "embedded-metro-disabled-"));
     try {
       const config = { projectRoot: root };
-      await expect(withConvexEmbedded(config, { disabled: true })).resolves.toBe(config);
+      await expect(
+        withConvexEmbedded(config, { disabled: true, schema: fixtureSchema }),
+      ).resolves.toBe(config);
     } finally {
       await rm(root, { force: true, recursive: true });
     }
@@ -152,4 +206,29 @@ async function file(root: string, relative: string, contents: string): Promise<v
 
 async function generateFixture(root: string): Promise<void> {
   await generateEmbedded({ analysis: analyzeEmbeddedSchema(fixtureSchema), root });
+}
+
+function embeddedEntrypoint(): string {
+  return `export const pull = null;
+export const push = null;
+export const remote = null;
+export const replicated = null;
+`;
+}
+
+function canonical(
+  placement: "replicated" | "remote",
+  builder: "query" | "mutation",
+  name: string,
+): string {
+  return `import { ${placement} } from "./embedded";
+export const ${name} = ${placement}.${builder}({});
+`;
+}
+
+function localFunctions(): string {
+  return `import { local } from "@convex-dev/embedded/local";
+
+export const setCompact = local.mutation({ args: {}, handler: async () => null });
+`;
 }

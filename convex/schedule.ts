@@ -1,9 +1,9 @@
 import { type GenericId, v } from "convex/values";
 import { internal } from "./_generated/api";
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 import { read as readTime } from "./time";
 
-export const append = embedded.replicated.mutation({
+export const append = replicated.mutation({
   args: { id: v.id("documents") },
   returns: v.id("_scheduled_functions"),
   handler: async (ctx, args): Promise<GenericId<"_scheduled_functions">> => {
@@ -11,7 +11,7 @@ export const append = embedded.replicated.mutation({
   },
 });
 
-export const appendAfter = embedded.replicated.mutation({
+export const appendAfter = replicated.mutation({
   args: { id: v.id("documents"), delayMs: v.number() },
   returns: v.id("_scheduled_functions"),
   handler: async (ctx, args): Promise<GenericId<"_scheduled_functions">> => {
@@ -21,7 +21,7 @@ export const appendAfter = embedded.replicated.mutation({
   },
 });
 
-export const cancel = embedded.replicated.mutation({
+export const cancel = replicated.mutation({
   args: { scheduleId: v.id("_scheduled_functions") },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -30,7 +30,7 @@ export const cancel = embedded.replicated.mutation({
   },
 });
 
-export const scheduledAppend = embedded.replicated.internalMutation({
+export const scheduledAppend = replicated.internalMutation({
   args: { id: v.id("documents") },
   returns: v.null(),
   handler: async (ctx, args) => {

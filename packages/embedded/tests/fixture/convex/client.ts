@@ -2,9 +2,9 @@ import { paginationOptsValidator } from "convex/server";
 import { v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { embedded } from "./embedded";
+import { remote } from "./embedded";
 
-export const list = embedded.remote.query({
+export const list = remote.query({
   args: {
     identityKey: v.optional(v.string()),
     schemaHash: v.optional(v.string()),
@@ -22,7 +22,7 @@ export const list = embedded.remote.query({
     }),
 });
 
-export const retire = embedded.remote.mutation({
+export const retire = remote.mutation({
   args: {
     clientId: v.string(),
     expectedIdentity: v.optional(v.string()),

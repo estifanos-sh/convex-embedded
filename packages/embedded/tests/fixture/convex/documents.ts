@@ -1,11 +1,11 @@
 import { paginationOptsValidator } from "convex/server";
 import { v } from "convex/values";
 
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 
 export * from "../../../../../convex/documents";
 
-export const page = embedded.replicated.query({
+export const page = replicated.query({
   args: {
     paginationOpts: paginationOptsValidator,
     prefix: v.string(),

@@ -47,7 +47,6 @@ import {
   fieldPlacements,
   projectWireDoc,
   type ConvexEmbeddedSchema,
-  type DeviceDataModel,
   type EmbeddedSchemaDefinition,
   type EmbeddedSchemaPlacements,
   type ReplicatedDataModel,
@@ -71,15 +70,6 @@ import {
   readStorageIds,
   type CompiledStorageIdPaths,
 } from "../storage/id/path";
-import type {
-  MutationCtx as RuntimeMutationCtx,
-  QueryCtx as LocalQueryCtx,
-} from "../runtime/functions";
-
-type LocalMutationCtx<DataModel extends GenericDataModel> = Omit<
-  RuntimeMutationCtx<DataModel>,
-  "scheduler" | "storage"
->;
 
 const MAX_TRACKED_ROWS = 1_024;
 const MAX_TRACKED_RANGES = 1_024;
@@ -87,7 +77,7 @@ const REPLAY_TTL_MS = 60_000;
 
 type EmbeddedRegisteredFunction = {
   __embeddedHandler?: (ctx: unknown, args: Record<string, unknown>) => unknown;
-  __embeddedPlacement?: "replicated" | "remote" | "local";
+  __embeddedPlacement?: "replicated" | "remote";
 };
 
 type EmbeddedComponent = ComponentApi<string | undefined>;
@@ -290,36 +280,6 @@ type RemoteMutationBuilder<
 }) => RegisteredMutation<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>) &
   MutationBuilder<DataModel, Visibility>;
 
-type LocalQueryBuilder<
-  DataModel extends GenericDataModel,
-  Visibility extends "public" | "internal",
-> = <
-  ArgsValidator extends PropertyValidators | void | Validator<any, any, any>,
-  ReturnsValidator extends PropertyValidators | GenericValidator | void,
-  ReturnValue extends ReturnValueForOptionalValidator<ReturnsValidator> = any,
-  OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
-    DefaultArgsForOptionalValidator<ArgsValidator>,
->(func: {
-  args?: ArgsValidator;
-  returns?: ReturnsValidator;
-  handler: (ctx: LocalQueryCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
-}) => RegisteredQuery<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>;
-
-type LocalMutationBuilder<
-  DataModel extends GenericDataModel,
-  Visibility extends "public" | "internal",
-> = <
-  ArgsValidator extends PropertyValidators | void | Validator<any, any, any>,
-  ReturnsValidator extends PropertyValidators | GenericValidator | void,
-  ReturnValue extends ReturnValueForOptionalValidator<ReturnsValidator> = any,
-  OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
-    DefaultArgsForOptionalValidator<ArgsValidator>,
->(func: {
-  args?: ArgsValidator;
-  returns?: ReturnsValidator;
-  handler: (ctx: LocalMutationCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
-}) => RegisteredMutation<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>;
-
 export type DefineEmbeddedOptions<Schema extends EmbeddedSchemaDefinition> = {
   component: EmbeddedComponent;
   /** Trusted generated placement metadata used for nested server calls. */
@@ -341,12 +301,6 @@ export type DefinedEmbedded<Schema extends EmbeddedSchemaDefinition> = {
     internalQuery: EmbeddedQueryBuilder<ServerDataModel<Schema>, "internal">;
     internalMutation: RemoteMutationBuilder<ServerDataModel<Schema>, "internal">;
   };
-  local: {
-    query: LocalQueryBuilder<DeviceDataModel<Schema>, "public">;
-    mutation: LocalMutationBuilder<DeviceDataModel<Schema>, "public">;
-    internalQuery: LocalQueryBuilder<DeviceDataModel<Schema>, "internal">;
-    internalMutation: LocalMutationBuilder<DeviceDataModel<Schema>, "internal">;
-  };
   upload: ReturnType<typeof buildUpload>;
   pull: ReturnType<typeof buildPull>;
   push: ReturnType<typeof buildPush>;
@@ -357,7 +311,6 @@ export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
 ): DefinedEmbedded<Schema> {
   type Replicated = ReplicatedDataModel<Schema>;
   type Server = ServerDataModel<Schema>;
-  type Device = DeviceDataModel<Schema>;
   const placements = embeddedSchemaMeta(options.schema as ConvexEmbeddedSchema);
   const tableNames = placements.replicatedTables;
   const crdtFields = schemaCrdtFields(options.schema);
@@ -418,21 +371,6 @@ export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
         "internal"
       >,
     },
-    local: {
-      query: buildLocalBuilder("query", "public") as unknown as LocalQueryBuilder<Device, "public">,
-      mutation: buildLocalBuilder("mutation", "public") as unknown as LocalMutationBuilder<
-        Device,
-        "public"
-      >,
-      internalQuery: buildLocalBuilder("query", "internal") as unknown as LocalQueryBuilder<
-        Device,
-        "internal"
-      >,
-      internalMutation: buildLocalBuilder(
-        "mutation",
-        "internal",
-      ) as unknown as LocalMutationBuilder<Device, "internal">,
-    },
     upload: buildUpload(),
     pull: buildPull(options.component, options.manifest),
     push: buildPush(options.component, tableNames, crdtFields, placements, options.manifest),
@@ -450,23 +388,6 @@ function buildRemoteBuilder(base: QueryBuilder<any, any> | MutationBuilder<any, 
     registered.__embeddedPlacement = "remote";
     return registered;
   };
-}
-
-function buildLocalBuilder(kind: "query" | "mutation", visibility: "public" | "internal") {
-  return (definition: {
-    args?: PropertyValidators | GenericValidator;
-    returns?: PropertyValidators | GenericValidator;
-    handler: (ctx: unknown, args: Record<string, unknown>) => unknown;
-  }) => ({
-    kind,
-    placement: "local" as const,
-    visibility,
-    args: definition.args,
-    returns: definition.returns,
-    handler: definition.handler,
-    __embeddedHandler: definition.handler,
-    __embeddedPlacement: "local" as const,
-  });
 }
 
 function buildUpload() {

@@ -13,7 +13,7 @@ describe("embedded values", () => {
     expect(json(e.text())).toEqual(json(v.string()));
     expect(json(e.count())).toEqual(json(v.number()));
     expect(json(e.set(v.string()))).toEqual(json(v.array(v.string())));
-    expect(json(e.omit(v.string()))).toEqual(json(v.string()));
+    expect(json(e.remote(v.string()))).toEqual(json(v.string()));
     expect(json(e.local(v.boolean()))).toEqual(json(v.boolean()));
   });
 
@@ -34,13 +34,13 @@ describe("embedded values", () => {
       crdt: { kind: "set", member: { type: "string" } },
       placement: "replicated",
     });
-    expect(embeddedFieldMeta(e.omit(v.string()))).toEqual({ placement: "remote" });
+    expect(embeddedFieldMeta(e.remote(v.string()))).toEqual({ placement: "remote" });
     expect(embeddedFieldMeta(e.local(v.boolean()))).toEqual({ placement: "local" });
     expect(embeddedFieldMeta(v.string())).toBeNull();
   });
 
   test("annotations cannot be combined", () => {
     expect(() => e.local(e.text())).toThrow("cannot be combined");
-    expect(() => e.omit(e.set(v.string()))).toThrow("cannot be combined");
+    expect(() => e.remote(e.set(v.string()))).toThrow("cannot be combined");
   });
 });

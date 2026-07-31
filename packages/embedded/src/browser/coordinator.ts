@@ -493,7 +493,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       role: "follower",
     });
     this.replayLedger();
-    this.postInitSuccess();
+    this.postInitSuccess(message.localConfigured);
   }
 
   handleRejected(message: Extract<PeerMessage, { op: typeof PeerOp.Rejected }>): void {
@@ -731,7 +731,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       role: "leader",
     });
     this.replayLedger();
-    this.postInitSuccess();
+    this.postInitSuccess(runtime.runner.localConfigured);
     return leader;
   }
 
@@ -883,12 +883,13 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.postLocal({ detail, op: WorkerEvent.Debug, phase });
   }
 
-  private postInitSuccess(): void {
+  /** The init result is the runtime's device-only module configuration, for the client's errors. */
+  private postInitSuccess(localConfigured: boolean | undefined): void {
     const lifecycle = this.state.lifecycle;
     if (lifecycle.lifecycle !== "starting") return;
     lifecycle.initReady.resolve();
     this.state.lifecycle = { lifecycle: "active" };
-    this.postLocal({ id: this.init.id, op: WorkerEvent.Result });
+    this.postLocal({ id: this.init.id, op: WorkerEvent.Result, result: localConfigured });
   }
 
   private postInitError(error: unknown): void {

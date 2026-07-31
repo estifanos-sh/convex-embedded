@@ -1,5 +1,4 @@
 import type { GenericDataModel, UserIdentity } from "convex/server";
-import { getFunctionName } from "convex/server";
 import { convexToJson } from "convex/values";
 import type {
   GenericValidator,
@@ -39,6 +38,7 @@ import {
   type ValidatorIdValue,
 } from "../id/path";
 import { EmbeddedUnsupportedError } from "../error";
+import { EMBEDDED_LOCAL_REFERENCE } from "../local";
 import { normalizeMutationResult } from "../result";
 import { embeddedComponentModules } from "../component/local";
 import { embeddedComponentStoreSchema } from "../schema";
@@ -89,7 +89,12 @@ import {
   type SchedulerPump,
   type SchedulerService,
 } from "./scheduler";
-import { createStorageService, type StorageWriterService, type UploadUrl } from "./storage/service";
+import {
+  createStorageService,
+  type StorageReaderService,
+  type StorageWriterService,
+  type UploadUrl,
+} from "./storage/service";
 import { fullStore, functionName, type RuntimeCalls } from "./service";
 import { EMBEDDED_PROTOCOL_VERSION, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 
@@ -113,6 +118,20 @@ export type ModuleExports = Record<string, unknown>;
  * @internal
  */
 export type ModuleEntry = ModuleExports | (() => Promise<ModuleExports>);
+
+/**
+ * Device-only function modules keyed by namespaced local module id, such as `local/sync/drafts`.
+ *
+ * @internal
+ */
+export type LocalModuleMap = Record<string, () => Promise<unknown>>;
+
+/** Namespace every device-only function name carries. @internal */
+export const LOCAL_FUNCTION_PREFIX = "local/";
+
+/** Raised when a device-only function is dispatched without any configured local root. @internal */
+export const LOCAL_UNCONFIGURED_ERROR =
+  "No local directory is configured; pass the local option to the bundler adapter.";
 
 /**
  * Watched-query value callback.
@@ -204,20 +223,28 @@ export interface RunnerOptions {
   deferNotify?(this: void, run: () => void): void;
   emit?: EmbeddedEventListener;
   hasEventListeners?(): boolean;
+  /** Device-only modules imported eagerly during runner construction. */
+  localModules?: LocalModuleMap;
   moduleGraphHash?: string;
   /** Trusted build-time placement metadata, including hosted-only functions. */
   manifest?: RuntimeFunctionManifest;
   remote?: boolean;
 }
 
-/** Build-time function metadata used to route functions omitted from the device bundle. @internal */
+/**
+ * Build-time function metadata used to route functions omitted from the device bundle. Device-only
+ * placement is never declared here: it belongs to modules under the bundler's local directory,
+ * which dispatch by their stamped name instead.
+ *
+ * @internal
+ */
 export type RuntimeFunctionManifest = Record<
   string,
   Record<
     string,
     {
       kind: "query" | "mutation";
-      placement: FunctionPlacement;
+      placement: "replicated" | "remote";
       visibility: "public" | "internal";
     }
   >
@@ -322,6 +349,16 @@ export interface Runner {
     read(): Promise<{ identity: UserIdentity | null; identityKey: string } | undefined>;
     write(identityKey: string): Promise<void>;
   };
+  /**
+   * Whether this runtime owns device-only modules from a configured local root. Clients read it to
+   * tell an unconfigured app apart from an unregistered device-only function.
+   */
+  readonly localConfigured: boolean;
+  /**
+   * Settles once every device-only module has been imported and every registration in it carries
+   * its namespaced name. Absent when the runtime was built without device-only modules.
+   */
+  readonly localReady?: Promise<void>;
   route(
     ref: FunctionReference,
     args: Record<string, unknown>,
@@ -616,6 +653,12 @@ export function createRunner(
   );
   const moduleCache = new Map<string, Promise<ModuleExports>>();
   const functionCache = new Map<string, Promise<RunnableFunction>>();
+  const localFunctions = new Map<string, RunnableFunction>();
+  const localConfigured = Object.keys(options.localModules ?? {}).length > 0;
+  const localReady = options.localModules
+    ? ingestLocalModules(options.localModules, localFunctions)
+    : undefined;
+  if (localReady) void localReady.catch(() => undefined);
   const watchers = new Map<string, Watcher>();
   const uploadUrls = new Map<string, UploadUrl>();
   const objectUrls = new Map<string, string>();
@@ -687,6 +730,28 @@ export function createRunner(
     }
   };
 
+  const resolveFunction = async (scope: RuntimeScope, name: string): Promise<RunnableFunction> => {
+    if (!name.startsWith(LOCAL_FUNCTION_PREFIX) || scope.instancePath !== ROOT_INSTANCE) {
+      return await loadFunction(
+        scope.modules,
+        moduleCache,
+        functionCache,
+        scope.instancePath,
+        name,
+      );
+    }
+    if (localReady) await localReady;
+    const local = localFunctions.get(name);
+    if (!local) {
+      throw new Error(
+        localConfigured
+          ? `${name} is not registered under the configured local directories.`
+          : LOCAL_UNCONFIGURED_ERROR,
+      );
+    }
+    return local;
+  };
+
   const runQuery = async (
     ref: FunctionReference,
     args: Record<string, unknown>,
@@ -699,14 +764,8 @@ export function createRunner(
     while (tx === undefined && entropySpan) await entropySpan;
     const resolved = resolveFunctionAddress(ref, scope);
     const scopeStore = namespaceStore(store, resolved.scope.instancePath);
-    const fn = await loadFunction(
-      resolved.scope.modules,
-      moduleCache,
-      functionCache,
-      resolved.scope.instancePath,
-      resolved.name,
-    );
-    if (fn.kind !== "query") throw new Error(`${describeRef(ref)} is not a query`);
+    const fn = await resolveFunction(resolved.scope, resolved.name);
+    if (fn.kind !== "query") throw kindMismatch(fn, ref, "query");
     ensureVisible(fn, ref, options);
     ensureSamePlacement(fn, ref, options.callerPlacement);
     const txDb = tx?.writer(resolved.scope).db;
@@ -721,6 +780,7 @@ export function createRunner(
             fn.placement === "local" ? "device" : "replicated",
           ));
     const checked = await resolveQueryArgs(scopeStore, fn, args);
+    let storageService: StorageReaderService | undefined;
     const result = await fn.handler(
       {
         auth: authService(options.auth ?? null),
@@ -732,13 +792,18 @@ export function createRunner(
             allowInternal: true,
             callerPlacement: fn.placement,
           }),
-        storage: createStorageService(
-          namespaceStore(store, resolved.scope.instancePath),
-          uploadUrls,
-          objectUrls,
-          "reader",
-          emit,
-        ),
+        get storage(): StorageReaderService {
+          if (fn.placement === "local") {
+            throw new Error("Local functions cannot access file storage.");
+          }
+          return (storageService ??= createStorageService(
+            namespaceStore(store, resolved.scope.instancePath),
+            uploadUrls,
+            objectUrls,
+            "reader",
+            emit,
+          ));
+        },
       },
       checked,
     );
@@ -912,14 +977,8 @@ export function createRunner(
     const timingStartedAt = timing ? getTimerTime() : 0;
     let timingPhaseStartedAt = timingStartedAt;
     const resolved = resolveFunctionAddress(ref, scope);
-    const fn = await loadFunction(
-      resolved.scope.modules,
-      moduleCache,
-      functionCache,
-      resolved.scope.instancePath,
-      resolved.name,
-    );
-    if (fn.kind !== "mutation") throw new Error(`${describeRef(ref)} is not a mutation`);
+    const fn = await resolveFunction(resolved.scope, resolved.name);
+    if (fn.kind !== "mutation") throw kindMismatch(fn, ref, "mutation");
     ensureVisible(fn, ref, options);
     ensureSamePlacement(fn, ref, options.callerPlacement);
     if (fn.placement === "remote") {
@@ -1429,13 +1488,7 @@ export function createRunner(
     options: RunOptions = {},
   ): Promise<unknown> => {
     const resolved = resolveFunctionAddress(ref, scope);
-    const fn = await loadFunction(
-      resolved.scope.modules,
-      moduleCache,
-      functionCache,
-      resolved.scope.instancePath,
-      resolved.name,
-    );
+    const fn = await resolveFunction(resolved.scope, resolved.name);
     if (fn.kind !== "action") throw new Error(`${describeRef(ref)} is not an action`);
     ensureVisible(fn, ref, options);
     ensureSamePlacement(fn, ref, options.callerPlacement);
@@ -1496,13 +1549,10 @@ export function createRunner(
 
   const functionKind = async (ref: FunctionReference): Promise<ScheduledFunctionKind> => {
     const resolved = resolveFunctionAddress(ref, rootScope);
-    const fn = await loadFunction(
-      resolved.scope.modules,
-      moduleCache,
-      functionCache,
-      resolved.scope.instancePath,
-      resolved.name,
-    );
+    const fn = await resolveFunction(resolved.scope, resolved.name);
+    if (fn.placement === "local") {
+      throw new Error(`${describeRef(ref)} is a local function and cannot be scheduled.`);
+    }
     if (fn.kind !== "mutation" && fn.kind !== "action") {
       throw new Error(`${describeRef(ref)} cannot be scheduled locally.`);
     }
@@ -1608,13 +1658,12 @@ export function createRunner(
   const subscriptionDescriptor = async (
     watcher: Watcher,
   ): Promise<({ fn: string; resultCacheKey: string } & RemoteSubscription) | undefined> => {
-    const subscription = await hostedPullArgs(
-      store,
-      await watcherFunction(watcher, rootScope, moduleCache, functionCache),
-      watcher.args,
-    );
+    const resolved = resolveFunctionAddress(watcher.ref, rootScope);
+    const watched = await resolveFunction(resolved.scope, resolved.name);
+    if (watched.placement === "local") return undefined;
+    const subscription = await hostedPullArgs(store, watched, watcher.args);
     if (subscription === undefined) return undefined;
-    const fn = getFunctionName(watcher.ref as unknown as Parameters<typeof getFunctionName>[0]);
+    const fn = functionName(watcher.ref);
     const identity =
       (await store.identity?.read())?.identityKey ?? EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY;
     return {
@@ -1808,15 +1857,23 @@ export function createRunner(
         );
       },
     },
+    localConfigured,
+    localReady,
     async route(ref, args, kind) {
       const detached = normalizeCopy(args) as Record<string, unknown>;
       if (kind !== "action") {
         const resolved = resolveFunctionAddress(ref, rootScope);
+        const local = resolved.name.startsWith(LOCAL_FUNCTION_PREFIX);
         const declared =
-          resolved.scope.instancePath === ROOT_INSTANCE
+          !local && resolved.scope.instancePath === ROOT_INSTANCE
             ? manifestFunction(options.manifest, resolved.name)
             : undefined;
-        if (options.manifest && resolved.scope.instancePath === ROOT_INSTANCE && !declared) {
+        if (
+          !local &&
+          options.manifest &&
+          resolved.scope.instancePath === ROOT_INSTANCE &&
+          !declared
+        ) {
           throw new Error(`unknown embedded function: ${resolved.name}`);
         }
         if (declared) {
@@ -1833,14 +1890,8 @@ export function createRunner(
               : { execution: "hosted", args: hosted };
           }
         }
-        const fn = await loadFunction(
-          resolved.scope.modules,
-          moduleCache,
-          functionCache,
-          resolved.scope.instancePath,
-          resolved.name,
-        );
-        if (fn.kind !== kind) throw new Error(`${describeRef(ref)} is not a ${kind}`);
+        const fn = await resolveFunction(resolved.scope, resolved.name);
+        if (fn.kind !== kind) throw kindMismatch(fn, ref, kind);
         ensureVisible(fn, ref, {});
         if (kind === "query") await resolveQueryArgs(store, fn, detached);
         else validateArgs(fn, detached, true);
@@ -2221,7 +2272,10 @@ export function createRunner(
     const service = fullStore(store);
     const idMappings: Record<string, unknown>[] = [];
     if (service.id) {
-      for (const table of [...storeSchema.tables.map((def) => def.name), "_storage"]) {
+      const mapped = storeSchema.tables
+        .filter((def) => def.placement === "replicated")
+        .map((def) => def.name);
+      for (const table of [...mapped, "_storage"]) {
         for (const mapping of await service.id.page.read(table)) {
           idMappings.push(normalizeCopy(mapping) as Record<string, unknown>);
         }
@@ -2352,22 +2406,6 @@ interface Watcher {
    */
   coveredMemo: string | undefined;
   readDocIds: Set<string>;
-}
-
-async function watcherFunction(
-  watcher: Watcher,
-  rootScope: RuntimeScope,
-  moduleCache: Map<string, Promise<ModuleExports>>,
-  functionCache: Map<string, Promise<RunnableFunction>>,
-): Promise<RunnableFunction> {
-  const resolved = resolveFunctionAddress(watcher.ref, rootScope);
-  return await loadFunction(
-    resolved.scope.modules,
-    moduleCache,
-    functionCache,
-    resolved.scope.instancePath,
-    resolved.name,
-  );
 }
 
 async function hostedPullArgs(
@@ -2536,16 +2574,15 @@ async function clearDeletes(
 function rootBatchInvalidationKeys(batch: WriteBatch): string[] {
   const keys: string[] = [];
   const seen = new Set<string>();
-  for (const docWrite of batch.docWrites) {
-    if (seen.has(docWrite.table)) continue;
-    seen.add(docWrite.table);
-    keys.push(docWrite.table);
-  }
-  for (const deleted of batch.deletes) {
-    if (seen.has(deleted.table)) continue;
-    seen.add(deleted.table);
-    keys.push(deleted.table);
-  }
+  const add = (table: string): void => {
+    if (seen.has(table)) return;
+    seen.add(table);
+    keys.push(table);
+  };
+  for (const docWrite of batch.docWrites) add(docWrite.table);
+  for (const deleted of batch.deletes) add(deleted.table);
+  for (const write of batch.localFieldWrites ?? []) add(write.table);
+  for (const deleted of batch.localFieldDeletes ?? []) add(deleted.table);
   return keys;
 }
 
@@ -2553,6 +2590,8 @@ function rootBatchDataOnlyDocIds(batch: WriteBatch): Map<InvalidationKey, Set<st
   if (batch.docWrites.length === 0 || batch.deletes.length > 0) return undefined;
   if ((batch.crdtOps?.length ?? 0) > 0) return undefined;
   if ((batch.freshIds?.length ?? 0) > 0) return undefined;
+  if ((batch.localFieldWrites?.length ?? 0) > 0) return undefined;
+  if ((batch.localFieldDeletes?.length ?? 0) > 0) return undefined;
   const dataOnlyIds = batch.dataOnlyIds ?? [];
   if (dataOnlyIds.length !== batch.docWrites.length) return undefined;
   const marked = new Set(dataOnlyIds.map((row) => `${row.table}\0${row.id}`));
@@ -2802,9 +2841,53 @@ function ensureSamePlacement(
 }
 
 function ensureVisible(fn: RunnableFunction, ref: FunctionReference, options: RunOptions): void {
-  if (fn.visibility === "internal" && !options.allowInternal) {
-    throw new Error(`${describeRef(ref)} is internal and cannot be called from the public client.`);
+  if (fn.visibility !== "internal" || options.allowInternal) return;
+  if (fn.placement === "local") {
+    throw new Error("Internal local functions are only callable from other local functions.");
   }
+  throw new Error(`${describeRef(ref)} is internal and cannot be called from the public client.`);
+}
+
+function kindMismatch(
+  fn: RunnableFunction,
+  ref: FunctionReference,
+  kind: "query" | "mutation",
+): Error {
+  return fn.placement === "local"
+    ? new Error(`${functionName(ref)} is a local ${fn.kind} and cannot be called as a ${kind}.`)
+    : new Error(`${describeRef(ref)} is not a ${kind}`);
+}
+
+/**
+ * Imports every device-only module up front and names each registration it exports. Everything else
+ * a module exports passes through untouched, so a device module is free to export helpers and
+ * constants the app imports directly.
+ */
+async function ingestLocalModules(
+  localModules: LocalModuleMap,
+  table: Map<string, RunnableFunction>,
+): Promise<void> {
+  await Promise.all(
+    Object.entries(localModules).map(async ([moduleId, load]) => {
+      const exports = (await load()) as Record<string, unknown>;
+      for (const [exportName, value] of Object.entries(exports)) {
+        if (!isLocalRegistration(value)) continue;
+        const registration = toRunnable(value);
+        if (!registration || registration.kind === "action") continue;
+        const name = `${moduleId}:${exportName}`;
+        (value as Record<string, unknown>)[EMBEDDED_LOCAL_REFERENCE] = name;
+        table.set(name, registration);
+      }
+    }),
+  );
+}
+
+function isLocalRegistration(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { __embeddedPlacement?: unknown }).__embeddedPlacement === "local"
+  );
 }
 
 function runQueuedTask<T>(task: () => Promise<T>): Promise<T> {

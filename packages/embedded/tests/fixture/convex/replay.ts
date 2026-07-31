@@ -1,8 +1,8 @@
 import { v } from "convex/values";
 
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 
-export const updatePair = embedded.replicated.mutation({
+export const updatePair = replicated.mutation({
   args: {
     first: v.id("documents"),
     second: v.id("documents"),
@@ -22,7 +22,7 @@ export const updatePair = embedded.replicated.mutation({
   },
 });
 
-export const insertNull = embedded.replicated.mutation({
+export const insertNull = replicated.mutation({
   args: { slug: v.string(), title: v.string(), updatedAt: v.number() },
   returns: v.null(),
   handler: async (ctx, args) => {

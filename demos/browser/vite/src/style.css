@@ -380,6 +380,54 @@
     color: var(--color-content-primary);
   }
 
+  .documentRowSelect {
+    display: flex;
+    min-width: 0;
+    flex: 1 1 auto;
+    align-items: center;
+    gap: 9px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    padding: 0;
+    text-align: left;
+  }
+
+  .documentRowExpand,
+  .documentRowPin {
+    display: inline-flex;
+    width: 24px;
+    height: 24px;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--color-content-tertiary);
+    padding: 0;
+  }
+
+  .documentRowExpand:hover,
+  .documentRowPin:hover {
+    background: var(--color-background-secondary);
+    color: var(--color-content-primary);
+  }
+
+  .documentRowExpand.active,
+  .documentRowPin.active {
+    color: var(--color-content-accent);
+  }
+
+  .pinnedCount {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    color: var(--color-content-tertiary);
+    font-size: 12px;
+  }
+
   .documentListEmpty {
     color: var(--color-content-secondary);
     padding: 14px 12px;

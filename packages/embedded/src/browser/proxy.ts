@@ -120,6 +120,8 @@ export class IndeterminateMutationError extends Error {
  * @internal
  */
 export class WorkerRunner implements Runner {
+  /** Reported by the worker once initialization settles; false until then. */
+  localConfigured = false;
   private readonly clientId = randomId("client");
   private closed = false;
   private closedError = new Error("ConvexEmbeddedClient has already been closed.");
@@ -160,8 +162,8 @@ export class WorkerRunner implements Runner {
     this.worker.addEventListener("messageerror", this.onWorkerError);
     this.worker.start?.();
     this.ready = init
-      ? Promise.resolve(init.storageOwner ?? false).then((storageOwner) =>
-          this.request(
+      ? Promise.resolve(init.storageOwner ?? false).then(async (storageOwner) => {
+          const localConfigured = await this.request<boolean | undefined>(
             {
               clientId: this.clientId,
               debug: init.debug ?? debugHook() !== undefined,
@@ -184,8 +186,9 @@ export class WorkerRunner implements Runner {
               op: WorkerCommand.Init,
             },
             { timeoutMs: this.initTimeoutMs },
-          ),
-        )
+          );
+          this.localConfigured = localConfigured === true;
+        })
       : Promise.resolve();
     this.ready.catch(() => undefined);
   }

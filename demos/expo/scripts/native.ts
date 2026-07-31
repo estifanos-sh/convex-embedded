@@ -8,18 +8,20 @@ const path = require("node:path") as typeof import("node:path");
 type MobilePlatform = "android" | "ios";
 
 /**
- * `IOS_TARGETS`, `ANDROID_NDK_VERSION`, and `CARGO_NDK_VERSION` mirror `iosTargetTriples`,
- * `androidNdkVersion`, and `cargoNdkVersion` in `config/build.ts` and must stay in sync. This
- * `eas-build-pre-install` hook runs as a bare-node CommonJS script before `node_modules` and the
- * ESM `config` package exist, so it cannot import them.
+ * `IOS_TARGETS`, `ANDROID_TARGETS`, `ANDROID_NDK_VERSION`, and `CARGO_NDK_VERSION` mirror
+ * `iosTargetTriples`, `androidAbis`, `androidNdkVersion`, and `cargoNdkVersion` in
+ * `config/build.ts` and must stay in sync. This `eas-build-pre-install` hook runs as a bare-node
+ * CommonJS script before `node_modules` and the ESM `config` package exist, so it cannot import
+ * them — including `mobileSlices`, whose `CONVEX_EMBEDDED_MOBILE_SLICES` contract `readSlices`
+ * repeats here so the installed Rust targets match the slices `mobile.ts` goes on to build.
  */
-const IOS_TARGETS = ["aarch64-apple-ios", "aarch64-apple-ios-sim", "x86_64-apple-ios"] as const;
-const ANDROID_TARGETS = [
-  "aarch64-linux-android",
-  "armv7-linux-androideabi",
-  "i686-linux-android",
-  "x86_64-linux-android",
-] as const;
+const IOS_TARGETS = ["aarch64-apple-ios", "aarch64-apple-ios-sim"] as const;
+const ANDROID_TARGETS = {
+  "arm64-v8a": "aarch64-linux-android",
+  "armeabi-v7a": "armv7-linux-androideabi",
+  x86: "i686-linux-android",
+  x86_64: "x86_64-linux-android",
+} as const;
 const ANDROID_NDK_VERSION = "28.1.13356709";
 const CARGO_NDK_VERSION = "3.5.4";
 const RUSTUP_VERSION = "1.28.2";
@@ -60,7 +62,11 @@ function prepareToolchain(platform: MobilePlatform, env: NodeJS.ProcessEnv): voi
   const toolchain = readFileSync(toolchainPath, "utf8");
   const channel = matchValue(toolchain, /channel\s*=\s*"([^"]+)"/, "Rust channel");
   const components = matchValues(toolchain, /components\s*=\s*\[([^\]]+)\]/, "Rust components");
-  const targets = platform === "ios" ? IOS_TARGETS : ANDROID_TARGETS;
+  const slices = readSlices(platform);
+  const targets =
+    platform === "ios"
+      ? slices
+      : slices.map((abi) => ANDROID_TARGETS[abi as keyof typeof ANDROID_TARGETS]);
 
   run(
     "rustup",
@@ -77,6 +83,21 @@ function prepareToolchain(platform: MobilePlatform, env: NodeJS.ProcessEnv): voi
   run("rustup", ["target", "add", "--toolchain", channel, ...targets], env);
 
   if (platform === "android") prepareAndroid(channel, env);
+}
+
+function readSlices(platform: MobilePlatform): string[] {
+  const all: readonly string[] = platform === "ios" ? IOS_TARGETS : Object.keys(ANDROID_TARGETS);
+  const requested = process.env.CONVEX_EMBEDDED_MOBILE_SLICES?.trim();
+  if (!requested) return [...all];
+  const selected = requested.split(",").map((part) => part.trim());
+  const slices = all.filter((slice) => selected.includes(slice));
+  if (slices.length !== selected.length) {
+    throw new Error(
+      `CONVEX_EMBEDDED_MOBILE_SLICES must name distinct ${platform} slices from ` +
+        `${all.join(", ")}; received ${requested}.`,
+    );
+  }
+  return slices;
 }
 
 function prepareRustup(env: NodeJS.ProcessEnv): void {

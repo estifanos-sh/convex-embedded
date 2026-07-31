@@ -27,7 +27,8 @@ pnpm dev:browser:vite
 - `src/lib/client.ts` — `ConvexEmbeddedClient` setup and optional remote configuration.
 - `vite.config.ts` — React, Tailwind, the shared deployment/generated paths, and embedded devtools.
 
-The schema and functions live at the workspace root in `convex/`. The Vite plugin regenerates
-`convex/generated/embedded.ts`, bundles device functions into the browser worker, and emits a stable
-identity hash so compatible tabs attach to the same local runtime. The generated contract remains
-outside Convex CLI-owned `_generated`, so `convex dev` and `convex deploy` do not delete it.
+The schema and functions live at the workspace root in `convex/`. The Vite plugin rewrites the
+`convex/embedded.generated.ts` placement lockfile, inlines the device schema into its virtual
+registry, bundles device functions into the browser worker, and emits a stable identity hash so
+compatible tabs attach to the same local runtime. The lockfile's multi-dot basename keeps the Convex
+CLI from deploying it as a function module, and `convex dev` never replaces it.

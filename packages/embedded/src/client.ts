@@ -24,6 +24,8 @@ import { ConvexClient, type AuthTokenFetcher, type QueryJournal } from "convex/b
 import { freezeNormalizedTree, normalizeObject } from "./runtime/codec";
 import {
   createRunner,
+  LOCAL_UNCONFIGURED_ERROR,
+  type LocalModuleMap,
   type ModuleMap,
   type Runner,
   type RunnerDevtoolsRequest,
@@ -32,6 +34,14 @@ import {
   type RunMutationTiming,
   type StopOnUpdate,
 } from "./runtime/runner";
+import {
+  isLocalFunction,
+  localReferenceName,
+  type LocalFunctionArgs,
+  type LocalFunctionReturns,
+  type LocalMutation,
+  type LocalQuery,
+} from "./local";
 import { consumeRemoteTick, remotePendingIsEmpty, REMOTE_PULL_DIAGNOSTIC_ERROR } from "./rev";
 import { toRuntimeStoreSchema, type ConvexEmbeddedSchema } from "./schema";
 import type {
@@ -183,6 +193,29 @@ export interface Watch<T> {
 export type ConvexModules = ModuleMap;
 
 /**
+ * Device-only function modules keyed by namespaced local module id.
+ *
+ * @remarks
+ * Bundler-driven runtimes receive this map from the generated virtual module. Node passes it
+ * directly.
+ *
+ * @public
+ */
+export type ConvexLocalModules = LocalModuleMap;
+
+/** Arguments accepted by a device-only function at the app surface. @public */
+export type LocalArgs<Fn> =
+  LocalFunctionArgs<Fn> extends Record<string, never>
+    ? [args?: Record<string, never>]
+    : [args: LocalFunctionArgs<Fn>];
+
+/** Arguments and mutation options accepted by a device-only mutation. @public */
+export type LocalArgsAndOptions<Fn, Options> =
+  LocalFunctionArgs<Fn> extends Record<string, never>
+    ? [args?: Record<string, never>, options?: Options]
+    : [args: LocalFunctionArgs<Fn>, options?: Options];
+
+/**
  * Mutable authentication state shared by the app client and its remote driver.
  *
  * @internal
@@ -223,6 +256,8 @@ export interface ConvexEmbeddedRemoteOptions {
 interface EmbeddedClientBaseOptions {
   /** Convex function modules executed by the local runtime. */
   modules: ConvexModules;
+  /** Device-only function modules imported when the runtime starts. */
+  localModules?: ConvexLocalModules;
   /** Storage backend, or a promise for one, owned by the client. */
   store: StorageBackend | Promise<StorageBackend>;
   /** Mutable auth state shared with the remote driver. */
@@ -364,7 +399,7 @@ interface QueryState<T = unknown> {
   journal: QueryJournal | undefined;
   logs: string[] | undefined;
   name: string;
-  ref: FunctionReference<"query">;
+  ref: FunctionReference<"query"> | LocalQuery<"public", any, any>;
   stop: StopOnUpdate | undefined;
   value: T | undefined;
 }
@@ -488,27 +523,36 @@ export class EmbeddedClient {
    * const todos = await client.query(api.todos.list, {});
    * ```
    */
-  async query<Query extends FunctionReference<"query">>(
+  query<Query extends FunctionReference<"query">>(
     query: Query,
     ...args: OptionalRestArgs<Query>
-  ): Promise<FunctionReturnType<Query>> {
+  ): Promise<FunctionReturnType<Query>>;
+  query<Query extends LocalQuery<"public", any, any>>(
+    query: Query,
+    ...args: LocalArgs<Query>
+  ): LocalFunctionReturns<Query>;
+  async query(
+    query: FunctionReference<"query"> | LocalQuery<"public", any, any>,
+    ...args: [Record<string, Value>?]
+  ): Promise<unknown> {
     this.ensureOpen();
     const { runner } = await this.state;
     this.ensureOpen();
+    const reference = toReference(query, runner.localConfigured);
     const normalized = toArgs(args[0]);
     // A one-shot `query()` returns to its caller only — it never feeds the reactive cache. The
     // watcher loop is the sole producer of `baseValue`/`baseError`, so a concurrent watched read
     // cannot tear against this result. Mirrors Convex's `client.query()`.
-    return (await this.recordOperation("query", getFunctionName(query), normalized, async () => {
-      const cachedPlacement = this.cachedLocalRoute(query, "query");
+    return await this.recordOperation("query", getFunctionName(reference), normalized, async () => {
+      const cachedPlacement = this.cachedLocalRoute(reference, "query");
       const route = cachedPlacement
         ? ({ execution: "local", placement: cachedPlacement } as const)
-        : await this.resolveRoute(runner, query, normalized, "query");
+        : await this.resolveRoute(runner, reference, normalized, "query");
       if (route.execution === "hosted") {
-        return this.runHosted("query", query, route.args);
+        return this.runHosted("query", reference, route.args);
       }
-      return runner.runQuery(query, normalized, { auth: await this.currentAuth() });
-    })) as FunctionReturnType<Query>;
+      return runner.runQuery(reference, normalized, { auth: await this.currentAuth() });
+    });
   }
 
   /**
@@ -525,14 +569,28 @@ export class EmbeddedClient {
    * await client.mutation(api.todos.create, { text: "Write docs" });
    * ```
    */
-  async mutation<Mutation extends FunctionReference<"mutation">>(
+  mutation<Mutation extends FunctionReference<"mutation">>(
     mutation: Mutation,
     ...argsAndOptions: ArgsAndOptions<
       Mutation,
       ConvexEmbeddedMutationOptions<FunctionArgs<Mutation>>
     >
-  ): Promise<FunctionReturnType<Mutation>> {
-    const timingOptions = argsAndOptions[1] as MutationOptions<FunctionArgs<Mutation>> | undefined;
+  ): Promise<FunctionReturnType<Mutation>>;
+  mutation<Mutation extends LocalMutation<"public", any, any>>(
+    mutation: Mutation,
+    ...argsAndOptions: LocalArgsAndOptions<
+      Mutation,
+      ConvexEmbeddedMutationOptions<LocalFunctionArgs<Mutation>>
+    >
+  ): LocalFunctionReturns<Mutation>;
+  async mutation(
+    mutation: FunctionReference<"mutation"> | LocalMutation<"public", any, any>,
+    ...argsAndOptions: [
+      Record<string, Value>?,
+      ConvexEmbeddedMutationOptions<Record<string, Value>>?,
+    ]
+  ): Promise<unknown> {
+    const timingOptions = argsAndOptions[1] as MutationOptions<Record<string, Value>> | undefined;
     const timingStartedAt = timingOptions?.onTiming ? getTimerTime() : 0;
     let timingPhaseStartedAt = timingStartedAt;
     const clientTiming: EmbeddedClientMutationTiming | undefined = timingOptions?.onTiming
@@ -553,24 +611,25 @@ export class EmbeddedClient {
       timingPhaseStartedAt = getTimerTime();
     }
     this.ensureOpen();
+    const reference = toReference(mutation, runner.localConfigured);
     const [args] = argsAndOptions;
-    const normalized = toArgs(args) as FunctionArgs<Mutation>;
+    const normalized = toArgs(args);
     if (clientTiming) {
       clientTiming.normalizeMs = getTimerTime() - timingPhaseStartedAt;
       timingPhaseStartedAt = getTimerTime();
     }
     let runnerTiming: RunMutationTiming | undefined;
-    const result = (await this.recordOperation(
+    const result = await this.recordOperation(
       "mutation",
-      getFunctionName(mutation),
+      getFunctionName(reference),
       normalized,
       async () => {
-        const cachedPlacement = this.cachedLocalRoute(mutation, "mutation");
+        const cachedPlacement = this.cachedLocalRoute(reference, "mutation");
         const route = cachedPlacement
           ? ({ execution: "local", placement: cachedPlacement } as const)
-          : await this.resolveRoute(runner, mutation, normalized, "mutation");
+          : await this.resolveRoute(runner, reference, normalized, "mutation");
         if (route.execution === "hosted") {
-          return this.runHosted("mutation", mutation, route.args);
+          return this.runHosted("mutation", reference, route.args);
         }
         if (clientTiming) {
           clientTiming.operationMs += getTimerTime() - timingPhaseStartedAt;
@@ -582,7 +641,7 @@ export class EmbeddedClient {
           timingPhaseStartedAt = getTimerTime();
         }
         if (route.placement === "local") {
-          const value = await runner.runMutation(mutation, normalized, {
+          const value = await runner.runMutation(reference, normalized, {
             auth,
             onTiming: (value) => {
               runnerTiming = value;
@@ -599,12 +658,12 @@ export class EmbeddedClient {
           clientTiming.idMs += getTimerTime() - timingPhaseStartedAt;
           timingPhaseStartedAt = getTimerTime();
         }
-        const value = await runner.runMutation(mutation, normalized, {
+        const value = await runner.runMutation(reference, normalized, {
           auth,
           mutationIsFresh: true,
           mutationId,
           pushCall: {
-            fn: getFunctionName(mutation),
+            fn: getFunctionName(reference),
             rngSeed: randomId("rng"),
           },
           onTiming: (value) => {
@@ -620,7 +679,7 @@ export class EmbeddedClient {
       (operation) => {
         if (runnerTiming) operation.timing = runnerTiming;
       },
-    )) as FunctionReturnType<Mutation>;
+    );
     if (clientTiming) {
       clientTiming.totalMs = getTimerTime() - timingStartedAt;
       timingOptions?.onTiming?.(clientTiming);
@@ -776,17 +835,24 @@ export class EmbeddedClient {
   watchQuery<Query extends FunctionReference<"query">>(
     query: Query,
     ...args: OptionalRestArgs<Query>
-  ): Watch<FunctionReturnType<Query>> {
+  ): Watch<FunctionReturnType<Query>>;
+  watchQuery<Query extends LocalQuery<"public", any, any>>(
+    query: Query,
+    ...args: LocalArgs<Query>
+  ): Watch<Awaited<LocalFunctionReturns<Query>>>;
+  watchQuery(
+    query: FunctionReference<"query"> | LocalQuery<"public", any, any>,
+    ...args: [Record<string, Value>?]
+  ): Watch<unknown> {
     this.ensureOpen();
-    const name = getFunctionName(query);
     const normalized = toArgs(args[0]);
-    const key = queryKey(name, normalized);
+    const key = queryKey(referenceKey(query), normalized);
     return {
       onUpdate: (callback) => this.listen(query, key, normalized, callback),
       localQueryResult: () => {
         const state = this.queries.get(key);
         if (state?.error) throw state.error;
-        return state?.value as FunctionReturnType<Query> | undefined;
+        return state?.value;
       },
       localQueryLogs: () => this.queries.get(key)?.logs,
     };
@@ -913,6 +979,7 @@ export class EmbeddedClient {
     const runner = createRunner(options.modules, store, schema, {
       emit: (event) => this.emitEvent(event),
       hasEventListeners: () => this.eventListeners.size > 0,
+      localModules: options.localModules,
       manifest: options.manifest,
       moduleGraphHash,
       remote: options.remote !== undefined,
@@ -921,7 +988,7 @@ export class EmbeddedClient {
     let remoteRetryTimer: ReturnType<typeof setTimeout> | undefined;
     let remoteStartAttempt = 0;
     try {
-      await store.setup(schema);
+      await Promise.all([runner.localReady, store.setup(schema)]);
       const generation = this.authGeneration;
       await this.readCachedIdentity(runner, generation);
       if (options.remote) {
@@ -1018,15 +1085,14 @@ export class EmbeddedClient {
     };
   }
 
-  private listen<Query extends FunctionReference<"query">>(
-    query: Query,
+  private listen(
+    query: FunctionReference<"query"> | LocalQuery<"public", any, any>,
     key: string,
     args: Record<string, unknown>,
     callback: () => void,
   ): () => void {
     this.ensureOpen();
-    const name = getFunctionName(query);
-    const state = this.queryState(key, name, args, query);
+    const state = this.queryState(key, referenceKey(query), args, query);
     state.callbacks.add(callback);
     void this.startQuery(query, args, state);
     let active = true;
@@ -1046,8 +1112,8 @@ export class EmbeddedClient {
     };
   }
 
-  private async startQuery<Query extends FunctionReference<"query">>(
-    query: Query,
+  private async startQuery(
+    query: FunctionReference<"query"> | LocalQuery<"public", any, any>,
     args: Record<string, unknown>,
     state: QueryState,
   ): Promise<void> {
@@ -1055,10 +1121,14 @@ export class EmbeddedClient {
       if (state.stop) return;
       const { runner } = await this.state;
       if (this.closed || state.stop || !state.callbacks.size) return;
-      const cachedPlacement = this.cachedLocalRoute(query, "query");
+      // A device-only function only carries its name once the runtime has imported the module it
+      // came from, so the watch resolves it here rather than in the synchronous `watchQuery` call.
+      const reference = toReference(query, runner.localConfigured);
+      state.name = getFunctionName(reference);
+      const cachedPlacement = this.cachedLocalRoute(reference, "query");
       const route = cachedPlacement
         ? ({ execution: "local", placement: cachedPlacement } as const)
-        : await this.resolveRoute(runner, query, args, "query");
+        : await this.resolveRoute(runner, reference, args, "query");
       if (
         this.closed ||
         state.stop ||
@@ -1072,8 +1142,8 @@ export class EmbeddedClient {
         if (!hosted) throw new EmbeddedOfflineError();
         const client = this.hostedClient ?? this.createHostedClient(hosted);
         state.stop = client.onUpdate(
-          query,
-          route.args as FunctionArgs<Query>,
+          reference,
+          route.args as FunctionArgs<FunctionReference<"query">>,
           (value) => {
             if (this.closed || this.queries.get(state.key) !== state) return;
             state.baseError = undefined;
@@ -1091,7 +1161,7 @@ export class EmbeddedClient {
         return;
       }
       state.stop = runner.onUpdate(
-        query,
+        reference,
         args,
         (value) => {
           state.baseError = undefined;
@@ -1114,7 +1184,7 @@ export class EmbeddedClient {
     key: string,
     name: string,
     args: Record<string, unknown>,
-    ref: FunctionReference<"query">,
+    ref: FunctionReference<"query"> | LocalQuery<"public", any, any>,
   ): QueryState {
     let state = this.queries.get(key);
     if (!state) {
@@ -1755,6 +1825,46 @@ function toArgs(args: unknown): Record<string, unknown> {
   const normalized = normalizeObject((args ?? {}) as Record<string, unknown>);
   freezeNormalizedTree(normalized);
   return normalized;
+}
+
+/**
+ * The identity a watched query is tracked under. A stamped device-only registration keys on its
+ * namespaced name, so separate copies of one registration share a single subscription. A copy the
+ * runtime has not named yet keys on the value itself and stays stable across that transition; the
+ * name still decides dispatch once {@link toReference} can read it.
+ */
+function referenceKey(ref: unknown): string {
+  if (!isLocalFunction(ref)) return getFunctionName(ref as FunctionReference<any>);
+  const name = localReferenceName(ref);
+  if (name !== undefined) return name;
+  let key = localWatchKeys.get(ref as object);
+  if (key === undefined) {
+    nextLocalWatchKey += 1;
+    key = `local#${nextLocalWatchKey}`;
+    localWatchKeys.set(ref as object, key);
+  }
+  return key;
+}
+
+const localWatchKeys = new WeakMap<object, string>();
+let nextLocalWatchKey = 0;
+
+/**
+ * Dispatches a device-only function by the namespaced name it was stamped with. A page-bundle copy
+ * carries that name from the bundler; a single-graph app holds the registration the runtime itself
+ * stamped, so both reach the runtime identically. Convex references pass through untouched.
+ */
+function toReference(ref: unknown, localConfigured: boolean): FunctionReference<any> {
+  if (!isLocalFunction(ref)) return ref as FunctionReference<any>;
+  const name = localReferenceName(ref);
+  if (name === undefined) {
+    throw new Error(
+      localConfigured
+        ? "This device-only function is not registered under the configured local directories, or the embedded client has not finished starting."
+        : LOCAL_UNCONFIGURED_ERROR,
+    );
+  }
+  return name as unknown as FunctionReference<any>;
 }
 
 function toDebugValue(value: unknown): unknown {

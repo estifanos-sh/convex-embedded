@@ -8,11 +8,12 @@
  * `metro.config.js`.
  *
  * @example
- * ```js
- * const { getDefaultConfig } = require("expo/metro-config");
- * const { withConvexEmbedded } = require("@convex-dev/embedded/metro");
+ * ```ts
+ * import { getDefaultConfig } from "expo/metro-config";
+ * import { withConvexEmbedded } from "@convex-dev/embedded/metro";
+ * import schema from "./convex/schema";
  *
- * module.exports = withConvexEmbedded(getDefaultConfig(__dirname));
+ * export default withConvexEmbedded(getDefaultConfig(__dirname), { schema });
  * ```
  *
  * @packageDocumentation
@@ -20,7 +21,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { createEmbeddedBundle, generateEmbedded, type EmbeddedBundleInput } from "./bundler";
+import { generateEmbedded, type EmbeddedBundleInput } from "./bundler";
 import {
   fromVirtualSourceId,
   renderEmbeddedBundle,
@@ -32,13 +33,13 @@ import {
 import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "./schema";
 
 /** Options for {@link withConvexEmbedded}. @public */
-export interface ConvexEmbeddedMetroOptions extends Omit<EmbeddedBundleInput, "root"> {
+export interface ConvexEmbeddedMetroOptions extends Omit<EmbeddedBundleInput, "analysis" | "root"> {
   /** Disable generation and return the original Metro configuration unchanged. */
   disabled?: boolean;
   /** Project root. Defaults to Metro's `projectRoot`, then `process.cwd()`. */
   root?: string;
-  /** Live schema used to generate and validate the literal device contract. */
-  schema?: ConvexEmbeddedSchema;
+  /** Live schema the registry inlines and the placement lockfile is written from. */
+  schema: ConvexEmbeddedSchema;
 }
 
 interface MetroResolverContext {
@@ -69,33 +70,24 @@ interface MetroConfigShape {
  * @remarks
  * Existing resolver customizations are preserved and receive every unrelated
  * request. Encoded source requests are limited to the files discovered in the
- * Convex module graph. Passing `schema` regenerates the device contract before
- * validation; otherwise a current generated contract must already exist. Restart
- * Metro after changing the schema or any device function source so its registry
- * and identity are regenerated.
+ * Convex module graph. Restart Metro after changing the schema or any device
+ * function source so its registry and identity are regenerated.
  *
  * @public
  */
 export async function withConvexEmbedded<Config extends object>(
   config: Config,
-  options: ConvexEmbeddedMetroOptions = {},
+  options: ConvexEmbeddedMetroOptions,
 ): Promise<Config> {
   if (options.disabled) return config;
 
   const current = config as Config & MetroConfigShape;
   const root = path.resolve(options.root ?? current.projectRoot ?? process.cwd());
-  if (options.schema !== undefined) {
-    await generateEmbedded({
-      analysis: analyzeEmbeddedSchema(options.schema),
-      convexDir: options.convexDir,
-      generatedPath: options.generatedPath,
-      root,
-      schemaPath: options.schemaPath,
-    });
-  }
-  const bundle = await createEmbeddedBundle({
+  const { bundle } = await generateEmbedded({
+    analysis: analyzeEmbeddedSchema(options.schema),
     convexDir: options.convexDir,
     generatedPath: options.generatedPath,
+    local: options.local,
     root,
     schemaPath: options.schemaPath,
   });
@@ -105,15 +97,15 @@ export async function withConvexEmbedded<Config extends object>(
   await mkdir(cacheDir, { recursive: true });
   await Promise.all([
     writeIfChanged(registryPath, renderEmbeddedBundle(bundle)),
-    renderEmbeddedIdentity(bundle).then((source) => writeIfChanged(identityPath, source)),
+    writeIfChanged(identityPath, renderEmbeddedIdentity(bundle)),
   ]);
 
   const sourceFiles = new Set(
     [
-      bundle.generatedPath,
       bundle.schemaPath,
       ...bundle.sourceFiles,
       ...Object.values(bundle.modules),
+      ...Object.values(bundle.localModules).map((module) => module.file),
     ].map((file) => path.normalize(file)),
   );
   const generated = new Map([

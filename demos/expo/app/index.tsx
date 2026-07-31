@@ -17,6 +17,11 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { pinned as pinnedDocumentsQuery, toggle as togglePinMutation } from "$local/pins";
+import {
+  expanded as expandedDocumentsQuery,
+  toggleExpanded as toggleExpandedMutation,
+} from "$local/view";
 import { client } from "@/src/client";
 import {
   markFirstRender,
@@ -43,6 +48,8 @@ export default function DocumentsScreen() {
     return prefix ? { limit: 40, prefix } : { limit: 40 };
   }, [search]);
   const query = useEmbeddedQuery(api.documents.read, queryArgs);
+  const pinnedDocumentIds = usePinnedDocumentIds();
+  const expandedDocumentIds = useExpandedDocumentIds();
   const [openingDocumentId, setOpeningDocumentId] = React.useState<string | null>(null);
   const [selectedDocumentId, setSelectedDocumentId] = React.useState<string | null>(
     linkedDocumentId ?? null,
@@ -124,6 +131,24 @@ export default function DocumentsScreen() {
     }
   }, [creating, openDocument]);
 
+  const togglePin = React.useCallback(async (documentId: DocumentSummary["_id"]) => {
+    if (process.env.EXPO_OS === "ios") void Haptics.selectionAsync();
+    try {
+      await client.mutation(togglePinMutation, { documentId });
+    } catch (error: unknown) {
+      setCreateError(error instanceof Error ? error.message : "The pin could not be changed.");
+    }
+  }, []);
+
+  const toggleExpanded = React.useCallback(async (documentId: DocumentSummary["_id"]) => {
+    if (process.env.EXPO_OS === "ios") void Haptics.selectionAsync();
+    try {
+      await client.mutation(toggleExpandedMutation, { documentId });
+    } catch (error: unknown) {
+      setCreateError(error instanceof Error ? error.message : "The row could not be expanded.");
+    }
+  }, []);
+
   React.useEffect(() => {
     if (!editorVisible) return;
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -133,7 +158,15 @@ export default function DocumentsScreen() {
     return () => subscription.remove();
   }, [editorVisible, requestCloseDocument]);
 
-  const documents: DocumentSummary[] = query.status === "ready" ? query.value : [];
+  const rows = query.status === "ready" ? query.value : undefined;
+  const documents: DocumentSummary[] = React.useMemo(() => {
+    const list = rows ?? [];
+    if (pinnedDocumentIds.size === 0) return list;
+    return [
+      ...list.filter((document) => pinnedDocumentIds.has(document._id)),
+      ...list.filter((document) => !pinnedDocumentIds.has(document._id)),
+    ];
+  }, [pinnedDocumentIds, rows]);
 
   React.useEffect(() => {
     markFirstRender();
@@ -198,6 +231,11 @@ export default function DocumentsScreen() {
                     style={styles.searchInput}
                     value={search}
                   />
+                  {pinnedDocumentIds.size > 0 ? (
+                    <Text style={styles.pinnedCount}>
+                      {pinnedDocumentIds.size} pinned on this device
+                    </Text>
+                  ) : null}
                   {createError ? (
                     <View accessibilityRole="alert" style={styles.errorBanner}>
                       <Text selectable style={styles.errorText}>
@@ -229,8 +267,12 @@ export default function DocumentsScreen() {
               renderItem={({ item }) => (
                 <DocumentRow
                   document={item}
+                  expanded={expandedDocumentIds.has(item._id)}
                   opening={openingDocumentId === item._id}
+                  pinned={pinnedDocumentIds.has(item._id)}
                   onOpen={() => openDocument(item._id)}
+                  onToggleExpanded={() => void toggleExpanded(item._id)}
+                  onTogglePin={() => void togglePin(item._id)}
                 />
               )}
               style={styles.list}
@@ -289,14 +331,62 @@ function PerfHud() {
   );
 }
 
+function usePinnedDocumentIds(): ReadonlySet<string> {
+  const [pinnedIds, setPinnedIds] = React.useState<ReadonlySet<string>>(() => new Set());
+
+  React.useEffect(() => {
+    const watch = client.watchQuery(pinnedDocumentsQuery, {});
+    const read = () => {
+      try {
+        setPinnedIds(new Set(watch.localQueryResult() ?? []));
+      } catch {
+        setPinnedIds(new Set());
+      }
+    };
+    const unsubscribe = watch.onUpdate(read);
+    read();
+    return unsubscribe;
+  }, []);
+
+  return pinnedIds;
+}
+
+function useExpandedDocumentIds(): ReadonlySet<string> {
+  const [expandedIds, setExpandedIds] = React.useState<ReadonlySet<string>>(() => new Set());
+
+  React.useEffect(() => {
+    const watch = client.watchQuery(expandedDocumentsQuery, {});
+    const read = () => {
+      try {
+        setExpandedIds(new Set(watch.localQueryResult() ?? []));
+      } catch {
+        setExpandedIds(new Set());
+      }
+    };
+    const unsubscribe = watch.onUpdate(read);
+    read();
+    return unsubscribe;
+  }, []);
+
+  return expandedIds;
+}
+
 function DocumentRow({
   document,
+  expanded,
   opening,
+  pinned,
   onOpen,
+  onToggleExpanded,
+  onTogglePin,
 }: {
   document: DocumentSummary;
+  expanded: boolean;
   opening: boolean;
+  pinned: boolean;
   onOpen: () => void;
+  onToggleExpanded: () => void;
+  onTogglePin: () => void;
 }) {
   return (
     <Pressable
@@ -322,7 +412,35 @@ function DocumentRow({
           {document.title || "Untitled"}
         </Text>
         <Text style={styles.rowMeta}>{formatDate(document.updatedAt)}</Text>
+        {expanded ? (
+          <Text numberOfLines={1} style={styles.rowMeta}>
+            /{document.slug}
+          </Text>
+        ) : null}
       </View>
+      <Pressable
+        accessibilityHint="Shows more about this document on this device only"
+        accessibilityLabel={expanded ? "Collapse document details" : "Expand document details"}
+        accessibilityRole="button"
+        accessibilityState={{ expanded }}
+        hitSlop={8}
+        onPress={onToggleExpanded}
+        style={({ pressed }) => [styles.pinButton, pressed && styles.rowPressed]}
+      >
+        <Text style={[styles.pinGlyph, expanded && styles.pinGlyphActive]}>
+          {expanded ? "▾" : "▸"}
+        </Text>
+      </Pressable>
+      <Pressable
+        accessibilityHint="Keeps this document listed on this device only"
+        accessibilityLabel={pinned ? "Unpin document" : "Pin document"}
+        accessibilityRole="button"
+        hitSlop={8}
+        onPress={onTogglePin}
+        style={({ pressed }) => [styles.pinButton, pressed && styles.rowPressed]}
+      >
+        <Text style={[styles.pinGlyph, pinned && styles.pinGlyphActive]}>{pinned ? "★" : "☆"}</Text>
+      </Pressable>
       {opening ? (
         <ActivityIndicator color={colors.content.secondary} size="small" />
       ) : (
@@ -599,6 +717,26 @@ const styles = StyleSheet.create({
     color: colors.content.tertiary,
     fontSize: 24,
     fontWeight: "300",
+  },
+  pinButton: {
+    width: 32,
+    height: 32,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.sm,
+    borderCurve: "continuous",
+  },
+  pinGlyph: {
+    color: colors.content.tertiary,
+    fontSize: 18,
+    lineHeight: 22,
+  },
+  pinGlyphActive: {
+    color: colors.content.primary,
+  },
+  pinnedCount: {
+    color: colors.content.tertiary,
+    fontSize: fontSize.caption,
   },
   state: {
     flex: 1,

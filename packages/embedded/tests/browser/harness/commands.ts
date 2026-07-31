@@ -60,7 +60,7 @@ export const browserCommands = {
     const pageUrl = new URL("/__convex_embedded_page", command.page.url()).toString();
     const browserUrl = `/@fs${browserDistPath}?offline=${getTimerTime()}`;
     const hosted = new ConvexHttpClient(remoteUrl);
-    const history = makeFunctionReference<"query">("documents:history");
+    const history = makeFunctionReference<"query">("remote:history");
     const update = makeFunctionReference<"mutation">("documents:write");
     const remove = makeFunctionReference<"mutation">("documents:del");
     const initialTitle = `${runId}:local`;
@@ -230,11 +230,7 @@ export const browserCommands = {
           `Supposedly offline edit reached Convex before conflict setup: ${hostedBeforeConflict?.title}`,
         );
       }
-      await hosted.mutation(update, {
-        id: remoteId,
-        title: authoritativeTitle,
-        updatedAt: performance.now(),
-      });
+      await hosted.mutation(update, { id: remoteId, title: authoritativeTitle });
 
       const conflictReconnectStartedAt = getTimerTime();
       await context.setOffline(false);
@@ -431,6 +427,23 @@ export const browserCommands = {
             return rows.length === 1 && rows[0]?.title === title ? true : undefined;
           }, initialTitle),
         "follower to observe the owner mutation",
+        async () =>
+          await follower.evaluate(async () => {
+            const state = (
+              globalThis as typeof globalThis & {
+                __embeddedMetalState: MetalDeviceState & {
+                  connectionState(): { local: string; remote: string };
+                };
+              }
+            ).__embeddedMetalState;
+            return {
+              connection: state.connectionState(),
+              devtoolsRows: (await state.allDevtoolsRows()).map((row) => row.title),
+              errors: state.errors,
+              events: state.events.slice(-100),
+              remoteTickTotals: state.remoteTickTotals,
+            };
+          }),
       );
 
       const incumbent = await poll(

@@ -16,13 +16,16 @@ import path from "node:path";
 import type { EmbeddedSchemaAnalysis } from "../schema";
 import {
   EMBEDDED_GENERATED_FORMAT_VERSION,
+  toEmbeddedGeneratedSchema,
   renderEmbeddedGenerated as renderGenerated,
+  type EmbeddedGeneratedIdentity,
+  type EmbeddedGeneratedSchema,
 } from "./generated";
 
 export {
   EMBEDDED_GENERATED_FORMAT_VERSION,
   renderEmbeddedGenerated,
-  type EmbeddedGeneratedInput,
+  type EmbeddedGeneratedIdentity,
   type EmbeddedGeneratedSchema,
 } from "./generated";
 
@@ -32,6 +35,7 @@ export {
  * @example
  * ```ts
  * const bundle = await createEmbeddedBundle({
+ *   analysis: analyzeEmbeddedSchema(schema),
  *   root: process.cwd(),
  *   convexDir: "convex",
  * });
@@ -40,6 +44,9 @@ export {
  * @public
  */
 export interface EmbeddedBundleInput {
+  /** Placement analysis of the live Convex schema the build is compiled against. */
+  analysis: EmbeddedSchemaAnalysis;
+
   /**
    * Project root used to resolve `convexDir`.
    *
@@ -62,19 +69,27 @@ export interface EmbeddedBundleInput {
   schemaPath?: string;
 
   /**
-   * Generated literal device schema, relative to `convexDir`.
+   * Device-only function directories, relative to `root` unless absolute.
    *
-   * Keep checked-in contracts outside Convex CLI-owned `_generated`, for
-   * example `generated/embedded.ts`.
+   * Modules under these roots never reach the deployment: the device runtime
+   * imports them through the virtual registry, and application graphs import
+   * the same sources directly.
+   */
+  local?: string | string[];
+
+  /**
+   * Checked-in placement lockfile, relative to `convexDir`.
+   *
+   * Keep the multi-dot basename the default uses: the Convex CLI skips those
+   * modules, so the lockfile never deploys as a hosted function module.
+   *
+   * @defaultValue `"embedded.generated.ts"`
    */
   generatedPath?: string;
 }
 
-export interface GenerateEmbeddedInput extends EmbeddedBundleInput {
-  analysis: EmbeddedSchemaAnalysis;
-}
-
 export interface GenerateEmbeddedResult {
+  bundle: EmbeddedBundleResult;
   path: string;
   source: string;
 }
@@ -93,7 +108,7 @@ export interface EmbeddedBundleResult {
    */
   schemaPath: string;
 
-  /** Generated literal schema path when generation has completed. */
+  /** Checked-in placement lockfile path. */
   generatedPath: string;
 
   /**
@@ -101,26 +116,31 @@ export interface EmbeddedBundleResult {
    */
   modules: Record<string, string>;
 
+  /**
+   * Namespaced device-only module IDs mapped to their source files.
+   */
+  localModules: Record<string, { file: string }>;
+
   /** Every project source reachable from a device function entrypoint. */
   sourceFiles: string[];
+
+  /** Placement-aware device schema inlined into the virtual registry. */
+  embeddedSchema: EmbeddedGeneratedSchema;
 
   /** Hash of the current schema source bytes. */
   schemaSourceHash: string;
 
-  /** Hash of the generated, placement-aware schema payload. */
-  schemaHash: string;
-
-  /** Stable storage schema hash used by the remote wire identity. */
-  runtimeSchemaHash?: string;
-
   /** Hash of the canonical function manifest. */
   manifestHash: string;
+
+  /** Hash of the manifest plus every device source, used by the runtime identity. */
+  moduleGraphHash: string;
 
   /** Canonical function registrations included in the device artifact. */
   manifest: EmbeddedFunctionManifest;
 }
 
-export type FunctionPlacement = "replicated" | "remote" | "local";
+export type FunctionPlacement = "replicated" | "remote";
 export type EmbeddedFunctionKind = "query" | "mutation";
 export type EmbeddedFunctionVisibility = "public" | "internal";
 
@@ -138,7 +158,8 @@ export type EmbeddedFunctionManifest = Record<
 const DEFAULT_CONVEX_DIR = "convex";
 const DEFAULT_SCHEMA_PATH = "schema.ts";
 const EMBEDDED_ENTRYPOINT_PATH = "embedded.ts";
-const DEFAULT_GENERATED_PATH = "_generated/embedded.ts";
+const DEFAULT_GENERATED_PATH = "embedded.generated.ts";
+const LOCAL_ENTRYPOINT = "@convex-dev/embedded/local";
 const SOURCE_EXTENSIONS = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const SYSTEM_MODULE_RE =
   /^(?:convex\.config|auth\.config|crons|http)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
@@ -159,34 +180,34 @@ const GENERATED_IDENTITY_PREFIX = "// @convex-dev/embedded-generated ";
 /**
  * Discovers Convex schema and function module files for embedded bundler adapters.
  *
- * @param input - Optional project root, Convex directory, and schema path.
+ * @param input - Schema analysis plus optional project root, Convex directory, and schema path.
  * @returns Absolute schema path and Convex module IDs mapped to absolute source files.
- * @throws If the schema file cannot be found or two source files produce the
- * same Convex module ID.
+ * @throws If the schema file cannot be found, the checked-in lockfile is stale,
+ * or two source files produce the same Convex module ID.
  *
  * @example
  * ```ts
- * const { schemaPath, modules } = await createEmbeddedBundle();
+ * const { schemaPath, modules } = await createEmbeddedBundle({ analysis });
  * ```
  *
  * @public
  */
 export async function createEmbeddedBundle(
-  input: EmbeddedBundleInput = {},
+  input: EmbeddedBundleInput,
 ): Promise<EmbeddedBundleResult> {
   return createEmbeddedBundleInner(input, true);
 }
 
-/** Generates the literal schema/function contract consumed by device builds. */
+/** Writes the checked-in placement lockfile and returns the bundle it was rendered from. */
 export async function generateEmbedded(
-  input: GenerateEmbeddedInput,
+  input: EmbeddedBundleInput,
 ): Promise<GenerateEmbeddedResult> {
   const bundle = await createEmbeddedBundleInner(input, false);
-  const source = renderGenerated({ analysis: input.analysis, bundle });
+  const source = renderGenerated(bundle);
   await mkdir(path.dirname(bundle.generatedPath), { recursive: true });
   try {
     if ((await readFile(bundle.generatedPath, "utf8")) === source) {
-      return { path: bundle.generatedPath, source };
+      return { bundle, path: bundle.generatedPath, source };
     }
   } catch (error) {
     if (!isMissingFile(error)) throw error;
@@ -194,7 +215,7 @@ export async function generateEmbedded(
   const temporary = `${bundle.generatedPath}.${process.pid}.tmp`;
   await writeFile(temporary, source, "utf8");
   await rename(temporary, bundle.generatedPath);
-  return { path: bundle.generatedPath, source };
+  return { bundle, path: bundle.generatedPath, source };
 }
 
 function isMissingFile(error: unknown): boolean {
@@ -212,20 +233,73 @@ async function createEmbeddedBundleInner(
   const schemaPath = resolveInputPath(convexDir, input.schemaPath ?? DEFAULT_SCHEMA_PATH);
   const embeddedPath = resolveInputPath(convexDir, EMBEDDED_ENTRYPOINT_PATH);
   const generatedPath = resolveInputPath(convexDir, input.generatedPath ?? DEFAULT_GENERATED_PATH);
+  const localDirs =
+    input.local === undefined
+      ? []
+      : (Array.isArray(input.local) ? input.local : [input.local]).map((dir) =>
+          resolveInputPath(root, dir),
+        );
+  for (const [index, localDir] of localDirs.entries()) {
+    if (isInside(localDir, convexDir) || isInside(convexDir, localDir)) {
+      throw new Error(
+        `local function directory ${localDir} must live outside the Convex directory ${convexDir}`,
+      );
+    }
+    for (const other of localDirs.slice(index + 1)) {
+      if (isInside(localDir, other) || isInside(other, localDir)) {
+        throw new Error(`local function directories ${localDir} and ${other} must not overlap`);
+      }
+    }
+  }
   await assertSchemaFile(schemaPath);
   await assertEmbeddedEntrypoint(embeddedPath);
-  const files = (await listConvexFiles(convexDir)).filter(
-    (file) => path.resolve(file) !== generatedPath,
+  const convexFiles = await listSourceFiles(convexDir);
+  const sources = new Map(
+    await Promise.all(
+      convexFiles.map(async (file) => [path.resolve(file), await readFile(file, "utf8")] as const),
+    ),
   );
+  const files = convexFiles.filter((file) => {
+    const name = path.basename(file);
+    return (
+      path.resolve(file) !== generatedPath &&
+      !SYSTEM_MODULE_RE.test(name) &&
+      !GENERATED_MODULE_RE.test(name)
+    );
+  });
   const modules: Record<string, string> = {};
   const manifest: EmbeddedFunctionManifest = {};
   const seen = new Map<string, string>();
-  const sources = new Map(
-    await Promise.all(
-      files.map(async (file) => [path.resolve(file), await readFile(file, "utf8")] as const),
-    ),
-  );
-  const placementByFile = new Map<string, FunctionPlacement | "node">();
+  const placementByFile = new Map<string, FunctionPlacement | "local" | "node">();
+  const localModules = await readLocalModules(localDirs, sources, placementByFile);
+
+  const resolver = await createProjectResolver(root);
+  for (const file of convexFiles) {
+    const resolved = path.resolve(file);
+    const source = sources.get(resolved)!;
+    for (const match of source.matchAll(STATIC_IMPORT)) {
+      const specifier = match[2]!;
+      if (/^(?:import|export)\s+type\b/.test(match[0]!)) continue;
+      if (specifier === LOCAL_ENTRYPOINT) {
+        throw new Error(
+          `Convex module ${file} must not import ${LOCAL_ENTRYPOINT}; device-only functions live under the bundler local directories`,
+        );
+      }
+      if (localDirs.length === 0) continue;
+      let target: string | undefined;
+      try {
+        target = await resolveProjectImport(resolved, specifier, resolver);
+      } catch {
+        continue;
+      }
+      const normalized = target === undefined ? undefined : path.normalize(target);
+      if (normalized !== undefined && localDirs.some((dir) => isInside(normalized, dir))) {
+        throw new Error(
+          `Convex module ${file} must not import device-only module ${target}; device-only code never deploys`,
+        );
+      }
+    }
+  }
 
   for (const file of files) {
     const resolved = path.resolve(file);
@@ -242,57 +316,248 @@ async function createEmbeddedBundleInner(
     }
     const registrations = readCanonicalRegistrations(moduleId, file, source);
     if (Object.keys(registrations).length === 0) continue;
+    if (moduleId === "local" || moduleId.startsWith("local/")) {
+      throw new Error(
+        `Convex module ${moduleId} uses the reserved local/ function namespace; move it outside convex/local`,
+      );
+    }
+    if ((path.basename(file).match(/\./g) ?? []).length > 1) {
+      throw new Error(
+        `Convex module ${moduleId} in ${file} contains multiple dots, which the Convex CLI silently skips; rename the module`,
+      );
+    }
     const placements = new Set(Object.values(registrations).map((entry) => entry.placement));
     if (placements.size !== 1) {
       throw new Error(`Convex module ${moduleId} mixes embedded function placements`);
     }
     const [placement] = placements;
     placementByFile.set(resolved, placement!);
-    if (placement === "local" && !/\.local\.[^.]+$/.test(file)) {
-      throw new Error(
-        `local function module ${moduleId} must use the *.local.ts naming convention`,
-      );
-    }
     seen.set(moduleId, file);
     manifest[moduleId] = registrations;
     if (placement !== "remote") modules[moduleId] = file;
   }
 
-  const resolver = await createProjectResolver(root);
   const sourceFiles = new Set<string>();
-  for (const file of Object.values(modules)) {
-    const reachable = await readDeviceImportGraph({
+  const entrypoints = [
+    ...Object.values(modules),
+    ...Object.values(localModules).map((module) => module.file),
+  ];
+  for (const file of entrypoints) {
+    await readDeviceImportGraph({
+      convexDir,
       entry: path.resolve(file),
       generatedPath,
       placementByFile,
       resolver,
       root,
       sources,
+      visited: sourceFiles,
     });
-    for (const sourceFile of reachable) sourceFiles.add(sourceFile);
   }
 
-  const schemaSourceHash = hashBytes(await readFile(schemaPath));
+  const schemaSourceHash = hashBytes(
+    sources.get(schemaPath) ?? (await readFile(schemaPath, "utf8")),
+  );
   const manifestHash = hashJson(manifest);
-  let schemaHash = schemaSourceHash;
-  let runtimeSchemaHash: string | undefined;
   if (requireGenerated) {
-    const generated = await assertGeneratedFile(generatedPath, { manifestHash, schemaSourceHash });
-    schemaHash = generated.analysisHash;
-    runtimeSchemaHash = generated.runtimeSchemaHash;
+    await assertGeneratedFile(generatedPath, { manifestHash, schemaSourceHash });
   }
+  const graph = [...sourceFiles].sort();
 
   return {
+    embeddedSchema: toEmbeddedGeneratedSchema(input.analysis),
     generatedPath,
+    localModules,
     manifest,
     manifestHash,
+    moduleGraphHash: hashJson({
+      manifest,
+      sources: graph.map((file) => hashBytes(sources.get(file)!)),
+    }),
     modules,
-    schemaHash,
-    runtimeSchemaHash,
     schemaPath,
     schemaSourceHash,
-    sourceFiles: [...sourceFiles].sort(),
+    sourceFiles: graph,
   };
+}
+
+const LOCAL_NAMED_EXPORT = /export\s+(?:async\s+)?(?:function\s*\*?|class)\s+([$A-Z_a-z][$\w]*)/g;
+const LOCAL_VARIABLE_EXPORT = /export\s+(?:const|let|var)\s+/g;
+const LOCAL_EXPORT_LIST = /export\s+(type\s+)?\{([^}]*)\}(\s*from\b)?/g;
+const LOCAL_EXPORT_ALIAS = /^([$A-Z_a-z][$\w]*)\s+as\s+([$A-Z_a-z][$\w]*)$/;
+const AMBIENT_DECLARATION = /\bdeclare\b/g;
+const IDENTIFIER = /^[$A-Z_a-z][$\w]*$/;
+const RESERVED_BINDINGS = new Set([
+  "await",
+  "break",
+  "case",
+  "catch",
+  "class",
+  "const",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "enum",
+  "export",
+  "extends",
+  "false",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "import",
+  "in",
+  "instanceof",
+  "new",
+  "null",
+  "return",
+  "super",
+  "switch",
+  "this",
+  "throw",
+  "true",
+  "try",
+  "typeof",
+  "var",
+  "void",
+  "while",
+  "with",
+  "yield",
+]);
+
+async function readLocalModules(
+  localDirs: string[],
+  sources: Map<string, string>,
+  placementByFile: Map<string, FunctionPlacement | "local" | "node">,
+): Promise<EmbeddedBundleResult["localModules"]> {
+  const localModules: EmbeddedBundleResult["localModules"] = {};
+  for (const localDir of localDirs) {
+    for (const file of await listSourceFiles(localDir)) {
+      const resolved = path.resolve(file);
+      sources.set(resolved, await readFile(file, "utf8"));
+      placementByFile.set(resolved, "local");
+      const moduleId = `local/${toModuleId(localDir, file)}`;
+      const existing = localModules[moduleId];
+      if (existing !== undefined) {
+        throw new Error(
+          `Duplicate local module id "${moduleId}" from "${existing.file}" and "${resolved}".`,
+        );
+      }
+      localModules[moduleId] = { file: resolved };
+    }
+  }
+  return localModules;
+}
+
+/**
+ * Named exports of a device module as `[exported, binding]` pairs, in the order the appended stamp
+ * call lists them. Anything that is not an identifier-named local binding is skipped: the worker
+ * registry stamps whatever it loads, so a missed name never becomes an error.
+ *
+ * @internal
+ */
+export function readLocalExportNames(source: string): Array<[string, string]> {
+  const code = maskAmbientDeclarations(maskCommentsAndStrings(source));
+  const names = new Map<string, string>();
+  for (const match of code.matchAll(LOCAL_NAMED_EXPORT)) {
+    const name = match[1]!;
+    if (!RESERVED_BINDINGS.has(name)) names.set(name, name);
+  }
+  for (const match of code.matchAll(LOCAL_VARIABLE_EXPORT)) {
+    const declarators = code.slice(match.index + match[0].length);
+    const end = indexOfTopLevel(declarators, ";}");
+    for (const declarator of splitTopLevel(end === -1 ? declarators : declarators.slice(0, end))) {
+      const boundary = indexOfTopLevel(declarator, "=:");
+      const target = (boundary === -1 ? declarator : declarator.slice(0, boundary)).trim();
+      for (const name of readBoundNames(target)) names.set(name, name);
+    }
+  }
+  for (const match of code.matchAll(LOCAL_EXPORT_LIST)) {
+    if (match[1] !== undefined || match[3] !== undefined) continue;
+    for (const clause of match[2]!.split(",")) {
+      const trimmed = clause.trim();
+      if (trimmed === "" || /^type\s/.test(trimmed)) continue;
+      const alias = LOCAL_EXPORT_ALIAS.exec(trimmed);
+      const exported = alias?.[2] ?? trimmed;
+      const binding = alias?.[1] ?? trimmed;
+      if (exported === "default" || !IDENTIFIER.test(exported) || !IDENTIFIER.test(binding)) {
+        continue;
+      }
+      if (RESERVED_BINDINGS.has(binding)) continue;
+      names.set(exported, binding);
+    }
+  }
+  return [...names].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+/** Bindings introduced by one declarator target: an identifier or a destructuring pattern. */
+function readBoundNames(target: string): string[] {
+  if (IDENTIFIER.test(target)) return RESERVED_BINDINGS.has(target) ? [] : [target];
+  if (!target.startsWith("{") && !target.startsWith("[")) return [];
+  const names: string[] = [];
+  for (const element of splitTopLevel(target.slice(1, -1))) {
+    let text = element.trim();
+    if (text.startsWith("...")) text = text.slice(3).trim();
+    const initializer = indexOfTopLevel(text, "=");
+    if (initializer !== -1) text = text.slice(0, initializer).trim();
+    const key = indexOfTopLevel(text, ":");
+    if (key !== -1) text = text.slice(key + 1).trim();
+    names.push(...readBoundNames(text));
+  }
+  return names;
+}
+
+function indexOfTopLevel(text: string, characters: string): number {
+  let depth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (depth === 0 && characters.includes(character)) return index;
+    if (character === "(" || character === "[" || character === "{") depth += 1;
+    else if (character === ")" || character === "]" || character === "}") depth -= 1;
+  }
+  return -1;
+}
+
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index]!;
+    if (character === "(" || character === "[" || character === "{") depth += 1;
+    else if (character === ")" || character === "]" || character === "}") depth -= 1;
+    else if (character === "," && depth === 0) {
+      parts.push(text.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/** Blanks `declare` blocks and statements, whose bindings never exist at runtime. */
+function maskAmbientDeclarations(code: string): string {
+  let output = code;
+  for (const match of code.matchAll(AMBIENT_DECLARATION)) {
+    let end = match.index;
+    let depth = 0;
+    while (end < code.length) {
+      const character = code[end]!;
+      end += 1;
+      if (character === "{") depth += 1;
+      else if (character === "}") {
+        depth -= 1;
+        if (depth <= 0) break;
+      } else if (character === ";" && depth === 0) break;
+    }
+    output = `${output.slice(0, match.index)}${code
+      .slice(match.index, end)
+      .replaceAll(/[^\n\r]/g, " ")}${output.slice(end)}`;
+  }
+  return output;
 }
 
 const STATIC_IMPORT =
@@ -301,18 +566,22 @@ const STATIC_IMPORT =
 interface ProjectResolver {
   baseUrl?: string;
   paths: Array<{ pattern: string; targets: string[] }>;
+  /** Candidate path to source file for the lifetime of one scan. */
+  resolved: Map<string, string | undefined>;
 }
 
 async function readDeviceImportGraph(options: {
+  convexDir: string;
   entry: string;
   generatedPath: string;
   sources: Map<string, string>;
-  placementByFile: Map<string, FunctionPlacement | "node">;
+  placementByFile: Map<string, FunctionPlacement | "local" | "node">;
   resolver: ProjectResolver;
   root: string;
-}): Promise<Set<string>> {
-  const { entry, generatedPath, placementByFile, resolver, root, sources } = options;
-  const visited = new Set<string>();
+  visited: Set<string>;
+}): Promise<void> {
+  const { convexDir, entry, generatedPath, placementByFile, resolver, root, sources, visited } =
+    options;
   const visit = async (file: string): Promise<void> => {
     if (visited.has(file)) return;
     visited.add(file);
@@ -329,7 +598,7 @@ async function readDeviceImportGraph(options: {
         const targetSource = await readProjectSource(target, sources);
         if (hasUseNodeDirective(targetSource)) {
           placement = "node";
-        } else {
+        } else if (isInside(target, convexDir)) {
           const moduleId = normalizePath(path.relative(root, target)).replace(/\.[^.]+$/, "");
           const registrations = readCanonicalRegistrations(moduleId, target, targetSource);
           const placements = new Set(Object.values(registrations).map((entry) => entry.placement));
@@ -351,27 +620,19 @@ async function readDeviceImportGraph(options: {
     }
   };
   await visit(entry);
-  return visited;
 }
 
 function isGeneratedImport(importer: string, specifier: string, generatedPath: string): boolean {
   if (!specifier.startsWith(".") && !path.isAbsolute(specifier)) return false;
   const base = path.resolve(path.dirname(importer), specifier);
   if (base === generatedPath) return true;
-  if (path.extname(base) !== "") return false;
   return PROJECT_SOURCE_EXTENSIONS.some((extension) => `${base}${extension}` === generatedPath);
 }
 
 async function assertGeneratedFile(
   file: string,
   expected: { manifestHash: string; schemaSourceHash: string },
-): Promise<{
-  analysisHash: string;
-  formatVersion: number;
-  manifestHash: string;
-  schemaSourceHash: string;
-  runtimeSchemaHash: string;
-}> {
+): Promise<void> {
   let source: string;
   try {
     if (!(await stat(file)).isFile()) throw new Error("not a file");
@@ -409,44 +670,12 @@ async function assertGeneratedFile(
       `Generated Embedded contract at ${file} is stale for the current function manifest`,
     );
   }
-  const embeddedSchemaMatch = /^export const embeddedSchema = (.+) as const;$/m.exec(source);
-  if (embeddedSchemaMatch?.[1] === undefined) {
-    throw new Error(`Generated Embedded contract at ${file} has no verifiable schema payload`);
-  }
-  let embeddedSchema: unknown;
-  try {
-    embeddedSchema = JSON.parse(embeddedSchemaMatch[1]);
-  } catch {
-    throw new Error(`Generated Embedded contract at ${file} has an invalid schema payload`);
-  }
-  if (hashJson(embeddedSchema) !== identity.analysisHash) {
-    throw new Error(`Generated Embedded contract at ${file} failed its schema integrity check`);
-  }
-  const runtimeSchemaHash = readRuntimeSchemaHash(embeddedSchema);
-  if (runtimeSchemaHash === undefined) {
-    throw new Error(`Generated Embedded contract at ${file} has no runtime storage schema hash`);
-  }
-  return { ...identity, runtimeSchemaHash };
 }
 
-function readRuntimeSchemaHash(value: unknown): string | undefined {
-  if (typeof value !== "object" || value === null) return undefined;
-  const runtimeStoreSchema = (value as Record<string, unknown>).runtimeStoreSchema;
-  if (typeof runtimeStoreSchema !== "object" || runtimeStoreSchema === null) return undefined;
-  const hash = (runtimeStoreSchema as Record<string, unknown>).hash;
-  return typeof hash === "string" && hash.length > 0 ? hash : undefined;
-}
-
-function isGeneratedIdentity(value: unknown): value is {
-  analysisHash: string;
-  formatVersion: number;
-  manifestHash: string;
-  schemaSourceHash: string;
-} {
+function isGeneratedIdentity(value: unknown): value is EmbeddedGeneratedIdentity {
   if (typeof value !== "object" || value === null) return false;
   const identity = value as Record<string, unknown>;
   return (
-    typeof identity.analysisHash === "string" &&
     typeof identity.formatVersion === "number" &&
     typeof identity.manifestHash === "string" &&
     typeof identity.schemaSourceHash === "string"
@@ -454,13 +683,17 @@ function isGeneratedIdentity(value: unknown): value is {
 }
 
 const CANONICAL_REGISTRATION =
-  /export\s+const\s+([$A-Z_a-z][$\w]*)\s*=\s*[$A-Z_a-z][$\w]*\.(replicated|remote|local)\.(query|mutation|internalQuery|internalMutation)\s*\(/g;
+  /export\s+const\s+([$A-Z_a-z][$\w]*)\s*=\s*(replicated|remote)\.(query|mutation|internalQuery|internalMutation)\s*\(/g;
 const EMBEDDED_REGISTRATION_LIKE =
   /export\s+const\s+([$A-Z_a-z][$\w]*)(?:\s*:[^=;\n]+)?\s*=\s*(?:\(\s*)*[$A-Z_a-z][$\w]*(?:\s*\.\s*[A-Za-z_$][\w$]*){0,2}\s*\.\s*(?:query|mutation|internalQuery|internalMutation)(?:\s*\))*\s*\(/g;
 const DIRECT_REGISTRATION =
   /export\s+const\s+([$A-Z_a-z][$\w]*)(?:\s*:[^=;\n]+)?\s*=\s*(?:\(\s*)*(?:query|mutation|internalQuery|internalMutation)(?:\s*\))*\s*\(/g;
 const PLACEMENT_BUILDER_REFERENCE =
-  /\b[$A-Z_a-z][$\w]*\s*\.\s*(?:replicated|remote|local)\s*\.\s*(?:query|mutation|internalQuery|internalMutation)\b/g;
+  /\b(?:replicated|remote)\s*\.\s*(?:query|mutation|internalQuery|internalMutation)\b/g;
+const LOCAL_BUILDER_REFERENCE =
+  /\bembedded\s*\.\s*local\s*\.\s*(?:query|mutation|internalQuery|internalMutation)\b/;
+const PLACEMENT_IMPORT = /import\s*\{([^}]*)\}\s*from\s*(["'])([^"']+)\2/g;
+const PLACEMENT_MODULE = /\/embedded(?:\.[cm]?[jt]s)?$/;
 
 function readCanonicalRegistrations(
   moduleId: string,
@@ -468,10 +701,16 @@ function readCanonicalRegistrations(
   source: string,
 ): Record<string, EmbeddedFunctionManifestEntry> {
   const code = maskCommentsAndStrings(source);
+  if (LOCAL_BUILDER_REFERENCE.test(code)) {
+    throw new Error(
+      "embedded.local builders were removed; define device-only functions with the local builders from @convex-dev/embedded/local under one of the plugin's `local` roots",
+    );
+  }
+  const imported = readPlacementImports(source, code);
   const entries: Record<string, EmbeddedFunctionManifestEntry> = {};
   for (const match of code.matchAll(CANONICAL_REGISTRATION)) {
     const [, name, placement, builder] = match;
-    if (!name || !placement || !builder) continue;
+    if (!name || !placement || !builder || !imported.has(placement)) continue;
     entries[name] = {
       kind: builder.endsWith("Query") || builder === "query" ? "query" : "mutation",
       placement: placement as FunctionPlacement,
@@ -483,29 +722,63 @@ function readCanonicalRegistrations(
     const name = match[1];
     if (name && !canonicalNames.has(name)) {
       throw new Error(
-        `function ${moduleId}:${name} in ${file} must use a canonical embedded.<placement>.<builder> registration`,
+        `function ${moduleId}:${name} in ${file} must use a canonical replicated.<builder> or remote.<builder> registration imported from the Convex embedded module`,
       );
     }
   }
   for (const match of code.matchAll(DIRECT_REGISTRATION)) {
     const name = match[1];
     throw new Error(
-      `function ${moduleId}:${name ?? "unknown"} in ${file} must use a canonical embedded.<placement>.<builder> registration`,
+      `function ${moduleId}:${name ?? "unknown"} in ${file} must use a canonical replicated.<builder> or remote.<builder> registration imported from the Convex embedded module`,
     );
   }
   const placementReferences = [...code.matchAll(PLACEMENT_BUILDER_REFERENCE)].length;
   if (placementReferences !== canonicalNames.size) {
     throw new Error(
-      `function module ${moduleId} in ${file} must call each embedded.<placement>.<builder> directly from its exported canonical registration`,
+      `function module ${moduleId} in ${file} must call each <placement>.<builder> directly from its exported canonical registration`,
     );
   }
   return entries;
 }
 
+function readPlacementImports(source: string, code: string): Set<string> {
+  const placements = new Set<string>();
+  for (const match of source.matchAll(PLACEMENT_IMPORT)) {
+    if (!code.startsWith("import", match.index)) continue;
+    if (!PLACEMENT_MODULE.test(match[3]!)) continue;
+    for (const clause of match[1]!.split(",")) {
+      const name = clause.trim();
+      if (name === "replicated" || name === "remote") placements.add(name);
+    }
+  }
+  return placements;
+}
+
+const REGEX_PRECEDING_OPERATORS = "(,=:[!&|?{;+-*%~^>";
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "await",
+  "case",
+  "delete",
+  "do",
+  "else",
+  "in",
+  "instanceof",
+  "new",
+  "of",
+  "return",
+  "throw",
+  "typeof",
+  "void",
+  "yield",
+]);
+
 function maskCommentsAndStrings(source: string): string {
   let output = "";
-  let state: "code" | "line" | "block" | "string" = "code";
+  let state: "code" | "line" | "block" | "string" | "regex" = "code";
   let quote = "";
+  let previous = "";
+  let word = "";
+  let characterClass = false;
   for (let index = 0; index < source.length; index += 1) {
     const character = source[index]!;
     const next = source[index + 1];
@@ -518,12 +791,20 @@ function maskCommentsAndStrings(source: string): string {
         output += "  ";
         index += 1;
         state = "block";
+      } else if (character === "/" && startsRegexLiteral(previous, word)) {
+        output += " ";
+        characterClass = false;
+        state = "regex";
       } else if (character === '"' || character === "'" || character === "`") {
         output += " ";
         quote = character;
         state = "string";
       } else {
         output += character;
+        if (!/\s/.test(character)) {
+          word = /[$\w]/.test(character) ? `${word}${character}` : "";
+          previous = character;
+        }
       }
       continue;
     }
@@ -542,6 +823,28 @@ function maskCommentsAndStrings(source: string): string {
       }
       continue;
     }
+    if (state === "regex") {
+      output += character === "\n" || character === "\r" ? character : " ";
+      if (character === "\\") {
+        if (next !== undefined) {
+          output += next === "\n" || next === "\r" ? next : " ";
+          index += 1;
+        }
+      } else if (character === "[") {
+        characterClass = true;
+      } else if (character === "]") {
+        characterClass = false;
+      } else if (
+        (character === "/" && !characterClass) ||
+        character === "\n" ||
+        character === "\r"
+      ) {
+        previous = "/";
+        word = "";
+        state = "code";
+      }
+      continue;
+    }
     if (character === "\\") {
       output += " ";
       if (next !== undefined) {
@@ -550,12 +853,23 @@ function maskCommentsAndStrings(source: string): string {
       }
     } else if (character === quote) {
       output += " ";
+      previous = quote;
+      word = "";
       state = "code";
     } else {
       output += character === "\n" || character === "\r" ? character : " ";
     }
   }
   return output;
+}
+
+/**
+ * Whether a `/` opens a regex literal rather than a division, from the last significant token.
+ * JSX closes (`</`, `/>`) keep `<` and `}` out of the operand-position set.
+ */
+function startsRegexLiteral(previous: string, word: string): boolean {
+  if (word !== "") return REGEX_PRECEDING_KEYWORDS.has(word);
+  return previous === "" || REGEX_PRECEDING_OPERATORS.includes(previous);
 }
 
 function hasUseNodeDirective(source: string): boolean {
@@ -632,7 +946,7 @@ function resolveInputPath(root: string, value: string): string {
   return path.resolve(path.isAbsolute(value) ? value : path.join(root, value));
 }
 
-async function listConvexFiles(root: string): Promise<string[]> {
+async function listSourceFiles(root: string): Promise<string[]> {
   let entries: Dirent[];
   try {
     entries = await readdir(root, { withFileTypes: true });
@@ -645,13 +959,11 @@ async function listConvexFiles(root: string): Promise<string[]> {
       const next = path.join(root, entry.name);
       if (entry.isDirectory()) {
         if (entry.name === "_generated") return [] as string[];
-        return listConvexFiles(next);
+        return listSourceFiles(next);
       }
       if (!entry.isFile()) return [] as string[];
       if (!SOURCE_EXTENSIONS.test(entry.name)) return [] as string[];
       if (isDeclarationFile(entry.name)) return [] as string[];
-      if (SYSTEM_MODULE_RE.test(entry.name)) return [] as string[];
-      if (GENERATED_MODULE_RE.test(entry.name)) return [] as string[];
       return [next];
     }),
   );
@@ -660,6 +972,11 @@ async function listConvexFiles(root: string): Promise<string[]> {
 
 function normalizePath(value: string): string {
   return value.split(path.sep).join("/");
+}
+
+function isInside(file: string, dir: string): boolean {
+  const relative = path.relative(dir, file);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 async function assertSchemaFile(schemaPath: string): Promise<void> {
@@ -692,7 +1009,7 @@ async function createProjectResolver(root: string): Promise<ProjectResolver> {
   try {
     config = JSON.parse(stripJsonComments(await readFile(configPath, "utf8"))) as typeof config;
   } catch {
-    return { paths: [] };
+    return { paths: [], resolved: new Map() };
   }
   const compilerOptions = config.compilerOptions ?? {};
   const baseUrl =
@@ -707,7 +1024,7 @@ async function createProjectResolver(root: string): Promise<ProjectResolver> {
             : [],
         )
       : [];
-  return { baseUrl, paths };
+  return { baseUrl, paths, resolved: new Map() };
 }
 
 async function resolveProjectImport(
@@ -731,11 +1048,11 @@ async function resolveProjectImport(
     }
     if (!matchedAlias && resolver.baseUrl !== undefined) {
       const baseUrlTarget = path.resolve(resolver.baseUrl, specifier);
-      if (await resolveSourcePath(baseUrlTarget)) bases.push(baseUrlTarget);
+      if (await resolveSourcePath(baseUrlTarget, resolver)) bases.push(baseUrlTarget);
     }
   }
   for (const base of bases) {
-    const resolved = await resolveSourcePath(base);
+    const resolved = await resolveSourcePath(base, resolver);
     if (resolved !== undefined) return resolved;
   }
   if (matchedAlias || specifier.startsWith(".") || path.isAbsolute(specifier)) {
@@ -755,17 +1072,28 @@ function matchPathPattern(pattern: string, specifier: string): string | undefine
   return specifier.slice(prefix.length, specifier.length - suffix.length);
 }
 
-async function resolveSourcePath(base: string): Promise<string | undefined> {
+async function resolveSourcePath(
+  base: string,
+  resolver: ProjectResolver,
+): Promise<string | undefined> {
+  const memoized = resolver.resolved.get(base);
+  if (memoized !== undefined || resolver.resolved.has(base)) return memoized;
+  const resolved = await readSourcePath(base);
+  resolver.resolved.set(base, resolved);
+  return resolved;
+}
+
+async function readSourcePath(base: string): Promise<string | undefined> {
   const candidates: string[] = [base];
   const extension = path.extname(base);
-  if (extension === "") {
-    for (const sourceExtension of PROJECT_SOURCE_EXTENSIONS) {
-      candidates.push(`${base}${sourceExtension}`, path.join(base, `index${sourceExtension}`));
-    }
-  } else if ([".js", ".jsx", ".mjs", ".cjs"].includes(extension)) {
+  if ([".js", ".jsx", ".mjs", ".cjs"].includes(extension)) {
     const stem = base.slice(0, -extension.length);
     for (const sourceExtension of [".ts", ".tsx", ".mts", ".cts"] as const) {
       candidates.push(`${stem}${sourceExtension}`);
+    }
+  } else if (!(PROJECT_SOURCE_EXTENSIONS as readonly string[]).includes(extension)) {
+    for (const sourceExtension of PROJECT_SOURCE_EXTENSIONS) {
+      candidates.push(`${base}${sourceExtension}`, path.join(base, `index${sourceExtension}`));
     }
   }
   for (const candidate of candidates) {

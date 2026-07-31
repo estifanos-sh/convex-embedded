@@ -9,7 +9,8 @@ import { describe, expect, test } from "vite-plus/test";
 import { v } from "convex/values";
 
 import { createEmbeddedBundle, generateEmbedded, toModuleId } from "../../src/bundler";
-import { analyzeEmbeddedSchema, defineEmbeddedSchema, embeddedTable } from "../../src/schema";
+import { toEmbeddedGeneratedSchema } from "../../src/bundler/generated";
+import { analyzeEmbeddedSchema, defineEmbeddedSchema, replicatedTable } from "../../src/schema";
 import { convexEmbeddedUnplugin } from "../../src/unplugin";
 import {
   fromVirtualSourceId,
@@ -25,6 +26,13 @@ const convexServerPath = fileURLToPath(import.meta.resolve("convex/server"));
 const convexValuesPath = fileURLToPath(import.meta.resolve("convex/values"));
 const embeddedServerPath = fileURLToPath(new URL("../../src/server/index.ts", import.meta.url));
 const fixtureSchema = defineEmbeddedSchema({});
+const fixtureAnalysis = analyzeEmbeddedSchema(fixtureSchema);
+
+interface BundlerPlugin {
+  load: (id: string) => Promise<string | null> | string | null;
+  resolveId: (id: string, importer?: string) => Promise<string | null> | string | null;
+  transform: (code: string, id: string) => Promise<{ code: string } | null | undefined>;
+}
 
 describe("embedded bundler core", () => {
   test("discovers Convex modules and renders a lazy virtual registry", async () => {
@@ -32,7 +40,11 @@ describe("embedded bundler core", () => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
-      await file(convexDir, "admin/users.tsx", canonical("replicated", "query", "list"));
+      await file(
+        convexDir,
+        "admin/users.tsx",
+        canonical("replicated", "query", "list", "../embedded"),
+      );
       await file(convexDir, "_generated/api.ts", "export const api = {};\n");
       await file(convexDir, "ignored.d.ts", "export {};\n");
 
@@ -109,7 +121,9 @@ describe("embedded bundler core", () => {
 
   test("throws a clear error when the schema file is missing", async () => {
     await withFixture(async ({ root }) => {
-      await expect(createEmbeddedBundle({ root })).rejects.toThrow("Could not find Convex schema");
+      await expect(createEmbeddedBundle({ analysis: fixtureAnalysis, root })).rejects.toThrow(
+        "Could not find Convex schema",
+      );
     });
   });
 
@@ -117,7 +131,7 @@ describe("embedded bundler core", () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
 
-      await expect(createEmbeddedBundle({ root })).rejects.toThrow(
+      await expect(createEmbeddedBundle({ analysis: fixtureAnalysis, root })).rejects.toThrow(
         "Could not find Convex embedded entrypoint",
       );
     });
@@ -128,7 +142,7 @@ describe("embedded bundler core", () => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await file(convexDir, "embedded.ts", "export const pull = null;\n");
 
-      await expect(createEmbeddedBundle({ root })).rejects.toThrow(
+      await expect(createEmbeddedBundle({ analysis: fixtureAnalysis, root })).rejects.toThrow(
         "Could not find generated Embedded contract",
       );
     });
@@ -140,24 +154,24 @@ describe("embedded bundler core", () => {
       await file(
         convexDir,
         "embedded.ts",
-        'import { embeddedManifest } from "./generated/embedded";\nvoid embeddedManifest;\n',
+        `import { embeddedManifest } from "./generated/embedded";
+void embeddedManifest;
+export const replicated = null;
+`,
       );
-      await file(
-        convexDir,
-        "messages.ts",
-        `import "./embedded";\n${canonical("replicated", "query", "list")}`,
-      );
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
       const generatedPath = "generated/embedded.ts";
 
       const generated = await generateEmbedded({
-        analysis: analyzeEmbeddedSchema(fixtureSchema),
+        analysis: fixtureAnalysis,
         generatedPath,
         root,
       });
-      const bundle = await createEmbeddedBundle({ generatedPath, root });
+      const bundle = await createEmbeddedBundle({ analysis: fixtureAnalysis, generatedPath, root });
 
       expect(generated.path).toBe(path.join(convexDir, generatedPath));
       expect(bundle.modules).toEqual({ messages: path.join(convexDir, "messages.ts") });
+      expect(bundle.sourceFiles).toContain(path.join(convexDir, "embedded.ts"));
       expect(bundle.sourceFiles).not.toContain(generated.path);
     });
   });
@@ -166,7 +180,7 @@ describe("embedded bundler core", () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      const input = { analysis: analyzeEmbeddedSchema(fixtureSchema), root };
+      const input = { analysis: fixtureAnalysis, root };
 
       const generated = await generateEmbedded(input);
       const before = await stat(generated.path, { bigint: true });
@@ -186,11 +200,13 @@ describe("embedded bundler core", () => {
       await createFixtureBundle(root);
 
       await file(convexDir, "schema.ts", "export default { changed: true };\n");
-      await expect(createEmbeddedBundle({ root })).rejects.toThrow("stale for the current schema");
+      await expect(createEmbeddedBundle({ analysis: fixtureAnalysis, root })).rejects.toThrow(
+        "stale for the current schema",
+      );
 
       await file(convexDir, "schema.ts", "export default {};\n");
       await file(convexDir, "messages.ts", canonical("remote", "query", "list"));
-      await expect(createEmbeddedBundle({ root })).rejects.toThrow(
+      await expect(createEmbeddedBundle({ analysis: fixtureAnalysis, root })).rejects.toThrow(
         "stale for the current function manifest",
       );
     });
@@ -202,15 +218,17 @@ describe("embedded bundler core", () => {
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
       await createFixtureBundle(root);
-      const generatedPath = path.join(convexDir, "_generated/embedded.ts");
+      const generatedPath = path.join(convexDir, "embedded.generated.ts");
       const generated = await readFile(generatedPath, "utf8");
       await writeFile(
         generatedPath,
-        generated.replace('"formatVersion":1', '"formatVersion":999'),
+        generated.replace('"formatVersion":2', '"formatVersion":999'),
         "utf8",
       );
 
-      await expect(createEmbeddedBundle({ root })).rejects.toThrow("format 999 is unsupported");
+      await expect(createEmbeddedBundle({ analysis: fixtureAnalysis, root })).rejects.toThrow(
+        "format 999 is unsupported",
+      );
     });
   });
 
@@ -245,7 +263,7 @@ describe("embedded bundler core", () => {
     });
   });
 
-  test("excludes Node-runtime modules from the local worker graph", async () => {
+  test("excludes Node-runtime modules from the device worker graph", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -254,13 +272,77 @@ describe("embedded bundler core", () => {
         "hosted.ts",
         `/* hosted only */\n"use strict";\n"use node";\nexport const run = null;\n`,
       );
-      await file(convexDir, "device.local.ts", canonical("local", "query", "read"));
+      await file(convexDir, "device.ts", canonical("replicated", "query", "read"));
 
       const bundle = await createFixtureBundle(root);
 
       expect(bundle.modules).toEqual({
-        "device.local": path.join(convexDir, "device.local.ts"),
+        device: path.join(convexDir, "device.ts"),
       });
+    });
+  });
+
+  test("rejects Convex modules that register with the removed local builders", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "device.ts",
+        "declare const embedded: any;\nexport const read = embedded.local.query({});\n",
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow(
+        "embedded.local builders were removed",
+      );
+    });
+  });
+
+  test("rejects Convex modules that import the device-only entrypoint", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "device.ts",
+        `import { local } from "@convex-dev/embedded/local";\nvoid local;\n`,
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow(
+        "must not import @convex-dev/embedded/local",
+      );
+    });
+  });
+
+  test("rejects multi-dot Convex modules that the Convex CLI would skip", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "device.helpers.ts", canonical("replicated", "query", "read"));
+
+      await expect(createFixtureBundle(root)).rejects.toThrow("contains multiple dots");
+    });
+  });
+
+  test("keeps multi-dot Convex modules without registrations in the graph", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.ts",
+        `import { value } from "./feed.helpers";\nvoid value;\n${canonical(
+          "replicated",
+          "query",
+          "list",
+        )}`,
+      );
+      await file(convexDir, "feed.helpers.ts", "export const value = 1;\n");
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.modules).toEqual({ feed: path.join(convexDir, "feed.ts") });
+      expect(bundle.sourceFiles).toContain(path.join(convexDir, "feed.helpers.ts"));
     });
   });
 
@@ -353,12 +435,12 @@ describe("embedded bundler core", () => {
       await file(convexDir, "helper.ts", "export const value = 1;\n");
 
       const beforeBundle = await createFixtureBundle(root);
-      const before = await renderEmbeddedIdentity(beforeBundle);
+      const before = renderEmbeddedIdentity(beforeBundle);
       expect(beforeBundle.sourceFiles).toContain(path.join(convexDir, "helper.ts"));
 
       await file(convexDir, "helper.ts", "export const value = 2;\n");
       const afterBundle = await createFixtureBundle(root);
-      const after = await renderEmbeddedIdentity(afterBundle);
+      const after = renderEmbeddedIdentity(afterBundle);
 
       expect(after).not.toBe(before);
     });
@@ -374,7 +456,39 @@ describe("embedded bundler core", () => {
         "declare const embedded: any; export const list = embedded.query({});\n",
       );
 
-      await expect(createFixtureBundle(root)).rejects.toThrow("canonical embedded");
+      await expect(createFixtureBundle(root)).rejects.toThrow("must use a canonical replicated");
+    });
+  });
+
+  test("rejects the namespaced embedded.<placement>.<builder> registration form", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "legacy.ts",
+        `import { embedded } from "./embedded";
+export const list = embedded.replicated.query({});
+`,
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow("must use a canonical replicated");
+    });
+  });
+
+  test("rejects bare-namespace registrations that never import the embedded module", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "loose.ts",
+        "declare const replicated: any;\nexport const list = replicated.query({});\n",
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow(
+        "imported from the Convex embedded module",
+      );
     });
   });
 
@@ -385,24 +499,130 @@ describe("embedded bundler core", () => {
       await file(
         convexDir,
         "typed.ts",
-        "declare const embedded: any; export const list: unknown = embedded.replicated.query({});\n",
+        `import { replicated } from "./embedded";
+export const list: unknown = replicated.query({});
+`,
       );
 
-      await expect(createFixtureBundle(root)).rejects.toThrow("canonical embedded");
+      await expect(createFixtureBundle(root)).rejects.toThrow("must use a canonical replicated");
 
       await file(
         convexDir,
         "typed.ts",
-        "declare const embedded: any; export const list = (embedded.replicated.query)({});\n",
+        `import { replicated } from "./embedded";
+export const list = (replicated.query)({});
+`,
       );
-      await expect(createFixtureBundle(root)).rejects.toThrow("canonical embedded");
+      await expect(createFixtureBundle(root)).rejects.toThrow("must use a canonical replicated");
 
       await file(
         convexDir,
         "typed.ts",
-        "declare const embedded: any; const localQuery = embedded.local.query; export const list = localQuery({});\n",
+        `import { replicated } from "./embedded";
+const deviceQuery = replicated.query;
+export const list = deviceQuery({});
+`,
       );
       await expect(createFixtureBundle(root)).rejects.toThrow("directly from its exported");
+    });
+  });
+
+  test("keeps registrations that follow a regex literal containing quotes", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "pins.ts",
+        `import { replicated } from "./embedded";
+const quoted = /["']/g;
+void quoted;
+export const toggle = replicated.mutation({});
+`,
+      );
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.manifest.pins?.toggle).toEqual({
+        kind: "mutation",
+        placement: "replicated",
+        visibility: "public",
+      });
+      expect(bundle.modules).toEqual({ pins: path.join(convexDir, "pins.ts") });
+    });
+  });
+
+  test("requires a live placement import, and accepts NodeNext specifiers", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.ts",
+        `// import { replicated } from "./embedded";
+export const list = replicated.query({});
+`,
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow(
+        "imported from the Convex embedded module",
+      );
+
+      await file(
+        convexDir,
+        "feed.ts",
+        `import { replicated } from "./embedded.js";
+export const list = replicated.query({});
+`,
+      );
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.manifest.feed?.list).toMatchObject({ kind: "query", placement: "replicated" });
+    });
+  });
+
+  test("rejects only the embedded.local builder namespace", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "settings.ts",
+        `import { replicated } from "./embedded";
+declare const cache: { local: { query: (key: string) => unknown } };
+export const list = replicated.query({});
+void cache.local.query("recent");
+`,
+      );
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.manifest.settings?.list).toBeDefined();
+    });
+  });
+
+  test("enforces canonical registrations only inside the Convex directory", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const helper = `export const remote = { query: async () => [] };
+export const readRows = async () => remote.query();
+`;
+      await file(root, "src/helpers.ts", helper);
+      await file(
+        localDir,
+        "drafts.ts",
+        `import { readRows } from "../src/helpers";\nvoid readRows;\n`,
+      );
+
+      await expect(createFixtureBundle(root, localDir)).resolves.toMatchObject({
+        localModules: { "local/drafts": { file: path.join(localDir, "drafts.ts") } },
+      });
+
+      await file(convexDir, "helpers.ts", helper);
+      await expect(createFixtureBundle(root, localDir)).rejects.toThrow(
+        "directly from its exported canonical registration",
+      );
     });
   });
 
@@ -496,21 +716,236 @@ export default defineComponent("defaultChild");
 
   test("renders quoted keys for module ids that are not identifiers", () => {
     const source = renderEmbeddedBundle({
-      generatedPath: "/repo/convex/_generated/embedded.ts",
+      embeddedSchema: toEmbeddedGeneratedSchema(fixtureAnalysis),
+      generatedPath: "/repo/convex/embedded.generated.ts",
+      localModules: {
+        "local/admin/drafts": { file: "/repo/local/admin/drafts.ts" },
+      },
       manifest: {
         "admin/users": {
           list: { kind: "query", placement: "replicated", visibility: "public" },
         },
       },
       modules: { "admin/users": "/repo/convex/admin/users.ts" },
-      schemaHash: "schema",
       sourceFiles: ["/repo/convex/admin/users.ts"],
       schemaPath: "/repo/convex/schema.ts",
       schemaSourceHash: "schema",
       manifestHash: "manifest",
+      moduleGraphHash: "graph",
     });
 
     expect(source).toContain('"admin/users": () => import(');
+    expect(source).toContain('"local/admin/drafts": () => import(');
+  });
+});
+
+describe("embedded local modules", () => {
+  test("discovers every device-only module under a root, including shared helpers", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
+      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(localDir, "shapes.ts", localExportShapes());
+      await file(localDir, "_helpers.ts", "export const limit = 10;\n");
+      await file(localDir, "ignored.d.ts", "export {};\n");
+
+      const bundle = await createFixtureBundle(root, localDir);
+
+      expect(bundle.localModules).toEqual({
+        "local/_helpers": { file: path.join(localDir, "_helpers.ts") },
+        "local/shapes": { file: path.join(localDir, "shapes.ts") },
+        "local/sync/drafts": { file: path.join(localDir, "sync/drafts.ts") },
+      });
+      expect(bundle.manifest.messages?.list).toBeDefined();
+      expect(JSON.stringify(bundle.manifest)).not.toContain("local/");
+      expect(bundle.sourceFiles).toContain(path.join(localDir, "sync/drafts.ts"));
+      expect(JSON.stringify(bundle)).not.toContain("ignored.d.ts");
+    });
+  });
+
+  test("namespaces module ids per root when several roots are configured", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      const deviceDir = path.join(root, "device");
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(deviceDir, "prefs.ts", localFunctions());
+
+      const bundle = await createFixtureBundle(root, [localDir, deviceDir]);
+
+      expect(bundle.localModules).toEqual({
+        "local/prefs": { file: path.join(deviceDir, "prefs.ts") },
+        "local/sync/drafts": { file: path.join(localDir, "sync/drafts.ts") },
+      });
+      expect(bundle.sourceFiles).toContain(path.join(deviceDir, "prefs.ts"));
+    });
+  });
+
+  test("rejects a device-only module id claimed by two roots, naming both files", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      const deviceDir = path.join(root, "device");
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "prefs.ts", localFunctions());
+      await file(deviceDir, "prefs.ts", localFunctions());
+
+      await expect(createFixtureBundle(root, [localDir, deviceDir])).rejects.toThrow(
+        `Duplicate local module id "local/prefs" from "${path.join(
+          localDir,
+          "prefs.ts",
+        )}" and "${path.join(deviceDir, "prefs.ts")}".`,
+      );
+    });
+  });
+
+  test("keeps the local/ function namespace reserved inside the Convex directory", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "local/pins.ts",
+        canonical("replicated", "query", "list", "../embedded"),
+      );
+
+      await expect(createFixtureBundle(root)).rejects.toThrow(
+        "uses the reserved local/ function namespace",
+      );
+    });
+  });
+
+  test("watches every configured local root while loading the registry", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      const deviceDir = path.join(root, "device");
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(deviceDir, "prefs.ts", localFunctions());
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: [localDir, deviceDir],
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+      const load = plugin.load as unknown as (
+        this: { addWatchFile(id: string): void },
+        id: string,
+      ) => Promise<string | null>;
+      const watched: string[] = [];
+
+      await load.call({ addWatchFile: (id: string) => watched.push(id) }, `\0${VIRTUAL_MODULE_ID}`);
+
+      expect(watched).toContain(convexDir);
+      expect(watched).toContain(localDir);
+      expect(watched).toContain(deviceDir);
+      expect(watched).toContain(path.join(deviceDir, "prefs.ts"));
+    });
+  });
+
+  test("renders lazy device-only thunks beside the Convex registry", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
+      await file(localDir, "sync/drafts.ts", localFunctions());
+
+      const source = renderEmbeddedBundle(await createFixtureBundle(root, localDir));
+
+      expect(source).toContain(`messages: () => import("${VIRTUAL_SOURCE_MODULE_PREFIX}`);
+      expect(source).toContain(
+        `  "local/sync/drafts": () => import(${JSON.stringify(
+          toVirtualSourceId(path.join(localDir, "sync/drafts.ts")),
+        )}),`,
+      );
+    });
+  });
+
+  test("renders an empty local registry when no directory is configured", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.localModules).toEqual({});
+      expect(renderEmbeddedBundle(bundle)).toContain("export const localModules = {");
+    });
+  });
+
+  test("accepts device-only modules with default, star, and mixed exports", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "helpers.ts", "export const helper = 1;\n");
+      await file(
+        localDir,
+        "drafts.ts",
+        `export * from "./helpers";
+export default { setCompact: null };
+const pref = 1;
+export { pref as "compact pref" };
+`,
+      );
+
+      await expect(createFixtureBundle(root, localDir)).resolves.toMatchObject({
+        localModules: {
+          "local/drafts": { file: path.join(localDir, "drafts.ts") },
+          "local/helpers": { file: path.join(localDir, "helpers.ts") },
+        },
+      });
+    });
+  });
+
+  test("rejects device-only roots that overlap the Convex directory or each other", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+
+      await expect(createFixtureBundle(root, path.join(convexDir, "local"))).rejects.toThrow(
+        "must live outside the Convex directory",
+      );
+      await expect(createFixtureBundle(root, root)).rejects.toThrow(
+        "must live outside the Convex directory",
+      );
+      await expect(
+        createFixtureBundle(root, [localDir, path.join(localDir, "sync")]),
+      ).rejects.toThrow("must not overlap");
+      await expect(createFixtureBundle(root, [localDir, localDir])).rejects.toThrow(
+        "must not overlap",
+      );
+    });
+  });
+
+  test("rejects device-only modules that reach remote or Node-only modules", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "admin.ts", canonical("remote", "query", "audit"));
+      await file(localDir, "drafts.ts", `import "../convex/admin";\nexport const limit = 1;\n`);
+
+      await expect(createFixtureBundle(root, localDir)).rejects.toThrow("imports a remote module");
+
+      await file(convexDir, "admin.ts", `"use node";\nexport const audit = null;\n`);
+      await expect(createFixtureBundle(root, localDir)).rejects.toThrow(
+        "imports a Node-only module",
+      );
+    });
+  });
+
+  test("hashes device-only sources in the module graph identity", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "drafts.ts", `import { limit } from "./helpers";\nvoid limit;\n`);
+      await file(localDir, "helpers.ts", "export const limit = 10;\n");
+
+      const before = renderEmbeddedIdentity(await createFixtureBundle(root, localDir));
+
+      await file(localDir, "helpers.ts", "export const limit = 20;\n");
+      const after = renderEmbeddedIdentity(await createFixtureBundle(root, localDir));
+
+      expect(after).not.toBe(before);
+    });
   });
 });
 
@@ -543,15 +978,12 @@ describe("embedded unplugin adapter", () => {
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
         schema: fixtureSchema,
-      }) as unknown as {
-        load(id: string): Promise<string | null>;
-        resolveId(id: string): Promise<string | null>;
-      };
+      }) as unknown as BundlerPlugin;
 
       const resolved = await plugin.resolveId(VIRTUAL_MODULE_ID);
       expect(resolved).toBe(`\0${VIRTUAL_MODULE_ID}`);
       const source = await plugin.load(resolved!);
-      expect(source).toContain(`from "${VIRTUAL_SOURCE_MODULE_PREFIX}`);
+      expect(source).toContain("export const embeddedSchema = ");
       expect(source).toContain(`messages: () => import("${VIRTUAL_SOURCE_MODULE_PREFIX}`);
       expect(source).not.toContain("import.meta.glob");
       expect(source).not.toContain("/@fs/");
@@ -559,26 +991,28 @@ describe("embedded unplugin adapter", () => {
     });
   });
 
-  test("regenerates the literal contract from a schema supplied to the plugin", async () => {
+  test("inlines the fresh device schema and writes only the placement lockfile", async () => {
     await withFixture(async ({ convexDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
-      await file(convexDir, "embedded.ts", "export const pull = null;\n");
+      await file(convexDir, "embedded.ts", "export const replicated = null;\n");
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
-      const schema = defineEmbeddedSchema({ messages: embeddedTable({ body: v.string() }) });
-      const plugin = convexEmbeddedUnplugin.rollup({ convexDir, schema }) as unknown as {
-        load(id: string): Promise<string | null>;
-        resolveId(id: string): Promise<string | null>;
-      };
+      const schema = defineEmbeddedSchema({ messages: replicatedTable({ body: v.string() }) });
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        schema,
+      }) as unknown as BundlerPlugin;
 
       const resolved = await plugin.resolveId(VIRTUAL_MODULE_ID);
       const source = await plugin.load(resolved!);
 
-      expect(source).toContain("embeddedSchema");
-      await expect(
-        import("node:fs/promises").then(({ readFile }) =>
-          readFile(path.join(convexDir, "_generated/embedded.ts"), "utf8"),
-        ),
-      ).resolves.toContain("runtimeStoreSchema");
+      expect(source).toContain("export const embeddedSchema = ");
+      expect(source).toContain("runtimeStoreSchema");
+      expect(source).not.toMatch(/^import\s/m);
+      const lockfile = await readFile(path.join(convexDir, "embedded.generated.ts"), "utf8");
+      expect(lockfile).toContain("embeddedManifest");
+      expect(lockfile).not.toContain("runtimeStoreSchema");
+      expect(lockfile).not.toContain("embeddedSchema");
+      expect(lockfile.length).toBeLessThan(1024);
     });
   });
 
@@ -593,12 +1027,10 @@ describe("embedded unplugin adapter", () => {
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
         schema: fixtureSchema,
-      }) as unknown as {
-        resolveId(id: string): Promise<string | null>;
-      };
+      }) as unknown as BundlerPlugin;
 
       expect(fromVirtualSourceId(sourceId)).toBe(modulePath);
-      await expect(plugin.resolveId(sourceId)).resolves.toBe(modulePath);
+      expect(await plugin.resolveId(sourceId)).toBe(modulePath);
     });
   });
 
@@ -612,29 +1044,28 @@ describe("embedded unplugin adapter", () => {
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
         schema: fixtureSchema,
-      }) as unknown as {
-        resolveId(id: string): Promise<string | null>;
-      };
+      }) as unknown as BundlerPlugin;
 
-      await expect(plugin.resolveId(toVirtualSourceId(path.join(root, "secret.ts")))).resolves.toBe(
-        null,
-      );
+      expect(await plugin.resolveId(toVirtualSourceId(path.join(root, "secret.ts")))).toBe(null);
     });
   });
 
   test("keeps Vite dev import-analysis directory probes pinned to schema", async () => {
-    await withFixture(async ({ convexDir }) => {
+    await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
+      await file(localDir, "drafts.ts", localFunctions());
 
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
+        local: localDir,
         schema: fixtureSchema,
-      }) as unknown as {
-        resolveId(id: string, importer?: string): Promise<string | null>;
-      };
+      }) as unknown as BundlerPlugin;
 
-      await expect(plugin.resolveId(convexDir, `\0${VIRTUAL_MODULE_ID}`)).resolves.toBe(
+      expect(await plugin.resolveId(convexDir, `\0${VIRTUAL_MODULE_ID}`)).toBe(
+        path.join(convexDir, "schema.ts"),
+      );
+      expect(await plugin.resolveId(localDir, `\0${VIRTUAL_MODULE_ID}`)).toBe(
         path.join(convexDir, "schema.ts"),
       );
     });
@@ -645,27 +1076,331 @@ describe("embedded unplugin adapter", () => {
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir: path.join(root, "missing-convex"),
         schema: fixtureSchema,
-      }) as unknown as {
-        load(id: string): Promise<string | null>;
-      };
+      }) as unknown as BundlerPlugin;
 
-      await expect(plugin.load(path.join(root, "src/main.ts"))).resolves.toBe(null);
+      expect(await plugin.load(path.join(root, "src/main.ts"))).toBe(null);
     });
   });
 
-  test("requires the generated embedded contract without rewriting it", async () => {
+  test("appends one stamp call to every device-only module it bundles", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = localFunctions();
+      await file(localDir, "sync/drafts.ts", source);
+      const modulePath = path.join(localDir, "sync/drafts.ts");
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const transformed = await plugin.transform(source, modulePath);
+
+      expect(transformed?.code).toBe(`${source}
+import { stampLocal as __embeddedStampLocal } from "@convex-dev/embedded/local";
+__embeddedStampLocal("local/sync/drafts", { readCompact, setCompact });
+`);
+      expect((await plugin.transform(source, `${modulePath}?import`))?.code).toBe(
+        transformed?.code,
+      );
+    });
+  });
+
+  test("never replaces a device-only module with a stub", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "sync/drafts.ts", localFunctions());
+      const modulePath = path.join(localDir, "sync/drafts.ts");
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      expect(await plugin.load(modulePath)).toBe(null);
+      expect(await plugin.load(`${modulePath}?import`)).toBe(null);
+      expect(await plugin.load(path.join(convexDir, "schema.ts"))).toBe(null);
+      expect(await plugin.resolveId(toVirtualSourceId(modulePath))).toBe(modulePath);
+
+      const vite = (
+        convexEmbeddedUnplugin as unknown as {
+          raw(options: unknown, meta: { framework: string }): BundlerPlugin;
+        }
+      ).raw({ convexDir, local: localDir, schema: fixtureSchema }, { framework: "vite" });
+      expect(await vite.resolveId(toVirtualSourceId(modulePath))).toBe(modulePath);
+      expect(await vite.load(modulePath)).toBe(null);
+    });
+  });
+
+  test("stamps aliased export names and dodges an identifier the module already uses", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = `${localFunctions()}const __embeddedStampLocal = 1;
+export { setCompact as delete, __embeddedStampLocal as marker };
+`;
+      await file(localDir, "sync/drafts.ts", source);
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const transformed = await plugin.transform(source, path.join(localDir, "sync/drafts.ts"));
+
+      expect(transformed?.code).toBe(`${source}
+import { stampLocal as __embeddedStampLocal$ } from "@convex-dev/embedded/local";
+__embeddedStampLocal$("local/sync/drafts", { delete: setCompact, marker: __embeddedStampLocal, readCompact, setCompact });
+`);
+    });
+  });
+
+  test("skips exports the stamp cannot name, and modules with nothing to name", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const skipped = `export * from "./helpers";
+export { helper } from "./helpers";
+export type { Draft } from "./helpers";
+const value = 1;
+export { value as "compact pref", value as default };
+`;
+      await file(localDir, "helpers.ts", "export const helper = 1;\nexport type Draft = string;\n");
+      await file(localDir, "drafts.ts", skipped);
+      await file(localDir, "empty.ts", "const unused = 1;\nvoid unused;\n");
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      expect((await plugin.transform(skipped, path.join(localDir, "drafts.ts"))) ?? null).toBe(
+        null,
+      );
+      expect(
+        (await plugin.transform(
+          "const unused = 1;\nvoid unused;\n",
+          path.join(localDir, "empty.ts"),
+        )) ?? null,
+      ).toBe(null);
+    });
+  });
+
+  test("names exports that follow a regex literal containing quotes", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = `import { local } from "@convex-dev/embedded/local";
+
+const quoted = /["']/g;
+void quoted;
+
+export const toggle = local.mutation({ args: {}, handler: async () => null });
+`;
+      await file(localDir, "pins.ts", source);
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
+
+      expect(transformed?.code).toContain(`__embeddedStampLocal("local/pins", { toggle });`);
+    });
+  });
+
+  test("never names ambient declarations or reserved words in the stamp", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = `import { local } from "@convex-dev/embedded/local";
+
+declare global {
+  export const leakedGlobal: number;
+}
+
+declare module "virtual:pins" {
+  export const leakedModule: number;
+}
+
+export const enum Flag {
+  On = 1,
+}
+
+export const toggle = local.mutation({ args: {}, handler: async () => null });
+`;
+      await file(localDir, "pins.ts", source);
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
+
+      expect(transformed?.code).toBe(`${source}
+import { stampLocal as __embeddedStampLocal } from "@convex-dev/embedded/local";
+__embeddedStampLocal("local/pins", { toggle });
+`);
+    });
+  });
+
+  test("names every declarator of an export, including destructuring patterns", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = `const pair = { first: 1, second: 2 };
+
+export const alpha = 1,
+  beta: Record<string, number> = {};
+export const { first, second } = pair;
+export const [head, ...tail] = [1, 2, 3];
+`;
+      await file(localDir, "pins.ts", source);
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
+
+      expect(transformed?.code).toContain(
+        `__embeddedStampLocal("local/pins", { alpha, beta, first, head, second, tail });`,
+      );
+    });
+  });
+
+  test("leaves CommonJS device modules unstamped but registered", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = localFunctions();
+      await file(localDir, "legacy.cts", source);
+      await file(localDir, "bridge.cjs", source);
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      expect((await plugin.transform(source, path.join(localDir, "legacy.cts"))) ?? null).toBe(
+        null,
+      );
+      expect((await plugin.transform(source, path.join(localDir, "bridge.cjs"))) ?? null).toBe(
+        null,
+      );
+      await expect(createFixtureBundle(root, localDir)).resolves.toMatchObject({
+        localModules: {
+          "local/bridge": { file: path.join(localDir, "bridge.cjs") },
+          "local/legacy": { file: path.join(localDir, "legacy.cts") },
+        },
+      });
+    });
+  });
+
+  test("scans the project once and reuses the bundle across transforms", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = localFunctions();
+      await file(localDir, "sync/drafts.ts", source);
+      const modulePath = path.join(localDir, "sync/drafts.ts");
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const stamped = await plugin.transform(source, modulePath);
+      await rm(path.join(convexDir, "schema.ts"));
+
+      expect((await plugin.transform(source, modulePath))?.code).toBe(stamped?.code);
+    });
+  });
+
+  test("leaves modules outside the local roots untransformed", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "drafts.ts", localFunctions());
+      const source = canonical("replicated", "query", "list");
+      await file(convexDir, "messages.ts", source);
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      expect((await plugin.transform(source, path.join(convexDir, "messages.ts"))) ?? null).toBe(
+        null,
+      );
+    });
+  });
+
+  test("rejects Convex modules that import device-only modules from any root", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      const deviceDir = path.join(root, "device");
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "prefs.ts", localFunctions());
+      await file(deviceDir, "notes.ts", localFunctions());
+      await file(
+        convexDir,
+        "documents.ts",
+        `import { setCompact } from "../local/prefs";\nvoid setCompact;\n${canonical(
+          "replicated",
+          "query",
+          "list",
+        )}`,
+      );
+
+      await expect(createFixtureBundle(root, [localDir, deviceDir])).rejects.toThrow(
+        "must not import device-only module",
+      );
+
+      await file(
+        convexDir,
+        "documents.ts",
+        `import { setCompact } from "../device/notes";\nvoid setCompact;\n${canonical(
+          "replicated",
+          "query",
+          "list",
+        )}`,
+      );
+      await expect(createFixtureBundle(root, [localDir, deviceDir])).rejects.toThrow(
+        "must not import device-only module",
+      );
+    });
+  });
+
+  test("keeps the default lockfile out of the scanned Convex module graph", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
 
-      await createFixtureBundle(root);
+      const bundle = await createFixtureBundle(root);
+      const lockfile = path.join(convexDir, "embedded.generated.ts");
 
-      await expect(
-        import("node:fs/promises").then(({ readFile }) =>
-          readFile(path.join(convexDir, "_generated/embedded.ts"), "utf8"),
-        ),
-      ).resolves.toContain("embeddedSchema");
+      expect(bundle.generatedPath).toBe(lockfile);
+      expect(Object.values(bundle.modules)).not.toContain(lockfile);
+      expect(bundle.sourceFiles).not.toContain(lockfile);
+      expect(bundle.manifest["embedded.generated"]).toBeUndefined();
+      await expect(readFile(lockfile, "utf8")).resolves.toContain("embeddedManifest");
     });
   });
 });
@@ -691,26 +1426,43 @@ describe("embedded Vite adapter", () => {
     });
   });
 
+  test("stamps device-only modules identically in the app and worker builds", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = localFunctions();
+      await file(localDir, "sync/drafts.ts", source);
+      const modulePath = path.join(localDir, "sync/drafts.ts");
+
+      const [configPlugin, appPlugin] = convexEmbedded({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as Array<{
+        config(): { worker: { plugins(): BundlerPlugin[] } };
+        load(id: string): Promise<string | null>;
+        transform(code: string, id: string): Promise<{ code: string } | null | undefined>;
+      }>;
+      const [workerPlugin] = configPlugin.config().worker.plugins();
+
+      const stamped = await appPlugin.transform(source, modulePath);
+      expect(stamped?.code).toContain(`__embeddedStampLocal("local/sync/drafts", {`);
+      expect((await workerPlugin.transform(source, modulePath))?.code).toBe(stamped?.code);
+      expect(await appPlugin.load(modulePath)).toBe(null);
+    });
+  });
+
   test("builds a fixture that imports the virtual registry", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       await file(
         convexDir,
-        "_generated/server.ts",
-        `import { mutationGeneric, queryGeneric } from "convex/server";
-export const mutation = mutationGeneric;
-export const query = queryGeneric;
-`,
-      );
-      await file(convexDir, "_generated/api.ts", "export const components = { embedded: {} };\n");
-      await file(
-        convexDir,
         "messages.ts",
-        `import { embedded } from "./embedded";
+        `import { replicated } from "./embedded";
 import { v } from "convex/values";
 
-export const list = embedded.replicated.query({
+export const list = replicated.query({
   args: { channel: v.string() },
   handler: () => [],
 });
@@ -750,15 +1502,6 @@ void modules.messages;
   test("builds the package-owned browser worker entry with the virtual registry", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
-      await file(
-        convexDir,
-        "_generated/server.ts",
-        `import { mutationGeneric, queryGeneric } from "convex/server";
-export const mutation = mutationGeneric;
-export const query = queryGeneric;
-`,
-      );
-      await file(convexDir, "_generated/api.ts", "export const components = { embedded: {} };\n");
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
 
@@ -803,20 +1546,42 @@ export const query = queryGeneric;
 });
 
 async function withFixture(
-  run: (fixture: { convexDir: string; root: string }) => Promise<void>,
+  run: (fixture: { convexDir: string; localDir: string; root: string }) => Promise<void>,
 ): Promise<void> {
   const root = await mkdtemp(path.join(tmpdir(), "embedded-bundler-"));
   try {
     const convexDir = path.join(root, "convex");
-    await run({ convexDir, root });
+    await run({ convexDir, localDir: path.join(root, "local"), root });
   } finally {
     await rm(root, { force: true, recursive: true });
   }
 }
 
-async function createFixtureBundle(root: string) {
-  await generateEmbedded({ analysis: analyzeEmbeddedSchema(fixtureSchema), root });
-  return createEmbeddedBundle({ root });
+async function createFixtureBundle(root: string, local?: string | string[]) {
+  await generateEmbedded({ analysis: fixtureAnalysis, local, root });
+  return createEmbeddedBundle({ analysis: fixtureAnalysis, local, root });
+}
+
+function localFunctions(): string {
+  return `import { local } from "@convex-dev/embedded/local";
+
+export const setCompact = local.mutation({ args: {}, handler: async () => null });
+export const readCompact = local.query({ args: {}, handler: async () => null });
+`;
+}
+
+function localExportShapes(): string {
+  return `type Something = string;
+const helper = 1;
+const other = 2;
+
+export const alpha = 1;
+export function beta() {}
+export async function gamma() {}
+export class Draft {}
+export { helper, other as epsilon };
+export type { Something };
+`;
 }
 
 async function file(root: string, relative: string, contents: string): Promise<void> {
@@ -826,6 +1591,15 @@ async function file(root: string, relative: string, contents: string): Promise<v
 }
 
 async function embeddedEntrypoint(convexDir: string): Promise<void> {
+  await file(convexDir, "_generated/api.ts", "export const components = { embedded: {} };\n");
+  await file(
+    convexDir,
+    "_generated/server.ts",
+    `import { mutationGeneric, queryGeneric } from "convex/server";
+export const mutation = mutationGeneric;
+export const query = queryGeneric;
+`,
+  );
   await file(
     convexDir,
     "embedded.ts",
@@ -840,14 +1614,18 @@ export const embedded = defineEmbedded({
 });
 
 export const { pull, push } = embedded;
+export const { remote, replicated } = embedded;
 `,
   );
 }
 
 function canonical(
-  placement: "replicated" | "remote" | "local",
+  placement: "replicated" | "remote",
   builder: "query" | "mutation" | "internalQuery" | "internalMutation",
   name: string,
+  specifier = "./embedded",
 ): string {
-  return `declare const embedded: any;\nexport const ${name} = embedded.${placement}.${builder}({});\n`;
+  return `import { ${placement} } from "${specifier}";
+export const ${name} = ${placement}.${builder}({});
+`;
 }

@@ -1,13 +1,13 @@
 import { v } from "convex/values";
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 
-export const generateUploadUrl = embedded.replicated.mutation({
+export const generateUploadUrl = replicated.mutation({
   args: {},
   returns: v.string(),
   handler: async (ctx) => await ctx.storage.generateUploadUrl(),
 });
 
-export const attach = embedded.replicated.mutation({
+export const attach = replicated.mutation({
   args: {
     contentType: v.string(),
     documentId: v.id("documents"),
@@ -54,7 +54,7 @@ export const attach = embedded.replicated.mutation({
   },
 });
 
-export const resolve = embedded.replicated.query({
+export const resolve = replicated.query({
   args: { token: v.string() },
   returns: v.union(v.string(), v.null()),
   handler: async (ctx, args) => {
@@ -66,7 +66,7 @@ export const resolve = embedded.replicated.query({
   },
 });
 
-export const metadata = embedded.replicated.query({
+export const metadata = replicated.query({
   args: { storageId: v.id("_storage") },
   returns: v.union(v.object({ contentType: v.optional(v.string()), size: v.number() }), v.null()),
   handler: async (ctx, args) => {
@@ -75,7 +75,7 @@ export const metadata = embedded.replicated.query({
   },
 });
 
-export const url = embedded.replicated.query({
+export const url = replicated.query({
   args: { storageId: v.id("_storage") },
   returns: v.union(v.string(), v.null()),
   handler: async (ctx, args) => await ctx.storage.getUrl(args.storageId),

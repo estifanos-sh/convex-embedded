@@ -1847,25 +1847,14 @@ where
     fn prepare_transport_runtime(&self, envelope: &mut PushEnvelope) -> RemoteResult<()> {
         let queued = &envelope.runtime;
         let current = &self.config.runtime;
-        if queued == current {
-            return Ok(());
-        }
         if queued.protocol_version > current.protocol_version {
             return Err(RemoteError::DeploymentMismatch(format!(
                 "queued mutation {} requires newer embedded protocol {} (this app uses {}); local data was preserved, so update the app before replaying it",
                 envelope.mutation_id, queued.protocol_version, current.protocol_version
             )));
         }
-        Err(RemoteError::DeploymentMismatch(format!(
-            "queued mutation {} uses embedded protocol {} with schemaHash={} and moduleGraphHash={}, but this app uses protocol {} with schemaHash={} and moduleGraphHash={}; local data was preserved and not upgraded",
-            envelope.mutation_id,
-            queued.protocol_version,
-            queued.schema_hash,
-            queued.module_graph_hash,
-            current.protocol_version,
-            current.schema_hash,
-            current.module_graph_hash
-        )))
+        envelope.runtime.clone_from(current);
+        Ok(())
     }
 
     fn speculative_crdt_prefixes(
@@ -6516,26 +6505,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incompatible_legacy_envelope_is_preserved_and_not_sent() {
+    async fn an_envelope_from_an_earlier_release_is_sent_under_the_current_runtime() {
         for (name, schema_hash, module_graph_hash) in [
-            ("schema", "legacy-schema", "local"),
-            ("modules", "local", "legacy-modules"),
+            ("schema", "prior-schema", "local"),
+            ("modules", "local", "prior-modules"),
         ] {
             let trace = Arc::new(Mutex::new(TransportTrace::default()));
             let transport = TraceTransport {
                 trace: Arc::clone(&trace),
             };
-            let store = test_store(&format!("remote-legacy-envelope-{name}.db"));
-            let mut legacy: serde_json::Value =
-                serde_json::from_str(&replay_envelope_json("legacy", 1)).unwrap();
-            legacy["clientRuntime"]["protocolVersion"] =
-                serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION - 1);
-            legacy["clientRuntime"]["schemaHash"] =
+            let store = test_store(&format!("remote-prior-release-envelope-{name}.db"));
+            let mut queued: serde_json::Value =
+                serde_json::from_str(&replay_envelope_json("queued", 1)).unwrap();
+            queued["clientRuntime"]["schemaHash"] =
                 serde_json::Value::String(schema_hash.to_owned());
-            legacy["clientRuntime"]["moduleGraphHash"] =
+            queued["clientRuntime"]["moduleGraphHash"] =
                 serde_json::Value::String(module_graph_hash.to_owned());
             store
-                .remote_push_envelope_write("legacy", 1, &legacy.to_string(), 1)
+                .remote_push_envelope_write("queued", 1, &queued.to_string(), 1)
                 .unwrap();
             let mut driver = RemoteDriver::open_with_store(
                 RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
@@ -6545,31 +6532,24 @@ mod tests {
             );
             driver.connected = true;
 
-            let error = driver.dispatch_ready_remote_pushes().await.unwrap_err();
-            assert!(matches!(
-                error,
-                RemoteError::DeploymentMismatch(message)
-                    if message.contains("local data was preserved")
-                        && message.contains("not upgraded")
-            ));
-            assert_eq!(sent_mutation_frames(&trace), 0);
-            assert!(driver.inflight_remote_push.is_empty());
-            let durable = store.remote_push_envelope_read(1).unwrap();
-            assert_eq!(durable, vec![legacy.to_string()]);
+            driver.dispatch_ready_remote_pushes().await.unwrap();
+
+            assert_eq!(sent_mutation_frames(&trace), 1);
+            assert!(!driver.inflight_remote_push.is_empty());
         }
     }
 
     #[tokio::test]
-    async fn same_protocol_envelope_from_a_different_module_graph_is_preserved_and_not_sent() {
+    async fn an_envelope_requiring_a_newer_protocol_is_preserved_and_not_sent() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport {
             trace: Arc::clone(&trace),
         };
-        let store = test_store("remote-same-protocol-module-mismatch.db");
+        let store = test_store("remote-newer-protocol-envelope.db");
         let mut queued: serde_json::Value =
             serde_json::from_str(&replay_envelope_json("queued", 1)).unwrap();
-        queued["clientRuntime"]["moduleGraphHash"] =
-            serde_json::Value::String("prior-modules".to_owned());
+        queued["clientRuntime"]["protocolVersion"] =
+            serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION + 1);
         store
             .remote_push_envelope_write("queued", 1, &queued.to_string(), 1)
             .unwrap();
@@ -6582,7 +6562,11 @@ mod tests {
         driver.connected = true;
 
         let error = driver.dispatch_ready_remote_pushes().await.unwrap_err();
-        assert!(matches!(error, RemoteError::DeploymentMismatch(_)));
+
+        assert!(matches!(
+            error,
+            RemoteError::DeploymentMismatch(message) if message.contains("update the app")
+        ));
         assert_eq!(sent_mutation_frames(&trace), 0);
         assert_eq!(
             store.remote_push_envelope_read(1).unwrap(),

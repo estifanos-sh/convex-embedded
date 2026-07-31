@@ -1,6 +1,6 @@
-import { v, type Infer } from "convex/values";
+import { v, type GenericId, type Infer } from "convex/values";
 
-import { embedded } from "./embedded";
+import { replicated } from "./embedded";
 import {
   del as documentsDel,
   documentValidator,
@@ -11,13 +11,13 @@ import {
 type DocumentRow = Infer<typeof documentValidator>;
 
 /**
- * The static bundler manifest lists only inline `embedded.<placement>.<builder>` registrations and
- * never follows `export *`, yet the packaged browser worker gates every root call on that manifest.
+ * The static bundler manifest lists only inline `replicated.<builder>` registrations and never
+ * follows `export *`, yet the packaged browser worker gates every root call on that manifest.
  * Re-declare the demo's `read`/`write`/`del` as canonical registrations that delegate to the demo's
  * own handlers, so the browser build carries first-class `documents:read`/`documents:write`/
  * `documents:del` manifest entries while exercising the demo's real behavior rather than a copy.
  */
-function delegate<Ctx, Args, Result>(registration: unknown, ctx: Ctx, args: Args): Result {
+export function delegate<Ctx, Args, Result>(registration: unknown, ctx: Ctx, args: Args): Result {
   const handler = (registration as { __embeddedHandler?: (ctx: Ctx, args: Args) => Result })
     .__embeddedHandler;
   if (handler === undefined) {
@@ -33,7 +33,7 @@ const textSpliceValidator = v.object({
   insert: v.string(),
 });
 
-export const read = embedded.replicated.query({
+export const read = replicated.query({
   args: {
     id: v.optional(v.id("documents")),
     slug: v.optional(v.string()),
@@ -44,7 +44,7 @@ export const read = embedded.replicated.query({
   handler: (ctx, args): Promise<DocumentRow[]> => delegate(documentsRead, ctx, args),
 });
 
-export const write = embedded.replicated.mutation({
+export const write = replicated.mutation({
   args: {
     id: v.optional(v.id("documents")),
     body: v.optional(v.string()),
@@ -57,7 +57,7 @@ export const write = embedded.replicated.mutation({
   handler: (ctx, args): Promise<DocumentRow> => delegate(documentsWrite, ctx, args),
 });
 
-export const del = embedded.replicated.mutation({
+export const del = replicated.mutation({
   args: { id: v.id("documents") },
   returns: v.null(),
   handler: (ctx, args): Promise<null> => delegate(documentsDel, ctx, args),
@@ -75,7 +75,7 @@ const summaryValidator = v.object({
  * fixture to exercise the engine's retained-result cache: a body edit leaves the projection
  * byte-identical and is cache-served, while a title edit rewrites it.
  */
-export const summaries = embedded.replicated.query({
+export const summaries = replicated.query({
   args: {
     limit: v.optional(v.number()),
     prefix: v.optional(v.string()),
@@ -91,6 +91,10 @@ export const summaries = embedded.replicated.query({
             .query("documents")
             .withIndex("by_title", (q) => q.gte("title", prefix).lt("title", `${prefix}\uffff`))
             .take(limit);
-    return rows.map((row) => ({ _id: row._id, title: row.title, updatedAt: row.updatedAt }));
+    return rows.map((row: { [key: string]: unknown; _id: GenericId<string> }) => ({
+      _id: row._id as GenericId<"documents">,
+      title: row.title as string,
+      updatedAt: row.updatedAt as number,
+    }));
   },
 });

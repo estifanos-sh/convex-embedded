@@ -5,7 +5,8 @@
     "allowImportingTsExtensions": true,
     "paths": {
       "@/*": ["./*"],
-      "$convex/*": ["../../convex/*"]
+      "$convex/*": ["../../convex/*"],
+      "$local/*": ["../../local/*"]
     }
   },
   "include": [
@@ -14,6 +15,7 @@
     ".expo/types/**/*.ts",
     "expo-env.d.ts",
     "../../convex/**/*.ts",
-    "../../convex/**/*.d.ts"
+    "../../convex/**/*.d.ts",
+    "../../local/**/*.ts"
   ]
 }

@@ -2,9 +2,9 @@ import { paginationOptsValidator } from "convex/server";
 import { v } from "convex/values";
 
 import { components } from "./_generated/api";
-import { embedded } from "./embedded";
+import { remote } from "./embedded";
 
-export const get = embedded.remote.query({
+export const get = remote.query({
   args: { rowId: v.id("documents"), revId: v.string() },
   returns: v.any(),
   handler: async (ctx, args) => {
@@ -18,7 +18,7 @@ export const get = embedded.remote.query({
   },
 });
 
-export const list = embedded.remote.query({
+export const list = remote.query({
   args: { rowId: v.id("documents"), cursor: v.union(v.string(), v.null()) },
   returns: v.any(),
   handler: async (ctx, args) => {
@@ -32,7 +32,7 @@ export const list = embedded.remote.query({
   },
 });
 
-export const scan = embedded.remote.query({
+export const scan = remote.query({
   args: {
     table: v.optional(v.string()),
     origin: v.optional(
@@ -52,7 +52,7 @@ export const scan = embedded.remote.query({
   handler: async (ctx, args) => await ctx.runQuery(components.embedded.rev.list, args),
 });
 
-export const remove = embedded.remote.mutation({
+export const remove = remote.mutation({
   args: { table: v.string(), rowId: v.string(), revId: v.string(), numItems: v.number() },
   returns: v.any(),
   handler: async (ctx, args) => await ctx.runMutation(components.embedded.rev.delete, args),

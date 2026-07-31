@@ -7,7 +7,7 @@ import {
   setEmbeddedIdentity,
 } from "../../src/browser/identity";
 import { WASM_API_VERSION } from "../../src/browser/artifact";
-import { EMBEDDED_STORE_FORMAT_VERSION } from "../../src/abi";
+import { EMBEDDED_EPOCH } from "../../src/abi";
 import { getTimerTime } from "../../src/time";
 import { EmbeddedClient } from "../../src/client";
 import type { EmbeddedEvent } from "../../src/events";
@@ -233,9 +233,7 @@ describe("browser deployment coordination", () => {
 
   test("runtime identity carries the local store format version", () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
-    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(
-      EMBEDDED_STORE_FORMAT_VERSION,
-    );
+    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(EMBEDDED_EPOCH);
   });
 
   test("a store format version mismatch surfaces as a runtime identity mismatch", () => {
@@ -874,7 +872,7 @@ function identity(overrides: Partial<RuntimeIdentity> = {}): RuntimeIdentity {
     protocolVersion: EMBEDDED_PROTOCOL_VERSION,
     schemaHash: "schema",
     storageId: "documents",
-    storeFormatVersion: EMBEDDED_STORE_FORMAT_VERSION,
+    storeFormatVersion: EMBEDDED_EPOCH,
     wasmAbiVersion: WASM_API_VERSION,
     ...overrides,
   };

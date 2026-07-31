@@ -113,6 +113,8 @@ export type PeerMessage =
   | {
       leaderEpoch: string;
       leaderId: string;
+      /** The leader's device-only module configuration, which a follower cannot read itself. */
+      localConfigured?: boolean;
       op: typeof PeerOp.Attached;
       protocol: typeof CoordinatorProtocol;
     }

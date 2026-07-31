@@ -104,13 +104,13 @@ describe("public package surface", () => {
     const values = require("@convex-dev/embedded/values") as Record<string, unknown>;
 
     expect(typeof schema.defineEmbeddedSchema).toBe("function");
-    expect(typeof schema.embeddedTable).toBe("function");
+    expect(typeof schema.replicatedTable).toBe("function");
     expect(typeof schema.localTable).toBe("function");
     expect(values.e).toEqual(
       expect.objectContaining({
         count: expect.any(Function),
         local: expect.any(Function),
-        omit: expect.any(Function),
+        remote: expect.any(Function),
         set: expect.any(Function),
         text: expect.any(Function),
       }),

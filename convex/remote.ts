@@ -2,10 +2,10 @@ import { type Infer, v } from "convex/values";
 
 import { components } from "./_generated/api";
 import { documentValidator } from "./documents";
-import { embedded } from "./embedded";
+import { remote } from "./embedded";
 import { revisionValidator } from "./rev";
 
-export const history = embedded.remote.query({
+export const history = remote.query({
   args: {
     id: v.id("documents"),
     cursor: v.union(v.string(), v.null()),
@@ -22,7 +22,7 @@ export const history = embedded.remote.query({
   },
 });
 
-export const revision = embedded.remote.query({
+export const revision = remote.query({
   args: { id: v.id("documents"), revId: v.string() },
   returns: v.any(),
   handler: async (ctx, args) => {
@@ -35,7 +35,7 @@ export const revision = embedded.remote.query({
   },
 });
 
-export const restore = embedded.remote.mutation({
+export const restore = remote.mutation({
   args: { id: v.id("documents"), revId: v.string() },
   returns: v.object({
     document: documentValidator,
@@ -56,7 +56,7 @@ export const restore = embedded.remote.mutation({
   },
 });
 
-export const hostedUrl = embedded.remote.query({
+export const hostedUrl = remote.query({
   args: { token: v.string() },
   returns: v.union(v.string(), v.null()),
   handler: async (ctx, args) => {
@@ -68,7 +68,7 @@ export const hostedUrl = embedded.remote.query({
   },
 });
 
-export const serve = embedded.remote.internalQuery({
+export const serve = remote.internalQuery({
   args: { token: v.string() },
   returns: v.union(
     v.object({

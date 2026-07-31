@@ -23,18 +23,18 @@ import {
   validateTextSplice,
 } from "../../src/crdt/intent";
 import { e } from "../../src/values";
-import { defineEmbeddedSchema, embeddedTable } from "../../src/schema";
+import { defineEmbeddedSchema, replicatedTable } from "../../src/schema";
 
 const schema = defineEmbeddedSchema({
-  documents: embeddedTable({
+  documents: replicatedTable({
     owner: v.string(),
-    secret: e.omit(v.optional(v.string())),
+    secret: e.remote(v.optional(v.string())),
     title: v.string(),
     body: e.text(),
   })
     .index("by_owner", ["owner"])
     .index("by_secret", ["secret"]),
-  counters: embeddedTable({
+  counters: replicatedTable({
     owner: v.string(),
     value: e.count(),
     members: e.set(v.string()),
@@ -53,7 +53,6 @@ describe("v5 server surface", () => {
   test("requires only the component and app schema", () => {
     const embedded = defineEmbedded({ component, schema });
     expect(Object.keys(embedded).sort()).toEqual([
-      "local",
       "pull",
       "push",
       "remote",

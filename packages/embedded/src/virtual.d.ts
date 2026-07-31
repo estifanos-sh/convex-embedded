@@ -1,5 +1,6 @@
 declare module "virtual:convex-embedded" {
   export const modules: import("./runtime/runner").ModuleMap;
+  export const localModules: Record<string, () => Promise<unknown>>;
   export const embeddedManifest: import("./bundler").EmbeddedFunctionManifest;
   export const embeddedSchema: import("./bundler").EmbeddedGeneratedSchema;
 }

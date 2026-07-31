@@ -1,4 +1,4 @@
-name: Preview package
+name: CI
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
@@ -6,27 +6,87 @@ concurrency:
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
     tags-ignore: ["**"]
   pull_request:
     branches: ["**"]
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
 
+env:
+  # Every Rust entrypoint routes through config/build.ts, which defaults the target directory to
+  # the OS temp dir. Pin it inside the workspace so Swatinem/rust-cache actually caches the
+  # compiled artifacts instead of an empty directory.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_TERM_COLOR: always
+
 jobs:
-  verify:
-    name: Verify package
+  changes:
+    name: Changes
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
+
+    outputs:
+      mobile: ${{ steps.filter.outputs.mobile }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      # An unresolved filter leaves the output empty, which the mobile jobs read as "no native
+      # change". Pushes to main and manual runs build the mobile smoke slices regardless.
+      - name: Filter native paths
+        id: filter
+        continue-on-error: true
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          filters: |
+            mobile:
+              - '.cargo/**'
+              - '.github/workflows/**'
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'config/**'
+              - 'crates/**'
+              - 'demos/expo/app.json'
+              - 'demos/expo/eas.json'
+              - 'demos/expo/scripts/native.ts'
+              - 'packages/embedded/ConvexEmbeddedNative.podspec'
+              - 'packages/embedded/android/**'
+              - 'packages/embedded/expo-module.config.json'
+              - 'packages/embedded/ios/**'
+              - 'packages/embedded/native/**'
+              - 'packages/embedded/package.json'
+              - 'packages/embedded/scripts/mobile*.ts'
+              - 'packages/embedded/scripts/native.ts'
+              - 'rust-toolchain.toml'
+              - 'vendor/**'
+
+  verify:
+    name: Build and test
+    runs-on: large-runner
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Enable pnpm
         run: |
@@ -47,6 +107,16 @@ jobs:
 
       - name: Build embedded TypeScript
         run: vp run @convex-dev/embedded#build:ts
+
+      # The preview job packs this exact tree instead of rebuilding it, so upload before the
+      # native addon step writes the host-only dist/native artifact into the same directory.
+      - name: Upload the TypeScript bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: embedded-dist
+          path: packages/embedded/dist
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Typecheck Expo demo
         run: vp run @convex-dev/embedded-demo-expo#typecheck
@@ -78,11 +148,10 @@ jobs:
           vp run @convex-dev/embedded#test:surface
           vp run @convex-dev/embedded#test:runtime
 
-  mobile-apple:
-    name: Build Apple mobile artifact
-    runs-on: macos-15
-    timeout-minutes: 45
-    continue-on-error: true
+  wasm:
+    name: Build wasm
+    runs-on: large-runner
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -90,88 +159,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Node setup
-        uses: actions/setup-node@v6
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          node-version: 24
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.5.2 --activate
-
-      - name: Prepare Rust and build the XCFramework through the Expo hook
-        run: EAS_BUILD_PLATFORM=ios node demos/expo/scripts/native.ts eas
-
-      - name: Compile Expo Apple autolinking smoke app
-        run: node packages/embedded/scripts/mobilecompile.ts ios
-
-      - name: Upload XCFramework
-        uses: actions/upload-artifact@v4
-        with:
-          name: embedded-mobile-apple
-          path: packages/embedded/native/apple
-          if-no-files-found: error
-
-  mobile-android:
-    name: Build Android mobile artifacts
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    continue-on-error: true
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-
-      - name: Node setup
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.5.2 --activate
-
-      - name: Prepare Rust and build Android libraries through the Expo hook
-        run: EAS_BUILD_PLATFORM=android node demos/expo/scripts/native.ts eas
-
-      - name: Compile Expo Android autolinking smoke app
-        run: node packages/embedded/scripts/mobilecompile.ts android
-
-      - name: Upload Android libraries
-        uses: actions/upload-artifact@v4
-        with:
-          name: embedded-mobile-android
-          path: packages/embedded/native/android
-          if-no-files-found: error
-
-  preview:
-    name: Publish preview
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    needs: [mobile-apple, mobile-android]
-    continue-on-error: true
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          persist-credentials: false
-
-      - name: Download Apple mobile artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: embedded-mobile-apple
-          path: packages/embedded/native/apple
-
-      - name: Download Android mobile artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: embedded-mobile-android
-          path: packages/embedded/native/android
+          shared-key: wasm
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Enable pnpm
         run: |
@@ -190,8 +184,194 @@ jobs:
       - name: Expose local binaries
         run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
 
-      - name: Build embedded TypeScript
-        run: vp run @convex-dev/embedded#build:ts
+      - name: Build the WASM runtime
+        run: vp run @convex-dev/embedded#wasm
+
+      - name: Upload the WASM runtime
+        uses: actions/upload-artifact@v7
+        with:
+          name: embedded-wasm
+          path: packages/embedded/dist/wasm
+          if-no-files-found: error
+          retention-days: 1
+
+  # Per-push this job is a compile smoke, not a release build: it produces the single Apple slice
+  # the smoke app below links against. Release Native builds the full triple set.
+  mobile-apple:
+    name: Build iOS
+    runs-on: macos-15
+    timeout-minutes: 45
+    continue-on-error: true
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.outputs.mobile == 'true'
+      || github.event_name != 'pull_request')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Node setup
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      # The smoke app compiles with `-sdk iphoneos`, so the device triple is the only slice it
+      # consumes. Dropping the simulator triple halves this job's Rust builds.
+      - name: Prepare Rust and build the device XCFramework slice through the Expo hook
+        env:
+          CONVEX_EMBEDDED_MOBILE_SLICES: aarch64-apple-ios
+          EAS_BUILD_PLATFORM: ios
+        run: node demos/expo/scripts/native.ts eas
+
+      - name: Compile Expo Apple autolinking smoke app
+        run: node packages/embedded/scripts/mobilecompile.ts ios
+
+      - name: Upload the device XCFramework slice
+        uses: actions/upload-artifact@v7
+        with:
+          name: embedded-mobile-apple-smoke
+          path: packages/embedded/native/apple
+          if-no-files-found: error
+          retention-days: 7
+
+  # Per-push this job is a compile smoke, not a release build: it produces the single ABI the
+  # smoke app below packages. Release Native builds the full ABI set.
+  mobile-android:
+    name: Build Android
+    runs-on: large-runner
+    timeout-minutes: 45
+    continue-on-error: true
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.outputs.mobile == 'true'
+      || github.event_name != 'pull_request')
+
+    # `assembleDebug` packages whatever ABI directories exist and never runs the result, so the
+    # shipping ABI alone proves the JNI surface links. Four ABIs would be four Rust builds. Both
+    # the Rust build and the smoke app's Gradle invocation read this, so React Native's own
+    # libraries and the Convex library are packaged for the same ABI by construction.
+    env:
+      CONVEX_EMBEDDED_MOBILE_SLICES: arm64-v8a
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The large-runner pool images default to JDK 11, which Expo 54 and AGP reject.
+      - name: Java setup
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Gradle setup
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      # The smoke app is generated into a fresh temp directory on every run, so task output reuse
+      # has to come from the build cache in the shared Gradle user home that setup-gradle caches.
+      - name: Enable the Gradle build cache
+        run: |
+          mkdir -p "$HOME/.gradle"
+          echo "org.gradle.caching=true" >> "$HOME/.gradle/gradle.properties"
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Node setup
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Prepare Rust and build the arm64-v8a library through the Expo hook
+        env:
+          EAS_BUILD_PLATFORM: android
+        run: node demos/expo/scripts/native.ts eas
+
+      - name: Compile Expo Android autolinking smoke app
+        run: node packages/embedded/scripts/mobilecompile.ts android
+
+      - name: Upload the arm64-v8a library
+        uses: actions/upload-artifact@v7
+        with:
+          name: embedded-mobile-android-smoke
+          path: packages/embedded/native/android
+          if-no-files-found: error
+          retention-days: 7
+
+  preview:
+    name: Publish preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    needs: [verify, wasm]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Node setup
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Expose local binaries
+        run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Download the TypeScript bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: embedded-dist
+          path: packages/embedded/dist
+
+      - name: Download the WASM runtime
+        uses: actions/download-artifact@v8
+        with:
+          name: embedded-wasm
+          path: packages/embedded/dist/wasm
+
+      - name: Strip lifecycle scripts from the preview package
+        run: node -e "const fs=require('fs');const p='packages/embedded/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));delete j.scripts.prepack;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
 
       - name: Publish preview package
         run: >

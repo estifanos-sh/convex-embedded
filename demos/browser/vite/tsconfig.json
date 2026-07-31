@@ -20,9 +20,10 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
 
-    /* Path aliases — points at the workspace-root `convex/` folder shared by all demos. */
+    /* Path aliases — point at the workspace-root folders shared by all demos. */
     "paths": {
-      "~convex/*": ["../../../convex/*"]
+      "~convex/*": ["../../../convex/*"],
+      "~local/*": ["../../../local/*"]
     }
   },
   "include": ["src", "vite.config.ts"]
