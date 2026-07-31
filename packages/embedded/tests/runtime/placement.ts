@@ -22,6 +22,7 @@ import { nativeModule } from "../testkit/native";
 import { temporaryPath } from "../testkit/runtime";
 
 const schema: StoreSchema = {
+  hash: "0".repeat(64),
   tables: [
     {
       name: "documents",
@@ -246,6 +247,73 @@ describe("device-only function modules", () => {
     await expect(runner.route("local/sync/missing:read", {}, "query")).rejects.toThrow(
       "local/sync/missing:read is not registered under the configured local directories.",
     );
+  });
+
+  test("serializes identity switches behind local mutation commits", async () => {
+    for (const source of ["local", "remote"] as const) {
+      const documentId = "documents|00000000000040008000000000000001";
+      let mutationStarted!: () => void;
+      let releaseMutation!: () => void;
+      const started = new Promise<void>((resolve) => {
+        mutationStarted = resolve;
+      });
+      const release = new Promise<void>((resolve) => {
+        releaseMutation = resolve;
+      });
+      const module = {
+        clearExpanded: device.mutation({
+          args: { documentId: v.id("documents") },
+          handler: async (ctx, args) => {
+            await ctx.db.patch("documents", args.documentId, { expanded: undefined });
+            mutationStarted();
+            await release;
+          },
+        }),
+      };
+      const base = fakeStore();
+      let identityKey = "identity-a";
+      const order: string[] = [];
+      const writeIdentity = async () => {
+        order.push(`identity:${source}:identity-b`);
+        identityKey = "identity-b";
+      };
+      const store = {
+        ...base,
+        commit: async (batch: Parameters<RuntimeStorageWriter["commit"]>[0]) => {
+          order.push(`commit:${identityKey}:${batch.localFieldDeletes?.length ?? 0}`);
+          return { changedTables: [], changes: [], commitSeq: 1 };
+        },
+        identity: {
+          read: async () => ({ identity: null, identityKey }),
+          write: writeIdentity,
+        },
+        remote: {
+          close: async () => undefined,
+          identity: async () => {
+            await writeIdentity();
+            return { identity: null, identityKey, protocolVersion: 1 };
+          },
+          start: async () => undefined,
+        },
+      } as RuntimeStorageWriter;
+      const runner = createRunner({}, store, deviceStoreSchema, {
+        localModules: { "local/identity": () => Promise.resolve(module) },
+      });
+      await runner.localReady;
+
+      const mutation = runner.runMutation(module.clearExpanded, { documentId });
+      await started;
+      const switched =
+        source === "local"
+          ? runner.identity.write("identity-b")
+          : runner.remote!.identity.read().then(() => undefined);
+      await Promise.resolve();
+      expect(order).toEqual([]);
+
+      releaseMutation();
+      await Promise.all([mutation, switched]);
+      expect(order).toEqual(["commit:identity-a:1", `identity:${source}:identity-b`]);
+    }
   });
 
   test("separates an unconfigured local directory from an unregistered name", async () => {

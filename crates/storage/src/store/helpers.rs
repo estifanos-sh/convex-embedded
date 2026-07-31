@@ -106,56 +106,7 @@ pub(crate) fn commit_seq_key(path_key: &str, identity_key: &str) -> String {
 }
 
 pub(crate) fn schema_signature(schema: &StoreSchema) -> String {
-    let mut hash = Sha256::new();
-    let mut tables: Vec<&TableDef> = schema.tables.iter().collect();
-    tables.sort_by(|a, b| a.name.cmp(&b.name));
-    for table in tables {
-        hash.update(b"t\0");
-        hash.update(table.name.as_bytes());
-        hash.update(b"\0p\0");
-        hash.update(match table.placement {
-            crate::types::TablePlacement::Replicated => b"replicated".as_slice(),
-            crate::types::TablePlacement::Device => b"device".as_slice(),
-        });
-        let mut columns = table.columns.iter().collect::<Vec<_>>();
-        columns.sort_by(|a, b| a.name.cmp(&b.name));
-        for column in columns {
-            hash.update(b"\0c\0");
-            hash.update(column.name.as_bytes());
-            hash.update(b"\0");
-            hash.update(column.field.as_deref().unwrap_or("").as_bytes());
-        }
-        let mut crdt_fields = table.crdt_fields.iter().collect::<Vec<_>>();
-        crdt_fields.sort_by(|a, b| a.field.cmp(&b.field));
-        for field in crdt_fields {
-            hash.update(b"\0r\0");
-            hash.update(field.field.as_bytes());
-            hash.update(b"\0");
-            hash.update(match field.kind {
-                crate::types::CrdtFieldKind::Count => b"count".as_slice(),
-                crate::types::CrdtFieldKind::Set => b"set".as_slice(),
-                crate::types::CrdtFieldKind::Text => b"text".as_slice(),
-            });
-        }
-        let mut local_fields = table.local_fields.iter().collect::<Vec<_>>();
-        local_fields.sort_by(|a, b| a.field.cmp(&b.field));
-        for field in local_fields {
-            hash.update(b"\0l\0");
-            hash.update(field.field.as_bytes());
-        }
-        let mut indexes = table.indexes.iter().collect::<Vec<_>>();
-        indexes.sort_by(|a, b| a.name.cmp(&b.name));
-        for index in indexes {
-            hash.update(b"\0i\0");
-            hash.update(index.name.as_bytes());
-            for field in index.columns.as_ref().unwrap_or(&index.fields) {
-                hash.update(b"\0f\0");
-                hash.update(field.as_bytes());
-            }
-        }
-        hash.update(b"\0");
-    }
-    format!("sha256:{}", hex(&hash.finalize()))
+    schema.hash.clone()
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -633,15 +584,12 @@ pub(crate) fn row_to_dirty_head(row: &Row) -> Result<DirtyHead, StorageError> {
     let table = text_at(row, 0)?;
     let document_id = text_at(row, 1)?;
     let op_text = text_at(row, 2)?;
-    let op = match RowChangeOp::parse(&op_text) {
-        Some(op) => op,
-        None => {
-            return Err(StorageError::Decode {
-                expected: "dirty head operation",
-                index: 2,
-                got: op_text,
-            });
-        }
+    let Some(op) = RowChangeOp::parse(&op_text) else {
+        return Err(StorageError::Decode {
+            expected: "dirty head operation",
+            index: 2,
+            got: op_text,
+        });
     };
     Ok(DirtyHead {
         row: RowKey {

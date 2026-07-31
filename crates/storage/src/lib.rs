@@ -57,17 +57,20 @@ pub use types::{
     CrdtRemoteEffect, CrdtRemoteState, CrdtRemoteWrite, CrdtRestore, CrdtSnapshot, CrdtWireOp,
     DeleteIn, DeleteResult, DirtyHeadDebug, DirtyHeadToken, DocWrite, FileMetadata, FileStore,
     IdMapping, IdMappingContent, IndexDef, InsertRef, LocalFieldDef, LocalFieldDelete,
-    LocalFieldWrite, MembershipRange, MutationCall, MutationRecord, MutationStatus, Order, Page,
-    PendingUpload, PushEnvelope, PushOutcome, PushResponse, RangeVersion, ReadBound, ReadEquality,
-    ReadSpec, RemoteBlob, RemoteCrdtChange, RemoteIdMapping, RemoteMember,
-    RemotePageWrite, RemotePageWriteResult, RemotePending, RemoteRowTarget, RemoteScheduleMapping,
+    LocalFieldWrite, MembershipRange, MigrationCandidate, MigrationDefinition,
+    MigrationDisposition, MigrationProgress, MigrationRecordTarget, MutationCall, MutationRecord,
+    MutationStatus, Order, OriginCursor, OriginKind, OriginPage, OriginRecord, Page, PendingUpload,
+    PushEnvelope, PushOutcome, PushResponse, RangeVersion, ReadBound, ReadEquality, ReadSpec,
+    RemoteBlob, RemoteCrdtChange, RemoteIdMapping, RemoteMember, RemotePageWrite,
+    RemotePageWriteResult, RemotePending, RemoteRowTarget, RemoteScheduleMapping,
     RemoteSettlementOutcome, RemoteSettlementWrite, RemoteSettlementWriteResult, ResultEntry,
     RetainedRevision, RevFrontier, RevKey, RevLifecycle, RevState, RevWriteResult,
     RevisionCandidate, RevisionCheckpoint, RevisionCheckpointOperation, RevisionContent, RowChange,
     RowChangeOp, RowHead, RowKey, RuntimeWireIdentity, ScheduleRef, ScheduledFunctionKind,
     ScheduledJob, ScheduledState, SettledCrdt, SettledInsert, SettledRevision, SettledSchedule,
-    SettledUpload, StoreSchema, TableDef, TablePlacement, UploadLease, UploadLeaseWrite, UploadRef,
-    WriteBatch,
+    SettledUpload, StoreContract, StoreSchema, TableDef, TablePlacement, UploadLease,
+    UploadLeaseWrite, UploadRef, WriteBatch,
 };
+pub use types::{ORIGIN_FLAG_DISCARDED, ORIGIN_FLAG_QUARANTINED};
 
 pub use crdt::crdt_checkpoint_response;

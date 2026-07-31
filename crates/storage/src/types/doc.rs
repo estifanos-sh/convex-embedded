@@ -155,6 +155,14 @@ pub enum CrdtFieldKind {
 /// The full schema handed to `setup`. Mirrors the TS `StoreSchema`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct StoreSchema {
+    /// Canonical SHA-256 over the complete application schema, including validators.
+    pub hash: String,
+    /// Ordered, append-only device migration definitions bundled with the application.
+    #[serde(default)]
+    pub migrations: Vec<super::MigrationDefinition>,
+    /// Hash of the current migration handlers. Candidate-only; not released history.
+    #[serde(default)]
+    pub migration_code_hash: String,
     pub tables: Vec<TableDef>,
 }
 
@@ -176,7 +184,7 @@ pub struct Page {
         std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
-/// An doc_write: the document plus its extracted column values. Mirrors the TS `DocWrite`.
+/// A `doc_write`: the document plus its extracted column values. Mirrors the TS `DocWrite`.
 ///
 /// `data` is always compact JSON object text (the `encode()` output of the runtime): it starts
 /// with `{`, carries no `_id`/`_creationTime` keys, and has no insignificant whitespace. The
@@ -197,7 +205,7 @@ pub struct DeleteIn {
     pub id: String,
 }
 
-/// A batch of doc_writes and deletes applied in one transaction. Mirrors the TS `WriteBatch`.
+/// A batch of `doc_writes` and deletes applied in one transaction. Mirrors the TS `WriteBatch`.
 #[derive(Debug, Clone, Default)]
 pub struct WriteBatch {
     pub doc_writes: Vec<DocWrite>,
@@ -269,7 +277,7 @@ pub struct RowChange {
     pub op: RowChangeOp,
     pub table: String,
     pub id: String,
-    /// Materialized document JSON for doc_writes; absent for deletes.
+    /// Materialized document JSON for `doc_writes`; absent for deletes.
     pub row: Option<String>,
 }
 

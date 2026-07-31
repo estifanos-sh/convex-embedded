@@ -77,6 +77,7 @@ pub fn blob_args(
     )])
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn mutation_args(
     envelope: &PushEnvelope,
     client_id: &str,

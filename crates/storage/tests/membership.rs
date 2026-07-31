@@ -111,6 +111,9 @@ fn rows(store: &EmbeddedStore) -> Vec<serde_json::Value> {
 
 fn crdt_schema() -> StoreSchema {
     StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "issues".into(),
             placement: TablePlacement::Replicated,

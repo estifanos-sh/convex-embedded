@@ -40,6 +40,9 @@ pub fn tmp_path(name: &str) -> PathBuf {
 /// `issues` with a `by_status` index, plus a column-less `t`.
 pub fn schema() -> StoreSchema {
     StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![
             TableDef {
                 name: "issues".into(),
@@ -71,6 +74,9 @@ pub fn schema() -> StoreSchema {
 /// A single `flags` table with a boolean `active` column/index.
 pub fn bool_schema() -> StoreSchema {
     StoreSchema {
+        hash: "1".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "flags".into(),
             placement: TablePlacement::Replicated,
@@ -92,6 +98,9 @@ pub fn bool_schema() -> StoreSchema {
 /// A `users` table whose index columns are aliased to Convex field paths.
 pub fn alias_schema() -> StoreSchema {
     StoreSchema {
+        hash: "2".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "users".into(),
             placement: TablePlacement::Replicated,
@@ -150,6 +159,9 @@ pub fn sql_table() -> TableDef {
 /// A single `vals` table with one indexed `v` column — for total-order/key tests.
 pub fn vals_schema() -> StoreSchema {
     StoreSchema {
+        hash: "3".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "vals".into(),
             placement: TablePlacement::Replicated,
@@ -194,7 +206,7 @@ pub fn commit(store: &EmbeddedStore, batch: WriteBatch) -> CommitResult {
     store.commit(batch, &CommitOptions::default()).unwrap()
 }
 
-/// A `users` doc_write carrying a profile email.
+/// A `users` `doc_write` carrying a profile email.
 pub fn user(store: &EmbeddedStore, id: &str, email: &str) -> DocWrite {
     DocWrite {
         table: "users".into(),
@@ -205,7 +217,7 @@ pub fn user(store: &EmbeddedStore, id: &str, email: &str) -> DocWrite {
     }
 }
 
-/// A `users` doc_write with no email column.
+/// A `users` `doc_write` with no email column.
 pub fn user_without_email(store: &EmbeddedStore, id: &str) -> DocWrite {
     DocWrite {
         table: "users".into(),
@@ -216,7 +228,7 @@ pub fn user_without_email(store: &EmbeddedStore, id: &str) -> DocWrite {
     }
 }
 
-/// An `issues` doc_write with a fresh monotonic creation time.
+/// An `issues` `doc_write` with a fresh monotonic creation time.
 pub fn issue(store: &EmbeddedStore, id: &str, title: &str, status: &str) -> DocWrite {
     DocWrite {
         table: "issues".into(),
@@ -227,7 +239,7 @@ pub fn issue(store: &EmbeddedStore, id: &str, title: &str, status: &str) -> DocW
     }
 }
 
-/// A `flags` doc_write with the given boolean column value.
+/// A `flags` `doc_write` with the given boolean column value.
 pub fn flag(store: &EmbeddedStore, id: &str, active: ColValue) -> DocWrite {
     DocWrite {
         table: "flags".into(),
@@ -238,7 +250,7 @@ pub fn flag(store: &EmbeddedStore, id: &str, active: ColValue) -> DocWrite {
     }
 }
 
-/// A write batch of doc_writes only.
+/// A write batch of `doc_writes` only.
 pub fn doc_writes(rows: Vec<DocWrite>) -> WriteBatch {
     WriteBatch {
         doc_writes: rows,
@@ -338,6 +350,10 @@ pub fn read_deleted_id_mappings_sql() -> &'static str {
 
 pub fn read_doc_sql(table: &str) -> String {
     crate::sql::read_doc(table)
+}
+
+pub fn generation_sql(sql: &str) -> String {
+    crate::sql::generation_sql(sql, 1).into_owned()
 }
 
 /// Point-read SQL on the internal tables that share the composite-PK mis-planning hazard, exposed so

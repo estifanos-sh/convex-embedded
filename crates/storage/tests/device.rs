@@ -23,6 +23,9 @@ fn schema() -> StoreSchema {
         field: "expanded".into(),
     }];
     StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![
             issues,
             TableDef {
@@ -153,8 +156,31 @@ fn removing_a_local_field_from_schema_clears_every_overlay_partition() {
         .unwrap();
 
     let mut next = schema();
+    next.hash = "1".repeat(64);
     next.tables[0].local_fields.clear();
-    store.setup(&next).unwrap();
+    let candidate = store.migration_begin(&next).unwrap();
+    for record in store
+        .origin_page_read(candidate.candidate_generation, None, 100)
+        .unwrap()
+        .records
+        .into_iter()
+        .filter(|record| record.kind == 3)
+    {
+        store
+            .migration_record_disposition_write(
+                candidate.candidate_generation,
+                &record.identity_key,
+                record.kind,
+                &record.record_key,
+                "__finalize__",
+                "unclaimed",
+                false,
+            )
+            .unwrap();
+    }
+    store
+        .migration_commit(&next, candidate.candidate_generation)
+        .unwrap();
     assert!(store.local_fields_read("issues", "i1").unwrap().is_empty());
     store.identity_write("", Some("null")).unwrap();
     assert!(store.local_fields_read("issues", "i1").unwrap().is_empty());
@@ -325,6 +351,7 @@ fn setup_rejects_table_placement_changes_in_place() {
 
     let mut flipped = current.clone();
     flipped.tables[1].placement = TablePlacement::Replicated;
+    flipped.hash = "1".repeat(64);
     assert!(store.setup(&flipped).is_err());
 
     let path = tmp_path("device_table_flip_reverse.db");
@@ -333,6 +360,7 @@ fn setup_rejects_table_placement_changes_in_place() {
     replicated.tables[1].placement = TablePlacement::Replicated;
     store.setup(&replicated).unwrap();
     replicated.tables[1].placement = TablePlacement::Device;
+    replicated.hash = "1".repeat(64);
     replicated.tables[1].columns = vec![ColumnDef {
         name: "new_column".into(),
         field: None,
@@ -457,7 +485,7 @@ fn pull_id_adoption_rekeys_the_overlay_in_the_same_transaction() {
 }
 
 #[test]
-fn adding_a_device_field_preserves_an_existing_store() {
+fn adding_a_device_field_uses_a_new_generation() {
     let path = tmp_path("device_additive_field.db");
     let p = path.to_str().unwrap();
     {
@@ -474,11 +502,18 @@ fn adding_a_device_field_preserves_an_existing_store() {
     }
 
     let store = EmbeddedStore::open(p).expect("an existing store reopens");
+    let mut after = schema();
+    after.hash = "1".repeat(64);
+    assert!(matches!(
+        store.setup(&after),
+        Err(storage::StorageError::IncompatibleStore(_))
+    ));
+    let candidate = store.migration_begin(&after).unwrap();
     store
-        .setup(&schema())
-        .expect("adding a device-only field is an additive transition");
+        .migration_commit(&after, candidate.candidate_generation)
+        .unwrap();
 
-    assert!(store.doc_read("issues", "i1").unwrap().is_some());
+    assert!(store.doc_read("issues", "i1").unwrap().is_none());
     store
         .commit(
             WriteBatch {
@@ -517,11 +552,9 @@ fn converting_an_indexed_field_to_device_only_preserves_the_store() {
     after.tables[0].local_fields = vec![LocalFieldDef {
         field: field.clone(),
     }];
+    after.hash = "1".repeat(64);
     let error = store
         .setup(&after)
         .expect_err("an indexed field cannot become device-only in place");
-    assert!(
-        error.to_string().contains(&format!("issues.{field}")),
-        "{error}"
-    );
+    assert!(error.to_string().contains("migration runner"), "{error}");
 }

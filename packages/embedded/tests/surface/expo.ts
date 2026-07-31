@@ -72,6 +72,16 @@ describe("Expo package surface", () => {
 
     const expected = new Set([
       "setup",
+      "migrationBegin",
+      "originPageRead",
+      "migrationStepBegin",
+      "migrationRecordWrite",
+      "migrationRecordDelete",
+      "migrationRecordDispositionWrite",
+      "migrationPageWrite",
+      "migrationStepComplete",
+      "migrationCommit",
+      "migrationRetire",
       "identityRead",
       "identityWrite",
       "mutationWrite",

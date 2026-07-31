@@ -24,6 +24,46 @@ export class ExpoStoreBinding implements StoreBinding {
   constructor(private readonly native: NativeStoreObject) {}
 
   setup: StoreBinding["setup"] = (schema) => this.invoke("setup", [schema]);
+  migrationBegin: StoreBinding["migrationBegin"] = (schema) =>
+    this.invoke("migrationBegin", [schema]);
+  originPageRead: StoreBinding["originPageRead"] = (generation, cursorJson, pageSize, upperJson) =>
+    this.invoke("originPageRead", [generation, cursorJson, pageSize, upperJson]);
+  migrationStepBegin: StoreBinding["migrationStepBegin"] = (generation, migrationId) =>
+    this.invoke("migrationStepBegin", [generation, migrationId]);
+  migrationRecordWrite: StoreBinding["migrationRecordWrite"] = (generation, recordJson) =>
+    this.invoke("migrationRecordWrite", [generation, recordJson]);
+  migrationRecordDelete: StoreBinding["migrationRecordDelete"] = (
+    generation,
+    identityKey,
+    kind,
+    recordKey,
+  ) => this.invoke("migrationRecordDelete", [generation, identityKey, kind, recordKey]);
+  migrationRecordDispositionWrite: StoreBinding["migrationRecordDispositionWrite"] = (
+    generation,
+    identityKey,
+    kind,
+    recordKey,
+    migrationId,
+    reason,
+    discard,
+  ) =>
+    this.invoke("migrationRecordDispositionWrite", [
+      generation,
+      identityKey,
+      kind,
+      recordKey,
+      migrationId,
+      reason,
+      discard,
+    ]);
+  migrationPageWrite: StoreBinding["migrationPageWrite"] = (generation, migrationId, pageJson) =>
+    this.invoke("migrationPageWrite", [generation, migrationId, pageJson]);
+  migrationStepComplete: StoreBinding["migrationStepComplete"] = (generation, appliedMigrations) =>
+    this.invoke("migrationStepComplete", [generation, appliedMigrations]);
+  migrationCommit: StoreBinding["migrationCommit"] = (schema, generation) =>
+    this.invoke("migrationCommit", [schema, generation]);
+  migrationRetire: StoreBinding["migrationRetire"] = (generation) =>
+    this.invoke("migrationRetire", [generation]);
   identityRead: NonNullable<StoreBinding["identityRead"]> = () => this.invoke("identityRead", []);
   identityWrite: NonNullable<StoreBinding["identityWrite"]> = (identityKey, identityJson) =>
     this.invoke("identityWrite", [identityKey, identityJson]);

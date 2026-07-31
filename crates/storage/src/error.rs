@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -38,6 +40,9 @@ pub enum StorageError {
 
     #[error("system clock is before the unix epoch")]
     Clock,
+
+    #[error("storage owner lease: {0}")]
+    Owner(#[from] std::io::Error),
 }
 
 impl StorageError {
@@ -50,6 +55,10 @@ impl StorageError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::IoStep { source, .. } | Self::Turso(source) => is_transient_turso(source),
+            Self::Owner(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ),
             Self::Clock
             | Self::Decode { .. }
             | Self::IncompatibleStore(_)
@@ -58,21 +67,6 @@ impl StorageError {
             | Self::ReservedColumn(_)
             | Self::Unsatisfiable(_) => false,
         }
-    }
-
-    /// True when the physical bytes on disk are not a readable current-format store: the header is
-    /// corrupt or the file is not a database at all. This is a *format* incompatibility (e.g. a store
-    /// written by a prior turso release), not same-format corruption of an already-openable store, so
-    /// the opener resets it rather than failing closed (V5 "Local Store Evolution").
-    pub(crate) fn is_unreadable_store(&self) -> bool {
-        matches!(
-            self,
-            Self::Turso(error)
-                if matches!(
-                    error.as_ref(),
-                    turso_core::LimboError::Corrupt(_) | turso_core::LimboError::NotADB
-                )
-        )
     }
 }
 

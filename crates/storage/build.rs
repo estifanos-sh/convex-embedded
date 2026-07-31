@@ -13,6 +13,9 @@ fn main() {
         .and_then(|tail| tail.trim().trim_end_matches('}').trim().parse().ok())
         .unwrap_or_else(|| panic!("{} must contain an integer epoch", source.display()));
     let out = Path::new(&env::var("OUT_DIR").expect("OUT_DIR")).join("epoch.rs");
-    fs::write(out, format!("pub(crate) const EMBEDDED_EPOCH: i64 = {epoch};\n"))
-        .expect("could not write the generated epoch constant");
+    fs::write(
+        out,
+        format!("pub(crate) const EMBEDDED_EPOCH: i64 = {epoch};\n"),
+    )
+    .expect("could not write the generated epoch constant");
 }

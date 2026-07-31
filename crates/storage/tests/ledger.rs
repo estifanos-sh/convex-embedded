@@ -91,27 +91,27 @@ fn ledger_delete_uses_the_public_consumer_watermark() {
 #[test]
 fn remote_cursor_round_trips_and_clears_by_identity() {
     let path = tmp_path("rs_remote_cursor.db");
-    let store_a = EmbeddedStore::open_with_identity_key(path.to_str().unwrap(), "a").unwrap();
-    store_a.setup(&schema()).unwrap();
-    let store_b = EmbeddedStore::open_with_identity_key(path.to_str().unwrap(), "b").unwrap();
-    store_b.setup(&schema()).unwrap();
+    let store = EmbeddedStore::open_with_identity_key(path.to_str().unwrap(), "a").unwrap();
+    store.setup(&schema()).unwrap();
 
-    assert_eq!(store_a.remote_cursor_read("issues:list").unwrap(), None);
-    assert!(!store_a.remote_progress_has().unwrap());
-    store_a
+    assert_eq!(store.remote_cursor_read("issues:list").unwrap(), None);
+    assert!(!store.remote_progress_has().unwrap());
+    store
         .remote_cursor_write("issues:list", Some("c:1:1".into()), 100)
         .unwrap();
     assert_eq!(
-        store_a.remote_cursor_read("issues:list").unwrap(),
+        store.remote_cursor_read("issues:list").unwrap(),
         Some("c:1:1".into())
     );
-    assert!(store_a.remote_progress_has().unwrap());
-    assert_eq!(store_b.remote_cursor_read("issues:list").unwrap(), None);
-    assert!(!store_b.remote_progress_has().unwrap());
+    assert!(store.remote_progress_has().unwrap());
+    store.identity_write("b", None).unwrap();
+    assert_eq!(store.remote_cursor_read("issues:list").unwrap(), None);
+    assert!(!store.remote_progress_has().unwrap());
 
-    store_a.clear().unwrap();
-    assert_eq!(store_a.remote_cursor_read("issues:list").unwrap(), None);
-    assert!(!store_a.remote_progress_has().unwrap());
+    store.identity_write("a", None).unwrap();
+    store.clear().unwrap();
+    assert_eq!(store.remote_cursor_read("issues:list").unwrap(), None);
+    assert!(!store.remote_progress_has().unwrap());
 }
 
 #[test]

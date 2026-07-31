@@ -41,6 +41,7 @@ export type {
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,
+  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,

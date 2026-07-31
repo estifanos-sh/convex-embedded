@@ -83,20 +83,6 @@ interface InspectRequest {
   storageId: string;
 }
 
-interface CorruptResetRequest {
-  op: "corruptReset";
-  storageId: string;
-}
-
-interface CorruptResetResult {
-  resetStart: boolean;
-  resetDone: boolean;
-  resetErrorMessage: string;
-  rowsBefore: number;
-  rowsAfter: number;
-  phases: string[];
-}
-
 type BootPhaseTimings = Record<string, number>;
 
 interface BootResult {
@@ -125,7 +111,6 @@ self.onmessage = (
     | ReleaseRequest
     | DamageRequest
     | InspectRequest
-    | CorruptResetRequest
   >,
 ) => {
   const request = event.data;
@@ -142,15 +127,13 @@ self.onmessage = (
         ? damage(request)
         : request.op === "inspect"
           ? inspect(request)
-          : request.op === "corruptReset"
-            ? corruptReset(request)
-            : request.op === "boot"
-              ? boot(request)
-              : request.op === "hold"
-                ? hold(request)
-                : request.op === "woundStage"
-                  ? woundStage(request)
-                  : wound(request);
+          : request.op === "boot"
+            ? boot(request)
+            : request.op === "hold"
+              ? hold(request)
+              : request.op === "woundStage"
+                ? woundStage(request)
+                : wound(request);
   void handler
     .then((result) => self.postMessage({ ok: true, result }))
     .catch((error: unknown) =>
@@ -192,65 +175,6 @@ async function inspect(request: InspectRequest): Promise<{ bytes: number[] }> {
   } finally {
     opfs.closeAll();
   }
-}
-
-async function plantCorruptHeader(path: string): Promise<void> {
-  const opfs = new OpfsDirectory();
-  try {
-    await registerTursoFiles(opfs, path);
-    const handle = opfs.getFileHandle(path);
-    if (handle === null) throw new Error("corrupt header handle was not registered");
-    const header = new Uint8Array(512);
-    header.set(new TextEncoder().encode("SQLite format 3\0"), 0);
-    opfs.truncate(handle, 0);
-    opfs.write(handle, header, 0);
-    opfs.sync(handle);
-  } finally {
-    opfs.closeAll();
-  }
-}
-
-async function corruptReset(request: CorruptResetRequest): Promise<CorruptResetResult> {
-  const { modules, storeSchema, wasm } = await loadModules();
-  const path = storagePath(request.storageId);
-  await plantCorruptHeader(path);
-
-  const phases: string[] = [];
-  let resetErrorMessage = "";
-  const state = await initRuntime({
-    modules,
-    onDebug: (phase: string, detail?: unknown) => {
-      phases.push(phase);
-      if (phase === "worker:store:reset:start" && detail !== null && typeof detail === "object") {
-        const message = (detail as { message?: unknown }).message;
-        if (typeof message === "string") resetErrorMessage = message;
-      }
-    },
-    setupSchema: storeSchema,
-    storagePath: path,
-    storeSchema,
-    wasm,
-  });
-
-  let rowsBefore = 0;
-  let rowsAfter = 0;
-  try {
-    rowsBefore = (await state.store.doc.count.read({ table: "documents" })) ?? 0;
-    await writeSeedRow(state, 0);
-    rowsAfter = (await state.store.doc.count.read({ table: "documents" })) ?? 0;
-  } finally {
-    await state.store.close().catch(() => undefined);
-    state.opfs.closeAll();
-  }
-
-  return {
-    phases,
-    resetDone: phases.includes("worker:store:reset:done"),
-    resetErrorMessage,
-    resetStart: phases.includes("worker:store:reset:start"),
-    rowsAfter,
-    rowsBefore,
-  };
 }
 
 async function hold(request: HoldRequest): Promise<{ held: true }> {

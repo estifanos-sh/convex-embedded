@@ -34,7 +34,19 @@ where
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct Schema {
+    pub hash: String,
+    #[serde(default)]
+    pub migrations: Vec<MigrationDefinition>,
+    #[serde(default)]
+    pub migration_code_hash: String,
     pub tables: Vec<Table>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MigrationDefinition {
+    pub id: String,
+    pub definition_hash: String,
 }
 
 #[derive(Debug, Deserialize)]

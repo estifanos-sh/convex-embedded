@@ -12,9 +12,12 @@ use storage::*;
 
 fn legacy_document_schema() -> StoreSchema {
     StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "documents".into(),
-            placement: TablePlacement::Replicated,
+            placement: TablePlacement::Device,
             local_fields: vec![],
             columns: vec![
                 ColumnDef {
@@ -45,6 +48,7 @@ fn legacy_document_schema() -> StoreSchema {
 
 fn current_document_schema() -> StoreSchema {
     let mut schema = legacy_document_schema();
+    schema.hash = "1".repeat(64);
     let documents = &mut schema.tables[0];
     documents.columns.push(ColumnDef {
         name: "idx_title".into(),
@@ -205,6 +209,9 @@ fn data_only_update_changes_body_without_rewriting_index_columns() {
 fn supports_camel_case_indexed_fields() {
     let store = EmbeddedStore::open(tmp_path("rs_camel_case_index.db").to_str().unwrap()).unwrap();
     let schema = StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "documents".into(),
             placement: TablePlacement::Replicated,
@@ -261,7 +268,7 @@ fn supports_camel_case_indexed_fields() {
 }
 
 #[test]
-fn setup_resets_nonempty_store_when_format_version_changes() {
+fn setup_preserves_nonempty_store_when_format_version_changes() {
     let store = EmbeddedStore::open(tmp_path("rs_format_reset.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     commit(
@@ -271,32 +278,18 @@ fn setup_resets_nonempty_store_when_format_version_changes() {
     assert!(read_doc(&store, "issues", "i1").is_some());
 
     store.force_user_version_for_test(0);
-    fail_next_commit();
     assert!(matches!(
         store.setup(&schema()),
-        Err(StorageError::Turso(_))
+        Err(StorageError::IncompatibleStore(_))
     ));
     assert!(read_doc(&store, "issues", "i1").is_some());
 
-    store.setup(&schema()).unwrap();
-    assert!(read_doc(&store, "issues", "i1").is_none());
-    let next = commit(
-        &store,
-        doc_writes(vec![issue(&store, "i2", "Second", "open")]),
-    );
-    assert_eq!(next.commit_seq, 1);
-
     store.force_user_version_for_test(39);
-    store.setup(&schema()).unwrap();
-    assert!(read_doc(&store, "issues", "i2").is_none());
-    let reseeded = commit(
-        &store,
-        doc_writes(vec![issue(&store, "i3", "Third", "open")]),
-    );
-    assert_eq!(reseeded.commit_seq, 1);
-
-    store.setup(&schema()).unwrap();
-    assert!(read_doc(&store, "issues", "i3").is_some());
+    assert!(matches!(
+        store.setup(&schema()),
+        Err(StorageError::IncompatibleStore(_))
+    ));
+    assert!(read_doc(&store, "issues", "i1").is_some());
 }
 
 #[test]
@@ -313,7 +306,7 @@ fn setup_preserves_data_when_format_version_matches() {
 }
 
 #[test]
-fn setup_reconciles_schema_changes_without_deleting_existing_rows() {
+fn direct_setup_rejects_contract_changes_and_migration_rebuilds_derived_rows() {
     let store = EmbeddedStore::open(tmp_path("rs_schema_signature.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
     commit(
@@ -330,12 +323,18 @@ fn setup_reconciles_schema_changes_without_deleting_existing_rows() {
         crdt_fields: vec![],
         indexes: vec![],
     });
-    fail_next_commit();
-    assert!(matches!(store.setup(&changed), Err(StorageError::Turso(_))));
+    changed.hash = "1".repeat(64);
+    assert!(matches!(
+        store.setup(&changed),
+        Err(StorageError::IncompatibleStore(_))
+    ));
     assert!(read_doc(&store, "issues", "i1").is_some());
 
-    store.setup(&changed).unwrap();
-    assert!(read_doc(&store, "issues", "i1").is_some());
+    let candidate = store.migration_begin(&changed).unwrap();
+    store
+        .migration_commit(&changed, candidate.candidate_generation)
+        .unwrap();
+    assert!(read_doc(&store, "issues", "i1").is_none());
     commit(
         &store,
         doc_writes(vec![DocWrite {
@@ -350,25 +349,36 @@ fn setup_reconciles_schema_changes_without_deleting_existing_rows() {
 }
 
 #[test]
-fn setup_backfills_new_index_columns_from_existing_documents() {
+fn migration_rebuilds_new_index_columns_from_originated_documents() {
     let store =
         EmbeddedStore::open(tmp_path("rs_schema_index_backfill.db").to_str().unwrap()).unwrap();
     store.setup(&legacy_document_schema()).unwrap();
-    commit(
-        &store,
-        doc_writes(vec![DocWrite {
-            table: "documents".into(),
-            id: "documents|indexed".into(),
-            data: r#"{"slug":"indexed","title":"Indexed","updatedAt":36}"#.into(),
-            cols: vec![
-                ("idx_slug".into(), ColValue::Text("indexed".into())),
-                ("idx_updatedat".into(), ColValue::Integer(36)),
-            ],
-            creation_time: store.clock_read().unwrap(),
-        }]),
-    );
+    store
+        .commit(
+            doc_writes(vec![DocWrite {
+                table: "documents".into(),
+                id: "documents|indexed".into(),
+                data: r#"{"slug":"indexed","title":"Indexed","updatedAt":36}"#.into(),
+                cols: vec![
+                    ("idx_slug".into(), ColValue::Text("indexed".into())),
+                    ("idx_updatedat".into(), ColValue::Integer(36)),
+                ],
+                creation_time: store.clock_read().unwrap(),
+            }]),
+            &CommitOptions {
+                source: CommitSource::Device,
+                mutation: CommitMutation::None,
+                push: None,
+                changes: CommitChanges::Include,
+            },
+        )
+        .unwrap();
 
-    store.setup(&current_document_schema()).unwrap();
+    let current = current_document_schema();
+    let candidate = store.migration_begin(&current).unwrap();
+    store
+        .migration_commit(&current, candidate.candidate_generation)
+        .unwrap();
     let page = store
         .doc_page_read(&ReadSpec {
             table: "documents".into(),
@@ -383,10 +393,13 @@ fn setup_backfills_new_index_columns_from_existing_documents() {
 }
 
 #[test]
-fn setup_repairs_missing_index_columns_without_deleting_existing_rows() {
+fn setup_detects_missing_index_columns_without_mutating_the_store() {
     let store =
         EmbeddedStore::open(tmp_path("rs_schema_physical_mismatch.db").to_str().unwrap()).unwrap();
     let schema = StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "documents".into(),
             placement: TablePlacement::Replicated,
@@ -417,106 +430,68 @@ fn setup_repairs_missing_index_columns_without_deleting_existing_rows() {
 
     store.execute_sql_for_test("ALTER TABLE doc__documents RENAME COLUMN idx_slug TO idx_wrong");
 
-    store
-        .setup(&schema)
-        .expect("physical mismatch is repairable");
+    assert!(matches!(
+        store.setup(&schema),
+        Err(StorageError::IncompatibleStore(_))
+    ));
     assert_eq!(
         read_doc(&store, "documents", "documents|field-notes").unwrap()["slug"],
         "field-notes"
     );
-    let page = store
-        .doc_page_read(&ReadSpec {
-            table: "documents".into(),
-            index: Some("by_slug".into()),
-            bounds: Some(vec![Bound::Eq {
-                value: ColValue::Text("field-notes".into()),
-            }]),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(doc_ids(&page), vec!["documents|field-notes"]);
-    commit(
-        &store,
-        doc_writes(vec![DocWrite {
-            table: "documents".into(),
-            id: "documents|new".into(),
-            data: r#"{"slug":"new"}"#.into(),
-            cols: vec![("idx_slug".into(), ColValue::Text("new".into()))],
-            creation_time: store.clock_read().unwrap(),
-        }]),
-    );
-    assert_eq!(
-        read_doc(&store, "documents", "documents|new").unwrap()["slug"],
-        "new"
-    );
 }
 
 #[test]
-fn setup_recreates_a_missing_physical_doc_table() {
+fn setup_detects_a_missing_physical_doc_table_without_recreating_it() {
     let store =
         EmbeddedStore::open(tmp_path("rs_schema_missing_table.db").to_str().unwrap()).unwrap();
     let schema = current_document_schema();
     store.setup(&schema).unwrap();
     store.execute_sql_for_test("DROP TABLE doc__documents");
 
-    store
-        .setup(&schema)
-        .expect("a missing physical table is repairable");
-    commit(
-        &store,
-        doc_writes(vec![DocWrite {
-            table: "documents".into(),
-            id: "documents|restored".into(),
-            data: r#"{"title":"Restored"}"#.into(),
-            cols: vec![("idx_title".into(), ColValue::Text("Restored".into()))],
-            creation_time: store.clock_read().unwrap(),
-        }]),
-    );
-    assert_eq!(
-        read_doc(&store, "documents", "documents|restored").unwrap()["title"],
-        "Restored"
-    );
+    assert!(matches!(
+        store.setup(&schema),
+        Err(StorageError::IncompatibleStore(_))
+    ));
 }
 
 #[test]
 fn identity_keys_are_isolated() {
     let path = tmp_path("rs_identity.db");
     let p = path.to_str().unwrap();
-    let a = EmbeddedStore::open_with_identity_key(p, "a").unwrap();
-    let b = EmbeddedStore::open_with_identity_key(p, "b").unwrap();
-    a.setup(&schema()).unwrap();
-    b.setup(&schema()).unwrap();
-
-    commit(&a, doc_writes(vec![issue(&a, "same", "A", "open")]));
-    commit(&b, doc_writes(vec![issue(&b, "same", "B", "closed")]));
-
-    assert_eq!(read_doc(&a, "issues", "same").expect("a row")["title"], "A");
-    assert_eq!(read_doc(&b, "issues", "same").expect("b row")["title"], "B");
+    let store = EmbeddedStore::open_with_identity_key(p, "a").unwrap();
+    store.setup(&schema()).unwrap();
+    commit(&store, doc_writes(vec![issue(&store, "same", "A", "open")]));
+    store.identity_write("b", None).unwrap();
+    commit(
+        &store,
+        doc_writes(vec![issue(&store, "same", "B", "closed")]),
+    );
+    assert_eq!(
+        read_doc(&store, "issues", "same").expect("b row")["title"],
+        "B"
+    );
+    store.identity_write("a", None).unwrap();
+    assert_eq!(
+        read_doc(&store, "issues", "same").expect("a row")["title"],
+        "A"
+    );
 }
 
 #[test]
-fn concurrent_writers_for_same_identity_are_serialized() {
+fn concurrent_openers_observe_the_lifetime_owner() {
     let path = tmp_path("rs_concurrent_same_identity.db");
     let p = path.to_string_lossy().into_owned();
     let store = EmbeddedStore::open_with_identity_key(&p, "same").unwrap();
     store.setup(&schema()).unwrap();
-    drop(store);
 
     let handles: Vec<_> = (0..6)
         .map(|i| {
             let p = p.clone();
             std::thread::spawn(move || {
-                let store = EmbeddedStore::open_with_identity_key(&p, "same").unwrap();
-                store.setup(&schema()).unwrap();
-                commit(
-                    &store,
-                    doc_writes(vec![issue(
-                        &store,
-                        &format!("i{i}"),
-                        &format!("issue {i}"),
-                        "open",
-                    )]),
-                );
+                let error = EmbeddedStore::open_with_identity_key(&p, "same")
+                    .err()
+                    .unwrap_or_else(|| panic!("opener {i} unexpectedly acquired the store"));
+                assert!(error.is_transient());
             })
         })
         .collect();
@@ -524,17 +499,8 @@ fn concurrent_writers_for_same_identity_are_serialized() {
     for handle in handles {
         handle.join().unwrap();
     }
-
-    let store = EmbeddedStore::open_with_identity_key(&p, "same").unwrap();
-    store.setup(&schema()).unwrap();
-    let all = store
-        .doc_page_read(&ReadSpec {
-            table: "issues".into(),
-            order: Order::Asc,
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(doc_ids(&all).len(), 6);
+    drop(store);
+    EmbeddedStore::open_with_identity_key(&p, "same").unwrap();
 }
 
 #[test]
@@ -542,6 +508,9 @@ fn setup_rejects_invalid_and_reserved_schema_names() {
     let store = EmbeddedStore::open(tmp_path("rs_idents.db").to_str().unwrap()).unwrap();
     for name in ["issues; DROP TABLE x", "", "1abc"] {
         let bad = StoreSchema {
+            hash: "0".repeat(64),
+            migrations: vec![],
+            migration_code_hash: String::new(),
             tables: vec![TableDef {
                 name: name.into(),
                 placement: TablePlacement::Replicated,
@@ -557,6 +526,9 @@ fn setup_rejects_invalid_and_reserved_schema_names() {
         ));
     }
     let reserved = StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "issues".into(),
             placement: TablePlacement::Replicated,

@@ -1383,8 +1383,15 @@ function buildPush(
           }
           return result.settlement;
         } catch (error) {
-          const failure = embeddedFailure(error);
-          if (!failure) throw error;
+          // A function removed or narrowed by a later deployment fails before its embedded wrapper
+          // can translate the error. Convex has already retried internal mutation failures before
+          // surfacing an error here, so the durable envelope must settle instead of poisoning the
+          // device's push lane forever.
+          const failure = embeddedFailure(error) ?? {
+            code: "EMBEDDED_REJECTED" as const,
+            targets: [],
+            reason: error instanceof Error ? error.message : String(error),
+          };
           const outcome =
             failure.code === "EMBEDDED_CONFLICT"
               ? "conflict"

@@ -44,6 +44,11 @@ import {
 } from "./local";
 import { consumeRemoteTick, remotePendingIsEmpty, REMOTE_PULL_DIAGNOSTIC_ERROR } from "./rev";
 import { toRuntimeStoreSchema, type ConvexEmbeddedSchema } from "./schema";
+import {
+  withDeviceMigrations,
+  type DeviceMigrationManifest,
+  type DeviceMigrationReport,
+} from "./migrations";
 import type {
   RemoteStartOptions,
   RemoteSurface,
@@ -86,6 +91,7 @@ export type {
   EmbeddedDataDelete,
   EmbeddedDataEvent,
   EmbeddedDataWrite,
+  EmbeddedMigrationEvent,
   EmbeddedMutationTiming,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
@@ -264,6 +270,8 @@ interface EmbeddedClientBaseOptions {
   authState?: EmbeddedAuthState;
   /** Optional native remote replication configuration. */
   remote?: ConvexEmbeddedRemoteOptions;
+  /** Ordered device migration manifest for direct (non-bundled) runtimes. */
+  deviceMigrations?: DeviceMigrationManifest;
 }
 
 /** Platform-neutral embedded client configuration. @internal */
@@ -973,9 +981,25 @@ export class EmbeddedClient {
       };
     }
 
-    const schema = options.storeSchema ?? toRuntimeStoreSchema(options.schema);
+    const baseSchema = options.storeSchema ?? toRuntimeStoreSchema(options.schema);
+    const schema =
+      options.deviceMigrations === undefined
+        ? baseSchema
+        : withDeviceMigrations(baseSchema, options.deviceMigrations);
     const store = await options.store;
     const moduleGraphHash = options.moduleGraphHash ?? (await hashModuleGraph(options.modules));
+    try {
+      await store.setup(schema);
+      const migrationReport = (
+        store as StorageBackend & { migrationReport?: DeviceMigrationReport }
+      ).migrationReport;
+      if (migrationReport) {
+        this.emitEvent({ at: getTimerTime(), type: "migration", ...migrationReport });
+      }
+    } catch (error) {
+      await store.close();
+      throw error;
+    }
     const runner = createRunner(options.modules, store, schema, {
       emit: (event) => this.emitEvent(event),
       hasEventListeners: () => this.eventListeners.size > 0,
@@ -988,7 +1012,7 @@ export class EmbeddedClient {
     let remoteRetryTimer: ReturnType<typeof setTimeout> | undefined;
     let remoteStartAttempt = 0;
     try {
-      await Promise.all([runner.localReady, store.setup(schema)]);
+      await runner.localReady;
       const generation = this.authGeneration;
       await this.readCachedIdentity(runner, generation);
       if (options.remote) {

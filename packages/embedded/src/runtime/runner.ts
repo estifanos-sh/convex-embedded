@@ -331,6 +331,7 @@ export type RunnerDevtoolsRequest =
   | { cursor?: string | null; kind: "listRows"; limit?: number; table: string }
   | { fields: Record<string, unknown>; id: string; kind: "patchDocument"; table: string }
   | { id: string; kind: "deleteDocument"; table: string }
+  | { cursor?: string; kind: "exportQuarantine"; pageSize?: number }
   | { kind: "clearData" };
 
 /** Execution route and hosted arguments resolved before a public client operation starts. */
@@ -587,15 +588,25 @@ async function crdtEffects(batch: WriteBatch): Promise<Record<string, unknown>[]
   );
 }
 
-function afterImages(
-  batch: WriteBatch,
-): Array<
-  | { content: "value"; table: string; rowId: string; value: unknown }
+function afterImages(batch: WriteBatch): Array<
+  | {
+      content: "value";
+      table: string;
+      rowId: string;
+      value: unknown;
+      creationTime: number;
+    }
   | { content: "deleted"; table: string; rowId: string }
 > {
   const candidates = new Map<
     string,
-    | { content: "value"; table: string; rowId: string; value: unknown }
+    | {
+        content: "value";
+        table: string;
+        rowId: string;
+        value: unknown;
+        creationTime: number;
+      }
     | { content: "deleted"; table: string; rowId: string }
   >();
   const crdtOnly = new Set((batch.crdtOnlyIds ?? []).map((row) => `${row.table}\u0000${row.id}`));
@@ -606,6 +617,7 @@ function afterImages(
       table: docWrite.table,
       rowId: docWrite.id,
       value: docWrite.data,
+      creationTime: docWrite.creationTime,
     });
   }
   for (const deleted of batch.deletes) {
@@ -1847,14 +1859,17 @@ export function createRunner(
         return await store.identity.read();
       },
       write: async (identityKey) => {
-        if (!store.identity) {
+        const identity = store.identity;
+        if (!identity) {
           throw new Error("This runtime storage does not support identity partitions.");
         }
-        await store.identity.write(identityKey);
-        invalidateTables(
-          storeSchema.tables.map((table) => table.name),
-          "local",
-        );
+        await enqueueMutation(async () => {
+          await identity.write(identityKey);
+          invalidateTables(
+            storeSchema.tables.map((table) => table.name),
+            "local",
+          );
+        });
       },
     },
     localConfigured,
@@ -1941,7 +1956,7 @@ export function createRunner(
     },
     remote: {
       identity: {
-        read: async () => await store.remote?.identity?.(),
+        read: async () => enqueueMutation(async () => await store.remote?.identity?.()),
       },
       scope: {
         write: publishRemoteScope,
@@ -2061,6 +2076,13 @@ export function createRunner(
         return devtoolsPatch(request.table, request.id, request.fields);
       case "deleteDocument":
         return devtoolsDelete(request.table, request.id);
+      case "exportQuarantine": {
+        const quarantine = fullStore(store).ledger?.quarantine;
+        if (!quarantine) {
+          throw new Error("This storage backend does not expose quarantine inspection.");
+        }
+        return quarantine.read(request);
+      }
       case "clearData":
         return devtoolsClear();
     }

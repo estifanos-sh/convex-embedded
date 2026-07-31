@@ -39,6 +39,7 @@ const main = defineConfig({
     "internal/client": "src/client.ts",
     "internal/storage": "src/storage/binding.ts",
     local: "src/local.ts",
+    migrations: "src/migrations.ts",
     node: "src/node/index.ts",
     schema: "src/tables.ts",
     server: "src/server/index.ts",

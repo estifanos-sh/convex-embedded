@@ -32,6 +32,7 @@ import type {
 } from "convex/values";
 import componentSchema from "./component/schema";
 import { embeddedFieldMeta, type EmbeddedFieldPlacement, type EmbeddedValidator } from "./meta";
+import { sha256Text } from "./sha";
 import type { StoreSchema } from "./storage/types";
 
 const EMBEDDED_TABLE = Symbol.for("convex-embedded:table");
@@ -680,7 +681,8 @@ export function toRuntimeStoreSchema(schema: AnalyzableSchema): StoreSchema {
 
 /** Adds package-owned local component tables to an already generated app schema. @internal */
 export function withEmbeddedComponentTables(app: StoreSchema): StoreSchema {
-  return { ...app, tables: [...app.tables, ...embeddedComponentPhysicalTables()] };
+  const tables = [...app.tables, ...embeddedComponentPhysicalTables()];
+  return { ...app, hash: schemaFingerprint({ tables }), tables };
 }
 
 /**
@@ -755,17 +757,21 @@ function embeddedComponentPhysicalTables(): StoreSchema["tables"] {
 }
 
 function schemaFingerprint(schema: unknown): string {
-  const text = JSON.stringify(schema);
-  let high = 0xcbf29ce4;
-  let low = 0x84222325;
-  for (let index = 0; index < text.length; index += 1) {
-    low ^= text.charCodeAt(index);
-    const nextLow = Math.imul(low, 0x1b3);
-    const carry = Math.floor((low * 0x1b3) / 0x1_0000_0000);
-    high = (Math.imul(high, 0x1b3) + carry) >>> 0;
-    low = nextLow >>> 0;
-  }
-  return `${high.toString(16).padStart(8, "0")}${low.toString(16).padStart(8, "0")}`;
+  return sha256Text(canonicalSchemaJson(schema));
+}
+
+function canonicalSchemaJson(value: unknown): string {
+  return JSON.stringify(sortSchemaJson(value));
+}
+
+function sortSchemaJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortSchemaJson);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, child]) => [key, sortSchemaJson(child)]),
+  );
 }
 
 function storeTable(

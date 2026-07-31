@@ -22,6 +22,7 @@ exports[`public package surface > browser entry exports only its intended surfac
   "EmbeddedDataWrite",
   "EmbeddedEvent",
   "EmbeddedEventListener",
+  "EmbeddedMigrationEvent",
   "EmbeddedOperationEvent",
   "EmbeddedOperationKind",
   "EmbeddedOperationPhase",
@@ -103,6 +104,7 @@ exports[`public package surface > expo entry exports only its intended surface 1
   "EmbeddedDataWrite",
   "EmbeddedEvent",
   "EmbeddedEventListener",
+  "EmbeddedMigrationEvent",
   "EmbeddedOperationEvent",
   "EmbeddedOperationKind",
   "EmbeddedOperationPhase",
@@ -145,6 +147,29 @@ exports[`public package surface > metro entry exports only its intended surface 
 ]
 `;
 
+exports[`public package surface > migrations entry exports only its intended surface 1`] = `
+[
+  "CarryDocument",
+  "CarryRecord",
+  "CarrySelector",
+  "DeviceMigration",
+  "DeviceMigrationContext",
+  "DeviceMigrationManifest",
+  "DeviceMigrationOptions",
+  "DeviceMigrationRecord",
+  "DeviceMigrationRecordSuccessor",
+  "DeviceMigrationReport",
+  "DeviceMigrationSuccessor",
+  "DeviceQuarantinePage",
+  "DeviceQuarantineRecord",
+  "carry",
+  "defineDeviceMigrations",
+  "deviceMigration",
+  "setupWithDeviceMigrations",
+  "withDeviceMigrations",
+]
+`;
+
 exports[`public package surface > node entry exports only its intended surface 1`] = `
 [
   "AuthTokenFetcher",
@@ -163,6 +188,7 @@ exports[`public package surface > node entry exports only its intended surface 1
   "EmbeddedDataWrite",
   "EmbeddedEvent",
   "EmbeddedEventListener",
+  "EmbeddedMigrationEvent",
   "EmbeddedOperationEvent",
   "EmbeddedOperationKind",
   "EmbeddedOperationPhase",

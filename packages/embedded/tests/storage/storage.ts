@@ -18,6 +18,7 @@ defineConformance({
 });
 
 const schema: StoreSchema = {
+  hash: "0".repeat(64),
   tables: [
     {
       name: "issues",
@@ -29,6 +30,7 @@ const schema: StoreSchema = {
 };
 
 const aliasSchema: StoreSchema = {
+  hash: "1".repeat(64),
   tables: [
     {
       name: "users",
@@ -48,6 +50,7 @@ const aliasSchema: StoreSchema = {
 };
 
 const cacheSchema: StoreSchema = {
+  hash: "2".repeat(64),
   tables: [
     {
       name: "issues",

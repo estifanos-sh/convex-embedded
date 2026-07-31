@@ -39,7 +39,19 @@ export function renderEmbeddedBundle(bundle: EmbeddedBundleResult): string {
     )
     .join("\n");
 
-  return `export const embeddedSchema = ${JSON.stringify(bundle.embeddedSchema)};
+  const migrationImport =
+    bundle.migrationsPath === undefined
+      ? ""
+      : `import deviceMigrations from ${JSON.stringify(toVirtualSourceId(bundle.migrationsPath))};
+import { withDeviceMigrations } from "@convex-dev/embedded/migrations";
+`;
+  const runtimeSchema =
+    bundle.migrationsPath === undefined
+      ? "embeddedSchemaBase"
+      : `{ ...embeddedSchemaBase, runtimeStoreSchema: withDeviceMigrations(embeddedSchemaBase.runtimeStoreSchema, deviceMigrations) }`;
+
+  return `${migrationImport}const embeddedSchemaBase = ${JSON.stringify(bundle.embeddedSchema)};
+export const embeddedSchema = ${runtimeSchema};
 export const embeddedManifest = ${JSON.stringify(bundle.manifest)};
 export const modules = {
 ${moduleEntries}

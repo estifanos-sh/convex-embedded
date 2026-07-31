@@ -18,6 +18,7 @@ export type {
   EmbeddedDataWrite,
   EmbeddedEvent,
   EmbeddedEventListener,
+  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,

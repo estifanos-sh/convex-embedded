@@ -129,6 +129,10 @@
       "types": "./dist/local.d.mts",
       "import": "./dist/local.mjs"
     },
+    "./migrations": {
+      "types": "./dist/migrations.d.mts",
+      "import": "./dist/migrations.mjs"
+    },
     "./internal/text": {
       "types": "./dist/internal/text.d.mts",
       "import": "./dist/internal/text.mjs"

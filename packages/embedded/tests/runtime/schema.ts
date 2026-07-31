@@ -91,6 +91,18 @@ describe("Convex schema storage conversion", () => {
     expect(() => toRuntimeStoreSchema(schema)).not.toThrow();
   });
 
+  test("hashes validators and package-owned physical tables into the runtime contract", () => {
+    const strings = defineSchema({ documents: defineTable({ value: v.string() }) });
+    const numbers = defineSchema({ documents: defineTable({ value: v.number() }) });
+    const app = toStoreSchema(strings);
+    const runtime = toRuntimeStoreSchema(strings);
+
+    expect(toStoreSchema(numbers).hash).not.toBe(app.hash);
+    expect(runtime.hash).not.toBe(app.hash);
+    expect(runtime.hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(toRuntimeStoreSchema(strings).hash).toBe(runtime.hash);
+  });
+
   test("keeps hosted component maintenance indexes out of browser storage", () => {
     const schema = defineSchema({ documents: defineTable({ value: v.string() }) });
     const checkpoints = toRuntimeStoreSchema(schema).tables.find(

@@ -1,4 +1,6 @@
 import { cloneTree, encode, freezeNormalizedTreeWithEstimate, reviveDoc } from "../runtime/codec";
+import { setupWithDeviceMigrations, type DeviceMigrationReport } from "../migrations";
+import { readDeviceQuarantinePage } from "./quarantine";
 import { remoteTickTables } from "../rev";
 import type {
   BlobSurface,
@@ -346,6 +348,38 @@ export interface BindingScheduledJob {
  */
 export interface StoreBinding {
   setup(schema: StoreSchema): Promise<void>;
+  migrationBegin(schema: StoreSchema): Promise<string>;
+  originPageRead(
+    generation: bigint | number,
+    cursorJson: string | undefined,
+    pageSize: number,
+    upperJson?: string,
+  ): Promise<string>;
+  migrationStepBegin(generation: bigint | number, migrationId: string): Promise<string>;
+  migrationRecordWrite(generation: bigint | number, recordJson: string): Promise<void>;
+  migrationRecordDelete(
+    generation: bigint | number,
+    identityKey: string,
+    kind: bigint | number,
+    recordKey: Uint8Array,
+  ): Promise<void>;
+  migrationRecordDispositionWrite(
+    generation: bigint | number,
+    identityKey: string,
+    kind: bigint | number,
+    recordKey: Uint8Array,
+    migrationId: string,
+    reason: string,
+    discard: boolean,
+  ): Promise<void>;
+  migrationPageWrite(
+    generation: bigint | number,
+    migrationId: string,
+    pageJson: string,
+  ): Promise<void>;
+  migrationStepComplete(generation: bigint | number, appliedMigrations: number): Promise<void>;
+  migrationCommit(schema: StoreSchema, generation: bigint | number): Promise<void>;
+  migrationRetire(generation: bigint | number): Promise<void>;
   identityRead?(): Promise<string>;
   identityWrite?(identityKey: string, identityJson?: string): Promise<void>;
   mutationWrite(call: BindingMutationCall): Promise<BindingMutationRecord>;
@@ -513,6 +547,9 @@ function hasMethod(value: object, key: PropertyKey): boolean {
 }
 
 export class StoreAdapter implements StorageBackend {
+  /** Payload-free report from the most recent setup/upgrade. @internal */
+  migrationReport?: DeviceMigrationReport;
+
   private readonly inner: StoreBinding;
   private readonly readCache = new ReadCache();
   readonly capabilities = { hasExactBounds: true };
@@ -743,6 +780,18 @@ export class StoreAdapter implements StorageBackend {
         mutationsDeleted: Number(result.mutationsDeleted),
       };
     },
+    quarantine: {
+      read: (options) => {
+        const generation =
+          this.migrationReport?.required === true
+            ? this.migrationReport.candidateGeneration
+            : this.migrationReport?.activeGeneration;
+        if (generation === undefined) {
+          throw new Error("Store setup must complete before reading quarantined records");
+        }
+        return readDeviceQuarantinePage(this.inner, generation, options);
+      },
+    },
   };
 
   readonly blob: BlobSurface = {
@@ -817,8 +866,12 @@ export class StoreAdapter implements StorageBackend {
   };
 
   async setup(schema: StoreSchema): Promise<void> {
-    await this.inner.setup(schema);
+    const { report, retiredGenerations } = await setupWithDeviceMigrations(this.inner, schema);
+    this.migrationReport = report;
     this.readCache.clear();
+    for (const generation of retiredGenerations) {
+      await this.inner.migrationRetire(generation).catch(() => undefined);
+    }
   }
 
   async commit(batch: WriteBatch, options?: CommitOptions): Promise<CommitResult> {

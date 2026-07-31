@@ -14,6 +14,7 @@ import {
   type ConvexModules,
 } from "../client";
 import type { ConvexEmbeddedSchema } from "../schema";
+import type { DeviceMigrationManifest } from "../migrations";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { loadNativeModule, validateNativeModule, type NativeModule } from "./artifact";
 import { NativeStore } from "./native";
@@ -29,6 +30,7 @@ export type {
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,
+  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,
@@ -88,6 +90,9 @@ export interface ConvexEmbeddedClientOptions {
    */
   local?: Record<string, () => Promise<unknown>>;
 
+  /** Ordered device migration manifest for this store. */
+  migrations?: DeviceMigrationManifest;
+
   /**
    * Filesystem path for the embedded database.
    *
@@ -135,6 +140,7 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
       store: openStore(native, options.path),
       authState,
       remote: options.url === undefined ? undefined : { url: options.url },
+      deviceMigrations: options.migrations,
     });
   }
 }

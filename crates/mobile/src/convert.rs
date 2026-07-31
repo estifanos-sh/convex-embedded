@@ -1,7 +1,7 @@
 use storage::{
     Bound, ColValue, ColumnDef, CommitOptions, CountSpec, CrdtFieldDef, CrdtFieldKind, CrdtOp,
     CrdtOperation, CrdtRestore, DeleteIn, DocWrite, IdMapping, IdMappingContent, IndexDef,
-    LocalFieldDef, LocalFieldDelete, LocalFieldWrite, Order, ReadSpec, RowKey,
+    LocalFieldDef, LocalFieldDelete, LocalFieldWrite, MigrationDefinition, Order, ReadSpec, RowKey,
     ScheduledFunctionKind, ScheduledJob, ScheduledState, StoreSchema, TableDef, TablePlacement,
     UploadLease, UploadLeaseWrite, WriteBatch,
 };
@@ -10,6 +10,16 @@ use crate::{model, BridgeError, BridgeResult};
 
 pub(crate) fn schema(value: model::Schema) -> BridgeResult<StoreSchema> {
     Ok(StoreSchema {
+        hash: value.hash,
+        migrations: value
+            .migrations
+            .into_iter()
+            .map(|migration| MigrationDefinition {
+                id: migration.id,
+                definition_hash: migration.definition_hash,
+            })
+            .collect(),
+        migration_code_hash: value.migration_code_hash,
         tables: value
             .tables
             .into_iter()

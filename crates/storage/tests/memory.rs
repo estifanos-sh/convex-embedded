@@ -61,6 +61,9 @@ fn record(scenario: &str, net_kb: usize, peak_kb: usize) {
 
 fn crdt_schema() -> StoreSchema {
     StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "issues".into(),
             placement: TablePlacement::Replicated,

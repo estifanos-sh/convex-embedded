@@ -217,7 +217,12 @@ pub(crate) fn open(
     selector_key: Option<String>,
     default_identity_key: Option<String>,
 ) -> BridgeResult<u64> {
-    open_with_idle(path, selector_key, default_identity_key, WAL_CHECKPOINT_IDLE)
+    open_with_idle(
+        path,
+        selector_key,
+        default_identity_key,
+        WAL_CHECKPOINT_IDLE,
+    )
 }
 
 pub(crate) fn open_with_idle(

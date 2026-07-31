@@ -1,6 +1,5 @@
-//! reset — opening a physically-unreadable store (a header written by an incompatible build) resets
-//! to the current empty format instead of failing closed, per V5 "Local Store Evolution". Run with
-//! `--features testkit`.
+//! reset — physically unreadable bytes fail closed and remain untouched; only a readable empty
+//! path may be initialized. Run with `--features testkit`.
 #![cfg(feature = "testkit")]
 
 use std::path::Path;
@@ -18,41 +17,12 @@ fn write_unreadable_store(path: &Path) {
 }
 
 #[test]
-fn open_resets_an_unreadable_store_to_the_current_empty_format() {
+fn open_preserves_an_unreadable_store_for_explicit_recovery() {
     let path = tmp_path("reset-unreadable.db");
     write_unreadable_store(&path);
-    let p = path.to_str().unwrap();
-
-    let store =
-        EmbeddedStore::open(p).expect("an unreadable store resets rather than failing open");
-    store
-        .setup(&schema())
-        .expect("the reset store accepts the current schema");
-
-    let page = store
-        .doc_page_read(&storage::ReadSpec {
-            table: "issues".into(),
-            ..Default::default()
-        })
-        .expect("the reset store reads");
-    assert_eq!(page.text, "[]", "the reset store starts empty");
-
-    store
-        .commit(
-            doc_writes(vec![issue(&store, "a", "first", "open")]),
-            &CommitOptions::default(),
-        )
-        .expect("the reset store is writable");
-    let page = store
-        .doc_page_read(&storage::ReadSpec {
-            table: "issues".into(),
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(
-        page.text.contains("first"),
-        "writes to the reset store persist"
-    );
+    let before = std::fs::read(&path).unwrap();
+    assert!(EmbeddedStore::open(path.to_str().unwrap()).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]

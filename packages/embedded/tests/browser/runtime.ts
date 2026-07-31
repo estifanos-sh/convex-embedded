@@ -1187,15 +1187,6 @@ interface SeedResult {
   walBytes: number;
 }
 
-interface CorruptResetResult {
-  resetStart: boolean;
-  resetDone: boolean;
-  resetErrorMessage: string;
-  rowsBefore: number;
-  rowsAfter: number;
-  phases: string[];
-}
-
 type BootMessage<T> = { error: string; ok: false } | { ok: true; result: T };
 
 const VOLUME_ROWS = 2_000;
@@ -1407,33 +1398,6 @@ describe("browser boot stress", () => {
     } finally {
       inspector.terminate();
     }
-  }, 90_000);
-
-  test("resets an unreadable pre-existing store instead of failing closed", async () => {
-    const storageId = `boot-reset-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
-    const worker = spawnBootWorker();
-    let result: CorruptResetResult;
-    try {
-      result = await bootRequest<CorruptResetResult>(
-        worker,
-        { op: "corruptReset", storageId },
-        "corrupt-reset boot",
-      );
-    } finally {
-      worker.terminate();
-    }
-    await mark("boot unreadable-store reset", {
-      resetDone: result.resetDone,
-      resetErrorMessage: result.resetErrorMessage,
-      resetStart: result.resetStart,
-      rowsAfter: result.rowsAfter,
-      rowsBefore: result.rowsBefore,
-    });
-    expect(result.resetStart).toBe(true);
-    expect(result.resetDone).toBe(true);
-    expect(result.resetErrorMessage).toContain("Corrupt database");
-    expect(result.rowsBefore).toBe(0);
-    expect(result.rowsAfter).toBe(1);
   }, 90_000);
 
   test("waits out a held predecessor OPFS handle instead of failing the boot", async () => {

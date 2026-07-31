@@ -1,9 +1,14 @@
+#![allow(clippy::items_after_test_module)]
+
 #[cfg(any(test, feature = "testkit"))]
 use std::cell::Cell;
 use std::{
     num::NonZeroUsize,
     ops::ControlFlow,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, Mutex, PoisonError,
+    },
     time::{Duration, Instant},
 };
 
@@ -34,6 +39,7 @@ pub(crate) struct TursoDriver {
     /// Keep the database alive for the connection lifetime.
     _keep_alive: Arc<Database>,
     conn: Arc<Connection>,
+    generation: AtomicI64,
     /// Prepared statements keyed by SQL text. The key stays resident while the statement is checked
     /// out, avoiding a key allocation on every hot statement execution. Failed statements are left as
     /// empty slots and re-prepared on the next run.
@@ -49,20 +55,13 @@ impl TursoDriver {
         let io: Arc<dyn IO> = Arc::new(Opfs);
         #[cfg(not(target_arch = "wasm32"))]
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
-        match Self::open_tuned(path, io.clone()) {
-            Ok(driver) => Ok(driver),
-            Err(error) if reset_unreadable_store(&error) => {
-                reset_store_artifacts(io.as_ref(), path);
-                Self::open_tuned(path, io)
-            }
-            Err(error) => Err(error),
-        }
+        Self::open_tuned(path, io)
     }
 
     /// Open, tune, and prove the physical store is readable. The version probe forces turso to parse
     /// the database header inside this boundary, so a pre-existing store written by an incompatible
-    /// build surfaces its corruption here — where the opener can reset it — rather than escaping
-    /// later from schema setup.
+    /// build fails closed here rather than escaping later from schema setup. The caller preserves
+    /// the unreadable bytes for recovery or a future compatible runtime.
     fn open_tuned(path: &str, io: Arc<dyn IO>) -> Result<Self, StorageError> {
         let opened = Instant::now();
         let driver = Self::open_with_io(path, io)?;
@@ -89,8 +88,20 @@ impl TursoDriver {
             io,
             _keep_alive: db,
             conn,
+            generation: AtomicI64::new(0),
             stmts: Mutex::new(FxHashMap::default()),
         })
+    }
+
+    pub(crate) fn generation(&self) -> i64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn generation_write(&self, generation: i64) {
+        let previous = self.generation.swap(generation, Ordering::AcqRel);
+        if previous != generation {
+            self.clear_statements();
+        }
     }
 
     pub(crate) fn wal_write(&self) -> Result<(), StorageError> {
@@ -142,6 +153,8 @@ impl TursoDriver {
     where
         I: IntoIterator<Item = Value>,
     {
+        let sql = sql::generation_sql(sql, self.generation());
+        let sql = sql.as_ref();
         let mut stmt = self.take_stmt(sql)?;
         bind(&mut stmt, params)?;
         let result = step_rows(&self.io, &mut stmt, sql, &mut on_row);
@@ -218,26 +231,6 @@ impl TursoDriver {
 /// The guarded state is coherent at every release point, so a poisoned guard is safe to use.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Whether an open failure should hard-reset the store to the current empty format. Only a
-/// physically-unreadable store qualifies (a busy or locking error is transient and must surface).
-/// On wasm the OPFS artifacts are owned by the JS file registry and re-registration is unreachable
-/// from this IO bridge, so the browser opener owns the reset there and the raw error bubbles up.
-fn reset_unreadable_store(error: &StorageError) -> bool {
-    cfg!(not(target_arch = "wasm32")) && sql::RESET_UNREADABLE_STORE && error.is_unreadable_store()
-}
-
-/// Clear the `SQLite` database and its WAL/SHM sidecars so a fresh current-format store is created in
-/// their place. A leftover WAL from the old format would re-corrupt the fresh database on replay, so
-/// all three artifacts go. Best-effort per artifact: a missing sidecar is not an error; a genuine
-/// failure to clear the main file re-surfaces as the reopen fails again and escapes as the reserved
-/// hard failure.
-fn reset_store_artifacts(io: &dyn IO, path: &str) {
-    for suffix in ["", "-wal", "-shm"] {
-        let artifact = format!("{path}{suffix}");
-        io.remove_file(&artifact).ok();
-    }
 }
 
 #[cfg(test)]

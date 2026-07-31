@@ -91,8 +91,15 @@ export interface LocalFieldDef {
  * @internal
  */
 export interface StoreSchema {
-  hash?: string;
+  hash: string;
+  migrations?: MigrationDefinition[];
+  migrationCodeHash?: string;
   tables: TableDef[];
+}
+
+export interface MigrationDefinition {
+  id: string;
+  definitionHash: string;
 }
 
 /**
@@ -644,6 +651,26 @@ export interface LedgerSurface {
    * are never touched. Future replication calls this with its delivered watermark.
    */
   delete(upToSeq: number): Promise<DeleteResult>;
+  quarantine?: {
+    read(options?: { cursor?: string; pageSize?: number }): Promise<QuarantinePage>;
+  };
+}
+
+/** Raw retained record returned only through an explicit local quarantine export. @internal */
+export interface QuarantineRecord {
+  codec: number;
+  identityKey: string;
+  kind: number;
+  migrationId: string;
+  payload: Uint8Array;
+  reason: string;
+  recordKey: Uint8Array;
+}
+
+/** Bounded page of raw quarantined records. @internal */
+export interface QuarantinePage {
+  cursor?: string;
+  records: QuarantineRecord[];
 }
 
 /**

@@ -18,6 +18,7 @@ import type {
 } from "../events";
 import { EMBEDDED_ERROR_CODES, EmbeddedClientRetiredError, errorMessage } from "../error";
 import { randomId } from "../id/random";
+import type { DeviceMigrationReport } from "../migrations";
 import { createRunner, type Runner } from "../runtime/runner";
 import {
   consumeRemoteTick,
@@ -39,7 +40,7 @@ import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { REMOTE_CLIENT_RETIRED_PREFIX, RotationBreaker } from "../retirement";
 import { loadWasmModule, PthreadRegistry, type WasmSource } from "./artifact";
 import { type StoreRecovery } from "./recovery";
-import { OpfsDirectory, registerTursoFiles, resetTursoFiles } from "./opfs";
+import { OpfsDirectory, registerTursoFiles } from "./opfs";
 import {
   deserializeError,
   type EmbeddedWorker,
@@ -1453,6 +1454,9 @@ export async function initRuntime(options: {
       wasm: options.wasm,
     });
     store = opened.store;
+    if (opened.migrationReport) {
+      options.emit?.({ at: getTimerTime(), type: "migration", ...opened.migrationReport });
+    }
     const runner = createRunner(options.modules, store, options.storeSchema, {
       deferNotify: (run) => {
         setTimeout(run, 0);
@@ -1492,7 +1496,7 @@ export async function initRuntime(options: {
 
 /**
  * Constructs a fresh store instance over the given OPFS bridge: WASM re-instantiation, OPFS
- * re-registration, WAL replay, schema reconciliation, and a truncating checkpoint. Used both by
+ * re-registration, WAL replay, contract migration, and a truncating checkpoint. Used both by
  * {@link initRuntime} on boot and by the leader graft after a wedged instance is terminated; the
  * caller owns the {@link OpfsDirectory} lifecycle across both.
  *
@@ -1512,6 +1516,7 @@ export async function openStoreInstance(
   pthreads: PthreadRegistry;
   storagePath: string;
   wasmApiVersion: number;
+  migrationReport?: DeviceMigrationReport;
 }> {
   const debug = options.debug ?? (() => undefined);
   const pthreads = new PthreadRegistry();
@@ -1547,20 +1552,7 @@ export async function openStoreInstance(
     debug("worker:store:setup:done");
     return opened;
   };
-  let store: WasmStore;
-  try {
-    store = await openAndSetup();
-  } catch (error) {
-    if (!RESET_UNREADABLE_STORE || !isUnreadableStoreError(error)) throw error;
-    // The pre-existing store's physical bytes are unreadable — an incompatible format (e.g. written
-    // by a prior turso release), not same-format corruption of an openable store. While v5 is
-    // pre-release this resets to the current empty format; the current authority repopulates rows.
-    debug("worker:store:reset:start", describeError(error));
-    if (isTemporaryStoragePath(storagePath)) throw error;
-    await resetTursoFiles(opfs, storagePath);
-    store = await openAndSetup();
-    debug("worker:store:reset:done");
-  }
+  const store = await openAndSetup();
   try {
     debug("worker:store:wal-write:start");
     await store.wal.write();
@@ -1568,7 +1560,13 @@ export async function openStoreInstance(
   } catch (error) {
     debug("worker:store:wal-write:error", describeError(error));
   }
-  return { pthreads, storagePath, store, wasmApiVersion };
+  return {
+    pthreads,
+    storagePath,
+    store,
+    wasmApiVersion,
+    migrationReport: store.migrationReport,
+  };
 }
 
 function isTemporaryStoragePath(path: string): boolean {
@@ -1616,14 +1614,6 @@ function describeError(error: unknown): unknown {
     return { message: error.message, name: error.name, stack: error.stack };
   return String(error);
 }
-
-/**
- * While v5 remains unreleased (V5 "Local Store Evolution"), a store whose physical bytes cannot be
- * opened is an incompatible format that resets to the current empty state rather than failing
- * closed. Mirrors the Rust `RESET_UNREADABLE_STORE` seam; at release this becomes a durable-migration
- * decision.
- */
-const RESET_UNREADABLE_STORE = true;
 
 /**
  * A store-open failure that means the on-disk bytes are not a readable current-format store: a

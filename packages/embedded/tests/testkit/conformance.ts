@@ -13,6 +13,7 @@ import type {
 } from "../../src/storage/types";
 
 const schema: StoreSchema = {
+  hash: "0".repeat(64),
   tables: [
     {
       name: "issues",
@@ -28,6 +29,7 @@ const schema: StoreSchema = {
 };
 
 const boolSchema: StoreSchema = {
+  hash: "1".repeat(64),
   tables: [
     {
       name: "flags",
@@ -87,29 +89,34 @@ export function defineConformance(factory: ConformanceFactory): void {
     test("isolates identity keys", async () => {
       const db = path("identity");
       const a = await factory.open(db, "a");
-      const b = await factory.open(db, "b");
       await a.setup(schema);
-      await b.setup(schema);
-
       await a.commit({
         docWrites: [issue("same", "A", "open", 1, a.clock.read())],
         deletes: [],
       });
+      expect((await a.doc.read("issues", "same"))?.title).toBe("A");
+      await a.close();
+
+      const b = await factory.open(db, "b");
+      await b.setup(schema);
       await b.commit({
         docWrites: [issue("same", "B", "closed", 2, b.clock.read())],
         deletes: [],
       });
-
-      expect((await a.doc.read("issues", "same"))?.title).toBe("A");
       expect((await b.doc.read("issues", "same"))?.title).toBe("B");
-      await a.close();
       await b.close();
+
+      const reopenedA = await factory.open(db, "a");
+      await reopenedA.setup(schema);
+      expect((await reopenedA.doc.read("issues", "same"))?.title).toBe("A");
+      await reopenedA.close();
     });
 
     test("rejects unsafe schema names before issuing SQL", async () => {
       const store = await factory.open(path("idents"));
       await expect(
         store.setup({
+          hash: "0".repeat(64),
           tables: [
             {
               name: "issues; DROP TABLE x",
@@ -122,6 +129,7 @@ export function defineConformance(factory: ConformanceFactory): void {
       ).rejects.toThrow("invalid identifier");
       await expect(
         store.setup({
+          hash: "0".repeat(64),
           tables: [
             {
               name: "issues",

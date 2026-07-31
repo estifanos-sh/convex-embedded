@@ -3,7 +3,7 @@
 //! This module owns every SQL statement shape. It uses `SeaQuery` for schema/query construction,
 //! then hands final `SQLite` SQL text plus explicitly ordered Turso bind values to the driver.
 
-use std::sync::LazyLock;
+use std::{borrow::Cow, sync::LazyLock};
 
 use sea_query::{
     Alias, Asterisk, ColumnDef as SqlColumnDef, Cond, ConditionalStatement, Expr, ExprTrait, Func,
@@ -12,7 +12,9 @@ use sea_query::{
 use turso_core::Value;
 
 use crate::error::StorageError;
-use crate::types::{Bound, ColValue, CountSpec, Order, ReadSpec, TableDef};
+use crate::types::{
+    Bound, ColValue, ColumnDef, CountSpec, Order, ReadSpec, TableDef, TablePlacement,
+};
 
 /// Hard ceiling on rows in one page. Mirrors `READ_CAP` in the TS.
 pub const READ_CAP: usize = 32_768;
@@ -40,14 +42,6 @@ include!(concat!(env!("OUT_DIR"), "/epoch.rs"));
 /// Reads the database's stored format version (0 on a brand-new database).
 pub(crate) const READ_USER_VERSION: &str = "PRAGMA user_version";
 
-/// While v5 remains unreleased (V5 "Local Store Evolution"), a store whose physical bytes cannot be
-/// opened at all — a corrupt header, a store written by a prior turso release — is an incompatible
-/// *format*, not same-format corruption, and is hard-reset to the current empty format instead of
-/// failing closed. This mirrors the unconditional format-version reset in `EmbeddedStore::setup`;
-/// both are gated only by v5 being pre-release. At release this becomes a durable-migration decision
-/// and this seam flips to preserve, not discard, an unreadable released store.
-pub(crate) const RESET_UNREADABLE_STORE: bool = true;
-
 /// Lists every table name so startup can distinguish a new store from an incompatible one and
 /// reconcile app-owned tables without touching detached data.
 pub(crate) const LIST_TABLES: &str = "SELECT name FROM sqlite_master WHERE type = 'table'";
@@ -55,6 +49,195 @@ pub(crate) const LIST_TABLES: &str = "SELECT name FROM sqlite_master WHERE type 
 pub(crate) const BEGIN_TRANSACTION: &str = "BEGIN";
 pub(crate) const COMMIT: &str = "COMMIT";
 pub(crate) const ROLLBACK: &str = "ROLLBACK";
+
+pub(crate) const BOOTSTRAP_VERSION: i64 = 1;
+pub(crate) const BOOTSTRAP: &str = "__embedded_bootstrap";
+pub(crate) const ORIGIN: &str = "__embedded_origin";
+pub(crate) const ORIGIN_PAYLOAD: &str = "__embedded_origin_payload";
+pub(crate) const ACTIVE_GENERATION_KEY: &str = "active_generation";
+pub(crate) const BOOTSTRAP_VERSION_KEY: &str = "bootstrap_version";
+pub(crate) const NEXT_GENERATION_KEY: &str = "next_generation";
+pub(crate) const ACTIVE_CONTRACT_KEY: &str = "active_contract";
+pub(crate) const CANDIDATE_GENERATION_KEY: &str = "candidate_generation";
+pub(crate) const CANDIDATE_SOURCE_KEY: &str = "candidate_source";
+pub(crate) const CANDIDATE_CONTRACT_KEY: &str = "candidate_contract";
+pub(crate) const CANDIDATE_CODE_HASH_KEY: &str = "candidate_code_hash";
+pub(crate) const CANDIDATE_STATE_KEY: &str = "candidate_state";
+pub(crate) const CANDIDATE_APPLIED_KEY: &str = "candidate_applied_migrations";
+pub(crate) const CANDIDATE_PROGRESS_KEY: &str = "candidate_migration_progress";
+pub(crate) const CANDIDATE_COPY_CURSOR_KEY: &str = "candidate_copy_cursor";
+pub(crate) const CANDIDATE_MATERIALIZE_CURSOR_KEY: &str = "candidate_materialize_cursor";
+pub(crate) const RETIRED_GENERATIONS_KEY: &str = "retired_generations";
+
+pub(crate) const CREATE_BOOTSTRAP: &str = "\
+CREATE TABLE IF NOT EXISTS __embedded_bootstrap (\
+key TEXT PRIMARY KEY NOT NULL,\
+value BLOB NOT NULL\
+)";
+pub(crate) const CREATE_ORIGIN: &str = "\
+CREATE TABLE IF NOT EXISTS __embedded_origin (\
+generation INTEGER NOT NULL,\
+identity_key TEXT NOT NULL,\
+kind INTEGER NOT NULL,\
+record_key BLOB NOT NULL,\
+codec INTEGER NOT NULL,\
+flags INTEGER NOT NULL,\
+payload BLOB NOT NULL,\
+payload_hash BLOB NOT NULL,\
+PRIMARY KEY (generation, identity_key, kind, record_key)\
+)";
+pub(crate) const CREATE_ORIGIN_PAYLOAD: &str = "\
+CREATE TABLE IF NOT EXISTS __embedded_origin_payload (\
+hash BLOB PRIMARY KEY NOT NULL,\
+bytes BLOB NOT NULL\
+)";
+pub(crate) const READ_BOOTSTRAP: &str = "SELECT value FROM __embedded_bootstrap WHERE key = ?";
+pub(crate) const WRITE_BOOTSTRAP: &str = "\
+INSERT INTO __embedded_bootstrap (key, value) VALUES (?, ?) \
+ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+pub(crate) const DELETE_BOOTSTRAP: &str = "DELETE FROM __embedded_bootstrap WHERE key = ?";
+pub(crate) const WRITE_ORIGIN: &str = "\
+INSERT INTO __embedded_origin \
+(generation, identity_key, kind, record_key, codec, flags, payload, payload_hash) \
+VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+ON CONFLICT(generation, identity_key, kind, record_key) DO UPDATE SET \
+codec = excluded.codec, flags = excluded.flags, payload = excluded.payload, \
+payload_hash = excluded.payload_hash";
+pub(crate) const DELETE_ORIGIN: &str = "\
+DELETE FROM __embedded_origin \
+WHERE generation = ? AND identity_key = ? AND kind = ? AND record_key = ?";
+pub(crate) const READ_ORIGIN: &str = "\
+SELECT identity_key, kind, record_key, codec, flags, payload, payload_hash \
+FROM __embedded_origin \
+WHERE generation = ? AND \
+(identity_key > ? OR (identity_key = ? AND kind > ?) OR \
+(identity_key = ? AND kind = ? AND record_key > ?)) \
+ORDER BY identity_key, kind, record_key LIMIT ?";
+pub(crate) const READ_ORIGIN_BOUNDED: &str = "\
+SELECT identity_key, kind, record_key, codec, flags, payload, payload_hash \
+FROM __embedded_origin \
+WHERE generation = ? AND \
+(identity_key > ? OR (identity_key = ? AND kind > ?) OR \
+(identity_key = ? AND kind = ? AND record_key > ?)) AND \
+(identity_key < ? OR (identity_key = ? AND kind < ?) OR \
+(identity_key = ? AND kind = ? AND record_key <= ?)) \
+ORDER BY identity_key, kind, record_key LIMIT ?";
+pub(crate) const READ_ORIGIN_TAIL: &str = "\
+SELECT identity_key, kind, record_key FROM __embedded_origin \
+WHERE generation = ? ORDER BY identity_key DESC, kind DESC, record_key DESC LIMIT 1";
+pub(crate) const READ_ORIGIN_ONE: &str = "\
+SELECT identity_key, kind, record_key, codec, flags, payload, payload_hash \
+FROM __embedded_origin \
+WHERE generation = ? AND identity_key = ? AND kind = ? AND record_key = ?";
+pub(crate) const DELETE_ORIGIN_GENERATION_PAGE: &str = "\
+DELETE FROM __embedded_origin WHERE rowid IN (\
+SELECT rowid FROM __embedded_origin WHERE generation = ? LIMIT 512\
+)";
+pub(crate) const WRITE_ORIGIN_PAYLOAD: &str = "\
+INSERT INTO __embedded_origin_payload (hash, bytes) VALUES (?, ?) \
+ON CONFLICT(hash) DO NOTHING";
+pub(crate) const READ_ORIGIN_PAYLOAD: &str =
+    "SELECT bytes FROM __embedded_origin_payload WHERE hash = ?";
+pub(crate) const CREATE_ORIGIN_PAYLOAD_REACHABLE: &str = "\
+CREATE TEMP TABLE IF NOT EXISTS __embedded_origin_payload_reachable (\
+hash BLOB PRIMARY KEY NOT NULL\
+)";
+pub(crate) const CLEAR_ORIGIN_PAYLOAD_REACHABLE: &str =
+    "DELETE FROM temp.__embedded_origin_payload_reachable";
+pub(crate) const WRITE_ORIGIN_PAYLOAD_REACHABLE: &str = "\
+INSERT INTO temp.__embedded_origin_payload_reachable (hash) VALUES (?) \
+ON CONFLICT(hash) DO NOTHING";
+pub(crate) const READ_ORIGIN_PAYLOAD_REFERENCE_PAGE: &str = "\
+SELECT rowid, kind, codec, flags, payload FROM __embedded_origin \
+WHERE rowid > ? ORDER BY rowid LIMIT 512";
+pub(crate) const DELETE_UNREACHABLE_ORIGIN_PAYLOAD_PAGE: &str = "\
+DELETE FROM __embedded_origin_payload WHERE rowid IN (\
+SELECT payload.rowid FROM __embedded_origin_payload AS payload \
+LEFT JOIN temp.__embedded_origin_payload_reachable AS reachable \
+ON reachable.hash = payload.hash \
+WHERE reachable.hash IS NULL LIMIT 512\
+)";
+
+/// Canonical physical DDL for the engine-owned portion of a generation.
+///
+/// The store contract hashes these exact statements, so adding or changing an engine table cannot
+/// silently retain the prior contract.
+pub(crate) fn core_layout_manifest() -> Vec<String> {
+    let mut manifest = vec![
+        CREATE_BOOTSTRAP.to_owned(),
+        CREATE_ORIGIN.to_owned(),
+        CREATE_ORIGIN_PAYLOAD.to_owned(),
+    ];
+    manifest.extend(
+        generation_layout_manifest()
+            .into_iter()
+            .map(|statement| generation_sql(statement, 1).into_owned()),
+    );
+    manifest.push(generation_sql(CREATE_ORIGIN_PAYLOAD_REACHABLE, 1).into_owned());
+    let probe = TableDef {
+        name: "contract_probe".to_owned(),
+        placement: TablePlacement::Device,
+        columns: vec![
+            ColumnDef {
+                name: "first".to_owned(),
+                field: None,
+            },
+            ColumnDef {
+                name: "second".to_owned(),
+                field: Some("nested.value".to_owned()),
+            },
+        ],
+        crdt_fields: Vec::new(),
+        local_fields: Vec::new(),
+        indexes: Vec::new(),
+    };
+    manifest.push(generation_sql(&create_doc_table(&probe), 1).into_owned());
+    manifest.push(
+        generation_sql(
+            &create_doc_index(
+                &probe.name,
+                "contract_index",
+                &["first".to_owned(), "second".to_owned()],
+            )
+            .expect("the canonical layout probe uses valid identifiers"),
+            1,
+        )
+        .into_owned(),
+    );
+    manifest
+}
+
+/// Exact DDL executed for every new generation.
+pub(crate) fn generation_layout_manifest() -> Vec<&'static str> {
+    vec![
+        create_commits(),
+        create_meta(),
+        create_mutations(),
+        create_commits_mutation_index(),
+        create_blobs(),
+        create_revs(),
+        create_rev_log(),
+        create_dirty_heads(),
+        create_dirty_heads_seq_index(),
+        create_crdt_ops(),
+        create_crdt_field(),
+        create_local_fields(),
+        create_projections(),
+        create_projections_server_index(),
+        create_memberships(),
+        create_memberships_row_index(),
+        create_results(),
+        create_peers(),
+        create_files(),
+        create_id_mappings(),
+        create_id_mappings_convex_index(),
+        create_id_mappings_deleted_index(),
+        create_uploads(),
+        create_remote(),
+        create_schedules(),
+        CREATE_MIGRATION_SNAPSHOT,
+    ]
+}
 
 const COMMITS: &str = "__embedded_commits";
 const META: &str = "__embedded_meta";
@@ -150,6 +333,101 @@ const CLOCK: &str = "clock";
 const RANGE_LOWER: &str = "range_lower";
 const RANGE_UPPER: &str = "range_upper";
 const RANGE_ORDER: &str = "range_order";
+
+pub(crate) const CREATE_MIGRATION_SNAPSHOT: &str = "\
+CREATE TABLE IF NOT EXISTS __embedded_migration_snapshot (\
+identity_key TEXT NOT NULL,\
+kind INTEGER NOT NULL,\
+record_key BLOB NOT NULL,\
+codec INTEGER NOT NULL,\
+flags INTEGER NOT NULL,\
+payload BLOB NOT NULL,\
+payload_hash BLOB NOT NULL,\
+PRIMARY KEY (identity_key, kind, record_key)\
+) STRICT";
+pub(crate) const CLEAR_MIGRATION_SNAPSHOT: &str = "DELETE FROM __embedded_migration_snapshot";
+pub(crate) const WRITE_MIGRATION_SNAPSHOT: &str = "\
+INSERT INTO __embedded_migration_snapshot \
+(identity_key, kind, record_key, codec, flags, payload, payload_hash) \
+VALUES (?, ?, ?, ?, ?, ?, ?) \
+ON CONFLICT(identity_key, kind, record_key) DO NOTHING";
+pub(crate) const READ_MIGRATION_SNAPSHOT: &str = "\
+SELECT identity_key, kind, record_key, codec, flags, payload, payload_hash \
+FROM __embedded_migration_snapshot \
+WHERE (identity_key > ? OR (identity_key = ? AND kind > ?) OR \
+(identity_key = ? AND kind = ? AND record_key > ?)) \
+ORDER BY identity_key, kind, record_key LIMIT ?";
+
+/// Applies the selected generation to every mutable table and index identifier.
+///
+/// Token-wise rewriting keeps the hundreds of statement builders generation-agnostic while
+/// ensuring already-qualified identifiers and the three frozen ABI tables remain untouched.
+pub(crate) fn generation_sql(input: &str, generation: i64) -> Cow<'_, str> {
+    if generation <= 0 {
+        return Cow::Borrowed(input);
+    }
+    let prefix = format!("g{generation}__");
+    let mut output = String::with_capacity(input.len() + prefix.len() * 2);
+    let bytes = input.as_bytes();
+    let mut cursor = 0;
+    let mut changed = false;
+    while cursor < bytes.len() {
+        if is_identifier_byte(bytes[cursor]) {
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len() && is_identifier_byte(bytes[cursor]) {
+                cursor += 1;
+            }
+            let token = &input[start..cursor];
+            if let Some(table) = token.strip_prefix("sqlite_autoindex___embedded_") {
+                output.push_str("sqlite_autoindex_");
+                output.push_str(&prefix);
+                output.push_str("embedded_");
+                output.push_str(table);
+                changed = true;
+            } else if is_generation_scoped_identifier(token) {
+                output.push_str(&prefix);
+                output.push_str(token.strip_prefix("__").unwrap_or(token));
+                changed = true;
+            } else {
+                output.push_str(token);
+            }
+        } else {
+            output.push(bytes[cursor] as char);
+            cursor += 1;
+        }
+    }
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_generation_scoped_identifier(token: &str) -> bool {
+    if matches!(token, BOOTSTRAP | ORIGIN | ORIGIN_PAYLOAD) {
+        return false;
+    }
+    token.starts_with("__embedded_")
+        || token.starts_with("doc__")
+        || token.starts_with("ix__")
+        || token.starts_with("ux__embedded_")
+}
+
+pub(crate) fn generation_identifier(identifier: &str, generation: i64) -> String {
+    if generation <= 0 || !is_generation_scoped_identifier(identifier) {
+        identifier.to_owned()
+    } else {
+        format!(
+            "g{generation}__{}",
+            identifier.strip_prefix("__").unwrap_or(identifier)
+        )
+    }
+}
 
 static CREATE_COMMITS: LazyLock<String> = LazyLock::new(|| {
     strict(
@@ -884,10 +1162,6 @@ static DELETE_LOCAL_FIELDS_ROW: LazyLock<String> = LazyLock::new(|| {
 });
 static CLEAR_LOCAL_FIELDS: LazyLock<String> =
     LazyLock::new(|| delete_where(LOCAL_FIELDS, [eq(IDENTITY_KEY)]));
-static DELETE_LOCAL_FIELDS_TABLE: LazyLock<String> =
-    LazyLock::new(|| delete_where(LOCAL_FIELDS, [eq(TABLE_NAME)]));
-static DELETE_LOCAL_FIELDS_DEFINITION: LazyLock<String> =
-    LazyLock::new(|| delete_where(LOCAL_FIELDS, [eq(TABLE_NAME), eq(FIELD)]));
 static REKEY_LOCAL_FIELDS: LazyLock<String> = LazyLock::new(|| {
     format!(
         "INSERT OR IGNORE INTO {LOCAL_FIELDS} ({IDENTITY_KEY}, {TABLE_NAME}, {DOCUMENT_ID}, {FIELD}, {VALUE_JSON}, {LOGICAL_CLOCK}) \
@@ -1975,14 +2249,6 @@ pub(crate) fn clear_local_fields() -> &'static str {
     &CLEAR_LOCAL_FIELDS
 }
 
-pub(crate) fn delete_local_fields_table() -> &'static str {
-    &DELETE_LOCAL_FIELDS_TABLE
-}
-
-pub(crate) fn delete_local_fields_definition() -> &'static str {
-    &DELETE_LOCAL_FIELDS_DEFINITION
-}
-
 pub(crate) fn rekey_local_fields() -> &'static str {
     &REKEY_LOCAL_FIELDS
 }
@@ -2295,13 +2561,6 @@ pub(crate) fn create_doc_table(def: &TableDef) -> String {
     strict(&table.to_string(SqliteQueryBuilder))
 }
 
-pub(crate) fn read_doc_columns(table: &str) -> Result<String, StorageError> {
-    validate_bare_ident(table)?;
-    let table = doc_table(table);
-    validate_bare_ident(&table)?;
-    Ok(format!("PRAGMA table_info({})", quote_ident(&table)))
-}
-
 pub(crate) fn doc_table_name(table: &str) -> Result<String, StorageError> {
     validate_bare_ident(table)?;
     let name = doc_table(table);
@@ -2309,47 +2568,11 @@ pub(crate) fn doc_table_name(table: &str) -> Result<String, StorageError> {
     Ok(name)
 }
 
-pub(crate) fn write_doc_column(table: &str, column: &str) -> Result<String, StorageError> {
-    let table = doc_table_name(table)?;
-    validate_bare_ident(column)?;
-    Ok(format!(
-        "ALTER TABLE {} ADD COLUMN {} BLOB NOT NULL DEFAULT X'00'",
-        quote_ident(&table),
-        quote_ident(column)
-    ))
-}
-
-pub(crate) fn delete_doc_column(table: &str, column: &str) -> Result<String, StorageError> {
-    let table = doc_table_name(table)?;
-    validate_bare_ident(column)?;
-    Ok(format!(
-        "ALTER TABLE {} DROP COLUMN {}",
-        quote_ident(&table),
-        quote_ident(column)
-    ))
-}
-
-pub(crate) fn read_doc_rows(table: &str) -> Result<String, StorageError> {
-    let table = doc_table_name(table)?;
-    Ok(format!(
-        "SELECT {}, {}, {} FROM {}",
-        quote_ident(IDENTITY_KEY),
-        quote_ident(ID),
-        quote_ident(DATA),
-        quote_ident(&table)
-    ))
-}
-
-pub(crate) fn write_doc_column_value(table: &str, column: &str) -> Result<String, StorageError> {
-    let table = doc_table_name(table)?;
-    validate_bare_ident(column)?;
-    Ok(format!(
-        "UPDATE {} SET {} = ? WHERE {} = ? AND {} = ?",
-        quote_ident(&table),
-        quote_ident(column),
-        quote_ident(IDENTITY_KEY),
-        quote_ident(ID)
-    ))
+pub(crate) fn read_doc_columns(table: &str) -> Result<String, StorageError> {
+    validate_bare_ident(table)?;
+    let table = doc_table(table);
+    validate_bare_ident(&table)?;
+    Ok(format!("PRAGMA table_info({})", quote_ident(&table)))
 }
 
 pub(crate) fn read_doc_indexes(table: &str) -> Result<String, StorageError> {
@@ -2365,12 +2588,31 @@ pub(crate) fn read_doc_index_columns(table: &str, index: &str) -> Result<String,
     Ok(format!("PRAGMA index_info({})", quote_ident(&name)))
 }
 
-pub(crate) fn delete_doc_index(table: &str, index: &str) -> Result<String, StorageError> {
-    validate_bare_ident(table)?;
-    validate_bare_ident(index)?;
-    let name = format!("ix__{table}__{index}");
-    validate_bare_ident(&name)?;
-    Ok(format!("DROP INDEX IF EXISTS {}", quote_ident(&name)))
+/// Reads the last unreleased, generation-zero document layout for one table.
+///
+/// This query is used exactly once to seed the frozen originated ledger. Its
+/// projection is deliberately explicit so the seeder never depends on `*` or
+/// on `SQLite` column declaration order.
+pub(crate) fn read_legacy_doc_rows(def: &TableDef) -> Result<String, StorageError> {
+    validate_bare_ident(&def.name)?;
+    let table = doc_table_name(&def.name)?;
+    let mut columns = vec![
+        quote_ident(IDENTITY_KEY),
+        quote_ident(ID),
+        quote_ident(CREATION_TIME),
+        quote_ident(DATA),
+    ];
+    for column in &def.columns {
+        validate_bare_ident(&column.name)?;
+        columns.push(quote_ident(&column.name));
+    }
+    Ok(format!(
+        "SELECT {} FROM {} ORDER BY {}, {}",
+        columns.join(", "),
+        quote_ident(&table),
+        quote_ident(IDENTITY_KEY),
+        quote_ident(ID)
+    ))
 }
 
 pub(crate) fn create_doc_index(
@@ -3272,4 +3514,55 @@ where
 
 fn merge(left: Cond, right: Cond) -> Cond {
     all([left, right])
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::{core_layout_manifest, generation_sql};
+
+    #[test]
+    fn core_layout_fingerprints_the_sql_executed_for_a_generation() {
+        let manifest = core_layout_manifest().join("\n");
+        assert!(manifest.contains("g1__embedded_mutations"));
+        assert!(manifest.contains("g1__doc__contract_probe"));
+        assert!(manifest.contains("__embedded_bootstrap"));
+        assert!(!manifest.contains("g1__embedded_bootstrap"));
+    }
+
+    #[test]
+    fn namespaces_mutable_identifiers_only_once() {
+        assert_eq!(
+            generation_sql(
+                "SELECT * FROM __embedded_mutations INDEXED BY ux__embedded_commits__mutation",
+                7,
+            ),
+            "SELECT * FROM g7__embedded_mutations INDEXED BY g7__ux__embedded_commits__mutation"
+        );
+        assert_eq!(
+            generation_sql("SELECT * FROM g7__embedded_mutations", 7),
+            "SELECT * FROM g7__embedded_mutations"
+        );
+        assert_eq!(
+            generation_sql("SELECT * FROM doc__issues INDEXED BY ix__issues__by_id", 7),
+            "SELECT * FROM g7__doc__issues INDEXED BY g7__ix__issues__by_id"
+        );
+        assert_eq!(
+            generation_sql(
+                "SELECT * FROM __embedded_projections INDEXED BY sqlite_autoindex___embedded_projections_1",
+                7,
+            ),
+            "SELECT * FROM g7__embedded_projections INDEXED BY sqlite_autoindex_g7__embedded_projections_1"
+        );
+    }
+
+    #[test]
+    fn leaves_the_frozen_plane_unqualified() {
+        assert_eq!(
+            generation_sql(
+                "SELECT value FROM __embedded_bootstrap; SELECT * FROM __embedded_origin; SELECT * FROM __embedded_origin_payload",
+                3,
+            ),
+            "SELECT value FROM __embedded_bootstrap; SELECT * FROM __embedded_origin; SELECT * FROM __embedded_origin_payload"
+        );
+    }
 }

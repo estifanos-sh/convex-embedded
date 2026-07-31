@@ -86,6 +86,13 @@ export interface EmbeddedBundleInput {
    * @defaultValue `"embedded.generated.ts"`
    */
   generatedPath?: string;
+
+  /**
+   * Device migration manifest module, relative to `convexDir`.
+   *
+   * @defaultValue `"device.migrations.ts"` when that file exists
+   */
+  migrationsPath?: string;
 }
 
 export interface GenerateEmbeddedResult {
@@ -124,6 +131,9 @@ export interface EmbeddedBundleResult {
   /** Every project source reachable from a device function entrypoint. */
   sourceFiles: string[];
 
+  /** Optional default-exported device migration manifest module. */
+  migrationsPath?: string;
+
   /** Placement-aware device schema inlined into the virtual registry. */
   embeddedSchema: EmbeddedGeneratedSchema;
 
@@ -159,6 +169,7 @@ const DEFAULT_CONVEX_DIR = "convex";
 const DEFAULT_SCHEMA_PATH = "schema.ts";
 const EMBEDDED_ENTRYPOINT_PATH = "embedded.ts";
 const DEFAULT_GENERATED_PATH = "embedded.generated.ts";
+const DEFAULT_MIGRATIONS_PATH = "device.migrations.ts";
 const LOCAL_ENTRYPOINT = "@convex-dev/embedded/local";
 const SOURCE_EXTENSIONS = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const SYSTEM_MODULE_RE =
@@ -233,6 +244,16 @@ async function createEmbeddedBundleInner(
   const schemaPath = resolveInputPath(convexDir, input.schemaPath ?? DEFAULT_SCHEMA_PATH);
   const embeddedPath = resolveInputPath(convexDir, EMBEDDED_ENTRYPOINT_PATH);
   const generatedPath = resolveInputPath(convexDir, input.generatedPath ?? DEFAULT_GENERATED_PATH);
+  const requestedMigrationsPath = resolveInputPath(
+    convexDir,
+    input.migrationsPath ?? DEFAULT_MIGRATIONS_PATH,
+  );
+  const migrationsPath = (await fileExists(requestedMigrationsPath))
+    ? requestedMigrationsPath
+    : undefined;
+  if (input.migrationsPath !== undefined && migrationsPath === undefined) {
+    throw new Error(`Device migration manifest not found: ${requestedMigrationsPath}`);
+  }
   const localDirs =
     input.local === undefined
       ? []
@@ -259,6 +280,13 @@ async function createEmbeddedBundleInner(
       convexFiles.map(async (file) => [path.resolve(file), await readFile(file, "utf8")] as const),
     ),
   );
+  if (migrationsPath !== undefined) {
+    const source = sources.get(migrationsPath) ?? (await readFile(migrationsPath, "utf8"));
+    sources.set(migrationsPath, source);
+    if (!/\bexport\s+default\b/.test(maskCommentsAndStrings(source))) {
+      throw new Error(`Device migration manifest ${migrationsPath} must have a default export`);
+    }
+  }
   const files = convexFiles.filter((file) => {
     const name = path.basename(file);
     return (
@@ -304,6 +332,7 @@ async function createEmbeddedBundleInner(
   for (const file of files) {
     const resolved = path.resolve(file);
     if (resolved === schemaPath || resolved === embeddedPath) continue;
+    if (resolved === migrationsPath) continue;
     const source = sources.get(resolved)!;
     if (hasUseNodeDirective(source)) {
       placementByFile.set(resolved, "node");
@@ -341,6 +370,7 @@ async function createEmbeddedBundleInner(
   const entrypoints = [
     ...Object.values(modules),
     ...Object.values(localModules).map((module) => module.file),
+    ...(migrationsPath === undefined ? [] : [migrationsPath]),
   ];
   for (const file of entrypoints) {
     await readDeviceImportGraph({
@@ -375,10 +405,19 @@ async function createEmbeddedBundleInner(
       sources: graph.map((file) => hashBytes(sources.get(file)!)),
     }),
     modules,
+    migrationsPath,
     schemaPath,
     schemaSourceHash,
     sourceFiles: graph,
   };
+}
+
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    return (await stat(file)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 const LOCAL_NAMED_EXPORT = /export\s+(?:async\s+)?(?:function\s*\*?|class)\s+([$A-Z_a-z][$\w]*)/g;

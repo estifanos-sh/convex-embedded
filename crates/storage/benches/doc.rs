@@ -9,6 +9,9 @@ use storage::{
 
 fn schema() -> StoreSchema {
     StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "vals".into(),
             placement: TablePlacement::Replicated,

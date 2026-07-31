@@ -1,7 +1,7 @@
 import epoch from "../../../config/epoch.json" with { type: "json" };
 
 /** Native and WASM storage binding ABI required by this JavaScript bundle. @internal */
-export const EMBEDDED_STORAGE_ABI_VERSION = 21;
+export const EMBEDDED_STORAGE_ABI_VERSION = 23;
 
 /**
  * The package epoch: one identity for everything the package owns — the SQLite layout, the wire

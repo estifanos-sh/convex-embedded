@@ -6335,6 +6335,9 @@ mod tests {
 
     fn documents_crdt_schema() -> storage::StoreSchema {
         storage::StoreSchema {
+            hash: "0".repeat(64),
+            migrations: vec![],
+            migration_code_hash: String::new(),
             tables: vec![storage::TableDef {
                 name: "documents".to_owned(),
                 placement: storage::TablePlacement::Replicated,
@@ -6775,6 +6778,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn applied_crdt_replay_drains_after_pull_already_observed_the_accepted_head() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport {

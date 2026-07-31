@@ -28,6 +28,9 @@ use turso_core::{
 
 fn schema() -> StoreSchema {
     StoreSchema {
+        hash: "0".repeat(64),
+        migrations: vec![],
+        migration_code_hash: String::new(),
         tables: vec![TableDef {
             name: "vals".into(),
             placement: TablePlacement::Replicated,
@@ -153,12 +156,12 @@ fn point_read_seeks_by_id_index() {
     for r in rows(
         &io,
         &conn,
-        "SELECT type, name FROM sqlite_master WHERE tbl_name = 'doc__vals' AND type IN ('index','table') ORDER BY type, name",
+        "SELECT type, name FROM sqlite_master WHERE tbl_name = 'g1__doc__vals' AND type IN ('index','table') ORDER BY type, name",
     ) {
         println!("  {}", r.join("  "));
     }
 
-    let read_sql = testkit::read_doc_sql("vals");
+    let read_sql = testkit::generation_sql(&testkit::read_doc_sql("vals"));
     let point = plan(&io, &conn, &read_sql);
     println!("\npoint read plan:\n  {read_sql}\n  -> {point}");
 
@@ -226,7 +229,7 @@ fn count_plans_stay_index_backed() {
     ];
 
     for (label, spec, expected_index) in cases {
-        let sql = testkit::count_plan(&spec, &table).unwrap().sql;
+        let sql = testkit::generation_sql(&testkit::count_plan(&spec, &table).unwrap().sql);
         let p = plan(&io, &conn, &sql);
         println!("\n{label}:\n  {sql}\n  -> {p}");
         let lower = p.to_lowercase();
@@ -261,26 +264,26 @@ fn internal_point_reads_seek_pk_autoindex() {
 
     let (io, _db, conn) = raw_conn(&path);
 
-    let cases: [(&str, &str, &str, &[&str], &str); 2] = [
+    let cases = [
         (
             "READ_PROJECTION",
-            testkit::read_projection_sql(),
-            "__embedded_projections",
+            testkit::generation_sql(testkit::read_projection_sql()),
+            "g1__embedded_projections",
             &["identity_key=?", "table_name=?", "document_id=?"],
-            "idx__embedded_projections__seen",
+            "g1__idx__embedded_projections__seen",
         ),
         (
             "DELETE_PROJECTION_ROW",
-            testkit::delete_projection_row_sql(),
-            "__embedded_projections",
+            testkit::generation_sql(testkit::delete_projection_row_sql()),
+            "g1__embedded_projections",
             &["identity_key=?", "table_name=?", "document_id=?"],
-            "idx__embedded_projections__seen",
+            "g1__idx__embedded_projections__seen",
         ),
     ];
 
     for (label, sql, table, keys, wrong_index) in cases {
         let autoindex = format!("sqlite_autoindex_{table}_1");
-        let p = plan(&io, &conn, sql);
+        let p = plan(&io, &conn, &sql);
         println!("\n{label}:\n  {sql}\n  -> {p}");
         let lower = p.to_lowercase();
         assert!(
@@ -309,12 +312,12 @@ fn deleted_id_mapping_read_seeks_the_deleted_partial_index() {
     let path = db_path("deleted-mapping");
     let _store = seeded(&path, 100);
     let (io, _db, conn) = raw_conn(&path);
-    let read_sql = testkit::read_deleted_id_mappings_sql();
-    let point = plan(&io, &conn, read_sql);
+    let read_sql = testkit::generation_sql(testkit::read_deleted_id_mappings_sql());
+    let point = plan(&io, &conn, &read_sql);
     println!("\ndeleted-mapping read plan:\n  {read_sql}\n  -> {point}");
     let lower = point.to_lowercase();
     assert!(
-        lower.contains("ix__embedded_id_mappings__convex_deleted"),
+        lower.contains("g1__ix__embedded_id_mappings__convex_deleted"),
         "deleted-mapping read does not seek the deleted partial index: {point}"
     );
 }

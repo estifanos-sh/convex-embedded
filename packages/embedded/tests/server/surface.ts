@@ -1518,6 +1518,49 @@ describe("v5 server surface", () => {
     expect(targetInvocations).toBe(1);
   });
 
+  test("settles a push whose deployed target no longer exists", async () => {
+    const replayWrite = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
+    };
+    const commit = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:commit",
+    };
+    const pushComponent = {
+      protocol: { commit, installation: {}, pull: componentPullReference, replayWrite },
+    } as unknown as ComponentApi<"embedded">;
+    const embedded = defineEmbedded({ component: pushComponent, schema });
+    let committed: Record<string, unknown> | undefined;
+    const ctx = {
+      auth: { getUserIdentity: async () => null },
+      meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
+      runMutation: async (reference: unknown, args: Record<string, unknown>) => {
+        if (reference === replayWrite) return null;
+        if (reference === commit) {
+          committed = args;
+          return (args.request as { settlement: unknown }).settlement;
+        }
+        throw new Error("Could not find public function documents:renamed");
+      },
+    };
+
+    await expect(
+      invokePush(embedded, ctx, mutationPushRequest("documents:renamed", {})),
+    ).resolves.toMatchObject({
+      mutationId: "mutation-1",
+      outcome: "rejected",
+      error: {
+        code: "EMBEDDED_REJECTED",
+        reason: "Could not find public function documents:renamed",
+      },
+    });
+    expect(committed).toMatchObject({
+      request: {
+        kind: "failure",
+        settlement: { mutationId: "mutation-1", outcome: "rejected" },
+      },
+    });
+  });
+
   test("gates a pull by manifest placement, rejecting a non-replicated target before invoking it", async () => {
     const embedded = defineEmbedded({
       component,
