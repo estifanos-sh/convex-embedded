@@ -6,7 +6,10 @@
 import { embeddedManifest, embeddedSchema, localModules, modules } from "virtual:convex-embedded";
 import { embeddedIdentity } from "virtual:convex-embedded/identity";
 
-import { createEmbeddedAuthState, EmbeddedClient } from "../client";
+import { createEmbeddedAuthState, EmbeddedClient, validateLoadedSetupIdentity } from "../client";
+import { localReferenceName } from "../local";
+import { localFunctionSchema, localGraphHash } from "../local/internal";
+import type { ConvexEmbeddedSchema } from "../schema";
 import { openExpoStore } from "./store";
 
 export type {
@@ -18,7 +21,6 @@ export type {
   EmbeddedDataWrite,
   EmbeddedEvent,
   EmbeddedEventListener,
-  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,
@@ -67,12 +69,13 @@ export interface ConvexEmbeddedClientOptions {
  * import { ConvexEmbeddedClient } from "@convex-dev/embedded/expo";
  *
  * const client = new ConvexEmbeddedClient();
+ * await client.open();
  * ```
  *
  * @public
  */
 export class ConvexEmbeddedClient extends EmbeddedClient {
-  /** Creates an Expo client and opens its native store during initialization. */
+  /** Creates an inert Expo client; {@link EmbeddedClient.open} acquires the native store. */
   constructor(options: ConvexEmbeddedClientOptions = {}) {
     const path = options.path ?? DEFAULT_PATH;
     if (path.length === 0 || path.includes("\0")) {
@@ -80,11 +83,7 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
     }
     super({
       authState: createEmbeddedAuthState(),
-      localModules,
-      manifest: embeddedManifest,
-      moduleGraphHash: embeddedIdentity.moduleGraphHash,
-      modules,
-      remote:
+      hosted:
         options.url === undefined
           ? undefined
           : {
@@ -92,8 +91,50 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
               operationTimeoutMs: options.operationTimeoutMs,
               receiveTimeoutMs: options.receiveTimeoutMs,
             },
-      storeSchema: embeddedSchema.runtimeStoreSchema,
-      store: openExpoStore(path),
+      start: async (setup) => {
+        const local = await localModuleMetadata(localModules);
+        validateLoadedSetupIdentity(setup, local.setupIdentities, embeddedIdentity.moduleGraphHash);
+        return {
+          localModules,
+          localSchemas: local.schemas,
+          localSetupIdentities: local.setupIdentities,
+          manifest: embeddedManifest,
+          moduleGraphHash: embeddedIdentity.moduleGraphHash,
+          modules,
+          remote:
+            options.url === undefined
+              ? undefined
+              : {
+                  url: options.url,
+                  operationTimeoutMs: options.operationTimeoutMs,
+                  receiveTimeoutMs: options.receiveTimeoutMs,
+                },
+          storeSchema: embeddedSchema.runtimeStoreSchema,
+          store: openExpoStore(path),
+        };
+      },
     });
   }
+}
+
+async function localModuleMetadata(moduleLoaders: Record<string, () => Promise<unknown>>): Promise<{
+  schemas: ConvexEmbeddedSchema[];
+  setupIdentities: Record<string, string>;
+}> {
+  const schemas = new Set<ConvexEmbeddedSchema>();
+  const setupIdentities: Record<string, string> = {};
+  for (const load of Object.values(moduleLoaders)) {
+    const module = await load();
+    if (typeof module !== "object" || module === null) continue;
+    for (const value of Object.values(module as Record<string, unknown>)) {
+      const schema = localFunctionSchema(value);
+      if (schema !== undefined) schemas.add(schema);
+      const reference = localReferenceName(value);
+      const graphHash = localGraphHash(value);
+      if (reference !== undefined && graphHash !== undefined) {
+        setupIdentities[reference] = graphHash;
+      }
+    }
+  }
+  return { schemas: [...schemas], setupIdentities };
 }

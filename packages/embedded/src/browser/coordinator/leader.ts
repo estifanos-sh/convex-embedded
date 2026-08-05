@@ -222,6 +222,7 @@ const leaderRequestHandlers = {
   [WorkerCommand.Upload]: handleUpload,
   [WorkerCommand.Devtools]: handleDevtools,
   [WorkerCommand.Mutation]: handleMutation,
+  [WorkerCommand.Action]: handleAction,
   [WorkerCommand.Query]: handleQuery,
   [WorkerCommand.Route]: handleRoute,
   [WorkerCommand.IdentityRead]: handleIdentityRead,
@@ -480,6 +481,19 @@ async function handleQuery(
 ): Promise<void> {
   if (leader.runtime.abandoned) throw abandonedInstanceError(leader);
   const result = await leader.runtime.runner.runQuery(request.name, request.args, {
+    auth: request.auth as never,
+  });
+  client.post({ id: request.id, result, op: WorkerEvent.Result });
+}
+
+async function handleAction(
+  leader: LeaderState,
+  client: ClientState,
+  request: Extract<WorkerRequest, { op: typeof WorkerCommand.Action }>,
+): Promise<void> {
+  if (leader.runtime.abandoned) throw abandonedInstanceError(leader);
+  const result = await leader.runtime.runner.runAction(request.name, request.args, {
+    allowInternal: true,
     auth: request.auth as never,
   });
   client.post({ id: request.id, result, op: WorkerEvent.Result });

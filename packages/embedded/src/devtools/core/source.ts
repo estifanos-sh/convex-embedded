@@ -5,7 +5,6 @@ import type {
   RunnerDevtoolsRows,
   RunnerDevtoolsSnapshot,
 } from "../../runtime/runner";
-import type { QuarantinePage } from "../../storage/types";
 import type {
   EmbeddedDevtoolsClient,
   EmbeddedDevtoolsRuntime,
@@ -94,15 +93,6 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
     }
     const fn = await this.readFunction(input.path);
     return this.client.__devtoolsRunFunction({ ...input, kind: fn.kind });
-  }
-
-  async exportQuarantine(
-    options: { cursor?: string; pageSize?: number } = {},
-  ): Promise<QuarantinePage> {
-    return (await this.runtimeRequest({
-      kind: "exportQuarantine",
-      ...options,
-    })) as QuarantinePage;
   }
 
   async patchDocument(table: string, id: string, fields: Record<string, unknown>): Promise<void> {
@@ -271,10 +261,6 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
       if (this.hasViewListeners("data")) this.scheduleRuntimeRefresh();
     }
     if (event.type === "storage") {
-      this.queueView("storage", event);
-      if (this.hasViewListeners("storage")) this.scheduleRuntimeRefresh();
-    }
-    if (event.type === "migration") {
       this.queueView("storage", event);
       if (this.hasViewListeners("storage")) this.scheduleRuntimeRefresh();
     }

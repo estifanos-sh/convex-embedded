@@ -1,10 +1,11 @@
+import type { CommitTsPlaceholder } from "convex/values";
+
 interface MutationPosition {
-  _creationTime: number;
+  acknowledgedAt?: bigint | CommitTsPlaceholder;
   clientId: string;
 }
 
 interface ClientFence {
-  acknowledgedThrough?: number;
   retired: boolean;
 }
 
@@ -15,7 +16,6 @@ export function isAcknowledged(
   return (
     mutation.clientId === "hosted" ||
     client?.retired === true ||
-    (client?.acknowledgedThrough !== undefined &&
-      mutation._creationTime <= client.acknowledgedThrough)
+    mutation.acknowledgedAt !== undefined
   );
 }

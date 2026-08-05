@@ -1,5 +1,6 @@
 import type { GenericValidator, PropertyValidators, ValidatorJSON } from "convex/values";
 import { assertValueWalk, equals, fromJson, isNormalized, isSimpleObject } from "./codec";
+import { isPendingCommitTs } from "./pending";
 import { tableFromId } from "./doc";
 
 /**
@@ -92,6 +93,11 @@ const checkValueByKind = {
   int64(value, _validator, path) {
     return typeof value === "bigint" ? undefined : `${path} must be an int64`;
   },
+  commitTs(value, _validator, path) {
+    return typeof value === "bigint" || isPendingCommitTs(value)
+      ? undefined
+      : `${path} must be a commit timestamp`;
+  },
   boolean(value, _validator, path) {
     return typeof value === "boolean" ? undefined : `${path} must be a boolean`;
   },
@@ -169,6 +175,11 @@ const checkJsonByType = {
   },
   bigint(value, _validator, path) {
     return typeof value === "bigint" ? undefined : `${path} must be an int64`;
+  },
+  commitTs(value, _validator, path) {
+    return typeof value === "bigint" || isPendingCommitTs(value)
+      ? undefined
+      : `${path} must be a commit timestamp`;
   },
   boolean(value, _validator, path) {
     return typeof value === "boolean" ? undefined : `${path} must be a boolean`;

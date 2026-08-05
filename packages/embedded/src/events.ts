@@ -206,24 +206,6 @@ export interface EmbeddedRuntimeEvent {
   waitedMs?: number;
 }
 
-/** Payload-free outcome of a device-store generation upgrade. @public */
-export interface EmbeddedMigrationEvent {
-  at: number;
-  activeGeneration: number;
-  candidateGeneration: number;
-  created: boolean;
-  discarded: number;
-  migrated: number;
-  quarantined: number;
-  readonly reasons: Readonly<Record<string, number>>;
-  required: boolean;
-  resumed: boolean;
-  scanned: number;
-  sourceContractHash: string;
-  targetContractHash: string;
-  type: "migration";
-}
-
 /** A local after-image retained as a restorable revision. @public */
 export interface EmbeddedConflict {
   id: string;
@@ -261,7 +243,6 @@ export interface EmbeddedSchedulerEvent {
 export type EmbeddedEvent =
   | EmbeddedConflictEvent
   | EmbeddedDataEvent
-  | EmbeddedMigrationEvent
   | EmbeddedOperationEvent
   | EmbeddedRemoteEvent
   | EmbeddedRuntimeEvent
@@ -350,22 +331,6 @@ export type EmbeddedPublicEvent =
       target: "crdt" | "revision" | "file" | "mutation" | "client";
       processed: number;
       isDone: boolean;
-    }
-  | {
-      type: "migration";
-      at: number;
-      activeGeneration: number;
-      candidateGeneration: number;
-      created: boolean;
-      discarded: number;
-      migrated: number;
-      quarantined: number;
-      reasons: Readonly<Record<string, number>>;
-      required: boolean;
-      resumed: boolean;
-      scanned: number;
-      sourceContractHash: string;
-      targetContractHash: string;
     };
 
 /** Listener registered with {@link import("./client").EmbeddedClient.subscribeEvents}. @public */
@@ -459,8 +424,6 @@ export function mapPublicEvent(event: EmbeddedEvent): EmbeddedPublicEvent | null
         source: event.source === undefined || event.source === "cache" ? "local" : event.source,
         tables: event.changedTables,
       };
-    case "migration":
-      return event;
     default:
       return null;
   }

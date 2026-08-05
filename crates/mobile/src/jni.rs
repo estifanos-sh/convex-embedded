@@ -35,7 +35,7 @@ pub extern "system" fn Java_dev_convex_embedded_mobile_Native_open(
     match result {
         Ok(Ok(handle)) => handle as jlong,
         Ok(Err(error)) => {
-            throw(&mut env, &error.to_string());
+            throw(&mut env, &error.marker());
             0
         }
         Err(_) => {

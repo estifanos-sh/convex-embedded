@@ -173,6 +173,7 @@ const localRequestHandlers = new Map<WorkerCommandCode, LocalRequestHandler>([
     (runtime, request) => runtime.handleRuntimeRequest(request as never),
   ],
   [WorkerCommand.Mutation, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
+  [WorkerCommand.Action, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
   [WorkerCommand.Query, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
   [WorkerCommand.Route, (runtime, request) => runtime.handleRuntimeRequest(request as never)],
   [

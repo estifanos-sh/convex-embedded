@@ -8,6 +8,7 @@ import {
   ConvexEmbeddedClient,
   createBrowserStorageOwnership,
   installBrowserNetworkLifecycle,
+  setBrowserLocalModules,
 } from "../../src/browser/client";
 import { BrowserLifecycleRunner, installPageLifecycle } from "../../src/browser/lifecycle";
 import type { WorkerRunner } from "../../src/browser/proxy";
@@ -16,6 +17,9 @@ import type { EmbeddedEvent } from "../../src/events";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import type { Runner } from "../../src/runtime/runner";
 import { setEmbeddedIdentity } from "../../src/browser/identity";
+import { defineLocal, stampLocal } from "../../src/local";
+import { defineEmbeddedSchema } from "../../src/schema";
+import { v } from "convex/values";
 
 type PageLocks = NonNullable<Parameters<typeof createBrowserStorageOwnership>[1]>;
 
@@ -332,6 +336,68 @@ describe("browser storage ownership", () => {
 });
 
 describe("local browser runtime cache", () => {
+  test("rejects a setup from another graph before creating a worker", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const local = defineLocal(defineEmbeddedSchema({}));
+    const stale = local.internalAction({
+      args: {},
+      returns: v.null(),
+      handler: () => null,
+    });
+    stampLocal("local/setup", "stale-modules", { stale });
+    let workers = 0;
+    const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    Object.defineProperty(globalThis, "Worker", {
+      configurable: true,
+      value: class {
+        constructor() {
+          workers += 1;
+        }
+      },
+    });
+    const client = new ConvexEmbeddedClient();
+    try {
+      await expect(client.open(stale)).rejects.toThrow("loaded browser module graph");
+      expect(workers).toBe(0);
+    } finally {
+      await client.close();
+      if (workerDescriptor) Object.defineProperty(globalThis, "Worker", workerDescriptor);
+      else Reflect.deleteProperty(globalThis, "Worker");
+    }
+  });
+
+  test("rejects an unknown same-graph setup reference before creating a worker", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const local = defineLocal(defineEmbeddedSchema({}));
+    const missing = local.internalAction({
+      args: {},
+      returns: v.null(),
+      handler: () => null,
+    });
+    stampLocal("local/missing", "modules", { missing });
+    setBrowserLocalModules({ "local/registered": async () => ({}) });
+    let workers = 0;
+    const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    Object.defineProperty(globalThis, "Worker", {
+      configurable: true,
+      value: class {
+        constructor() {
+          workers += 1;
+        }
+      },
+    });
+    const client = new ConvexEmbeddedClient();
+    try {
+      await expect(client.open(missing)).rejects.toThrow("not registered");
+      expect(workers).toBe(0);
+    } finally {
+      await client.close();
+      setBrowserLocalModules(undefined);
+      if (workerDescriptor) Object.defineProperty(globalThis, "Worker", workerDescriptor);
+      else Reflect.deleteProperty(globalThis, "Worker");
+    }
+  });
+
   test("evicts a worker whose initialization failed before the next client starts", async () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
     interface FakeWorker extends EmbeddedWorker {
@@ -378,20 +444,24 @@ describe("local browser runtime cache", () => {
     });
     try {
       const first = new ConvexEmbeddedClient();
+      const firstOpen = first.open();
       await Promise.resolve();
       await Promise.resolve();
       workers[0]?.emit({
         error: { message: "init failed", name: "Error" },
         op: WorkerEvent.Terminal,
       });
-      await expect(first.query("missing" as never)).rejects.toThrow("init failed");
+      await expect(firstOpen).rejects.toThrow("init failed");
 
       const second = new ConvexEmbeddedClient();
+      const secondOpen = second.open();
+      await Promise.resolve();
       expect(workers).toHaveLength(2);
       workers[1]?.emit({
         error: { message: "done", name: "Error" },
         op: WorkerEvent.Terminal,
       });
+      await expect(secondOpen).rejects.toThrow("done");
       await second.close();
     } finally {
       if (workerDescriptor) Object.defineProperty(globalThis, "Worker", workerDescriptor);

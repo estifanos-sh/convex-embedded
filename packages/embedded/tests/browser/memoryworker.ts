@@ -19,9 +19,20 @@ interface MemoryRequest {
   storageId: string;
 }
 
-self.onmessage = (event: MessageEvent<MemoryRequest | SeedRequest>) => {
+interface CandidateRequest {
+  op: "candidate";
+  rows: number;
+  storageId: string;
+}
+
+self.onmessage = (event: MessageEvent<CandidateRequest | MemoryRequest | SeedRequest>) => {
   const request = event.data;
-  const handler = request.op === "seed" ? seed(request) : measure(request);
+  const handler =
+    request.op === "seed"
+      ? seed(request)
+      : request.op === "candidate"
+        ? measureCandidate(request)
+        : measure(request);
   void handler
     .then((result) => self.postMessage({ ok: true, result }))
     .catch((error: unknown) =>
@@ -31,6 +42,138 @@ self.onmessage = (event: MessageEvent<MemoryRequest | SeedRequest>) => {
       }),
     );
 };
+
+async function measureCandidate(request: CandidateRequest): Promise<{
+  coldMs: number;
+  initialKiB: number;
+  maximumKiB: number;
+  peakKiB: number;
+  rows: number;
+  rowsPerSecond: number;
+  settledKiB: number;
+  warmMs: number;
+}> {
+  const capture = installMemoryCapture();
+  try {
+    const { modules, storeSchema, wasm } = await loadModules();
+    const seeded = await openWithSchema(request.storageId, storeSchema, modules, wasm);
+    const captured = capture.read();
+    const initialKiB = memoryKiB(captured.memory);
+    let peakKiB = initialKiB;
+    const sample = () => {
+      peakKiB = Math.max(peakKiB, memoryKiB(captured.memory));
+    };
+    try {
+      await writeCandidateRows(seeded, request.rows, sample);
+    } finally {
+      await close(seeded);
+    }
+    sample();
+
+    const target = {
+      ...storeSchema,
+      hash: "b".repeat(64),
+      setupHash: "",
+      tables: storeSchema.tables.map((table) =>
+        table.name === "setupState"
+          ? {
+              ...table,
+              columns: table.columns.some((column) => column.name === "version")
+                ? table.columns
+                : [...table.columns, { name: "version" }],
+            }
+          : table,
+      ),
+    };
+    const coldStarted = performance.now();
+    const cold = await openWithSchema(request.storageId, target, modules, wasm);
+    const coldMs = performance.now() - coldStarted;
+    sample();
+    const coldRows = await candidateRows(cold, request.rows);
+    await close(cold);
+    if (coldRows !== request.rows) {
+      throw new Error(`cold candidate retained ${coldRows}/${request.rows} rows`);
+    }
+
+    const warmStarted = performance.now();
+    const warm = await openWithSchema(request.storageId, target, modules, wasm);
+    const warmMs = performance.now() - warmStarted;
+    sample();
+    const warmRows = await candidateRows(warm, request.rows);
+    await close(warm);
+    if (warmRows !== request.rows) {
+      throw new Error(`warm candidate retained ${warmRows}/${request.rows} rows`);
+    }
+    const settledKiB = memoryKiB(captured.memory);
+    return {
+      coldMs,
+      initialKiB,
+      maximumKiB: captured.maximumPages * 64,
+      peakKiB: Math.max(peakKiB, settledKiB),
+      rows: request.rows,
+      rowsPerSecond: Math.round(request.rows / (coldMs / 1_000)),
+      settledKiB,
+      warmMs,
+    };
+  } finally {
+    capture.restore();
+  }
+}
+
+async function writeCandidateRows(
+  state: WorkerState,
+  rows: number,
+  sample: () => void,
+): Promise<void> {
+  const first = Math.floor(rows / 3);
+  const second = Math.floor((rows * 2) / 3);
+  for (const [identity, from, to] of [
+    ["unauthenticated", 0, first],
+    ["stress:a", first, second],
+    ["stress:b", second, rows],
+  ] as const) {
+    await state.store.identity?.write(identity);
+    for (let start = from; start < to; start += 1_000) {
+      const end = Math.min(to, start + 1_000);
+      await state.store.commit(
+        {
+          deletes: [],
+          docWrites: Array.from({ length: end - start }, (_, offset) => {
+            const index = start + offset;
+            return {
+              cols: [],
+              creationTime: index + 1,
+              data: { version: index },
+              id: `setupState|${index.toString(16).padStart(32, "0")}`,
+              table: "setupState",
+            };
+          }),
+        },
+        { changes: "omit", source: "device" },
+      );
+      sample();
+    }
+  }
+}
+
+async function candidateRows(state: WorkerState, rows: number): Promise<number> {
+  const first = Math.floor(rows / 3);
+  const second = Math.floor((rows * 2) / 3);
+  let total = 0;
+  for (const [identity, expected] of [
+    ["unauthenticated", first],
+    ["stress:a", second - first],
+    ["stress:b", rows - second],
+  ] as const) {
+    await state.store.identity?.write(identity);
+    const count = (await state.store.doc.count.read({ table: "setupState" })) ?? 0;
+    if (count !== expected) {
+      throw new Error(`${identity} candidate partition retained ${count}/${expected} rows`);
+    }
+    total += count;
+  }
+  return total;
+}
 
 async function seed(request: SeedRequest): Promise<{ rows: number }> {
   const state = await open(request.storageId);

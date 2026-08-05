@@ -138,7 +138,7 @@ fn ffi_result<T>(
             Some(value)
         }
         Ok(Err(failure)) => {
-            write_error(error, CemBuffer::from_vec(failure.to_string().into_bytes()));
+            write_error(error, CemBuffer::from_vec(failure.marker().into_bytes()));
             None
         }
         Err(_) => {

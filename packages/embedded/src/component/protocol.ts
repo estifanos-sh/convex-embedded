@@ -895,11 +895,16 @@ async function acknowledgeWrite(
 ): Promise<void> {
   const row = await mutationReplayRead(ctx, identity, replayId);
   if (!row) return;
+  if (row.acknowledgedAt === undefined) {
+    // Commit timestamps are assigned by Convex in this transaction. The fact lives on the exact
+    // settlement row, so later rows cannot become eligible for destructive GC by accident.
+    await ctx.db.patch("mutations", row._id, { acknowledgedAt: ctx.db.vars.commitTs });
+  }
   const client = await clientRead(ctx, row.clientId);
   if (client && row._creationTime > (client.acknowledgedThrough ?? 0)) {
-    await ctx.db.patch("clients", client._id, {
-      acknowledgedThrough: row._creationTime,
-    });
+    // Keep this legacy high-water diagnostic for the remote-client administration surface. It is
+    // intentionally not consulted by settlement deletion; only `mutations.acknowledgedAt` is.
+    await ctx.db.patch("clients", client._id, { acknowledgedThrough: row._creationTime });
   }
 }
 

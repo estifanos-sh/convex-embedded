@@ -222,7 +222,7 @@ export const replicated = null;
       const generated = await readFile(generatedPath, "utf8");
       await writeFile(
         generatedPath,
-        generated.replace('"formatVersion":2', '"formatVersion":999'),
+        generated.replace('"formatVersion":3', '"formatVersion":999'),
         "utf8",
       );
 
@@ -727,6 +727,7 @@ export default defineComponent("defaultChild");
         },
       },
       modules: { "admin/users": "/repo/convex/admin/users.ts" },
+      registerSchema: true,
       sourceFiles: ["/repo/convex/admin/users.ts"],
       schemaPath: "/repo/convex/schema.ts",
       schemaSourceHash: "schema",
@@ -1098,10 +1099,11 @@ describe("embedded unplugin adapter", () => {
 
       const transformed = await plugin.transform(source, modulePath);
 
-      expect(transformed?.code).toBe(`${source}
-import { stampLocal as __embeddedStampLocal } from "@convex-dev/embedded/local";
-__embeddedStampLocal("local/sync/drafts", { readCompact, setCompact });
-`);
+      expect(transformed?.code).toMatch(
+        new RegExp(
+          String.raw`__embeddedStampLocal\("local/sync/drafts", "[a-f0-9]{16}", \{ readCompact, setCompact \}\);`,
+        ),
+      );
       expect((await plugin.transform(source, `${modulePath}?import`))?.code).toBe(
         transformed?.code,
       );
@@ -1153,10 +1155,11 @@ export { setCompact as delete, __embeddedStampLocal as marker };
 
       const transformed = await plugin.transform(source, path.join(localDir, "sync/drafts.ts"));
 
-      expect(transformed?.code).toBe(`${source}
-import { stampLocal as __embeddedStampLocal$ } from "@convex-dev/embedded/local";
-__embeddedStampLocal$("local/sync/drafts", { delete: setCompact, marker: __embeddedStampLocal, readCompact, setCompact });
-`);
+      expect(transformed?.code).toMatch(
+        new RegExp(
+          String.raw`__embeddedStampLocal\$\("local/sync/drafts", "[a-f0-9]{16}", \{ delete: setCompact, marker: __embeddedStampLocal, readCompact, setCompact \}\);`,
+        ),
+      );
     });
   });
 
@@ -1213,7 +1216,9 @@ export const toggle = local.mutation({ args: {}, handler: async () => null });
 
       const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
 
-      expect(transformed?.code).toContain(`__embeddedStampLocal("local/pins", { toggle });`);
+      expect(transformed?.code).toMatch(
+        /__embeddedStampLocal\("local\/pins", "[a-f0-9]{16}", \{ toggle \}\);/,
+      );
     });
   });
 
@@ -1247,10 +1252,9 @@ export const toggle = local.mutation({ args: {}, handler: async () => null });
 
       const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
 
-      expect(transformed?.code).toBe(`${source}
-import { stampLocal as __embeddedStampLocal } from "@convex-dev/embedded/local";
-__embeddedStampLocal("local/pins", { toggle });
-`);
+      expect(transformed?.code).toMatch(
+        /__embeddedStampLocal\("local\/pins", "[a-f0-9]{16}", \{ toggle \}\);/,
+      );
     });
   });
 
@@ -1275,8 +1279,8 @@ export const [head, ...tail] = [1, 2, 3];
 
       const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
 
-      expect(transformed?.code).toContain(
-        `__embeddedStampLocal("local/pins", { alpha, beta, first, head, second, tail });`,
+      expect(transformed?.code).toMatch(
+        /__embeddedStampLocal\("local\/pins", "[a-f0-9]{16}", \{ alpha, beta, first, head, second, tail \}\);/,
       );
     });
   });
@@ -1446,7 +1450,9 @@ describe("embedded Vite adapter", () => {
       const [workerPlugin] = configPlugin.config().worker.plugins();
 
       const stamped = await appPlugin.transform(source, modulePath);
-      expect(stamped?.code).toContain(`__embeddedStampLocal("local/sync/drafts", {`);
+      expect(stamped?.code).toMatch(
+        /__embeddedStampLocal\("local\/sync\/drafts", "[a-f0-9]{16}", \{/,
+      );
       expect((await workerPlugin.transform(source, modulePath))?.code).toBe(stamped?.code);
       expect(await appPlugin.load(modulePath)).toBe(null);
     });

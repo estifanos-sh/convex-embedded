@@ -28,24 +28,50 @@ test("generated contract locks placements without carrying the device schema", (
     manifestHash: "manifest-hash",
     moduleGraphHash: "graph-hash",
     modules: { documents: "/repo/convex/documents.ts" },
+    registerSchema: true,
     schemaPath: "/repo/convex/schema.ts",
     schemaSourceHash: "schema-source-hash",
     sourceFiles: ["/repo/convex/documents.ts"],
   });
 
-  expect(source).toContain("embeddedGeneratedFormatVersion = 2");
+  expect(source).toContain("embeddedGeneratedFormatVersion = 3");
   expect(source).toContain(
-    'embeddedGeneratedIdentity = {"formatVersion":2,"manifestHash":"manifest-hash","schemaSourceHash":"schema-source-hash"}',
+    'embeddedGeneratedIdentity = {"formatVersion":3,"manifestHash":"manifest-hash","schemaSourceHash":"schema-source-hash"}',
   );
   expect(source).toContain(
     'embeddedManifest = {"documents":{"list":{"kind":"query","placement":"replicated","visibility":"public"}}}',
   );
+  expect(source).toContain('import type {} from "@convex-dev/embedded/local";');
+  expect(source).toContain('import type schema from "./schema.js";');
+  expect(source).toContain('declare module "@convex-dev/embedded/local"');
+  expect(source).toContain("schema: typeof schema;");
   expect(source).not.toContain("embeddedSchema");
   expect(source).not.toContain("runtimeStoreSchema");
   expect(source).not.toContain("localApi");
   expect(source).not.toContain("local/drafts");
-  expect(source).not.toContain("import schema");
   expect(source.length).toBeLessThan(2048);
+});
+
+test("unregistered contract stays a value-only lockfile", () => {
+  const schema = defineEmbeddedSchema({
+    documents: replicatedTable({ title: v.string() }),
+  });
+  const source = renderEmbeddedGenerated({
+    embeddedSchema: toEmbeddedGeneratedSchema(analyzeEmbeddedSchema(schema)),
+    generatedPath: "/repo/convex/embedded.generated.ts",
+    localModules: {},
+    manifest: {},
+    manifestHash: "manifest-hash",
+    moduleGraphHash: "graph-hash",
+    modules: {},
+    registerSchema: false,
+    schemaPath: "/repo/convex/schema.ts",
+    schemaSourceHash: "schema-source-hash",
+    sourceFiles: [],
+  });
+
+  expect(source).not.toContain("import type schema");
+  expect(source).not.toContain("declare module");
 });
 
 test("generator atomically creates the contract needed by bundler builds", async () => {

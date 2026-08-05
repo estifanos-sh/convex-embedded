@@ -10,11 +10,16 @@
 use storage::testkit::*;
 use storage::*;
 
+fn complete_empty_queue_policy(store: &EmbeddedStore, generation: i64) {
+    assert!(store
+        .migration_queue_policy_write(generation, r#"{"collectComplete":true,"thresholds":[]}"#,)
+        .unwrap());
+}
+
 fn legacy_document_schema() -> StoreSchema {
     StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "documents".into(),
             placement: TablePlacement::Device,
@@ -144,6 +149,8 @@ fn commit_reports_row_changes_for_observability() {
             }],
             fresh_ids: vec![],
             data_only_ids: vec![],
+            commit_ts_doc_writes: vec![],
+            commit_ts_local_field_writes: vec![],
             id_mappings: vec![],
             schedules: vec![],
         },
@@ -182,6 +189,8 @@ fn data_only_update_changes_body_without_rewriting_index_columns() {
                 table: "issues".into(),
                 document_id: "i1".into(),
             }],
+            commit_ts_doc_writes: vec![],
+            commit_ts_local_field_writes: vec![],
             deletes: vec![],
             fresh_ids: vec![],
             id_mappings: vec![],
@@ -210,8 +219,7 @@ fn supports_camel_case_indexed_fields() {
     let store = EmbeddedStore::open(tmp_path("rs_camel_case_index.db").to_str().unwrap()).unwrap();
     let schema = StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "documents".into(),
             placement: TablePlacement::Replicated,
@@ -280,14 +288,20 @@ fn setup_preserves_nonempty_store_when_format_version_changes() {
     store.force_user_version_for_test(0);
     assert!(matches!(
         store.setup(&schema()),
-        Err(StorageError::IncompatibleStore(_))
+        Err(StorageError::PreBaselineStore {
+            found: 0,
+            minimum: 47
+        })
     ));
     assert!(read_doc(&store, "issues", "i1").is_some());
 
     store.force_user_version_for_test(39);
     assert!(matches!(
         store.setup(&schema()),
-        Err(StorageError::IncompatibleStore(_))
+        Err(StorageError::PreBaselineStore {
+            found: 39,
+            minimum: 47
+        })
     ));
     assert!(read_doc(&store, "issues", "i1").is_some());
 }
@@ -331,6 +345,7 @@ fn direct_setup_rejects_contract_changes_and_migration_rebuilds_derived_rows() {
     assert!(read_doc(&store, "issues", "i1").is_some());
 
     let candidate = store.migration_begin(&changed).unwrap();
+    complete_empty_queue_policy(&store, candidate.candidate_generation);
     store
         .migration_commit(&changed, candidate.candidate_generation)
         .unwrap();
@@ -370,12 +385,15 @@ fn migration_rebuilds_new_index_columns_from_originated_documents() {
                 mutation: CommitMutation::None,
                 push: None,
                 changes: CommitChanges::Include,
+                commit_ts: false,
+                mutation_result_commit_ts: false,
             },
         )
         .unwrap();
 
     let current = current_document_schema();
     let candidate = store.migration_begin(&current).unwrap();
+    complete_empty_queue_policy(&store, candidate.candidate_generation);
     store
         .migration_commit(&current, candidate.candidate_generation)
         .unwrap();
@@ -398,8 +416,7 @@ fn setup_detects_missing_index_columns_without_mutating_the_store() {
         EmbeddedStore::open(tmp_path("rs_schema_physical_mismatch.db").to_str().unwrap()).unwrap();
     let schema = StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "documents".into(),
             placement: TablePlacement::Replicated,
@@ -509,8 +526,7 @@ fn setup_rejects_invalid_and_reserved_schema_names() {
     for name in ["issues; DROP TABLE x", "", "1abc"] {
         let bad = StoreSchema {
             hash: "0".repeat(64),
-            migrations: vec![],
-            migration_code_hash: String::new(),
+            setup_hash: String::new(),
             tables: vec![TableDef {
                 name: name.into(),
                 placement: TablePlacement::Replicated,
@@ -527,8 +543,7 @@ fn setup_rejects_invalid_and_reserved_schema_names() {
     }
     let reserved = StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "issues".into(),
             placement: TablePlacement::Replicated,
@@ -572,6 +587,8 @@ fn commit_applies_mixed_batch_and_rolls_back_failed_writes() {
             }],
             fresh_ids: vec![],
             data_only_ids: vec![],
+            commit_ts_doc_writes: vec![],
+            commit_ts_local_field_writes: vec![],
             id_mappings: vec![],
             schedules: vec![],
         },

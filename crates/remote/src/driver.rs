@@ -51,6 +51,13 @@ pub enum RemoteDocPushState {
     Stale,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AuthoritativeLocalAddress {
+    Matched(String),
+    SoleDurable(String),
+    AdoptHosted,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteDocPush {
     pub state: RemoteDocPushState,
@@ -2248,7 +2255,7 @@ where
             tick.merge(result_tick);
             return Ok((tick, response.outcome));
         }
-        let projections = self.authoritative_projections(&queued, &response, now)?;
+        let projections = self.authoritative_projections(&queued, envelope, &response, now)?;
         let crdt = if response.outcome == PushOutcome::Applied {
             if response.crdt.len() != envelope.crdt.len()
                 || envelope.crdt.len() != queued.crdt.len()
@@ -2403,40 +2410,40 @@ where
 
     fn authoritative_projections(
         &self,
-        envelope: &PushEnvelope,
+        queued: &PushEnvelope,
+        prepared: &PushEnvelope,
         response: &storage::PushResponse,
         now_ms: i64,
     ) -> RemoteResult<Vec<AuthoritativeRow>> {
-        response
-            .authoritative
-            .iter()
-            .map(|change| {
-                let (table, server_id, fields, plain_hash) = match change {
-                    storage::AuthoritativeChange::Put {
-                        table,
-                        row_id,
-                        fields,
-                        plain_hash,
-                    } => (table, row_id, Some(fields), plain_hash),
-                    storage::AuthoritativeChange::Delete {
-                        table,
-                        row_id,
-                        plain_hash,
-                    } => (table, row_id, None, plain_hash),
-                };
-                let local_id =
-                    self.local_id_for_authoritative(envelope, response, table, server_id)?;
-                let row = fields
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|error| {
-                        RemoteError::Protocol(format!(
-                            "authoritative row JSON encode failed: {error}"
-                        ))
-                    })?;
-                Ok(AuthoritativeRow {
+        let mut pending = Vec::with_capacity(response.authoritative.len());
+        for change in &response.authoritative {
+            let (table, server_id, fields, plain_hash) = match change {
+                storage::AuthoritativeChange::Put {
+                    table,
+                    row_id,
+                    fields,
+                    plain_hash,
+                } => (table, row_id, Some(fields), plain_hash),
+                storage::AuthoritativeChange::Delete {
+                    table,
+                    row_id,
+                    plain_hash,
+                } => (table, row_id, None, plain_hash),
+            };
+            let address =
+                self.local_id_for_authoritative(queued, prepared, response, table, server_id)?;
+            let row = fields
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    RemoteError::Protocol(format!("authoritative row JSON encode failed: {error}"))
+                })?;
+            pending.push((
+                table.clone(),
+                address,
+                AuthoritativeRow {
                     table: table.clone(),
-                    local_document_id: Some(local_id),
+                    local_document_id: None,
                     plain_hash: plain_hash.clone(),
                     server_document_id: server_id.clone(),
                     projection_hash: sha256_value(fields.unwrap_or(&serde_json::Value::Null))?,
@@ -2445,41 +2452,74 @@ where
                     row,
                     logical_clock: None,
                     received_time: now_ms,
-                })
-            })
-            .collect()
+                },
+            ));
+        }
+
+        let mut unresolved_by_table = BTreeMap::<String, usize>::new();
+        for (table, address, _) in &pending {
+            if !matches!(address, AuthoritativeLocalAddress::Matched(_)) {
+                *unresolved_by_table.entry(table.clone()).or_default() += 1;
+            }
+        }
+        let mut claimed = BTreeSet::new();
+        let mut projections = Vec::with_capacity(pending.len());
+        for (table, address, mut projection) in pending {
+            let local_id = match address {
+                AuthoritativeLocalAddress::Matched(local_id) => local_id,
+                AuthoritativeLocalAddress::AdoptHosted => projection.server_document_id.clone(),
+                AuthoritativeLocalAddress::SoleDurable(local_id) => {
+                    if unresolved_by_table.get(&table).copied() != Some(1) {
+                        return Err(RemoteError::Protocol(
+                            "authoritative rows have an ambiguous durable local address".to_owned(),
+                        ));
+                    }
+                    local_id
+                }
+            };
+            if !claimed.insert((table, local_id.clone())) {
+                return Err(RemoteError::Protocol(
+                    "authoritative rows resolved to the same local address".to_owned(),
+                ));
+            }
+            projection.local_document_id = Some(local_id);
+            projections.push(projection);
+        }
+        Ok(projections)
     }
 
     fn local_id_for_authoritative(
         &self,
-        envelope: &PushEnvelope,
+        queued: &PushEnvelope,
+        prepared: &PushEnvelope,
         response: &storage::PushResponse,
         table: &str,
         server_id: &str,
-    ) -> RemoteResult<String> {
+    ) -> RemoteResult<AuthoritativeLocalAddress> {
         if let Some(insert) = response
             .inserts
             .iter()
             .find(|insert| insert.table == table && insert.id == server_id)
         {
-            return envelope
+            return queued
                 .id_allocations
                 .get(insert.ordinal)
                 .cloned()
+                .map(AuthoritativeLocalAddress::Matched)
                 .ok_or_else(|| {
                     RemoteError::Protocol(
                         "authoritative insert has no matching local allocation".to_owned(),
                     )
                 });
         }
-        for candidate in &envelope.after_images {
+        for candidate in &queued.after_images {
             if candidate.table == table
                 && self.hosted_id_of(&candidate.row_id)?.as_deref() == Some(server_id)
             {
-                return Ok(candidate.row_id.clone());
+                return Ok(AuthoritativeLocalAddress::Matched(candidate.row_id.clone()));
             }
         }
-        for witness in &envelope.read_set {
+        for witness in &queued.read_set {
             if let storage::BaseVersion::Point {
                 table: witness_table,
                 id,
@@ -2487,13 +2527,112 @@ where
             } = witness
             {
                 if witness_table == table && self.hosted_id_of(id)?.as_deref() == Some(server_id) {
-                    return Ok(id.clone());
+                    return Ok(AuthoritativeLocalAddress::Matched(id.clone()));
                 }
             }
         }
-        Err(RemoteError::Protocol(
-            "authoritative row has no matching local address".to_owned(),
-        ))
+        let mut structural = BTreeSet::new();
+        for prepared_candidate in &prepared.after_images {
+            if prepared_candidate.table != table || prepared_candidate.row_id != server_id {
+                continue;
+            }
+            for queued_candidate in &queued.after_images {
+                if queued_candidate.table == table
+                    && queued_candidate.content == prepared_candidate.content
+                {
+                    structural.insert(queued_candidate.row_id.clone());
+                }
+            }
+        }
+        for prepared_witness in &prepared.read_set {
+            let storage::BaseVersion::Point {
+                table: prepared_table,
+                id: prepared_id,
+                version: prepared_version,
+                content_hash: prepared_hash,
+                crdt: prepared_crdt,
+            } = prepared_witness
+            else {
+                continue;
+            };
+            if prepared_table != table || prepared_id != server_id {
+                continue;
+            }
+            for queued_witness in &queued.read_set {
+                let storage::BaseVersion::Point {
+                    table: queued_table,
+                    id: queued_id,
+                    version: queued_version,
+                    content_hash: queued_hash,
+                    crdt: queued_crdt,
+                } = queued_witness
+                else {
+                    continue;
+                };
+                if queued_table == table
+                    && queued_version == prepared_version
+                    && queued_hash == prepared_hash
+                    && queued_crdt == prepared_crdt
+                {
+                    structural.insert(queued_id.clone());
+                }
+            }
+        }
+        if structural.len() == 1 {
+            return Ok(AuthoritativeLocalAddress::Matched(
+                structural
+                    .into_iter()
+                    .next()
+                    .expect("one structural address"),
+            ));
+        }
+        if structural.len() > 1 {
+            return Err(RemoteError::Protocol(
+                "authoritative row has ambiguous local addresses".to_owned(),
+            ));
+        }
+        // A cached hosted settlement can outlive the prepared after-image that originally named
+        // the row (for example, an older runtime omitted an unresolved image while still sending
+        // the mutation). A single durable address for this table is still unambiguous. Do not guess
+        // when the envelope touched more than one possible row.
+        let mut durable = BTreeSet::new();
+        durable.extend(
+            queued
+                .after_images
+                .iter()
+                .filter(|candidate| candidate.table == table)
+                .map(|candidate| candidate.row_id.clone()),
+        );
+        durable.extend(queued.read_set.iter().filter_map(|witness| match witness {
+            storage::BaseVersion::Point {
+                table: witness_table,
+                id,
+                ..
+            } if witness_table == table => Some(id.clone()),
+            _ => None,
+        }));
+        durable.extend(
+            queued
+                .crdt
+                .iter()
+                .filter(|effect| effect.table == table)
+                .map(|effect| effect.row_id.clone()),
+        );
+        if durable.len() == 1 {
+            return Ok(AuthoritativeLocalAddress::SoleDurable(
+                durable.into_iter().next().expect("one durable address"),
+            ));
+        }
+        if durable.len() > 1 {
+            return Err(RemoteError::Protocol(
+                "authoritative row has ambiguous durable local addresses".to_owned(),
+            ));
+        }
+        // No durable local address survived. The hosted mutation is already terminal, so adopt this
+        // row exactly like an ordinary pull: passing the hosted id as the proposed address makes the
+        // store allocate its deterministic local projection id. This preserves the authoritative
+        // result and drains the envelope without inventing an association to unrelated local state.
+        Ok(AuthoritativeLocalAddress::AdoptHosted)
     }
 
     async fn enqueue_pull_result(
@@ -3864,9 +4003,9 @@ mod tests {
     use super::{
         function_result_error, parse_identity_response, pull_change_has_changed,
         rejected_target_should_retain, rejected_write_targets, ActiveRemoteWrite,
-        InflightRemotePush, InflightRemotePushKind, PendingCheckpoint, PendingRemoteWrite,
-        PullSubscription, RemoteCommand, RemoteDriver, RemoteScope, RemoteSubscription,
-        RemoteWrite,
+        AuthoritativeLocalAddress, InflightRemotePush, InflightRemotePushKind, PendingCheckpoint,
+        PendingRemoteWrite, PullSubscription, RemoteCommand, RemoteDriver, RemoteScope,
+        RemoteSubscription, RemoteWrite,
     };
     use crate::{
         config::{RemoteConfig, RemoteFunction},
@@ -3913,6 +4052,129 @@ mod tests {
                 Err(RemoteError::DeploymentMismatch(_))
             ));
         }
+    }
+
+    #[test]
+    fn authoritative_settlement_recovers_the_durable_local_address_from_the_prepared_envelope() {
+        let store = test_store("remote-authoritative-structural-address.db");
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            store,
+            TraceTransport { trace },
+            SystemRemoteClock::default(),
+        );
+        let mut queued = crate::push::decode_envelope(&replay_envelope_json("edit", 1)).unwrap();
+        queued.after_images.push(storage::RevisionCandidate {
+            table: "issues".to_owned(),
+            row_id: "issues|11111111111111111111111111111111".to_owned(),
+            content: storage::RevisionContent::Value(serde_json::json!({ "title": "updated" })),
+        });
+        let mut prepared = queued.clone();
+        prepared.after_images[0].row_id = "j575pnjjhzf95ze91djp5v26b188xreb".to_owned();
+        let response = storage::PushResponse {
+            mutation_id: "edit".to_owned(),
+            outcome: storage::PushOutcome::Applied,
+            inserts: vec![],
+            schedules: vec![],
+            uploads: vec![],
+            revisions: vec![],
+            crdt: vec![],
+            authoritative: vec![],
+        };
+
+        assert_eq!(
+            driver
+                .local_id_for_authoritative(
+                    &queued,
+                    &prepared,
+                    &response,
+                    "issues",
+                    "j575pnjjhzf95ze91djp5v26b188xreb",
+                )
+                .unwrap(),
+            AuthoritativeLocalAddress::Matched(
+                "issues|11111111111111111111111111111111".to_owned()
+            )
+        );
+
+        prepared.after_images.clear();
+        assert_eq!(
+            driver
+                .local_id_for_authoritative(
+                    &queued,
+                    &prepared,
+                    &response,
+                    "issues",
+                    "j575pnjjhzf95ze91djp5v26b188xreb",
+                )
+                .unwrap(),
+            AuthoritativeLocalAddress::SoleDurable(
+                "issues|11111111111111111111111111111111".to_owned()
+            )
+        );
+
+        queued.after_images.clear();
+        assert_eq!(
+            driver
+                .local_id_for_authoritative(
+                    &queued,
+                    &prepared,
+                    &response,
+                    "issues",
+                    "j575pnjjhzf95ze91djp5v26b188xreb",
+                )
+                .unwrap(),
+            AuthoritativeLocalAddress::AdoptHosted
+        );
+    }
+
+    #[test]
+    fn authoritative_settlement_rejects_one_durable_address_for_two_hosted_rows() {
+        let store = test_store("remote-authoritative-ambiguous-address.db");
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            store,
+            TraceTransport { trace },
+            SystemRemoteClock::default(),
+        );
+        let mut queued = crate::push::decode_envelope(&replay_envelope_json("edit", 1)).unwrap();
+        queued.after_images.push(storage::RevisionCandidate {
+            table: "issues".to_owned(),
+            row_id: "issues|11111111111111111111111111111111".to_owned(),
+            content: storage::RevisionContent::Value(serde_json::json!({ "title": "updated" })),
+        });
+        let mut prepared = queued.clone();
+        prepared.after_images.clear();
+        let response = storage::PushResponse {
+            mutation_id: "edit".to_owned(),
+            outcome: storage::PushOutcome::Applied,
+            inserts: vec![],
+            schedules: vec![],
+            uploads: vec![],
+            revisions: vec![],
+            crdt: vec![],
+            authoritative: [
+                ("j575pnjjhzf95ze91djp5v26b188xreb", "one"),
+                ("k175pnjjhzf95ze91djp5v26b188xreb", "two"),
+            ]
+            .into_iter()
+            .map(|(row_id, title)| storage::AuthoritativeChange::Put {
+                table: "issues".to_owned(),
+                row_id: row_id.to_owned(),
+                fields: serde_json::json!({ "title": title }),
+                plain_hash: format!("plain:{title}"),
+            })
+            .collect(),
+        };
+
+        let error = driver
+            .authoritative_projections(&queued, &prepared, &response, 1)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("ambiguous durable local address"));
     }
 
     #[test]
@@ -6336,8 +6598,7 @@ mod tests {
     fn documents_crdt_schema() -> storage::StoreSchema {
         storage::StoreSchema {
             hash: "0".repeat(64),
-            migrations: vec![],
-            migration_code_hash: String::new(),
+            setup_hash: String::new(),
             tables: vec![storage::TableDef {
                 name: "documents".to_owned(),
                 placement: storage::TablePlacement::Replicated,

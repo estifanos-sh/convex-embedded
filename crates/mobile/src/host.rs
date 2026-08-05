@@ -41,12 +41,13 @@ impl StoreHost {
                     &path,
                     &selector_key,
                     &default_identity_key,
-                )
-                .map(Arc::new);
-                let Ok(store) = store.inspect_err(|error| {
-                    ready_tx.send(Err(error.to_string())).ok();
-                }) else {
-                    return;
+                );
+                let store = match store {
+                    Ok(store) => Arc::new(store),
+                    Err(error) => {
+                        ready_tx.send(Err(error)).ok();
+                        return;
+                    }
                 };
                 if ready_tx.send(Ok(store.clone())).is_err() {
                     return;
@@ -79,7 +80,7 @@ impl StoreHost {
         let store = ready_rx
             .recv()
             .map_err(|_| BridgeError::Closed("storage thread terminated during open".to_owned()))?
-            .map_err(BridgeError::Storage)?;
+            .map_err(BridgeError::from)?;
         Ok(Self {
             store,
             jobs: Mutex::new(Some(jobs_tx)),

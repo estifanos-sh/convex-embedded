@@ -41,6 +41,10 @@ rustc-ice-*.txt
 *.db
 *.db-wal
 *.db-shm
+crates/storage/tests/fixtures/**/store.sqlite3-wal
+crates/storage/tests/fixtures/**/store.sqlite3-shm
+crates/storage/tests/fixtures/**/store.sqlite3.owner
 
-# Local documentation
-/docs/
+# Local documentation, except the release-critical store migration contract.
+/docs/*
+!/docs/migrations.md

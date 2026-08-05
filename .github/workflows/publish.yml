@@ -1,0 +1,902 @@
+name: Robelest package
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Publish a package preview, npm prerelease, or stable npm release
+        required: true
+        default: preview
+        type: choice
+        options: [preview, prerelease, release]
+      ref:
+        description: Git ref or commit to validate and build
+        required: false
+        default: main
+        type: string
+      tag:
+        description: Robelest release tag to create after validation; required for npm modes
+        required: false
+        type: string
+  pull_request_target:
+    types: [closed]
+
+concurrency:
+  group: robelest-package-${{ inputs.tag || inputs.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_TERM_COLOR: always
+
+jobs:
+  readiness:
+    name: Release readiness
+    if: >-
+      github.repository == 'get-convex/embedded' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'npm package')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Validate version and release channel
+        working-directory: packages/embedded
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          SOURCE_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          BASE_VERSION=$(
+            git show "$BASE_SHA:packages/embedded/package.json" |
+              node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version"
+          )
+
+          if [[ "$SOURCE_NAME" != "@convex-dev/embedded" ]]; then
+            echo "::error::Source package identity must remain @convex-dev/embedded."
+            exit 1
+          fi
+          if [[ "$VERSION" == "$BASE_VERSION" ]]; then
+            echo "::error::The npm package label requires a version change from $BASE_VERSION."
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ || "$VERSION" == "0.0.0" ]]; then
+            echo "::error::Robelest releases require a nonzero semver version."
+            exit 1
+          fi
+          if ! node -e '
+            const parse = (version) => {
+              const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(version);
+              if (!match) process.exit(2);
+              return { core: match.slice(1, 4).map(Number), pre: match[4]?.split(".") };
+            };
+            const [base, next] = process.argv.slice(1).map(parse);
+            for (let i = 0; i < 3; i += 1) {
+              if (next.core[i] > base.core[i]) process.exit(0);
+              if (next.core[i] < base.core[i]) process.exit(1);
+            }
+            if (base.pre === undefined) process.exit(1);
+            if (next.pre === undefined) process.exit(0);
+            for (let i = 0; i < Math.max(base.pre.length, next.pre.length); i += 1) {
+              if (base.pre[i] === undefined) process.exit(0);
+              if (next.pre[i] === undefined) process.exit(1);
+              if (base.pre[i] === next.pre[i]) continue;
+              const a = /^\d+$/.test(base.pre[i]) ? Number(base.pre[i]) : base.pre[i];
+              const b = /^\d+$/.test(next.pre[i]) ? Number(next.pre[i]) : next.pre[i];
+              if (typeof a === "number" && typeof b !== "number") process.exit(0);
+              if (typeof a !== "number" && typeof b === "number") process.exit(1);
+              process.exit(b > a ? 0 : 1);
+            }
+            process.exit(1);
+          ' "$BASE_VERSION" "$VERSION"; then
+            echo "::error::Version $VERSION must be newer than $BASE_VERSION."
+            exit 1
+          fi
+          if npm view "@robelest/convex-embedded@$VERSION" version --json >/dev/null 2>&1; then
+            echo "::error::@robelest/convex-embedded@$VERSION is already published."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/robelest-v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Git tag robelest-v$VERSION already exists."
+            exit 1
+          fi
+
+          {
+            echo "## Robelest npm release"
+            echo
+            echo "| Package | Version | Consumer alias |"
+            echo "| --- | --- | --- |"
+            echo "| \`@robelest/convex-embedded\` | \`$VERSION\` | \`@convex-dev/embedded\` |"
+            echo
+            echo "Merging this labeled PR will assemble every native target and publish the test package."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dispatch-release:
+    name: Start validated Robelest release
+    if: >-
+      github.repository == 'get-convex/embedded' &&
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'npm package')
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Checkout merged release
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Resolve release metadata
+        id: release
+        working-directory: packages/embedded
+        run: |
+          SOURCE_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="robelest-v$VERSION"
+
+          if [[ "$SOURCE_NAME" != "@convex-dev/embedded" ]]; then
+            echo "::error::Source package identity must remain @convex-dev/embedded."
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ || "$VERSION" == "0.0.0" ]]; then
+            echo "::error::Robelest releases require a nonzero semver version."
+            exit 1
+          fi
+          if npm view "@robelest/convex-embedded@$VERSION" version --json >/dev/null 2>&1; then
+            echo "::error::@robelest/convex-embedded@$VERSION is already published."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "mode=prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start the exact-SHA validation and build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.release.outputs.mode }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SOURCE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          gh workflow run publish.yml --ref main -f mode="$MODE" -f ref="$SOURCE_SHA" -f tag="$TAG"
+
+  gate:
+    name: Package build gate
+    if: github.repository == 'get-convex/embedded'
+    runs-on: ubuntu-24.04
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      mode: ${{ steps.gate.outputs.mode }}
+      ref: ${{ steps.gate.outputs.ref }}
+      version: ${{ steps.gate.outputs.version }}
+      tag: ${{ steps.gate.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+
+    steps:
+      - name: Resolve package build
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          NPM_PACKAGE: ${{ contains(github.event.pull_request.labels.*.name, 'npm package') }}
+          PACKAGE_PREVIEW: ${{ contains(github.event.pull_request.labels.*.name, 'package preview') }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          if [[ "$REPOSITORY" != "get-convex/embedded" ]]; then
+            exit 0
+          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
+            if [[ "$INPUT_MODE" == "release" || "$INPUT_MODE" == "prerelease" ]]; then
+              if [[ -z "$INPUT_TAG" ]]; then
+                echo "::error::Prerelease and release modes require a robelest-v* tag."
+                exit 1
+              fi
+              VERSION=${INPUT_TAG#robelest-v}
+              if [[ "$VERSION" == "$INPUT_TAG" || -z "$VERSION" ]]; then
+                echo "::error::Prerelease and release tags must use robelest-v<version>."
+                exit 1
+              fi
+              if [[ "$INPUT_MODE" == "prerelease" && "$VERSION" != *-* ]]; then
+                echo "::error::Prerelease mode requires an x.y.z-prerelease tag."
+                exit 1
+              fi
+              if [[ "$INPUT_MODE" == "release" && "$VERSION" == *-* ]]; then
+                echo "::error::Release mode requires a stable x.y.z tag."
+                exit 1
+              fi
+              echo "ref=$INPUT_REF" >> "$GITHUB_OUTPUT"
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            else
+              echo "ref=$INPUT_REF" >> "$GITHUB_OUTPUT"
+            fi
+          elif [[ "$EVENT" == "pull_request" && "$IS_DRAFT" == "false" && ( "$NPM_PACKAGE" == "true" || "$PACKAGE_PREVIEW" == "true" ) ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "mode=preview" >> "$GITHUB_OUTPUT"
+            echo "ref=$PR_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout requested package source
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.gate.outputs.ref }}
+
+      - name: Pin package build to one commit
+        if: steps.gate.outputs.enabled == 'true'
+        id: source
+        env:
+          MODE: ${{ steps.gate.outputs.mode }}
+          RELEASE_TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          SOURCE_SHA=$(git rev-parse HEAD)
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+          if [[ "$MODE" == "release" || "$MODE" == "prerelease" ]]; then
+            if git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+              TAG_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
+              if [[ "$TAG_SHA" != "$SOURCE_SHA" ]]; then
+                echo "::error::Tag $RELEASE_TAG points to $TAG_SHA, not validated source $SOURCE_SHA."
+                exit 1
+              fi
+            fi
+          fi
+
+  qualification:
+    name: Qualify exact source for publication
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: robelest-qualification
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+
+      - name: Verify Preview2 baseline and release stress
+        env:
+          CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          node packages/embedded/scripts/publish.ts fixture
+          cargo test -p storage --features testkit --test fixture
+          cargo test -p storage --features testkit --test migration
+          cargo test -p mobile
+          cargo test -p storage --release --features testkit --test stress candidate_cold_and_warm_stress_preserves_every_row -- --ignored --exact --nocapture
+          cargo test -p storage --release --features testkit --test stress result_only_cursor_updates_batch_projection_dependencies -- --ignored --exact --nocapture
+          vp test run packages/embedded/tests/unit/expo.ts
+
+      - name: Build production Node and WASM artifacts
+        working-directory: packages/embedded
+        run: |
+          vp pack
+          vp run native
+          vp run wasm
+
+      - name: Install Chromium for production OPFS gates
+        working-directory: packages/embedded
+        run: vp exec playwright install --with-deps chromium
+
+      - name: Verify packaged Node candidate conformance and process death
+        working-directory: packages/embedded
+        run: |
+          vp run test:fixture:node
+          vp run test:stress:node
+          vp run test:kill:node
+
+      - name: Verify production WASM OPFS conformance, worker death, stress, and memory ceilings
+        working-directory: packages/embedded
+        run: |
+          vp test run --config vite/tests.ts --project browser tests/browser/fixture.ts
+          vp test run --config vite/tests.ts --project browser tests/browser/stress.ts
+          vp test run --config vite/tests.ts --project browser tests/browser/memory.ts
+
+  javascript:
+    name: Build JavaScript and WASM
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: robelest-wasm
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Build and verify JavaScript
+        run: |
+          vp run '@convex-dev/embedded#build:ts'
+          vp run '@convex-dev/embedded#test:surface'
+
+      - name: Build WASM
+        run: vp run '@convex-dev/embedded#wasm'
+
+      - name: Upload JavaScript and WASM
+        uses: actions/upload-artifact@v7
+        with:
+          name: robelest-dist
+          path: packages/embedded/dist
+          if-no-files-found: error
+          retention-days: 2
+
+  node:
+    name: Build Node ${{ matrix.target }}
+    needs: [gate, javascript]
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x64-gnu
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64-gnu
+          - runner: macos-15
+            target: darwin-arm64
+          - runner: macos-15-intel
+            target: darwin-x64
+          - runner: windows-2025
+            target: win32-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: robelest-node-${{ matrix.target }}
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Download JavaScript bundle for the Node smoke test
+        uses: actions/download-artifact@v8
+        with:
+          name: robelest-dist
+          path: packages/embedded/dist
+
+      - name: Build and load Node addon
+        run: |
+          vp run '@convex-dev/embedded#native'
+          vp run '@convex-dev/embedded#test:node'
+
+      - name: Upload Node addon
+        uses: actions/upload-artifact@v7
+        with:
+          name: robelest-node-${{ matrix.target }}
+          path: packages/embedded/dist/native
+          if-no-files-found: error
+          retention-days: 2
+
+  apple:
+    name: Build complete Apple XCFramework
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: robelest-apple
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Enable pnpm for the Expo compile fixture
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Build every Apple slice through the Expo hook
+        env:
+          EAS_BUILD_PLATFORM: ios
+        run: node demos/expo/scripts/native.ts eas
+
+      - name: Compile Expo Apple autolinking smoke app
+        run: node packages/embedded/scripts/mobilecompile.ts ios
+
+      - name: Upload Apple XCFramework
+        uses: actions/upload-artifact@v7
+        with:
+          name: robelest-apple
+          path: packages/embedded/native/apple
+          if-no-files-found: error
+          retention-days: 2
+
+  android:
+    name: Build complete Android libraries
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
+    # The complete four-ABI cargo-ndk build exceeds a standard runner's workspace. Keep this on the
+    # same repository-managed runner class as the existing full native release workflow.
+    runs-on: large-runner
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: robelest-android
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Enable pnpm for the Expo compile fixture
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Build every Android ABI through the Expo hook
+        env:
+          EAS_BUILD_PLATFORM: android
+        run: node demos/expo/scripts/native.ts eas
+
+      - name: Compile Expo Android autolinking smoke app
+        run: node packages/embedded/scripts/mobilecompile.ts android
+
+      - name: Upload Android libraries
+        uses: actions/upload-artifact@v7
+        with:
+          name: robelest-android
+          path: packages/embedded/native/android
+          if-no-files-found: error
+          retention-days: 2
+
+  assemble:
+    name: Assemble and verify package
+    needs: [gate, qualification, javascript, node, apple, android]
+    if: needs.gate.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Enable pnpm for package assembly
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Resolve assembled source
+        id: source
+        env:
+          EXPECTED_SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          SOURCE_SHA=$(git rev-parse HEAD)
+          if [[ "$SOURCE_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Assembly checked out $SOURCE_SHA instead of qualified source $EXPECTED_SHA."
+            exit 1
+          fi
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Download JavaScript and WASM
+        uses: actions/download-artifact@v8
+        with:
+          name: robelest-dist
+          path: packages/embedded/dist
+
+      - name: Download Node addons
+        uses: actions/download-artifact@v8
+        with:
+          pattern: robelest-node-*
+          path: packages/embedded/dist/native
+          merge-multiple: true
+
+      - name: Download Apple XCFramework
+        uses: actions/download-artifact@v8
+        with:
+          name: robelest-apple
+          path: packages/embedded/native/apple
+
+      - name: Download Android libraries
+        uses: actions/download-artifact@v8
+        with:
+          name: robelest-android
+          path: packages/embedded/native/android
+
+      - name: Verify native artifacts
+        run: |
+          node packages/embedded/scripts/mobile.ts verify
+          vp run '@convex-dev/embedded#test:node'
+
+      - name: Prepare and pack the guarded Robelest package
+        env:
+          CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          node packages/embedded/scripts/publish.ts prepare
+          node packages/embedded/scripts/publish.ts pack artifacts "${{ needs.gate.outputs.mode }}"
+
+      - name: Upload assembled package
+        uses: actions/upload-artifact@v7
+        with:
+          name: robelest-package
+          path: artifacts/convex-embedded.tgz
+          if-no-files-found: error
+          retention-days: 2
+
+  release-tag:
+    name: Bind release tag to validated source
+    needs: [gate, qualification, assemble]
+    if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Checkout exact validated source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Create or verify exact release tag
+        id: tag
+        env:
+          ASSEMBLED_SHA: ${{ needs.assemble.outputs.sha }}
+          EXPECTED_SHA: ${{ needs.gate.outputs.sha }}
+          RELEASE_TAG: ${{ needs.gate.outputs.tag }}
+        run: |
+          SOURCE_SHA=$(git rev-parse HEAD)
+          if [[ "$SOURCE_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checked out $SOURCE_SHA instead of validated source $EXPECTED_SHA."
+            exit 1
+          fi
+          if [[ "$ASSEMBLED_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Package was assembled from $ASSEMBLED_SHA instead of validated source $EXPECTED_SHA."
+            exit 1
+          fi
+
+          if git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            TAG_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
+            if [[ "$TAG_SHA" != "$EXPECTED_SHA" ]]; then
+              echo "::error::Tag $RELEASE_TAG points to $TAG_SHA, not validated source $EXPECTED_SHA."
+              exit 1
+            fi
+          else
+            git tag "$RELEASE_TAG" "$EXPECTED_SHA"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+          echo "sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  preview:
+    name: Publish complete package preview
+    needs: [gate, assemble]
+    if: needs.gate.outputs.mode == 'preview'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Download assembled package
+        uses: actions/download-artifact@v8
+        with:
+          name: robelest-package
+          path: artifacts
+
+      - name: Publish package preview prerelease
+        id: preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.assemble.outputs.sha }}
+        run: |
+          SHORT_SHA=${SHA:0:12}
+          TAG="robelest-preview-$SHORT_SHA"
+          TITLE="Embedded preview $SHORT_SHA"
+          NOTES="Complete @robelest/convex-embedded preview assembled from $SHA. This is not an npm release."
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/convex-embedded.tgz \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$TAG" artifacts/convex-embedded.tgz \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SHA" \
+              --prerelease \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi
+
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/convex-embedded.tgz"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Update pull request preview comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        env:
+          PREVIEW_TAG: ${{ steps.preview.outputs.tag }}
+          PREVIEW_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.assemble.outputs.sha }}
+        with:
+          script: |
+            const marker = "<!-- convex-embedded-preview -->";
+            const body = `${marker}
+            ## Complete Embedded package preview
+
+            This preview contains JavaScript, WASM, all five Node targets, both Apple slices, and all four Android ABIs. It is stored as an authenticated GitHub prerelease asset and is not published to npm.
+
+            \`\`\`sh
+            gh release download ${process.env.PREVIEW_TAG} --repo ${process.env.PREVIEW_REPOSITORY} --pattern convex-embedded.tgz --dir . --clobber
+            pnpm add "@convex-dev/embedded@file:./convex-embedded.tgz" convex
+            \`\`\`
+
+            Source: \`${process.env.SOURCE_SHA}\``;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((comment) =>
+              comment.user?.login === "github-actions[bot]" && comment.body?.includes(marker),
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Document the official-name alias
+        env:
+          PREVIEW_TAG: ${{ steps.preview.outputs.tag }}
+        run: |
+          {
+            echo "## Download and install this private-repository preview"
+            echo
+            echo "Authenticate \`gh\`, then run:"
+            echo
+            echo "\`gh release download $PREVIEW_TAG --repo $GITHUB_REPOSITORY --pattern convex-embedded.tgz --dir . --clobber\`"
+            echo
+            echo "\`pnpm add \"@convex-dev/embedded@file:./convex-embedded.tgz\" convex\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish Robelest npm package
+    needs: [gate, qualification, assemble, release-tag]
+    if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.release-tag.outputs.sha }}
+
+      - name: Setup Node trusted publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download assembled package
+        uses: actions/download-artifact@v8
+        with:
+          name: robelest-package
+          path: artifacts
+
+      - name: Resolve release metadata
+        id: release
+        env:
+          EXPECTED_VERSION: ${{ needs.gate.outputs.version }}
+          PUBLISH_MODE: ${{ needs.gate.outputs.mode }}
+          RELEASE_TAG: ${{ needs.release-tag.outputs.tag }}
+        run: |
+          PACKAGE_NAME=$(
+            tar -xOzf artifacts/convex-embedded.tgz package/package.json |
+              node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name"
+          )
+          VERSION=$(
+            tar -xOzf artifacts/convex-embedded.tgz package/package.json |
+              node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version"
+          )
+          TAG="robelest-v$VERSION"
+
+          if [[ "$PACKAGE_NAME" != "@robelest/convex-embedded" ]]; then
+            echo "::error::Refusing to publish unexpected package $PACKAGE_NAME."
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "$TAG" ]]; then
+            echo "::error::Tag $RELEASE_TAG does not match package version $VERSION."
+            exit 1
+          fi
+          if [[ "$VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "::error::Assembled version $VERSION does not match requested version $EXPECTED_VERSION."
+            exit 1
+          fi
+          node packages/embedded/scripts/publish.ts verify-tarball artifacts/convex-embedded.tgz "$PUBLISH_MODE"
+
+          if npm view "$PACKAGE_NAME@$VERSION" version --json >/dev/null 2>&1; then
+            PUBLISHED=true
+          else
+            PUBLISHED=false
+          fi
+          echo "package=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$PUBLISH_MODE" == "prerelease" ]]; then
+            echo "dist_tag=preview" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+
+      - name: Publish package with provenance
+        if: steps.release.outputs.published != 'true'
+        run: npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --provenance --access public --tag "${{ steps.release.outputs.dist_tag }}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          prerelease: ${{ needs.gate.outputs.mode == 'prerelease' }}
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.package }} ${{ steps.release.outputs.version }}
+          files: artifacts/convex-embedded.tgz

@@ -14,6 +14,9 @@ if (!deploymentUrl) {
 export const client =
   scope.__convexEmbeddedDemoClient ??
   (scope.__convexEmbeddedDemoClient = new ConvexEmbeddedClient({
-    path: "convex-embedded-demo.sqlite3",
+    path: "convex-embedded-demo-preview2.sqlite3",
     url: deploymentUrl,
   }));
+
+/** Await before mounting a consumer that issues queries. */
+export const clientReady = client.open();

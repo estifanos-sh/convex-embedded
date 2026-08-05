@@ -15,14 +15,16 @@ exports[`public package surface > browser entry exports only its intended surfac
   "ConvexEmbeddedSchema",
   "ConvexEmbeddedUploadFetch",
   "ConvexEmbeddedUploadFetchOptions",
+  "EMBEDDED_ERROR_CODES",
   "EMBEDDED_UPLOAD_PATH",
   "EmbeddedConnectionState",
   "EmbeddedDataDelete",
   "EmbeddedDataEvent",
   "EmbeddedDataWrite",
+  "EmbeddedError",
+  "EmbeddedErrorCode",
   "EmbeddedEvent",
   "EmbeddedEventListener",
-  "EmbeddedMigrationEvent",
   "EmbeddedOperationEvent",
   "EmbeddedOperationKind",
   "EmbeddedOperationPhase",
@@ -37,6 +39,7 @@ exports[`public package surface > browser entry exports only its intended surfac
   "EmbeddedStorageEvent",
   "Watch",
   "createConvexEmbeddedUploadFetch",
+  "isEmbeddedError",
 ]
 `;
 
@@ -98,13 +101,15 @@ exports[`public package surface > expo entry exports only its intended surface 1
   "ConvexEmbeddedClientOptions",
   "ConvexEmbeddedMutationOptions",
   "ConvexEmbeddedSchema",
+  "EMBEDDED_ERROR_CODES",
   "EmbeddedConnectionState",
   "EmbeddedDataDelete",
   "EmbeddedDataEvent",
   "EmbeddedDataWrite",
+  "EmbeddedError",
+  "EmbeddedErrorCode",
   "EmbeddedEvent",
   "EmbeddedEventListener",
-  "EmbeddedMigrationEvent",
   "EmbeddedOperationEvent",
   "EmbeddedOperationKind",
   "EmbeddedOperationPhase",
@@ -115,12 +120,16 @@ exports[`public package surface > expo entry exports only its intended surface 1
   "EmbeddedSpanPhase",
   "EmbeddedStorageEvent",
   "Watch",
+  "isEmbeddedError",
 ]
 `;
 
 exports[`public package surface > local entry exports only its intended surface 1`] = `
 [
   "EMBEDDED_LOCAL_REFERENCE",
+  "LocalAction",
+  "LocalActionBuilder",
+  "LocalActionCtx",
   "LocalBuilders",
   "LocalFunction",
   "LocalFunctionArgs",
@@ -147,29 +156,6 @@ exports[`public package surface > metro entry exports only its intended surface 
 ]
 `;
 
-exports[`public package surface > migrations entry exports only its intended surface 1`] = `
-[
-  "CarryDocument",
-  "CarryRecord",
-  "CarrySelector",
-  "DeviceMigration",
-  "DeviceMigrationContext",
-  "DeviceMigrationManifest",
-  "DeviceMigrationOptions",
-  "DeviceMigrationRecord",
-  "DeviceMigrationRecordSuccessor",
-  "DeviceMigrationReport",
-  "DeviceMigrationSuccessor",
-  "DeviceQuarantinePage",
-  "DeviceQuarantineRecord",
-  "carry",
-  "defineDeviceMigrations",
-  "deviceMigration",
-  "setupWithDeviceMigrations",
-  "withDeviceMigrations",
-]
-`;
-
 exports[`public package surface > node entry exports only its intended surface 1`] = `
 [
   "AuthTokenFetcher",
@@ -181,14 +167,16 @@ exports[`public package surface > node entry exports only its intended surface 1
   "ConvexEmbeddedUploadFetchOptions",
   "ConvexLocalModules",
   "ConvexModules",
+  "EMBEDDED_ERROR_CODES",
   "EMBEDDED_UPLOAD_PATH",
   "EmbeddedConnectionState",
   "EmbeddedDataDelete",
   "EmbeddedDataEvent",
   "EmbeddedDataWrite",
+  "EmbeddedError",
+  "EmbeddedErrorCode",
   "EmbeddedEvent",
   "EmbeddedEventListener",
-  "EmbeddedMigrationEvent",
   "EmbeddedOperationEvent",
   "EmbeddedOperationKind",
   "EmbeddedOperationPhase",
@@ -200,6 +188,7 @@ exports[`public package surface > node entry exports only its intended surface 1
   "EmbeddedStorageEvent",
   "Watch",
   "createConvexEmbeddedUploadFetch",
+  "isEmbeddedError",
 ]
 `;
 

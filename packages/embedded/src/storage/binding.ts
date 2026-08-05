@@ -1,7 +1,18 @@
 import { cloneTree, encode, freezeNormalizedTreeWithEstimate, reviveDoc } from "../runtime/codec";
-import { setupWithDeviceMigrations, type DeviceMigrationReport } from "../migrations";
-import { readDeviceQuarantinePage } from "./quarantine";
+import { normalizeStorageError } from "../error";
+import {
+  assertNoPendingCommitTs,
+  hasPendingCommitTs,
+  resolveKnownPendingCommitTs,
+} from "../runtime/pending";
+import {
+  applyQueuedMutationPolicyStep,
+  finalizeStoreSetup,
+  prepareStoreSetup,
+  validateStoreSetup,
+} from "../migrations";
 import { remoteTickTables } from "../rev";
+import { isPendingCommitTsColumn } from "./types";
 import type {
   BlobSurface,
   Bound,
@@ -54,6 +65,8 @@ export interface BindingTaggedValue {
   bool?: boolean;
   /** Convex `undefined` (a missing field). All-absent means `null`. */
   undef?: boolean;
+  /** Transient typed column marker; Rust substitutes it in the commit transaction. */
+  commitTs?: boolean;
 }
 
 export interface BindingColValue extends BindingTaggedValue {
@@ -91,12 +104,19 @@ export interface BindingDocWrite {
   data: string;
   cols: BindingColValue[];
   creationTime: number;
+  pendingCommitTs?: true;
 }
 
 export interface BindingWriteBatch {
   docWrites: BindingDocWrite[];
   deletes: { table: string; id: string }[];
-  localFieldWrites?: { table: string; id: string; field: string; valueJson: string }[];
+  localFieldWrites?: {
+    table: string;
+    id: string;
+    field: string;
+    valueJson: string;
+    pendingCommitTs?: true;
+  }[];
   localFieldDeletes?: { table: string; id: string; field: string }[];
   crdtOps?: BindingCrdtOp[];
   crdtRestores?: BindingCrdtRestore[];
@@ -135,14 +155,17 @@ export type BindingCrdtOp =
     };
 
 export interface BindingCommitOptions {
+  commitTs?: boolean;
   includeChanges?: boolean;
   mutationArgs?: string;
   mutationIsFresh?: boolean;
   mutationId?: string;
   mutationName?: string;
   mutationResult?: string;
+  mutationResultCommitTs?: true;
   pushEnvelopeJson?: string;
   pushEnvelopeNowMs?: number;
+  pushAfterImagesCommitTs?: true;
   source?: "local" | "remote" | "device";
 }
 
@@ -167,18 +190,25 @@ function bindingCommitMutation(options?: CommitOptions): {
   };
 }
 
-function toBindingCommitOptions(options?: CommitOptions): BindingCommitOptions | undefined {
-  if (!options) return undefined;
+function toBindingCommitOptions(
+  options?: CommitOptions,
+  batchHasCommitTs = false,
+): BindingCommitOptions | undefined {
+  if (!options && !batchHasCommitTs) return undefined;
+  if (!options) return { commitTs: true };
   const mutation = bindingCommitMutation(options);
   const push =
     options.source === "local" && (options.mutation === "terminal" || options.mutation === "push")
       ? options.push
       : undefined;
   return {
+    ...(options.commitTs === true || batchHasCommitTs ? { commitTs: true } : {}),
     includeChanges: options.changes === "include",
     ...mutation,
+    ...(options.mutationResultCommitTs === true ? { mutationResultCommitTs: true as const } : {}),
     pushEnvelopeJson: push?.json,
     pushEnvelopeNowMs: push?.nowMs,
+    ...(push?.afterImagesCommitTs === true ? { pushAfterImagesCommitTs: true as const } : {}),
     source: options.source,
   };
 }
@@ -187,6 +217,8 @@ export interface BindingCommitResult {
   changedTables: string[];
   changes?: BindingRowChange[];
   commitSeq: bigint | number;
+  /** Signed int64 decimal text: never accept a JS number for a commit timestamp. */
+  commitTs?: string | null;
   crdtOps?: BindingCrdtWireOp[];
 }
 
@@ -349,20 +381,17 @@ export interface BindingScheduledJob {
 export interface StoreBinding {
   setup(schema: StoreSchema): Promise<void>;
   migrationBegin(schema: StoreSchema): Promise<string>;
+  migrationCopyStep?(generation: bigint | number): Promise<string>;
+  migrationBind?(schema: StoreSchema, generation: bigint | number): Promise<void>;
+  migrationMaterializeStep?(generation: bigint | number): Promise<string>;
+  migrationUnbind?(): Promise<void>;
+  migrationSetupComplete?(generation: bigint | number): Promise<void>;
   originPageRead(
     generation: bigint | number,
     cursorJson: string | undefined,
     pageSize: number,
     upperJson?: string,
   ): Promise<string>;
-  migrationStepBegin(generation: bigint | number, migrationId: string): Promise<string>;
-  migrationRecordWrite(generation: bigint | number, recordJson: string): Promise<void>;
-  migrationRecordDelete(
-    generation: bigint | number,
-    identityKey: string,
-    kind: bigint | number,
-    recordKey: Uint8Array,
-  ): Promise<void>;
   migrationRecordDispositionWrite(
     generation: bigint | number,
     identityKey: string,
@@ -372,14 +401,12 @@ export interface StoreBinding {
     reason: string,
     discard: boolean,
   ): Promise<void>;
-  migrationPageWrite(
-    generation: bigint | number,
-    migrationId: string,
-    pageJson: string,
-  ): Promise<void>;
-  migrationStepComplete(generation: bigint | number, appliedMigrations: number): Promise<void>;
+  migrationQueuePolicyWrite(generation: bigint | number, policyJson: string): Promise<boolean>;
+  migrationQueuePolicyStateRead?(generation: bigint | number): Promise<string>;
+  migrationFinalizePrepare?(schema: StoreSchema, generation: bigint | number): Promise<void>;
   migrationCommit(schema: StoreSchema, generation: bigint | number): Promise<void>;
   migrationRetire(generation: bigint | number): Promise<void>;
+  migrationRetireStep?(generation: bigint | number): Promise<string>;
   identityRead?(): Promise<string>;
   identityWrite?(identityKey: string, identityJson?: string): Promise<void>;
   mutationWrite(call: BindingMutationCall): Promise<BindingMutationRecord>;
@@ -467,6 +494,8 @@ export interface StoreBinding {
     table: string,
     localId: string,
   ): Promise<BindingRemoteDocDebug | null | undefined>;
+  remoteCursorDebugRead?(subscription: string): Promise<string | null | undefined>;
+  remoteMemberDebugRead?(subscription: string): Promise<string>;
   idDelete(table: string, localId: string): Promise<void>;
   fileWrite(input: BindingFileStore): Promise<void>;
   fileMetaWrite(metadata: BindingFileMetadata): Promise<void>;
@@ -547,8 +576,105 @@ function hasMethod(value: object, key: PropertyKey): boolean {
 }
 
 export class StoreAdapter implements StorageBackend {
-  /** Payload-free report from the most recent setup/upgrade. @internal */
-  migrationReport?: DeviceMigrationReport;
+  /** Candidate generation controls used only while `client.open(setup)` executes. @internal */
+  readonly candidate = {
+    prepare: (schema: StoreSchema) => prepareStoreSetup(this.inner, schema),
+    copy: async (generation: bigint | number) => {
+      if (!this.inner.migrationCopyStep) {
+        throw new Error("This storage binding does not support bounded candidate copying.");
+      }
+      try {
+        return JSON.parse(await this.inner.migrationCopyStep(generation)) as {
+          done: boolean;
+          records: number;
+        };
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    bind: async (schema: StoreSchema, generation: bigint | number) => {
+      if (!this.inner.migrationBind) {
+        throw new Error("This storage binding does not support candidate setup.");
+      }
+      try {
+        await this.inner.migrationBind(schema, generation);
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    materialize: async (generation: bigint | number) => {
+      if (!this.inner.migrationMaterializeStep) {
+        throw new Error("This storage binding does not support bounded candidate materialization.");
+      }
+      try {
+        return JSON.parse(await this.inner.migrationMaterializeStep(generation)) as {
+          done: boolean;
+          records: number;
+        };
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    unbind: async () => {
+      if (!this.inner.migrationUnbind) {
+        throw new Error("This storage binding does not support candidate setup.");
+      }
+      try {
+        await this.inner.migrationUnbind();
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    complete: async (generation: bigint | number) => {
+      if (!this.inner.migrationSetupComplete) {
+        throw new Error("This storage binding does not support candidate setup completion.");
+      }
+      try {
+        await this.inner.migrationSetupComplete(generation);
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    policy: async (schema: StoreSchema, generation: bigint | number) => {
+      try {
+        return await applyQueuedMutationPolicyStep(this.inner, schema, generation);
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    validate: async (schema: StoreSchema, generation: bigint | number) => {
+      try {
+        await validateStoreSetup(this, schema, this.inner, generation);
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    retire: async (generation: bigint | number) => {
+      if (!this.inner.migrationRetireStep) {
+        throw new Error("This storage binding does not support bounded generation retirement.");
+      }
+      try {
+        return JSON.parse(await this.inner.migrationRetireStep(generation)) as {
+          done: boolean;
+          records: number;
+        };
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    finalizePrepare: async (schema: StoreSchema, generation: bigint | number) => {
+      if (!this.inner.migrationFinalizePrepare) {
+        throw new Error("This storage binding does not support bounded candidate finalization.");
+      }
+      try {
+        await this.inner.migrationFinalizePrepare(schema, generation);
+      } catch (error) {
+        throw normalizeStorageError(error);
+      }
+    },
+    finalize: (schema: StoreSchema, generation: number) =>
+      finalizeStoreSetup(this.inner, schema, generation),
+  };
 
   private readonly inner: StoreBinding;
   private readonly readCache = new ReadCache();
@@ -649,6 +775,7 @@ export class StoreAdapter implements StorageBackend {
           unknown
         >;
         reviveDoc(fields);
+        assertNoPendingCommitTs(fields, "persisted device fields");
         return fields;
       },
     },
@@ -780,18 +907,6 @@ export class StoreAdapter implements StorageBackend {
         mutationsDeleted: Number(result.mutationsDeleted),
       };
     },
-    quarantine: {
-      read: (options) => {
-        const generation =
-          this.migrationReport?.required === true
-            ? this.migrationReport.candidateGeneration
-            : this.migrationReport?.activeGeneration;
-        if (generation === undefined) {
-          throw new Error("Store setup must complete before reading quarantined records");
-        }
-        return readDeviceQuarantinePage(this.inner, generation, options);
-      },
-    },
   };
 
   readonly blob: BlobSurface = {
@@ -866,44 +981,56 @@ export class StoreAdapter implements StorageBackend {
   };
 
   async setup(schema: StoreSchema): Promise<void> {
-    const { report, retiredGenerations } = await setupWithDeviceMigrations(this.inner, schema);
-    this.migrationReport = report;
+    await this.inner.setup(schema);
     this.readCache.clear();
-    for (const generation of retiredGenerations) {
-      await this.inner.migrationRetire(generation).catch(() => undefined);
-    }
   }
 
   async commit(batch: WriteBatch, options?: CommitOptions): Promise<CommitResult> {
+    let batchHasCommitTs = batch.pendingCommitTs === true;
     const bindingBatch = {
-      docWrites: batch.docWrites.map((docWrite) => ({
-        table: docWrite.table,
-        id: docWrite.id,
-        data: encodeDocData(docWrite.data),
-        cols: toBindingColValues(docWrite.cols),
-        creationTime: docWrite.creationTime,
-      })),
+      docWrites: batch.docWrites.map((docWrite) => {
+        let pendingCommitTs =
+          docWrite.pendingCommitTs === true || hasPendingCommitTs(docWrite.data);
+        const cols = toBindingColValues(docWrite.cols, () => {
+          pendingCommitTs = true;
+        });
+        if (pendingCommitTs) batchHasCommitTs = true;
+        return {
+          table: docWrite.table,
+          id: docWrite.id,
+          data: encodeDocData(docWrite.data),
+          cols,
+          creationTime: docWrite.creationTime,
+          ...(pendingCommitTs ? { pendingCommitTs: true as const } : {}),
+        };
+      }),
       crdtOps: (batch.crdtOps ?? []).map(toBindingCrdtOp),
       crdtRestores: (batch.crdtRestores ?? []).map((restore) => ({
         ...restore,
         bytes: new Uint8Array(restore.bytes),
       })),
       deletes: batch.deletes,
-      localFieldWrites: (batch.localFieldWrites ?? []).map((write) => ({
-        table: write.table,
-        id: write.id,
-        field: write.field,
-        valueJson: encode(write.value),
-      })),
+      localFieldWrites: (batch.localFieldWrites ?? []).map((write) => {
+        const pendingCommitTs = write.pendingCommitTs === true || hasPendingCommitTs(write.value);
+        if (pendingCommitTs) batchHasCommitTs = true;
+        return {
+          table: write.table,
+          id: write.id,
+          field: write.field,
+          valueJson: encode(write.value),
+          ...(pendingCommitTs ? { pendingCommitTs: true as const } : {}),
+        };
+      }),
       localFieldDeletes: batch.localFieldDeletes ?? [],
       freshIds: batch.freshIds ?? [],
       dataOnlyIds: batch.dataOnlyIds ?? [],
       idMappings: (batch.idMappings ?? []).map(toBindingIdMapping),
       schedules: (batch.schedules ?? []).map(toBindingScheduledJob),
     };
-    const bindingOptions = toBindingCommitOptions(options);
+    const bindingOptions = toBindingCommitOptions(options, batchHasCommitTs);
     const result = await this.inner.commit(bindingBatch, bindingOptions);
     const commit = fromBindingCommitResult(result);
+    if (commit.commitTs !== undefined) resolveBatchCommitTs(batch, commit.commitTs);
     this.applyCommitCaches(commit, batch);
     return commit;
   }
@@ -913,6 +1040,27 @@ export class StoreAdapter implements StorageBackend {
     options?: CommitOptions,
   ): Promise<CommitResult> {
     const docWrite = commit.docWrite;
+    // The shortcut can only carry fully encoded physical columns. A timestamp marker is resolved
+    // together with its document/result in the generic transaction, never by the one-row path.
+    if (
+      docWrite.pendingCommitTs === true ||
+      hasPendingCommitTs(docWrite.data) ||
+      options?.commitTs === true
+    ) {
+      const row = { table: docWrite.table, id: docWrite.id };
+      return await this.commit(
+        {
+          docWrites: [docWrite],
+          deletes: [],
+          freshIds: commit.fresh ? [row] : [],
+          dataOnlyIds: commit.dataOnly ? [row] : [],
+          ...(docWrite.pendingCommitTs === true || hasPendingCommitTs(docWrite.data)
+            ? { pendingCommitTs: true }
+            : {}),
+        },
+        options,
+      );
+    }
     const hasFastPath =
       options?.changes === "omit"
         ? hasMethod(this.inner, "commitOneDocWriteEncodedDeferred") ||
@@ -1023,6 +1171,20 @@ export class StoreAdapter implements StorageBackend {
     return state ? fromBindingProjectionDebug(state) : undefined;
   }
 
+  async remoteCursorDebugRead(subscription: string): Promise<string | undefined> {
+    return (await this.inner.remoteCursorDebugRead?.(subscription)) ?? undefined;
+  }
+
+  async remoteMemberDebugRead(
+    subscription: string,
+  ): Promise<Array<{ serverDocumentId: string; table: string }>> {
+    if (!this.inner.remoteMemberDebugRead) return [];
+    return JSON.parse(await this.inner.remoteMemberDebugRead(subscription)) as Array<{
+      serverDocumentId: string;
+      table: string;
+    }>;
+  }
+
   clearReadCacheForBench(): void {
     this.readCache.clear();
   }
@@ -1035,7 +1197,8 @@ export class StoreAdapter implements StorageBackend {
       order: spec.order,
       pageSize: spec.pageSize,
       cursor: spec.cursor,
-      resumeAfterKey: spec.resumeAfterKey && spec.resumeAfterKey.map(toBindingValue),
+      resumeAfterKey:
+        spec.resumeAfterKey && spec.resumeAfterKey.map((value) => toBindingValue(value)),
     };
   }
 
@@ -1161,6 +1324,9 @@ function fromBindingCommitResult(result: BindingCommitResult): CommitResult {
     changedTables: result.changedTables,
     changes: (result.changes ?? []).map(fromBindingRowChange),
     commitSeq: safeCommitSeq(result.commitSeq),
+    ...(result.commitTs === undefined || result.commitTs === null
+      ? {}
+      : { commitTs: parseCommitTs(result.commitTs) }),
     ...(crdtOps.length > 0 ? { crdtOps } : {}),
   };
 }
@@ -1183,6 +1349,7 @@ function fromBindingRowChange(change: BindingRowChange): StorageRowChange {
     throw new Error(`storage row change for ${change.table}:${change.id} is missing row`);
   }
   reviveDoc(row);
+  assertNoPendingCommitTs(row, "persisted storage row");
   return { id: change.id, op: "write", row, table: change.table };
 }
 
@@ -1465,19 +1632,26 @@ function encodeDocData(data: Parameters<typeof encode>[0]): string {
 
 function parseDocs(text: string): StoredDoc[] {
   const docs = JSON.parse(text) as StoredDoc[];
-  for (const doc of docs) reviveDoc(doc);
+  for (const doc of docs) {
+    reviveDoc(doc);
+    assertNoPendingCommitTs(doc, "persisted storage document");
+  }
   return docs;
 }
 
 function parseDeviceFields(text: string): Record<string, Record<string, unknown>> {
   const rows = JSON.parse(text) as Record<string, Record<string, unknown>>;
-  for (const fields of Object.values(rows)) reviveDoc(fields);
+  for (const fields of Object.values(rows)) {
+    reviveDoc(fields);
+    assertNoPendingCommitTs(fields, "persisted device fields");
+  }
   return rows;
 }
 
 function parseDoc(text: string): StoredDoc {
   const doc = JSON.parse(text) as StoredDoc;
   reviveDoc(doc);
+  assertNoPendingCommitTs(doc, "persisted storage document");
   return doc;
 }
 
@@ -1488,14 +1662,40 @@ function cacheKey(value: unknown): string {
 }
 
 function toBindingColValue(name: string, value: ColValue): BindingColValue {
-  const tagged = toBindingValue(value) as BindingColValue;
+  const tagged = toBindingValue(value, true) as BindingColValue;
   tagged.name = name;
   return tagged;
 }
 
-function toBindingColValues(cols: ColValues): BindingColValue[] {
+function toBindingColValues(cols: ColValues, pending?: () => void): BindingColValue[] {
   const entries = Array.isArray(cols) ? cols : Object.entries(cols);
-  return entries.map(([name, value]) => toBindingColValue(name, value));
+  return entries.map(([name, value]) => {
+    if (isPendingCommitTsColumn(value)) pending?.();
+    return toBindingColValue(name, value);
+  });
+}
+
+function resolveBatchCommitTs(batch: WriteBatch, timestamp: bigint): void {
+  for (const write of batch.docWrites) {
+    if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.data)) continue;
+    write.data = resolveKnownPendingCommitTs(write.data, timestamp);
+    if (Array.isArray(write.cols)) {
+      for (const entry of write.cols) {
+        if (isPendingCommitTsColumn(entry[1])) entry[1] = timestamp;
+      }
+    } else {
+      for (const [name, value] of Object.entries(write.cols)) {
+        if (isPendingCommitTsColumn(value)) write.cols[name] = timestamp;
+      }
+    }
+    delete write.pendingCommitTs;
+  }
+  for (const write of batch.localFieldWrites ?? []) {
+    if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.value)) continue;
+    write.value = resolveKnownPendingCommitTs(write.value, timestamp);
+    delete write.pendingCommitTs;
+  }
+  delete batch.pendingCommitTs;
 }
 
 const EMPTY_ENCODED_COL_KEYS = new Uint8Array([0, 0, 0, 0]);
@@ -1525,6 +1725,9 @@ function encodeColKeys(cols: ColValues): Uint8Array {
 }
 
 function encodeColKey(value: ColValue): Uint8Array {
+  if (isPendingCommitTsColumn(value)) {
+    throw new Error("commit timestamp columns require the generic storage commit path");
+  }
   if (value === undefined) return new Uint8Array([0x00]);
   if (value === null) return new Uint8Array([0x01]);
   if (typeof value === "bigint") {
@@ -1562,7 +1765,11 @@ function writeU64BE(out: Uint8Array, offset: number, value: bigint): void {
  * affinity): a `number` is a Convex float64, a `bigint` is int64, etc. `undefined` (a missing
  * field) and `null` are distinct. NaN/±Infinity/-0 are valid floats.
  */
-function toBindingValue(value: ColValue): BindingTaggedValue {
+function toBindingValue(value: ColValue, allowPending = false): BindingTaggedValue {
+  if (isPendingCommitTsColumn(value)) {
+    if (!allowPending) return { int: ((1n << 63n) - 1n).toString() };
+    return { commitTs: true };
+  }
   if (value === undefined) return { undef: true };
   if (value === null) return {};
   if (typeof value === "string") return { text: value };
@@ -1577,6 +1784,18 @@ function checkedI64(value: bigint): bigint {
   const max = (1n << 63n) - 1n;
   if (value < min || value > max) throw new Error(`bigint out of i64 range: ${value}`);
   return value;
+}
+
+function parseCommitTs(value: string): bigint {
+  try {
+    const parsed = BigInt(value);
+    const min = -(1n << 63n);
+    const max = (1n << 63n) - 1n;
+    if (parsed < min || parsed > max) throw new Error("out of range");
+    return parsed;
+  } catch {
+    throw new Error(`storage returned an invalid commit timestamp: ${value}`);
+  }
 }
 
 const READ_CACHE_LIMIT_BYTES = 64 * 1024 * 1024;

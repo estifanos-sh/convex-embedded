@@ -8,11 +8,15 @@ import {
   EmbeddedOfflineError,
   EmbeddedUnsupportedError,
   isEmbeddedError,
+  normalizeStorageError,
   type EmbeddedErrorCode,
 } from "../../src/error";
+import { deserializeError, serializeError } from "../../src/browser/protocol";
 
 const CONTRACT_CODES: EmbeddedErrorCode[] = [
   "EMBEDDED_CLOSED",
+  "EMBEDDED_NOT_OPEN",
+  "EMBEDDED_OPEN_MISMATCH",
   "EMBEDDED_OFFLINE",
   "EMBEDDED_CONFLICT",
   "EMBEDDED_REJECTED",
@@ -24,6 +28,7 @@ const CONTRACT_CODES: EmbeddedErrorCode[] = [
   "EMBEDDED_PROTOCOL_MISMATCH",
   "EMBEDDED_CRDT_CORRUPT",
   "EMBEDDED_STORAGE",
+  "EMBEDDED_PRE_BASELINE_STORE",
   "EMBEDDED_UNSUPPORTED",
 ];
 
@@ -69,5 +74,24 @@ describe("embedded error registry", () => {
     const error = new EmbeddedError("EMBEDDED_CONFLICT");
     expect(isEmbeddedError(error, "EMBEDDED_REJECTED")).toBe(false);
     expect(isEmbeddedError(new Error("plain"))).toBe(false);
+  });
+
+  test("normalizes the stable prebaseline marker shared by Node, WASM, and Expo", () => {
+    const cause = new Error(
+      "[convex-embedded:EMBEDDED_PRE_BASELINE_STORE] store epoch 46 predates baseline 47",
+    );
+    const error = normalizeStorageError(cause);
+    expect(isEmbeddedError(error, "EMBEDDED_PRE_BASELINE_STORE")).toBe(true);
+    expect(error.cause).toBe(cause);
+  });
+
+  test("preserves typed embedded codes across the browser worker boundary", () => {
+    const source = new EmbeddedError(
+      "EMBEDDED_PRE_BASELINE_STORE",
+      "[convex-embedded:EMBEDDED_PRE_BASELINE_STORE] preserved",
+    );
+    const roundtrip = deserializeError(serializeError(source));
+    expect(isEmbeddedError(roundtrip, "EMBEDDED_PRE_BASELINE_STORE")).toBe(true);
+    expect(roundtrip.message).toBe(source.message);
   });
 });

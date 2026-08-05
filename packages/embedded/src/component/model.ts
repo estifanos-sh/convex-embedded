@@ -224,6 +224,7 @@ const readBoundValidator = v.object({
   field: v.string(),
   value: v.any(),
   inclusive: v.boolean(),
+  commitTs: v.optional(v.literal(true)),
 });
 
 export const readWitnessValidator = v.union(
@@ -245,7 +246,9 @@ export const readWitnessValidator = v.union(
     kind: v.literal("range"),
     table: v.string(),
     index: v.optional(v.string()),
-    equality: v.array(v.object({ field: v.string(), value: v.any() })),
+    equality: v.array(
+      v.object({ field: v.string(), value: v.any(), commitTs: v.optional(v.literal(true)) }),
+    ),
     limit: v.optional(v.number()),
     lower: v.optional(readBoundValidator),
     upper: v.optional(readBoundValidator),

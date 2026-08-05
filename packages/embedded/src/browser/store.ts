@@ -1,4 +1,5 @@
 import { StoreAdapter, type StoreBinding } from "../storage/binding";
+import { normalizeStorageError } from "../error";
 
 /**
  * Options for opening the browser embedded store adapter.
@@ -30,8 +31,12 @@ export class WasmStore extends StoreAdapter {
     name: string,
     options: WasmStoreOptions = {},
   ): Promise<WasmStore> {
-    return new WasmStore(
-      (await Store.open(name, options.selectorKey, options.defaultIdentityKey)) as StoreBinding,
-    );
+    try {
+      return new WasmStore(
+        (await Store.open(name, options.selectorKey, options.defaultIdentityKey)) as StoreBinding,
+      );
+    } catch (error) {
+      throw normalizeStorageError(error);
+    }
   }
 }

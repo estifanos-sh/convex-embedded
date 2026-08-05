@@ -6,6 +6,7 @@ import type {
   ReturnValueForOptionalValidator,
 } from "convex/server";
 import type { GenericValidator, PropertyValidators, Validator } from "convex/values";
+import { bindLocalSchema, stampLocalGraph } from "./local/internal";
 
 import {
   hasEmbeddedSchemaMeta,
@@ -14,6 +15,7 @@ import {
   type EmbeddedSchemaDefinition,
 } from "./schema";
 import type {
+  ActionCtx as RuntimeActionCtx,
   FunctionVisibility,
   MutationCtx as RuntimeMutationCtx,
   QueryCtx as RuntimeQueryCtx,
@@ -31,11 +33,17 @@ export type LocalMutationCtx<DataModel extends GenericDataModel> = Omit<
   "scheduler" | "storage"
 >;
 
+/** Context passed to a device-only action. Actions orchestrate separate query/mutation calls. */
+export type LocalActionCtx<DataModel extends GenericDataModel> = Omit<
+  RuntimeActionCtx<DataModel>,
+  "scheduler" | "storage" | "runAction"
+>;
+
 declare const localFunction: unique symbol;
 
 /** A device-only function value; usable directly as a client function reference. */
 export type LocalFunction<
-  Kind extends "query" | "mutation",
+  Kind extends "query" | "mutation" | "action",
   Visibility extends FunctionVisibility,
   Args,
   Returns,
@@ -55,6 +63,14 @@ export type LocalQuery<Visibility extends FunctionVisibility, Args, Returns> = L
 
 export type LocalMutation<Visibility extends FunctionVisibility, Args, Returns> = LocalFunction<
   "mutation",
+  Visibility,
+  Args,
+  Returns
+>;
+
+/** A device-only action. Internal actions are valid `client.open()` setup functions. */
+export type LocalAction<Visibility extends FunctionVisibility, Args, Returns> = LocalFunction<
+  "action",
   Visibility,
   Args,
   Returns
@@ -96,22 +112,38 @@ export type LocalMutationBuilder<
   handler: (ctx: LocalMutationCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
 }) => LocalMutation<Visibility, ArgsArrayToObject<OneOrZeroArgs>, ReturnValue>;
 
+export type LocalActionBuilder<
+  DataModel extends GenericDataModel,
+  Visibility extends FunctionVisibility,
+> = <
+  ArgsValidator extends PropertyValidators | void | Validator<any, any, any>,
+  ReturnsValidator extends PropertyValidators | GenericValidator | void,
+  ReturnValue extends ReturnValueForOptionalValidator<ReturnsValidator> = any,
+  OneOrZeroArgs extends ArgsArrayForOptionalValidator<ArgsValidator> =
+    DefaultArgsForOptionalValidator<ArgsValidator>,
+>(definition: {
+  args?: ArgsValidator;
+  returns?: ReturnsValidator;
+  handler: (ctx: LocalActionCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
+}) => LocalAction<Visibility, ArgsArrayToObject<OneOrZeroArgs>, Awaited<ReturnValue>>;
+
 /** Device-only function builders typed against one Embedded schema. */
 export type LocalBuilders<DataModel extends GenericDataModel> = {
   query: LocalQueryBuilder<DataModel, "public">;
   mutation: LocalMutationBuilder<DataModel, "public">;
   internalQuery: LocalQueryBuilder<DataModel, "internal">;
   internalMutation: LocalMutationBuilder<DataModel, "internal">;
+  internalAction: LocalActionBuilder<DataModel, "internal">;
 };
 
 /**
- * Application-side type registration for the `local` namespace. Augment it once from the schema
- * module: `declare module "@convex-dev/embedded/local" { interface Register { schema: typeof schema } }`.
+ * Application-side type registration for the `local` namespace. The Embedded bundler plugin
+ * augments it from the generated lockfile, binding the builders to the project schema.
  */
 export interface Register {}
 
 type UnregisteredSchema =
-  'Declare your schema in convex/schema.ts: declare module "@convex-dev/embedded/local" { interface Register { schema: typeof schema } }';
+  "The Embedded bundler plugin registers your schema through the module it generates in your convex directory; wire the plugin and include that module in this TypeScript program";
 
 type UnregisteredBuilder = (definition: UnregisteredSchema) => never;
 
@@ -122,6 +154,7 @@ type RegisteredLocal = Register extends { schema: infer Schema extends EmbeddedS
       mutation: UnregisteredBuilder;
       internalQuery: UnregisteredBuilder;
       internalMutation: UnregisteredBuilder;
+      internalAction: UnregisteredBuilder;
     };
 
 /** Device-only function builders typed via the app's {@link Register} declaration. */
@@ -130,6 +163,7 @@ export const local = {
   mutation: builder("mutation", "public"),
   internalQuery: builder("query", "internal"),
   internalMutation: builder("mutation", "internal"),
+  internalAction: builder("action", "internal"),
 } as unknown as RegisteredLocal;
 
 /** Create device-only builders bound to an explicit schema value instead of {@link Register}. */
@@ -140,14 +174,19 @@ export function defineLocal<Schema extends EmbeddedSchemaDefinition>(
     throw new Error("defineLocal requires the schema exported by defineEmbeddedSchema.");
   }
   return {
-    query: builder("query", "public"),
-    mutation: builder("mutation", "public"),
-    internalQuery: builder("query", "internal"),
-    internalMutation: builder("mutation", "internal"),
+    query: builder("query", "public", schema),
+    mutation: builder("mutation", "public", schema),
+    internalQuery: builder("query", "internal", schema),
+    internalMutation: builder("mutation", "internal", schema),
+    internalAction: builder("action", "internal", schema),
   } as unknown as LocalBuilders<DeviceDataModel<Schema>>;
 }
 
-function builder(kind: "query" | "mutation", visibility: FunctionVisibility) {
+function builder(
+  kind: "query" | "mutation" | "action",
+  visibility: FunctionVisibility,
+  schema?: ConvexEmbeddedSchema,
+) {
   return (definition: {
     args?: PropertyValidators | GenericValidator;
     returns?: PropertyValidators | GenericValidator;
@@ -161,6 +200,7 @@ function builder(kind: "query" | "mutation", visibility: FunctionVisibility) {
     handler: definition.handler,
     __embeddedHandler: definition.handler,
     __embeddedPlacement: "local" as const,
+    ...bindLocalSchema({}, schema),
   });
 }
 
@@ -173,7 +213,14 @@ export const EMBEDDED_LOCAL_REFERENCE = "__embeddedLocalReference";
  *
  * @internal
  */
-export function stampLocal(moduleId: string, exports: Record<string, unknown>): void {
+export function stampLocal(
+  moduleId: string,
+  graphHashOrExports: string | Record<string, unknown>,
+  maybeExports?: Record<string, unknown>,
+): void {
+  const graphHash = typeof graphHashOrExports === "string" ? graphHashOrExports : undefined;
+  const exports =
+    typeof graphHashOrExports === "string" ? (maybeExports ?? {}) : graphHashOrExports;
   for (const [name, value] of Object.entries(exports)) {
     if (
       typeof value !== "object" ||
@@ -183,6 +230,9 @@ export function stampLocal(moduleId: string, exports: Record<string, unknown>): 
       continue;
     }
     (value as Record<string, unknown>)[EMBEDDED_LOCAL_REFERENCE] = `${moduleId}:${name}`;
+    if (graphHash !== undefined) {
+      stampLocalGraph(value as Record<string, unknown>, graphHash);
+    }
   }
 }
 

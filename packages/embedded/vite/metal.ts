@@ -52,7 +52,10 @@ export const metalProject = {
     ),
     __CONVEX_EMBEDDED_METAL_BENCH_TIMEOUT_MS__: JSON.stringify(Math.min(300_000, bench.timeoutMs)),
   },
-  plugins: [convexEmbedded({ convexDir: metalConvexDir, schema }), browserRuntimeLog()],
+  plugins: [
+    convexEmbedded({ convexDir: metalConvexDir, registerSchema: false, schema }),
+    browserRuntimeLog(),
+  ],
   resolve: {
     alias: [
       { find: "@convex-dev/embedded/browser", replacement: browserDistPath },

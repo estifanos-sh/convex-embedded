@@ -160,10 +160,10 @@ type ReadWitness =
       kind: "range";
       table: string;
       index: string;
-      equality: Array<{ field: string; value: unknown }>;
+      equality: Array<{ field: string; value: unknown; commitTs?: true }>;
       limit?: number;
-      lower?: { field: string; value: unknown; inclusive: boolean };
-      upper?: { field: string; value: unknown; inclusive: boolean };
+      lower?: { field: string; value: unknown; inclusive: boolean; commitTs?: true };
+      upper?: { field: string; value: unknown; inclusive: boolean; commitTs?: true };
       order: "asc" | "desc";
       membersHash: string;
     };
@@ -618,6 +618,7 @@ const readBoundValidator = v.object({
   field: v.string(),
   value: v.any(),
   inclusive: v.boolean(),
+  commitTs: v.optional(v.literal(true)),
 });
 const readWitnessValidator = v.union(
   v.object({
@@ -638,7 +639,9 @@ const readWitnessValidator = v.union(
     kind: v.literal("range"),
     table: v.string(),
     index: v.string(),
-    equality: v.array(v.object({ field: v.string(), value: v.any() })),
+    equality: v.array(
+      v.object({ field: v.string(), value: v.any(), commitTs: v.optional(v.literal(true)) }),
+    ),
     limit: v.optional(v.number()),
     lower: v.optional(readBoundValidator),
     upper: v.optional(readBoundValidator),
@@ -2241,17 +2244,32 @@ async function inspectWitnesses(
         .withIndex(witness.index, (builder: any) => {
           let range = builder;
           for (const equality of witness.equality) {
-            range = range.eq(equality.field, equality.value);
+            range = range.eq(
+              equality.field,
+              equality.commitTs === true ? ctx.db.vars.commitTs : equality.value,
+            );
           }
           if (witness.lower) {
             range = witness.lower.inclusive
-              ? range.gte(witness.lower.field, witness.lower.value)
-              : range.gt(witness.lower.field, witness.lower.value);
+              ? range.gte(
+                  witness.lower.field,
+                  witness.lower.commitTs === true ? ctx.db.vars.commitTs : witness.lower.value,
+                )
+              : range.gt(
+                  witness.lower.field,
+                  witness.lower.commitTs === true ? ctx.db.vars.commitTs : witness.lower.value,
+                );
           }
           if (witness.upper) {
             range = witness.upper.inclusive
-              ? range.lte(witness.upper.field, witness.upper.value)
-              : range.lt(witness.upper.field, witness.upper.value);
+              ? range.lte(
+                  witness.upper.field,
+                  witness.upper.commitTs === true ? ctx.db.vars.commitTs : witness.upper.value,
+                )
+              : range.lt(
+                  witness.upper.field,
+                  witness.upper.commitTs === true ? ctx.db.vars.commitTs : witness.upper.value,
+                );
           }
           return range;
         })

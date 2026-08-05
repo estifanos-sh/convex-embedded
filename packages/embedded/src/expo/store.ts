@@ -1,4 +1,5 @@
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
+import { normalizeStorageError } from "../error";
 import { StoreAdapter, type StoreBinding } from "../storage/binding";
 import type { RemoteStartOptions, RemoteTick } from "../storage/types";
 import { decodeResponse, encodeRequest } from "./codec";
@@ -8,8 +9,12 @@ import { loadNativeModule } from "./native";
 /** Open the package-owned Expo native store. @internal */
 export async function openExpoStore(path: string): Promise<StoreAdapter> {
   const native = loadNativeModule();
-  const store = await native.open(path, path, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY);
-  return new StoreAdapter(new ExpoStoreBinding(store));
+  try {
+    const store = await native.open(path, path, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY);
+    return new StoreAdapter(new ExpoStoreBinding(store));
+  } catch (error) {
+    throw normalizeStorageError(error);
+  }
 }
 
 /** Full StoreBinding facade over the native binary request channel. @internal */
@@ -26,18 +31,17 @@ export class ExpoStoreBinding implements StoreBinding {
   setup: StoreBinding["setup"] = (schema) => this.invoke("setup", [schema]);
   migrationBegin: StoreBinding["migrationBegin"] = (schema) =>
     this.invoke("migrationBegin", [schema]);
+  migrationCopyStep: StoreBinding["migrationCopyStep"] = (generation) =>
+    this.invoke("migrationCopyStep", [generation]);
+  migrationBind: StoreBinding["migrationBind"] = (schema, generation) =>
+    this.invoke("migrationBind", [schema, generation]);
+  migrationMaterializeStep: StoreBinding["migrationMaterializeStep"] = (generation) =>
+    this.invoke("migrationMaterializeStep", [generation]);
+  migrationUnbind: StoreBinding["migrationUnbind"] = () => this.invoke("migrationUnbind", []);
+  migrationSetupComplete: StoreBinding["migrationSetupComplete"] = (generation) =>
+    this.invoke("migrationSetupComplete", [generation]);
   originPageRead: StoreBinding["originPageRead"] = (generation, cursorJson, pageSize, upperJson) =>
     this.invoke("originPageRead", [generation, cursorJson, pageSize, upperJson]);
-  migrationStepBegin: StoreBinding["migrationStepBegin"] = (generation, migrationId) =>
-    this.invoke("migrationStepBegin", [generation, migrationId]);
-  migrationRecordWrite: StoreBinding["migrationRecordWrite"] = (generation, recordJson) =>
-    this.invoke("migrationRecordWrite", [generation, recordJson]);
-  migrationRecordDelete: StoreBinding["migrationRecordDelete"] = (
-    generation,
-    identityKey,
-    kind,
-    recordKey,
-  ) => this.invoke("migrationRecordDelete", [generation, identityKey, kind, recordKey]);
   migrationRecordDispositionWrite: StoreBinding["migrationRecordDispositionWrite"] = (
     generation,
     identityKey,
@@ -56,14 +60,18 @@ export class ExpoStoreBinding implements StoreBinding {
       reason,
       discard,
     ]);
-  migrationPageWrite: StoreBinding["migrationPageWrite"] = (generation, migrationId, pageJson) =>
-    this.invoke("migrationPageWrite", [generation, migrationId, pageJson]);
-  migrationStepComplete: StoreBinding["migrationStepComplete"] = (generation, appliedMigrations) =>
-    this.invoke("migrationStepComplete", [generation, appliedMigrations]);
+  migrationQueuePolicyWrite: StoreBinding["migrationQueuePolicyWrite"] = (generation, policyJson) =>
+    this.invoke("migrationQueuePolicyWrite", [generation, policyJson]);
+  migrationQueuePolicyStateRead: StoreBinding["migrationQueuePolicyStateRead"] = (generation) =>
+    this.invoke("migrationQueuePolicyStateRead", [generation]);
+  migrationFinalizePrepare: StoreBinding["migrationFinalizePrepare"] = (schema, generation) =>
+    this.invoke("migrationFinalizePrepare", [schema, generation]);
   migrationCommit: StoreBinding["migrationCommit"] = (schema, generation) =>
     this.invoke("migrationCommit", [schema, generation]);
   migrationRetire: StoreBinding["migrationRetire"] = (generation) =>
     this.invoke("migrationRetire", [generation]);
+  migrationRetireStep: StoreBinding["migrationRetireStep"] = (generation) =>
+    this.invoke("migrationRetireStep", [generation]);
   identityRead: NonNullable<StoreBinding["identityRead"]> = () => this.invoke("identityRead", []);
   identityWrite: NonNullable<StoreBinding["identityWrite"]> = (identityKey, identityJson) =>
     this.invoke("identityWrite", [identityKey, identityJson]);
@@ -110,6 +118,10 @@ export class ExpoStoreBinding implements StoreBinding {
     this.invoke("dirtyHeadsDebugRead", []);
   remoteDocDebugRead: NonNullable<StoreBinding["remoteDocDebugRead"]> = (table, localId) =>
     this.invoke("remoteDocDebugRead", [table, localId]);
+  remoteCursorDebugRead: NonNullable<StoreBinding["remoteCursorDebugRead"]> = (subscription) =>
+    this.invoke("remoteCursorDebugRead", [subscription]);
+  remoteMemberDebugRead: NonNullable<StoreBinding["remoteMemberDebugRead"]> = (subscription) =>
+    this.invoke("remoteMemberDebugRead", [subscription]);
   idDelete: StoreBinding["idDelete"] = (table, localId) =>
     this.invoke("idDelete", [table, localId]);
   fileWrite: StoreBinding["fileWrite"] = (input) => this.invoke("fileWrite", [input]);

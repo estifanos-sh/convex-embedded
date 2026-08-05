@@ -53,6 +53,7 @@ import {
   equals,
   normalizeCopy,
 } from "./codec";
+import { assertNoPendingCommitTs, hasPendingCommitTs, resolvePendingCommitTs } from "./pending";
 import { pageCursorBoundary } from "./query";
 import {
   createReadAuthority,
@@ -331,7 +332,6 @@ export type RunnerDevtoolsRequest =
   | { cursor?: string | null; kind: "listRows"; limit?: number; table: string }
   | { fields: Record<string, unknown>; id: string; kind: "patchDocument"; table: string }
   | { id: string; kind: "deleteDocument"; table: string }
-  | { cursor?: string; kind: "exportQuarantine"; pageSize?: number }
   | { kind: "clearData" };
 
 /** Execution route and hosted arguments resolved before a public client operation starts. */
@@ -616,7 +616,9 @@ function afterImages(batch: WriteBatch): Array<
       content: "value",
       table: docWrite.table,
       rowId: docWrite.id,
-      value: docWrite.data,
+      // The durable push envelope is JSON. Encode Convex leaves explicitly so BigInts and the
+      // pending commit timestamp never invoke their throwing JavaScript `toJSON` methods.
+      value: convexToJson(docWrite.data as Value),
       creationTime: docWrite.creationTime,
     });
   }
@@ -819,7 +821,10 @@ export function createRunner(
       },
       checked,
     );
-    return validateReturn(fn, result);
+    // A query nested inside a mutation participates in that mutation's commit and may therefore
+    // carry its pending timestamp through a staged index read. A top-level query has no commit
+    // boundary and continues to reject the placeholder.
+    return validateReturn(fn, result, tx !== undefined);
   };
 
   const createMutationTransaction = (
@@ -888,9 +893,11 @@ export function createRunner(
         const idMappings: NonNullable<WriteBatch["idMappings"]> = [];
         const localFieldWrites: NonNullable<WriteBatch["localFieldWrites"]> = [];
         const localFieldDeletes: NonNullable<WriteBatch["localFieldDeletes"]> = [];
+        let pendingCommitTs = false;
         let rootBatch: WriteBatch = { deletes: [], docWrites: [] };
         for (const [instancePath, w] of writers) {
           const batch = w.toBatch();
+          pendingCommitTs ||= batch.pendingCommitTs === true;
           if (instancePath === ROOT_INSTANCE) rootBatch = batch;
           if (watching) {
             for (const key of batchInvalidationKeys(instancePath, batch)) touchedKeys.add(key);
@@ -919,6 +926,7 @@ export function createRunner(
             localFieldWrites,
             localFieldDeletes,
             docWrites,
+            pendingCommitTs,
           },
           rootBatch,
           touchedKeys: watching ? [...touchedKeys] : [],
@@ -1059,6 +1067,7 @@ export function createRunner(
       fn,
       args,
       argsAreNormalized,
+      tx !== undefined,
     );
     if (componentRevision === "create") {
       await validateRevisionCreate(root.writer(rootScope).db, checked);
@@ -1273,7 +1282,7 @@ export function createRunner(
       const result = await (!tx && options.pushCall && pushEnvelopeTimeHlc !== undefined
         ? withEntropySpan(pushEnvelopeTimeHlc, options.pushCall.rngSeed, runHandler)
         : runHandler());
-      validated = validateReturn(fn, result);
+      validated = validateReturn(fn, result, true);
       if (componentRevision === "restore") {
         const revision = validated as RevisionRestoreExpectation;
         const snapshots = (await runQuery(
@@ -1352,9 +1361,16 @@ export function createRunner(
         !hasEventListeners() &&
         !!store.commitOneDocWrite &&
         !options.pushCall &&
-        !localSchedules;
+        !localSchedules &&
+        !hasPendingCommitTs(validated);
       const oneDocWrite = canCommitOneDocWrite ? root.oneDocWrite() : undefined;
       const batchInfo = oneDocWrite ? undefined : root.toBatch(watching);
+      const resultHasCommitTs = hasPendingCommitTs(validated);
+      const batchHasCommitTs = batchInfo?.batch.pendingCommitTs === true;
+      const afterImagesHaveCommitTs =
+        batchHasCommitTs === true &&
+        batchInfo!.rootBatch.docWrites.some((write) => write.pendingCommitTs === true);
+      const requiresCommitTs = resultHasCommitTs || batchHasCommitTs;
       if (timing) {
         timing.batchMs = getTimerTime() - timingPhaseStartedAt;
         timingPhaseStartedAt = getTimerTime();
@@ -1425,9 +1441,9 @@ export function createRunner(
       }
       const commitOptions: CommitOptions =
         fn.placement === "local"
-          ? { changes: "omit", source: "device" }
+          ? { changes: "omit", source: "device", commitTs: requiresCommitTs }
           : options.mutationId === undefined
-            ? { changes: "omit", mutation: "none", source: "local" }
+            ? { changes: "omit", mutation: "none", source: "local", commitTs: requiresCommitTs }
             : options.mutationIsFresh &&
                 pushEnvelopeJson !== undefined &&
                 pushEnvelopeNowMs !== undefined
@@ -1435,8 +1451,13 @@ export function createRunner(
                   changes: "omit",
                   mutation: "push",
                   mutationId: options.mutationId,
-                  push: { json: pushEnvelopeJson, nowMs: pushEnvelopeNowMs },
+                  push: {
+                    json: pushEnvelopeJson,
+                    nowMs: pushEnvelopeNowMs,
+                    ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
+                  },
                   source: "local",
+                  commitTs: requiresCommitTs,
                 }
               : {
                   changes: "omit",
@@ -1446,15 +1467,37 @@ export function createRunner(
                   mutationId: options.mutationId,
                   mutationName: resolved.name,
                   mutationResult: encodedMutationResult!,
+                  ...(resultHasCommitTs ? { mutationResultCommitTs: true as const } : {}),
                   ...(pushEnvelopeJson === undefined || pushEnvelopeNowMs === undefined
                     ? {}
-                    : { push: { json: pushEnvelopeJson, nowMs: pushEnvelopeNowMs } }),
+                    : {
+                        push: {
+                          json: pushEnvelopeJson,
+                          nowMs: pushEnvelopeNowMs,
+                          ...(afterImagesHaveCommitTs
+                            ? { afterImagesCommitTs: true as const }
+                            : {}),
+                        },
+                      }),
                   source: "local",
+                  commitTs: requiresCommitTs,
                 };
       if (localSchedules) batchInfo!.batch.schedules = pendingScheduleRows;
       const commit = oneDocWrite
         ? await store.commitOneDocWrite!(oneDocWrite, commitOptions)
         : await runSpan("storage.commit", () => store.commit(batchInfo!.batch, commitOptions));
+      if (requiresCommitTs && commit.commitTs === undefined) {
+        throw new Error(
+          "storage committed db.vars.commitTs without returning its allocated timestamp",
+        );
+      }
+      const resolvedResult =
+        commit.commitTs === undefined
+          ? validated
+          : resolvePendingCommitTs(validated, commit.commitTs);
+      if (commit.commitTs !== undefined && batchInfo !== undefined) {
+        resolveBatchCommitTs(batchInfo.batch, commit.commitTs);
+      }
       if (timing) {
         timing.commitMs = getTimerTime() - timingPhaseStartedAt;
         timingPhaseStartedAt = getTimerTime();
@@ -1479,7 +1522,7 @@ export function createRunner(
       } else {
         for (const apply of pendingSchedules) await apply();
       }
-      return validated;
+      return resolvedResult;
     } catch (error) {
       // Transient storage failure: NOT recorded as `failed`, so the mutation can be retried. The
       // ledger entry stays pending and a later replay re-runs the handler.
@@ -1510,49 +1553,67 @@ export function createRunner(
         auth: authService(options.auth ?? null),
         meta: {},
         runAction: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-          runAction(childRef, childArgs, resolved.scope, { ...options, allowInternal: true }),
+          fn.placement === "local"
+            ? Promise.reject(new Error("Local actions cannot call nested actions."))
+            : runAction(childRef, childArgs, resolved.scope, {
+                ...options,
+                allowInternal: true,
+                callerPlacement: fn.placement,
+              }),
         runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
           enqueueMutation(() =>
             runMutationDirect(childRef, childArgs, resolved.scope, {
               ...options,
               allowInternal: true,
+              callerPlacement: fn.placement,
             }),
           ),
         runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
           runQuery(childRef, childArgs, resolved.scope, undefined, undefined, undefined, {
             ...options,
             allowInternal: true,
+            callerPlacement: fn.placement,
           }),
-        scheduler: createSchedulerService(
-          store,
-          emit,
-          {
-            kind: functionKind,
-            runAction: (childRef, childArgs = {}) =>
-              runAction(childRef, childArgs, resolved.scope, { ...options, allowInternal: true }),
-            runMutation: (childRef, childArgs = {}) =>
-              enqueueMutation(() =>
-                runMutationDirect(childRef, childArgs, resolved.scope, {
+        get scheduler() {
+          if (fn.placement === "local") {
+            throw new Error("Local actions cannot schedule functions.");
+          }
+          return createSchedulerService(
+            store,
+            emit,
+            {
+              kind: functionKind,
+              runAction: (childRef, childArgs = {}) =>
+                runAction(childRef, childArgs, resolved.scope, { ...options, allowInternal: true }),
+              runMutation: (childRef, childArgs = {}) =>
+                enqueueMutation(() =>
+                  runMutationDirect(childRef, childArgs, resolved.scope, {
+                    ...options,
+                    allowInternal: true,
+                  }),
+                ),
+              runQuery: (childRef, childArgs = {}) =>
+                runQuery(childRef, childArgs, resolved.scope, undefined, undefined, undefined, {
                   ...options,
                   allowInternal: true,
                 }),
-              ),
-            runQuery: (childRef, childArgs = {}) =>
-              runQuery(childRef, childArgs, resolved.scope, undefined, undefined, undefined, {
-                ...options,
-                allowInternal: true,
-              }),
-          },
-          remoteEnabled,
-          wakeScheduler,
-        ),
-        storage: createStorageService(
-          namespaceStore(store, resolved.scope.instancePath),
-          uploadUrls,
-          objectUrls,
-          "action",
-          emit,
-        ),
+            },
+            remoteEnabled,
+            wakeScheduler,
+          );
+        },
+        get storage() {
+          if (fn.placement === "local") {
+            throw new Error("Local actions cannot access file storage.");
+          }
+          return createStorageService(
+            namespaceStore(store, resolved.scope.instancePath),
+            uploadUrls,
+            objectUrls,
+            "action",
+            emit,
+          );
+        },
       },
       checked,
     );
@@ -2076,13 +2137,6 @@ export function createRunner(
         return devtoolsPatch(request.table, request.id, request.fields);
       case "deleteDocument":
         return devtoolsDelete(request.table, request.id);
-      case "exportQuarantine": {
-        const quarantine = fullStore(store).ledger?.quarantine;
-        if (!quarantine) {
-          throw new Error("This storage backend does not expose quarantine inspection.");
-        }
-        return quarantine.read(request);
-      }
       case "clearData":
         return devtoolsClear();
     }
@@ -2895,7 +2949,7 @@ async function ingestLocalModules(
       for (const [exportName, value] of Object.entries(exports)) {
         if (!isLocalRegistration(value)) continue;
         const registration = toRunnable(value);
-        if (!registration || registration.kind === "action") continue;
+        if (!registration) continue;
         const name = `${moduleId}:${exportName}`;
         (value as Record<string, unknown>)[EMBEDDED_LOCAL_REFERENCE] = name;
         table.set(name, registration);
@@ -3237,8 +3291,10 @@ function validateArgs(
   fn: RunnableFunction,
   args: Record<string, unknown>,
   argsAreNormalized = false,
+  allowPending = false,
 ): Record<string, unknown> {
   const checked = argsAreNormalized ? args : (normalizeCopy(args) as Record<string, unknown>);
+  if (!allowPending) assertNoPendingCommitTs(checked, "function arguments");
   if (fn.args) {
     validateFields(checked, fn.args, "args");
   } else if (fn.argsJson) {
@@ -3295,10 +3351,11 @@ async function resolveMutationArgs(
   fn: RunnableFunction,
   args: Record<string, unknown>,
   argsAreNormalized: boolean,
+  allowPending = false,
 ): Promise<Record<string, unknown>> {
-  if (store.remote === undefined) return validateArgs(fn, args, argsAreNormalized);
+  if (store.remote === undefined) return validateArgs(fn, args, argsAreNormalized, allowPending);
   const hosted = hostedIdArgs(fn, args);
-  if (hosted.length === 0) return validateArgs(fn, args, argsAreNormalized);
+  if (hosted.length === 0) return validateArgs(fn, args, argsAreNormalized, allowPending);
   const resolved = cloneTree(args) as Record<string, unknown>;
   for (const ref of hosted) {
     const localId = await hostedToLocal(store, ref.table, ref.id);
@@ -3309,14 +3366,26 @@ async function resolveMutationArgs(
     }
     jsonPointerSlot(resolved, ref.path)?.write(localId);
   }
-  return validateArgs(fn, resolved);
+  return validateArgs(fn, resolved, false, allowPending);
 }
 
-function validateReturn(fn: RunnableFunction, value: unknown): unknown {
+function validateReturn(fn: RunnableFunction, value: unknown, allowPending = false): unknown {
   const normalized = normalizeCopy(value);
+  if (!allowPending) assertNoPendingCommitTs(normalized, "function return value");
   if (fn.returns) validateValue(normalized, fn.returns, "return value");
   else if (fn.returnsJson) validateJson(normalized, fn.returnsJson, "return value");
   return normalized;
+}
+
+/** Resolve only the materialized JS side of a successful device commit. Rust has already
+ * substituted the typed values before persistence; this keeps caches and emitted rows aligned. */
+function resolveBatchCommitTs(batch: WriteBatch, timestamp: bigint): void {
+  for (const write of batch.docWrites) {
+    write.data = resolvePendingCommitTs(write.data, timestamp);
+  }
+  for (const write of batch.localFieldWrites ?? []) {
+    write.value = resolvePendingCommitTs(write.value, timestamp);
+  }
 }
 
 function collectVisibleDocIds(value: unknown): Set<string> {

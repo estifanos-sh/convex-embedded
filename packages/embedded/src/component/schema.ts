@@ -19,6 +19,10 @@ export default defineSchema({
     logicalFingerprint: v.string(),
     settlement: settlementValidator,
     settledAt: v.number(),
+    // Acknowledgement is a fact about this exact replay row. A client-wide creation-time fence
+    // can accidentally acknowledge another row written between two pushes, so it is retained
+    // only as legacy diagnostic data on `clients`, never as the deletion authority.
+    acknowledgedAt: v.optional(v.commitTs()),
     identity: v.optional(v.string()),
   })
     .index("by_clientid_and_mutationid", ["clientId", "mutationId"])

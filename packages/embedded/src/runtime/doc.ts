@@ -1,5 +1,12 @@
-import type { ColEntries, ColValue, StoredDoc, TableDef } from "../storage/types";
+import {
+  PENDING_COMMIT_TS,
+  type ColEntries,
+  type ColValue,
+  type StoredDoc,
+  type TableDef,
+} from "../storage/types";
 import { normalizeObject } from "./codec";
+import { isPendingCommitTs } from "./pending";
 
 /**
  * Materialized document shape used inside the local runtime. Backend documents already arrive in
@@ -153,6 +160,7 @@ function toColValue(value: unknown): ColValue {
   // (they encode to exact order keys). Composite values cannot be indexed.
   if (value === undefined) return undefined;
   if (value === null) return null;
+  if (isPendingCommitTs(value)) return PENDING_COMMIT_TS;
   if (
     typeof value === "string" ||
     typeof value === "bigint" ||

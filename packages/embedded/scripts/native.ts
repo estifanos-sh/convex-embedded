@@ -1,7 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +11,6 @@ import { EMBEDDED_STORAGE_ABI_VERSION } from "../src/abi.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
-const require = createRequire(import.meta.url);
 const target = nativeTarget();
 const targetDir = cargoTargetDir();
 const destinationDir = resolve(packageDir, "dist/native", target);
@@ -68,16 +66,31 @@ function loadNativeArtifact(path: string): void {
   );
   copyFileSync(path, probe);
   try {
-    const module = require(probe) as {
-      apiVersion?: () => number;
-      protocolVersion?: () => number;
-    };
-    if (module.apiVersion?.() !== EMBEDDED_STORAGE_ABI_VERSION) {
-      throw new Error(`Native artifact API version mismatch after copy: ${path}`);
-    }
-    if (module.protocolVersion?.() !== EMBEDDED_PROTOCOL_VERSION) {
-      throw new Error(`Native artifact protocol version mismatch after copy: ${path}`);
-    }
+    // Windows keeps an addon locked for the lifetime of the process that loaded it. Probe in a
+    // child so the handle is closed before this process removes the temporary copy.
+    execFileSync(
+      process.execPath,
+      [
+        "-e",
+        `
+          const module = require(process.argv[1]);
+          const api = Number(process.argv[2]);
+          const protocol = Number(process.argv[3]);
+          const source = process.argv[4];
+          if (module.apiVersion?.() !== api) {
+            throw new Error(\`Native artifact API version mismatch after copy: \${source}\`);
+          }
+          if (module.protocolVersion?.() !== protocol) {
+            throw new Error(\`Native artifact protocol version mismatch after copy: \${source}\`);
+          }
+        `,
+        probe,
+        String(EMBEDDED_STORAGE_ABI_VERSION),
+        String(EMBEDDED_PROTOCOL_VERSION),
+        path,
+      ],
+      { stdio: "inherit" },
+    );
   } finally {
     unlinkSync(probe);
   }

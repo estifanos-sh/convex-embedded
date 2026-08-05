@@ -43,6 +43,8 @@ enum BridgeError {
     Remote(String),
     #[error("{0}")]
     Storage(String),
+    #[error("{0}")]
+    PreBaseline(String),
     #[error("JSON codec failed: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -55,13 +57,39 @@ impl BridgeError {
             Self::Protocol(_) | Self::Json(_) => "protocol",
             Self::Remote(_) => "remote",
             Self::Storage(_) => "storage",
+            Self::PreBaseline(_) => "EMBEDDED_PRE_BASELINE_STORE",
         }
+    }
+
+    fn marker(&self) -> String {
+        format!("[convex-embedded:{}] {self}", self.code())
     }
 }
 
 impl From<storage::StorageError> for BridgeError {
     fn from(error: storage::StorageError) -> Self {
-        Self::Storage(error.to_string())
+        if matches!(error, storage::StorageError::PreBaselineStore { .. }) {
+            Self::PreBaseline(error.to_string())
+        } else {
+            Self::Storage(error.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::BridgeError;
+
+    #[test]
+    fn prebaseline_storage_error_keeps_its_cross_binding_code() {
+        let error = BridgeError::from(storage::StorageError::PreBaselineStore {
+            found: 46,
+            minimum: 47,
+        });
+        assert_eq!(error.code(), "EMBEDDED_PRE_BASELINE_STORE");
+        assert!(error
+            .marker()
+            .starts_with("[convex-embedded:EMBEDDED_PRE_BASELINE_STORE]"));
     }
 }
 
@@ -111,23 +139,50 @@ fn dispatch(host: &host::StoreHost, request: &Request) -> BridgeResult<Response>
         "migrationBegin" => {
             let (schema,): (model::Schema,) = wire::payload(request)?;
             let schema = convert::schema(schema)?;
-            let candidate = host.run(move |store| store.migration_begin(&schema))?;
+            let candidate = host.run(move |store| store.migration_prepare(&schema))?;
             Response::value(&serde_json::to_string(&serde_json::json!({
                 "activeGeneration": candidate.active_generation,
                 "candidateGeneration": candidate.candidate_generation,
+                "cleanupGeneration": candidate.cleanup_generation,
+                "sourceSchema": candidate.source_schema,
+                "setupComplete": candidate.setup_complete,
                 "sourceContractHash": candidate.source_contract_hash,
                 "targetContractHash": candidate.target_contract_hash,
                 "retiredGenerations": candidate.retired_generations,
-                "appliedMigrations": candidate.applied_migrations,
                 "required": candidate.required,
                 "resumed": candidate.resumed,
-                "progressMigrationId": candidate.progress_migration_id,
-                "progressCursor": candidate.progress_cursor.as_ref().map(|cursor| serde_json::json!({
-                    "identityKey": cursor.identity_key,
-                    "kind": cursor.kind,
-                    "recordKey": base64::encode(&cursor.record_key),
-                })),
             }))?)
+        }
+        "migrationCopyStep" => {
+            let (generation,): (i64,) = wire::payload(request)?;
+            let step = host.run(move |store| store.migration_copy_step(generation))?;
+            Response::value(&serde_json::to_string(&serde_json::json!({
+                "done": step.done,
+                "records": step.records,
+            }))?)
+        }
+        "migrationBind" => {
+            let (schema, generation): (model::Schema, i64) = wire::payload(request)?;
+            let schema = convert::schema(schema)?;
+            host.run(move |store| store.migration_bind_prepare(&schema, generation))?;
+            Response::value(&())
+        }
+        "migrationMaterializeStep" => {
+            let (generation,): (i64,) = wire::payload(request)?;
+            let step = host.run(move |store| store.migration_materialize_step(generation))?;
+            Response::value(&serde_json::to_string(&serde_json::json!({
+                "done": step.done,
+                "records": step.records,
+            }))?)
+        }
+        "migrationUnbind" => {
+            host.run(storage::EmbeddedStore::migration_unbind)?;
+            Response::value(&())
+        }
+        "migrationSetupComplete" => {
+            let (generation,): (i64,) = wire::payload(request)?;
+            host.run(move |store| store.migration_setup_complete(generation))?;
+            Response::value(&())
         }
         "originPageRead" => {
             let (generation, cursor_json, page_size, upper_json): (
@@ -154,26 +209,6 @@ fn dispatch(host: &host::StoreHost, request: &Request) -> BridgeResult<Response>
             })?;
             Response::value(&origin_page_json(&page)?)
         }
-        "migrationStepBegin" => {
-            let (generation, migration_id): (i64, String) = wire::payload(request)?;
-            let progress =
-                host.run(move |store| store.migration_step_begin(generation, &migration_id))?;
-            Response::value(&migration_progress_json(&progress)?)
-        }
-        "migrationRecordWrite" => {
-            let (generation, record_json): (i64, String) = wire::payload(request)?;
-            let record = origin_record_from_json(&record_json)?;
-            host.run(move |store| store.migration_record_write(generation, &record))?;
-            Response::value(&())
-        }
-        "migrationRecordDelete" => {
-            let (generation, identity_key, kind, record_key): (i64, String, i64, Vec<u8>) =
-                wire::payload(request)?;
-            host.run(move |store| {
-                store.migration_record_delete(generation, &identity_key, kind, &record_key)
-            })?;
-            Response::value(&())
-        }
         "migrationRecordDispositionWrite" => {
             let (generation, identity_key, kind, record_key, migration_id, reason, discard): (
                 i64,
@@ -197,37 +232,42 @@ fn dispatch(host: &host::StoreHost, request: &Request) -> BridgeResult<Response>
             })?;
             Response::value(&())
         }
-        "migrationPageWrite" => {
-            let (generation, migration_id, page_json): (i64, String, String) =
-                wire::payload(request)?;
-            let (cursor, writes, deletes, dispositions) = migration_page_from_json(&page_json)?;
-            host.run(move |store| {
-                store.migration_page_write(
-                    generation,
-                    &migration_id,
-                    &cursor,
-                    &writes,
-                    &deletes,
-                    &dispositions,
-                )
-            })?;
-            Response::value(&())
+        "migrationQueuePolicyStateRead" => {
+            let (generation,): (i64,) = wire::payload(request)?;
+            let state =
+                host.run(move |store| store.migration_queue_policy_state_read(generation))?;
+            Response::value(&state)
         }
-        "migrationStepComplete" => {
-            let (generation, applied_migrations): (i64, usize) = wire::payload(request)?;
-            host.run(move |store| store.migration_step_complete(generation, applied_migrations))?;
+        "migrationQueuePolicyWrite" => {
+            let (generation, policy_json): (i64, String) = wire::payload(request)?;
+            let complete = host
+                .run(move |store| store.migration_queue_policy_write(generation, &policy_json))?;
+            Response::value(&complete)
+        }
+        "migrationFinalizePrepare" => {
+            let (schema, generation): (model::Schema, i64) = wire::payload(request)?;
+            let schema = convert::schema(schema)?;
+            host.run(move |store| store.migration_finalize_prepare(&schema, generation))?;
             Response::value(&())
         }
         "migrationCommit" => {
             let (schema, generation): (model::Schema, i64) = wire::payload(request)?;
             let schema = convert::schema(schema)?;
-            host.run(move |store| store.migration_commit(&schema, generation))?;
+            host.run(move |store| store.migration_cutover(&schema, generation))?;
             Response::value(&())
         }
         "migrationRetire" => {
             let (generation,): (i64,) = wire::payload(request)?;
             host.run(move |store| store.migration_retire(generation))?;
             Response::value(&())
+        }
+        "migrationRetireStep" => {
+            let (generation,): (i64,) = wire::payload(request)?;
+            let step = host.run(move |store| store.migration_retire_step(generation))?;
+            Response::value(&serde_json::to_string(&serde_json::json!({
+                "done": step.done,
+                "records": step.records,
+            }))?)
         }
         "identityRead" => {
             let (identity_key, identity) = host.run(storage::EmbeddedStore::identity_read)?;
@@ -414,6 +454,26 @@ fn dispatch(host: &host::StoreHost, request: &Request) -> BridgeResult<Response>
             let value = host.run(move |store| store.remote_doc_read(&table, &local_id))?;
             Response::value(&value.as_ref().map(remote_doc))
         }
+        "remoteCursorDebugRead" => {
+            let (subscription,): (String,) = wire::payload(request)?;
+            let value = host.run(move |store| store.remote_cursor_read(&subscription))?;
+            Response::value(&value)
+        }
+        "remoteMemberDebugRead" => {
+            let (subscription,): (String,) = wire::payload(request)?;
+            let value = host.run(move |store| store.remote_member_read(&subscription))?;
+            Response::value(&serde_json::to_string(
+                &value
+                    .iter()
+                    .map(|member| {
+                        serde_json::json!({
+                            "table": member.table,
+                            "serverDocumentId": member.server_document_id,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )?)
+        }
         "fileMetaWrite" => {
             let (metadata,): (model::FileMetadata,) = wire::payload(request)?;
             let metadata = file_metadata(metadata);
@@ -554,6 +614,7 @@ fn commit_result(value: CommitResult, include_changes: bool) -> serde_json::Valu
         "changedTables": value.changed_tables,
         "changes": if include_changes { value.changes.iter().map(row_change).collect::<Vec<_>>() } else { Vec::new() },
         "commitSeq": value.commit_seq,
+        "commitTs": value.commit_ts.map(|timestamp| timestamp.to_string()),
         "crdtOps": value.crdt_ops.into_iter().map(|op| serde_json::json!({
             "table": op.table,
             "id": op.id,
@@ -722,21 +783,6 @@ fn origin_page_json(page: &storage::OriginPage) -> BridgeResult<String> {
     }))?)
 }
 
-fn migration_progress_json(progress: &storage::MigrationProgress) -> BridgeResult<String> {
-    Ok(serde_json::to_string(&serde_json::json!({
-        "cursor": progress.cursor.as_ref().map(|cursor| serde_json::json!({
-            "identityKey": cursor.identity_key,
-            "kind": cursor.kind,
-            "recordKey": base64::encode(&cursor.record_key),
-        })),
-        "upperBound": progress.upper_bound.as_ref().map(|cursor| serde_json::json!({
-            "identityKey": cursor.identity_key,
-            "kind": cursor.kind,
-            "recordKey": base64::encode(&cursor.record_key),
-        })),
-    }))?)
-}
-
 fn origin_cursor_from_json(json: &str) -> BridgeResult<storage::OriginCursor> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     Ok(storage::OriginCursor {
@@ -744,103 +790,6 @@ fn origin_cursor_from_json(json: &str) -> BridgeResult<storage::OriginCursor> {
         kind: origin_json_i64(&value, "kind")?,
         record_key: origin_base64_decode(origin_json_str(&value, "recordKey")?)?,
     })
-}
-
-fn origin_record_from_json(json: &str) -> BridgeResult<storage::OriginRecord> {
-    let value: serde_json::Value = serde_json::from_str(json)?;
-    Ok(storage::OriginRecord {
-        identity_key: origin_json_str(&value, "identityKey")?.to_owned(),
-        kind: origin_json_i64(&value, "kind")?,
-        record_key: origin_base64_decode(origin_json_str(&value, "recordKey")?)?,
-        codec: origin_json_i64(&value, "codec")?,
-        flags: origin_json_i64(&value, "flags")?,
-        payload: origin_base64_decode(origin_json_str(&value, "payload")?)?,
-        payload_hash: Vec::new(),
-    })
-}
-
-type MigrationPage = (
-    storage::OriginCursor,
-    Vec<storage::OriginRecord>,
-    Vec<storage::MigrationRecordTarget>,
-    Vec<storage::MigrationDisposition>,
-);
-
-fn migration_page_from_json(json: &str) -> BridgeResult<MigrationPage> {
-    let value: serde_json::Value = serde_json::from_str(json)?;
-    let cursor = origin_cursor_from_value(origin_json_value(&value, "cursor")?)?;
-    let writes = origin_json_array(&value, "writes")?
-        .iter()
-        .map(origin_record_from_value)
-        .collect::<BridgeResult<Vec<_>>>()?;
-    let deletes = origin_json_array(&value, "deletes")?
-        .iter()
-        .map(migration_target_from_value)
-        .collect::<BridgeResult<Vec<_>>>()?;
-    let dispositions = origin_json_array(&value, "dispositions")?
-        .iter()
-        .map(|value| {
-            Ok(storage::MigrationDisposition {
-                target: migration_target_from_value(value)?,
-                reason: origin_json_str(value, "reason")?.to_owned(),
-                discard: value
-                    .get("discard")
-                    .and_then(serde_json::Value::as_bool)
-                    .ok_or_else(|| {
-                        BridgeError::Protocol("missing boolean field discard".to_owned())
-                    })?,
-            })
-        })
-        .collect::<BridgeResult<Vec<_>>>()?;
-    Ok((cursor, writes, deletes, dispositions))
-}
-
-fn origin_cursor_from_value(value: &serde_json::Value) -> BridgeResult<storage::OriginCursor> {
-    Ok(storage::OriginCursor {
-        identity_key: origin_json_str(value, "identityKey")?.to_owned(),
-        kind: origin_json_i64(value, "kind")?,
-        record_key: origin_base64_decode(origin_json_str(value, "recordKey")?)?,
-    })
-}
-
-fn origin_record_from_value(value: &serde_json::Value) -> BridgeResult<storage::OriginRecord> {
-    Ok(storage::OriginRecord {
-        identity_key: origin_json_str(value, "identityKey")?.to_owned(),
-        kind: origin_json_i64(value, "kind")?,
-        record_key: origin_base64_decode(origin_json_str(value, "recordKey")?)?,
-        codec: origin_json_i64(value, "codec")?,
-        flags: origin_json_i64(value, "flags")?,
-        payload: origin_base64_decode(origin_json_str(value, "payload")?)?,
-        payload_hash: Vec::new(),
-    })
-}
-
-fn migration_target_from_value(
-    value: &serde_json::Value,
-) -> BridgeResult<storage::MigrationRecordTarget> {
-    Ok(storage::MigrationRecordTarget {
-        identity_key: origin_json_str(value, "identityKey")?.to_owned(),
-        kind: origin_json_i64(value, "kind")?,
-        record_key: origin_base64_decode(origin_json_str(value, "recordKey")?)?,
-    })
-}
-
-fn origin_json_value<'a>(
-    value: &'a serde_json::Value,
-    field: &str,
-) -> BridgeResult<&'a serde_json::Value> {
-    value
-        .get(field)
-        .ok_or_else(|| BridgeError::Protocol(format!("missing field {field}")))
-}
-
-fn origin_json_array<'a>(
-    value: &'a serde_json::Value,
-    field: &str,
-) -> BridgeResult<&'a Vec<serde_json::Value>> {
-    origin_json_value(value, field)?
-        .as_array()
-        .ok_or_else(|| BridgeError::Protocol(format!("missing array field {field}")))
 }
 
 fn origin_json_str<'a>(value: &'a serde_json::Value, field: &str) -> BridgeResult<&'a str> {
@@ -903,7 +852,7 @@ mod tests {
             open_path(path.to_string_lossy().into_owned(), None, None).expect("store should open");
         let schema = serde_json::json!([{
             "hash": "0000000000000000000000000000000000000000000000000000000000000000",
-            "migrationCodeHash": "",
+            "setupHash": "",
             "tables": [{
                 "name": "issues",
                 "placement": "replicated",
@@ -996,6 +945,53 @@ mod tests {
     }
 
     #[test]
+    fn migration_queue_policy_bridge_preserves_false_then_true_completion() {
+        let path = storage::testkit::tmp_path("mobile-policy-completion.db");
+        let handle = open_path(path.to_string_lossy().into_owned(), None, None).unwrap();
+        let host = host::read(handle).unwrap();
+        let source = storage::StoreSchema {
+            hash: "0".repeat(64),
+            setup_hash: String::new(),
+            tables: vec![],
+        };
+        host.run({
+            let source = source.clone();
+            move |store| store.setup(&source)
+        })
+        .unwrap();
+        let target = storage::StoreSchema {
+            hash: "1".repeat(64),
+            ..source
+        };
+        let candidate = host
+            .run(move |store| store.migration_prepare(&target))
+            .unwrap();
+        let generation = candidate.candidate_generation;
+        let policy = |collect_complete| wire::Request {
+            operation: "migrationQueuePolicyWrite".to_owned(),
+            json: serde_json::json!([
+                generation,
+                serde_json::json!({
+                    "collectComplete": collect_complete,
+                    "cursor": null,
+                    "thresholds": [],
+                })
+                .to_string(),
+            ])
+            .to_string(),
+            buffers: vec![],
+        };
+
+        let pending = dispatch(&host, &policy(false)).unwrap();
+        assert!(pending.ok);
+        assert_eq!(pending.json, "false");
+        let complete = dispatch(&host, &policy(true)).unwrap();
+        assert!(complete.ok);
+        assert_eq!(complete.json, "true");
+        close_handle(handle).unwrap();
+    }
+
+    #[test]
     fn the_storage_worker_folds_the_wal_after_idle_and_keeps_committed_rows() {
         let path = storage::testkit::tmp_path("mobile-idle-checkpoint.db");
         let path_string = path.to_string_lossy().into_owned();
@@ -1008,7 +1004,7 @@ mod tests {
         .expect("store should open");
         let schema = serde_json::json!([{
             "hash": "0000000000000000000000000000000000000000000000000000000000000000",
-            "migrationCodeHash": "",
+            "setupHash": "",
             "tables": [{
                 "name": "issues",
                 "placement": "replicated",

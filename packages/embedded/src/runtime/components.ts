@@ -104,6 +104,7 @@ export function namespaceBatch(instancePath: ComponentInstancePath, batch: Write
       ...docWrite,
       table: physicalTable(instancePath, docWrite.table),
     })),
+    pendingCommitTs: batch.pendingCommitTs,
     schedules: batch.schedules,
   };
 }

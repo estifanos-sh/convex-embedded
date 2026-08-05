@@ -9,6 +9,7 @@
  * @packageDocumentation
  */
 import type { ConvexModules } from "../client";
+import { openCandidate } from "../candidate";
 import type {
   EmbeddedEventListener,
   EmbeddedRemoteEvent,
@@ -18,8 +19,11 @@ import type {
 } from "../events";
 import { EMBEDDED_ERROR_CODES, EmbeddedClientRetiredError, errorMessage } from "../error";
 import { randomId } from "../id/random";
-import type { DeviceMigrationReport } from "../migrations";
+import { localFunctionSchema } from "../local/internal";
 import { createRunner, type Runner } from "../runtime/runner";
+import type { ConvexEmbeddedSchema } from "../schema";
+import { localReferenceName } from "../local";
+import { localGraphHash } from "../local/internal";
 import {
   consumeRemoteTick,
   mergeRemoteTicks,
@@ -238,7 +242,18 @@ export async function initFromMessage(
     },
     postResponse,
   );
-  const runtimeStoreSchema = embedded.embeddedSchema.runtimeStoreSchema;
+  await validateBrowserSetup(
+    request.setup,
+    request.identity?.moduleGraphHash,
+    embedded.localModules,
+  );
+  const runtimeStoreSchema =
+    request.setup === undefined
+      ? embedded.embeddedSchema.runtimeStoreSchema
+      : {
+          ...embedded.embeddedSchema.runtimeStoreSchema,
+          setupHash: `${request.setup.reference}\u0000${request.setup.graphHash}`,
+        };
   const state = await initRuntime({
     debug: request.debug,
     emit:
@@ -246,11 +261,13 @@ export async function initFromMessage(
         ? undefined
         : (event) => postResponse({ event, op: WorkerEvent.Event }),
     localModules: embedded.localModules,
+    localSchemas: await localModuleSchemas(embedded.localModules),
     modules: embedded.modules,
     manifest: embedded.embeddedManifest,
     moduleGraphHash: request.identity?.moduleGraphHash,
     onRuntimeEvent: (event) => postResponse({ event, op: WorkerEvent.Event }),
     setupSchema: runtimeStoreSchema,
+    setup: request.setup,
     storagePath: request.storagePath,
     temporaryStoragePath: `:memory:${request.storagePath}`,
     storeSchema: runtimeStoreSchema,
@@ -286,6 +303,33 @@ async function importEmbeddedBundle(): Promise<typeof import("virtual:convex-emb
         "ConvexEmbeddedClient requires the @convex-dev/embedded Vite or unplugin adapter so the browser worker can load your Convex schema and functions.",
       ),
       { cause },
+    );
+  }
+}
+
+async function validateBrowserSetup(
+  setup: { graphHash: string; reference: string } | undefined,
+  moduleGraphHash: string | undefined,
+  localModules: import("../runtime/runner").LocalModuleMap,
+): Promise<void> {
+  if (setup === undefined) return;
+  if (setup.graphHash !== moduleGraphHash) {
+    throw new Error("Candidate setup graph identity does not match the worker runtime.");
+  }
+  const separator = setup.reference.lastIndexOf(":");
+  const moduleId = separator < 0 ? "" : setup.reference.slice(0, separator);
+  const exportName = separator < 0 ? "" : setup.reference.slice(separator + 1);
+  const load = localModules[moduleId];
+  if (load === undefined || exportName.length === 0) {
+    throw new Error(
+      `Candidate setup ${setup.reference} is not registered in the loaded local module graph.`,
+    );
+  }
+  const loaded = (await load()) as Record<string, unknown>;
+  const value = loaded[exportName];
+  if (localReferenceName(value) !== setup.reference || localGraphHash(value) !== setup.graphHash) {
+    throw new Error(
+      `Candidate setup ${setup.reference} does not match the loaded local module graph.`,
     );
   }
 }
@@ -1406,12 +1450,14 @@ export async function initRuntime(options: {
   debug?: boolean;
   emit?: EmbeddedEventListener;
   localModules?: import("../runtime/runner").LocalModuleMap;
+  localSchemas?: readonly ConvexEmbeddedSchema[];
   modules: ConvexModules;
   manifest?: import("../runtime/runner").RuntimeFunctionManifest;
   moduleGraphHash?: string;
   onDebug?: (phase: string, detail?: unknown) => void;
   onRuntimeEvent?: RuntimeEventSink;
   setupSchema: StoreSchema;
+  setup?: { graphHash: string; reference: string };
   remote?: boolean;
   storageWaitNoticeMs?: number;
   storagePath: string;
@@ -1448,17 +1494,13 @@ export async function initRuntime(options: {
   try {
     const opened = await openStoreInstance(opfs, {
       debug: instanceDebug(0),
-      setupSchema: options.setupSchema,
       storagePath: options.storagePath,
       temporaryStoragePath: options.temporaryStoragePath,
       wasm: options.wasm,
     });
     store = opened.store;
-    if (opened.migrationReport) {
-      options.emit?.({ at: getTimerTime(), type: "migration", ...opened.migrationReport });
-    }
-    const runner = createRunner(options.modules, store, options.storeSchema, {
-      deferNotify: (run) => {
+    const runnerOptions = {
+      deferNotify: (run: () => void) => {
         setTimeout(run, 0);
       },
       emit: options.emit,
@@ -1466,8 +1508,37 @@ export async function initRuntime(options: {
       moduleGraphHash: options.moduleGraphHash,
       manifest: options.manifest,
       remote: options.remote,
+    };
+    let runner: Runner;
+    runtimeEvent?.({ at: getTimerTime(), phase: "store-setup", type: "runtime" });
+    if (options.setup !== undefined && options.setup.graphHash !== options.moduleGraphHash) {
+      throw new Error("Candidate setup graph identity does not match the worker runtime.");
+    }
+    const candidate = await openCandidate<Runner>(store, {
+      createRunner: (runnerSchema, remote) =>
+        createRunner(options.modules, store!, runnerSchema, { ...runnerOptions, remote }),
+      localReady: async (candidateRunner) => {
+        await candidateRunner.localReady;
+      },
+      progress: () => runtimeEvent?.({ at: getTimerTime(), phase: "store-setup", type: "runtime" }),
+      remote: options.remote === true,
+      runnerSchema: options.storeSchema,
+      setup:
+        options.setup === undefined
+          ? undefined
+          : {
+              localSchemas: options.localSchemas ?? [],
+              run: async (setupRunner) => {
+                await setupRunner.runAction(
+                  options.setup!.reference,
+                  {},
+                  { allowInternal: true, auth: null },
+                );
+              },
+            },
+      targetSchema: options.setupSchema,
     });
-    await runner.localReady;
+    runner = candidate.runner;
     if (slowOpenTimer !== undefined) clearTimeout(slowOpenTimer);
     runtimeEvent?.({ at: getTimerTime(), phase: "ready", type: "runtime" });
     const state: WorkerState = {
@@ -1494,11 +1565,28 @@ export async function initRuntime(options: {
   }
 }
 
+async function localModuleSchemas(
+  modules: import("../runtime/runner").LocalModuleMap | undefined,
+): Promise<ConvexEmbeddedSchema[]> {
+  if (modules === undefined) return [];
+  const schemas = new Set<ConvexEmbeddedSchema>();
+  for (const load of Object.values(modules)) {
+    const module = await load();
+    if (typeof module !== "object" || module === null) continue;
+    for (const value of Object.values(module as Record<string, unknown>)) {
+      const schema = localFunctionSchema(value);
+      if (schema !== undefined) schemas.add(schema);
+    }
+  }
+  return [...schemas];
+}
+
 /**
- * Constructs a fresh store instance over the given OPFS bridge: WASM re-instantiation, OPFS
- * re-registration, WAL replay, contract migration, and a truncating checkpoint. Used both by
- * {@link initRuntime} on boot and by the leader graft after a wedged instance is terminated; the
- * caller owns the {@link OpfsDirectory} lifecycle across both.
+ * Constructs a fresh physical store instance over the given OPFS bridge: WASM re-instantiation,
+ * OPFS re-registration, WAL replay, and a truncating checkpoint. Contract preparation and
+ * candidate publication belong to {@link initRuntime}; recovery can therefore replace the
+ * physical instance without accidentally running application setup twice. The caller owns the
+ * {@link OpfsDirectory} lifecycle.
  *
  * @internal
  */
@@ -1506,7 +1594,6 @@ export async function openStoreInstance(
   opfs: OpfsDirectory,
   options: {
     debug?: (phase: string, detail?: unknown) => void;
-    setupSchema: StoreSchema;
     storagePath: string;
     temporaryStoragePath?: string;
     wasm?: WasmSource;
@@ -1516,7 +1603,6 @@ export async function openStoreInstance(
   pthreads: PthreadRegistry;
   storagePath: string;
   wasmApiVersion: number;
-  migrationReport?: DeviceMigrationReport;
 }> {
   const debug = options.debug ?? (() => undefined);
   const pthreads = new PthreadRegistry();
@@ -1547,9 +1633,6 @@ export async function openStoreInstance(
       selectorKey: storagePath,
     });
     debug("worker:store:open:done");
-    debug("worker:store:setup:start");
-    await opened.setup(options.setupSchema);
-    debug("worker:store:setup:done");
     return opened;
   };
   const store = await openAndSetup();
@@ -1565,7 +1648,6 @@ export async function openStoreInstance(
     storagePath,
     store,
     wasmApiVersion,
-    migrationReport: store.migrationReport,
   };
 }
 

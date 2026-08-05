@@ -78,6 +78,7 @@ const COMMONJS_EXTENSIONS = /\.c[jt]s$/;
 /** Everything the plugin hooks read, resolved once per scan of the Convex and device sources. */
 interface EmbeddedGeneration {
   files: Set<string>;
+  graphHash: string;
   identity: string;
   localIds: Map<string, string>;
   registry: string;
@@ -141,6 +142,7 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
       convexDir: options.convexDir,
       generatedPath: options.generatedPath,
       local: options.local,
+      registerSchema: options.registerSchema,
       root: state.root,
       schemaPath: options.schemaPath,
     }).then(({ bundle }) => {
@@ -148,6 +150,7 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
         files: new Set(
           [bundle.schemaPath, ...bundle.sourceFiles].map((file) => path.normalize(file)),
         ),
+        graphHash: bundle.moduleGraphHash,
         identity: renderEmbeddedIdentity(bundle),
         localIds: new Map(
           Object.entries(bundle.localModules).map(([moduleId, module]) => [
@@ -225,7 +228,12 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
       return withGeneration((current) => {
         const moduleId = current.localIds.get(file);
         if (moduleId === undefined) return null;
-        const stamp = renderLocalStamp(moduleId, code, readLocalExportNames(code));
+        const stamp = renderLocalStamp(
+          moduleId,
+          current.graphHash,
+          code,
+          readLocalExportNames(code),
+        );
         return stamp === "" ? null : { code: `${code}${stamp}`, map: null };
       });
     },

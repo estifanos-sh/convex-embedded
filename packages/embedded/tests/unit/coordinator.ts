@@ -242,6 +242,22 @@ describe("browser deployment coordination", () => {
     ).toThrow(/store format/);
   });
 
+  test("a setup action mismatch is part of browser runtime ownership", () => {
+    const current = identity({ setupGraphHash: "graph-a", setupReference: "local/setup:setup" });
+    expect(() =>
+      assertSameRuntimeIdentity(
+        identity({ setupGraphHash: "graph-b", setupReference: "local/setup:setup" }),
+        current,
+      ),
+    ).toThrow(/setup action/);
+    expect(() =>
+      assertSameRuntimeIdentity(
+        identity({ setupGraphHash: "graph-a", setupReference: "local/setup:other" }),
+        current,
+      ),
+    ).toThrow(/setup action/);
+  });
+
   test("rejects a different deployment and notifies clients of the existing owner", () => {
     const oldIdentity = identity({ moduleGraphHash: "old" });
     const newIdentity = identity({ moduleGraphHash: "new" });

@@ -262,3 +262,124 @@ fn failed_mutation_cannot_be_committed() {
     assert!(matches!(err, Err(StorageError::Unsatisfiable(_))));
     assert!(store.doc_read("issues", "failed").unwrap().is_none());
 }
+
+#[test]
+fn commit_timestamp_is_substituted_atomically_and_is_monotonic() {
+    let store = EmbeddedStore::open(tmp_path("rs_commit_timestamp.db").to_str().unwrap()).unwrap();
+    store.setup(&schema()).unwrap();
+
+    let timestamp_write = DocWrite {
+        table: "issues".into(),
+        id: "timestamped".into(),
+        data: r#"{"status":{"$commitTs":null},"title":"timestamped"}"#.into(),
+        cols: vec![("status".into(), ColValue::PendingCommitTs)],
+        creation_time: store.clock_read().unwrap(),
+    };
+    let options = CommitOptions {
+        commit_ts: true,
+        ..CommitOptions::default()
+    };
+    let mut timestamp_batch = doc_writes(vec![timestamp_write]);
+    timestamp_batch.commit_ts_doc_writes.push(0);
+    let first = store
+        .commit(timestamp_batch, &options)
+        .unwrap()
+        .commit_ts
+        .expect("timestamp request must return the allocated i64");
+
+    let row =
+        read_doc(&store, "issues", "timestamped").expect("timestamped document must be durable");
+    let encoded = row["status"]["$integer"]
+        .as_str()
+        .expect("timestamp must be encoded as Convex int64 JSON");
+    let bytes = base64::decode(encoded).expect("timestamp int64 must be base64");
+    let timestamp = i64::from_le_bytes(bytes.try_into().expect("timestamp is eight bytes"));
+    assert_eq!(timestamp, first);
+    assert!(!row.to_string().contains("$commitTs"));
+
+    let second = store
+        .commit(
+            doc_writes(vec![issue(&store, "next", "next", "open")]),
+            &options,
+        )
+        .unwrap()
+        .commit_ts
+        .expect("second timestamp request must return a timestamp");
+    assert!(second > first);
+}
+
+#[test]
+fn commit_timestamp_resolves_flagged_results_and_push_after_images_only() {
+    let store =
+        EmbeddedStore::open(tmp_path("rs_commit_timestamp_push.db").to_str().unwrap()).unwrap();
+    store.setup(&schema()).unwrap();
+    let mutation_id = "timestamp-push";
+    let mut options = CommitOptions::terminal(
+        MutationCall {
+            args: "{}".into(),
+            mutation_id: mutation_id.into(),
+            name: "issues:timestamp".into(),
+        },
+        r#"{"first":{"$commitTs":null},"second":{"$commitTs":null}}"#,
+        true,
+        Some(CommitPush {
+            mutation_id: mutation_id.into(),
+            json: r#"{"mutationId":"timestamp-push","afterImages":[{"content":"value","table":"issues","rowId":"i1","value":{"stamp":{"$commitTs":null}}}],"crdt":[],"logical":{"$commitTs":null}}"#.into(),
+            now_ms: 1,
+            after_images_commit_ts: true,
+        }),
+    );
+    options.commit_ts = true;
+    options.mutation_result_commit_ts = true;
+
+    let committed = store.commit(WriteBatch::default(), &options).unwrap();
+    let timestamp = committed.commit_ts.expect("timestamp allocated");
+    let record = store
+        .mutation_cache_read(&MutationCall {
+            args: "{}".into(),
+            mutation_id: mutation_id.into(),
+            name: "issues:timestamp".into(),
+        })
+        .unwrap();
+    let result: serde_json::Value =
+        serde_json::from_str(record.result.as_deref().unwrap()).unwrap();
+    let encoded = base64::encode(timestamp.to_le_bytes());
+    assert_eq!(result["first"]["$integer"], encoded);
+    assert_eq!(result["second"]["$integer"], encoded);
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&store.remote_push_envelope_read(1).unwrap().remove(0)).unwrap();
+    assert_eq!(
+        envelope["afterImages"][0]["value"]["stamp"]["$integer"],
+        encoded
+    );
+    assert_eq!(envelope["logical"]["$commitTs"], serde_json::Value::Null);
+}
+
+#[test]
+fn commit_timestamp_resolution_error_rolls_back_the_open_transaction() {
+    let store = EmbeddedStore::open(
+        tmp_path("rs_commit_timestamp_rollback.db")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    store.setup(&schema()).unwrap();
+    let mut invalid = WriteBatch::default();
+    invalid.commit_ts_doc_writes.push(9);
+    let options = CommitOptions {
+        commit_ts: true,
+        ..CommitOptions::default()
+    };
+    assert!(matches!(
+        store.commit(invalid, &options),
+        Err(StorageError::Unsatisfiable(_))
+    ));
+
+    store
+        .commit(
+            doc_writes(vec![issue(&store, "after", "after", "open")]),
+            &CommitOptions::default(),
+        )
+        .expect("a resolver failure must not leave SQLite inside a transaction");
+}

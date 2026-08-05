@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,7 +17,7 @@ import {
 import { defineFunctions } from "../../src/runtime/functions";
 import type { StoreBinding } from "../../src/storage/binding";
 import type { RemoteSurface, RemoteTick } from "../../src/storage/types";
-import { defineLocal } from "../../src/local";
+import { defineLocal, stampLocal } from "../../src/local";
 import {
   defineEmbeddedSchema,
   localTable,
@@ -93,9 +93,126 @@ const prefs = {
   }),
 };
 
+const ensureCompact = device.internalMutation({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    if ((await ctx.db.query("preferences").first()) === null) {
+      await ctx.db.insert("preferences", { compact: true });
+    }
+    return null;
+  },
+});
+const setup = device.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    await ctx.runMutation(ensureCompact, {});
+    return null;
+  },
+});
+const setupModule = { ensureCompact, readCompact: prefs.readCompact, setup };
+stampLocal("local/setup", "setup-graph-v1", setupModule);
+
+const currentSetup = device.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async () => null,
+});
+const currentSetupModule = { currentSetup };
+stampLocal("local/setup", "setup-graph-v2", currentSetupModule);
+
+const writeThenFail = device.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    await ctx.runMutation(ensureCompact, {});
+    throw new Error("setup failed after a durable batch");
+  },
+});
+const failingSetupModule = { ensureCompact, writeThenFail };
+stampLocal("local/failing", "setup-graph-failing", failingSetupModule);
+
+const nestedLeaf = device.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: () => null,
+});
+const nestedSetup = device.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    await (
+      ctx as unknown as {
+        runAction(action: typeof nestedLeaf, args: Record<string, never>): Promise<unknown>;
+      }
+    ).runAction(nestedLeaf, {});
+    return null;
+  },
+});
+const nestedSetupModule = { nestedLeaf, nestedSetup };
+stampLocal("local/nested", "setup-graph-nested", nestedSetupModule);
+
+const narrowedSchema = defineEmbeddedSchema({
+  messages: replicatedTable({
+    channel: v.string(),
+    body: v.number(),
+  }).index("by_channel", ["channel"]),
+  preferences: localTable({ compact: v.boolean() }),
+});
+const narrowedDevice = defineLocal(narrowedSchema);
+const narrowedSetup = narrowedDevice.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async () => null,
+});
+const narrowedSetupModule = { narrowedSetup };
+stampLocal("local/narrowed", "setup-graph-narrowed", narrowedSetupModule);
+
 describe("v5 embedded client", () => {
+  test("does not acquire the runtime and rejects operations before explicit open", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-not-open-${crypto.randomUUID()}.sqlite3`);
+    const client = createConvexEmbeddedClientForTest(
+      { schema, modules: { messages: modules }, path },
+      nativeModule(),
+    );
+    try {
+      expect(client.connectionState()).toMatchObject({ local: "idle", remote: "disabled" });
+      await expect(client.query(list, { channel: "general" })).rejects.toMatchObject({
+        code: "EMBEDDED_NOT_OPEN",
+      });
+      await expect(
+        client.mutation(send, { body: "one", channel: "general" }),
+      ).rejects.toMatchObject({ code: "EMBEDDED_NOT_OPEN" });
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      await client.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("rejects an unstamped setup action before acquiring a native store", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-unstamped-${crypto.randomUUID()}.sqlite3`);
+    const client = createConvexEmbeddedClientForTest(
+      { schema, modules: { messages: modules }, path },
+      nativeModule(),
+    );
+    const unstamped = device.internalAction({
+      args: {},
+      returns: v.null(),
+      handler: () => null,
+    });
+    try {
+      await expect(client.open(unstamped)).rejects.toThrow("bundled local module");
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      await client.close();
+      rmSync(path, { force: true });
+    }
+  });
+
   test("uses ordinary typed query and mutation methods", async () => {
-    const client = createClient("ordinary");
+    const client = await createClient("ordinary");
     try {
       const id = await client.mutation(send, { channel: "general", body: "one" });
       await client.mutation(edit, { id, body: "two" });
@@ -107,7 +224,7 @@ describe("v5 embedded client", () => {
   });
 
   test("reacts through watchQuery", async () => {
-    const client = createClient("watch");
+    const client = await createClient("watch");
     try {
       const watch = client.watchQuery(list, { channel: "general" });
       let observed: string | undefined;
@@ -129,7 +246,7 @@ describe("v5 embedded client", () => {
   });
 
   test("does not expose document or revision side channels", async () => {
-    const client = createClient("surface");
+    const client = await createClient("surface");
     try {
       expect("doc" in client).toBe(false);
       expect("rev" in client).toBe(false);
@@ -159,6 +276,7 @@ describe("v5 embedded client", () => {
       native,
     );
     try {
+      await client.open();
       await expect(client.query(identityRead, {})).resolves.toBe("issuer|cached");
       client.clearAuth();
       await expect(client.query(identityRead, {})).resolves.toBeNull();
@@ -167,11 +285,232 @@ describe("v5 embedded client", () => {
       rmSync(path, { force: true });
     }
   });
+
+  test("runs a compatible schema upgrade through the candidate protocol without app setup", async () => {
+    const path = join(
+      tmpdir(),
+      `convex-embedded-v5-automatic-upgrade-${crypto.randomUUID()}.sqlite3`,
+    );
+    const native = nativeModule();
+    const first = createConvexEmbeddedClientForTest(
+      { schema, modules: { messages: modules }, path },
+      native,
+    );
+    const upgradedSchema = defineEmbeddedSchema({
+      messages: replicatedTable({
+        channel: v.string(),
+        body: v.string(),
+      }).index("by_channel", ["channel"]),
+      preferences: localTable({ compact: v.boolean() }),
+      notices: localTable({ read: v.boolean() }),
+    });
+    try {
+      await first.open();
+      await first.close();
+      const second = createConvexEmbeddedClientForTest(
+        { schema: upgradedSchema, modules: { messages: modules }, path },
+        native,
+      );
+      try {
+        await expect(second.open()).resolves.toBeUndefined();
+      } finally {
+        await second.close();
+      }
+    } finally {
+      await first.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("blocks cutover when carried local data violates the target validator", async () => {
+    const path = join(
+      tmpdir(),
+      `convex-embedded-v5-invalid-upgrade-${crypto.randomUUID()}.sqlite3`,
+    );
+    const native = nativeModule();
+    const originalOptions = {
+      schema,
+      modules: { messages: modules },
+      local: { prefs: async () => prefs },
+      path,
+    };
+    const original = createConvexEmbeddedClientForTest(originalOptions, native);
+    try {
+      await original.open();
+      await original.mutation(prefs.setCompact, { compact: false });
+      await original.close();
+
+      const incompatibleSchema = defineEmbeddedSchema({
+        messages: replicatedTable({ channel: v.string(), body: v.string() }).index("by_channel", [
+          "channel",
+        ]),
+        preferences: localTable({ compact: v.string() }),
+      });
+      const incompatible = createConvexEmbeddedClientForTest(
+        { schema: incompatibleSchema, modules: { messages: modules }, path },
+        native,
+      );
+      await expect(incompatible.open()).rejects.toThrow("preferences.compact must be a string");
+      await incompatible.close();
+
+      const reopened = createConvexEmbeddedClientForTest(originalOptions, native);
+      await reopened.open();
+      await expect(reopened.query(prefs.readCompact, {})).resolves.toEqual([false]);
+      await reopened.close();
+    } finally {
+      await original.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("runs a stamped internal local action before first publication and reuses its identity", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-setup-${crypto.randomUUID()}.sqlite3`);
+    const native = nativeModule();
+    const options = {
+      schema,
+      modules: { messages: modules },
+      local: { setup: async () => setupModule },
+      path,
+    };
+    const first = createConvexEmbeddedClientForTest(options, native);
+    try {
+      await Promise.all([first.open(setup), first.open(setup)]);
+      await expect(first.open(writeThenFail)).rejects.toMatchObject({
+        code: "EMBEDDED_OPEN_MISMATCH",
+      });
+      await expect(first.query(prefs.readCompact, {})).resolves.toEqual([true]);
+      await first.close();
+
+      const second = createConvexEmbeddedClientForTest(options, native);
+      await expect(second.open(setup)).resolves.toBeUndefined();
+      await expect(second.query(prefs.readCompact, {})).resolves.toEqual([true]);
+      await second.close();
+
+      const omitted = createConvexEmbeddedClientForTest(options, native);
+      await expect(omitted.open()).resolves.toBeUndefined();
+      await expect(omitted.query(prefs.readCompact, {})).resolves.toEqual([true]);
+      await omitted.close();
+    } finally {
+      await first.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("quarantines a validator-incompatible queued suffix before setup materialization", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-queue-setup-${crypto.randomUUID()}.sqlite3`);
+    const native = nativeModule();
+    const original = createConvexEmbeddedClientForTest(
+      { schema, modules: { messages: modules }, path },
+      native,
+    );
+    try {
+      await original.open();
+      await original.mutation(send, { body: "old queued shape", channel: "general" });
+      await original.close();
+
+      const upgraded = createConvexEmbeddedClientForTest(
+        {
+          schema: narrowedSchema,
+          modules: { messages: modules },
+          local: { narrowed: async () => narrowedSetupModule },
+          path,
+        },
+        native,
+      );
+      await expect(upgraded.open(narrowedSetup)).resolves.toBeUndefined();
+      await expect(upgraded.query(list, { channel: "general" })).resolves.toEqual([]);
+      await upgraded.close();
+    } finally {
+      await original.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("rejects a setup reference copied from a different local module graph", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-stale-setup-${crypto.randomUUID()}.sqlite3`);
+    const client = createConvexEmbeddedClientForTest(
+      {
+        schema,
+        modules: { messages: modules },
+        local: { setup: async () => currentSetupModule },
+        path,
+      },
+      nativeModule(),
+    );
+    try {
+      await expect(client.open(setup)).rejects.toThrow(
+        "does not match the loaded local module graph",
+      );
+    } finally {
+      await client.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("rejects nested local actions at runtime even through an untyped setup context", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-nested-setup-${crypto.randomUUID()}.sqlite3`);
+    const client = createConvexEmbeddedClientForTest(
+      {
+        schema,
+        modules: { messages: modules },
+        local: { nested: async () => nestedSetupModule },
+        path,
+      },
+      nativeModule(),
+    );
+    try {
+      await expect(client.open(nestedSetup)).rejects.toThrow(
+        "Local actions cannot call nested actions",
+      );
+    } finally {
+      await client.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("keeps the published generation unchanged when setup throws after a durable batch", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-setup-failure-${crypto.randomUUID()}.sqlite3`);
+    const native = nativeModule();
+    const baselineOptions = {
+      schema,
+      modules: { messages: modules },
+      local: { prefs: async () => prefs },
+      path,
+    };
+    const baseline = createConvexEmbeddedClientForTest(baselineOptions, native);
+    try {
+      await baseline.open();
+      await baseline.mutation(prefs.setCompact, { compact: false });
+      await baseline.close();
+
+      const failing = createConvexEmbeddedClientForTest(
+        {
+          ...baselineOptions,
+          local: { failing: async () => failingSetupModule },
+        },
+        native,
+      );
+      await expect(failing.open(writeThenFail)).rejects.toThrow(
+        "setup failed after a durable batch",
+      );
+      await failing.close();
+
+      const reopened = createConvexEmbeddedClientForTest(baselineOptions, native);
+      await reopened.open();
+      await expect(reopened.query(prefs.readCompact, {})).resolves.toEqual([false]);
+      await reopened.close();
+    } finally {
+      await baseline.close();
+      rmSync(path, { force: true });
+    }
+  });
 });
 
 describe("v5 embedded client device-only functions", () => {
   test("writes and watches a device table through registrations the app imported", async () => {
-    const client = createClient("device-only", { "sync/prefs": () => Promise.resolve(prefs) });
+    const client = await createClient("device-only", {
+      "sync/prefs": () => Promise.resolve(prefs),
+    });
     try {
       const watch = client.watchQuery(prefs.readCompact, {});
       let observed: boolean[] | undefined;
@@ -200,7 +539,7 @@ describe("v5 embedded client device-only functions", () => {
         await ctx.db.insert("preferences", { compact: args.compact });
       },
     });
-    const client = createClient("device-only-orphan", {
+    const client = await createClient("device-only-orphan", {
       "sync/prefs": () => Promise.resolve(prefs),
     });
     try {
@@ -217,7 +556,7 @@ describe("v5 embedded client device-only functions", () => {
       args: {},
       handler: async (ctx) => (await ctx.db.query("preferences").collect()).length,
     });
-    const client = createClient("device-only-unconfigured");
+    const client = await createClient("device-only-unconfigured");
     try {
       await expect(client.query(orphan, {})).rejects.toThrow(
         "No local directory is configured; pass the local option to the bundler adapter.",
@@ -228,7 +567,7 @@ describe("v5 embedded client device-only functions", () => {
   });
 
   test("refuses an internal registration at the app surface", async () => {
-    const client = createClient("device-only-internal", {
+    const client = await createClient("device-only-internal", {
       "sync/prefs": () => Promise.resolve(prefs),
     });
     try {
@@ -262,7 +601,7 @@ describe("v5 embedded client device-only functions", () => {
   });
 
   test("watches one subscription for separate copies of the same registration", async () => {
-    const client = createClient("device-only-copies", {
+    const client = await createClient("device-only-copies", {
       "sync/prefs": () => Promise.resolve(prefs),
     });
     try {
@@ -313,6 +652,7 @@ describe("v5 embedded client device-only functions", () => {
       store,
     });
     try {
+      await client.open();
       await expect(client.query(prefs.readCompact, {})).resolves.toEqual([]);
     } finally {
       await client.close();
@@ -449,7 +789,7 @@ function devtoolsQueries(client: EmbeddedClient): Array<{ key: string; name: str
   return snapshot.queries.map((query) => ({ key: query.key, name: query.name }));
 }
 
-function createClient(name: string, local?: Record<string, () => Promise<unknown>>) {
+async function createClient(name: string, local?: Record<string, () => Promise<unknown>>) {
   const path = join(tmpdir(), `convex-embedded-v5-${name}-${crypto.randomUUID()}.sqlite3`);
   const options = { schema, local, modules: { messages: modules }, path };
   const client = createConvexEmbeddedClientForTest(options, nativeModule());
@@ -458,6 +798,7 @@ function createClient(name: string, local?: Record<string, () => Promise<unknown
     await close();
     rmSync(path, { force: true });
   };
+  await client.open();
   return client;
 }
 
@@ -477,6 +818,7 @@ async function createRemoteClient(
     store,
     remote: { url: "http://remote.invalid" },
   });
+  await client.open();
   return { client, path };
 }
 

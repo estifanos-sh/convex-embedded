@@ -14,7 +14,7 @@ import type {
   RunnerDevtoolsStorage,
   RunnerDevtoolsTable,
 } from "../../runtime/runner";
-import type { QuarantinePage, ScheduledJob } from "../../storage/types";
+import type { ScheduledJob } from "../../storage/types";
 
 /** Devtools pane that can emit source updates. @public */
 export type EmbeddedDevtoolsView = "activity" | "data" | "functions" | "scheduler" | "storage";
@@ -91,7 +91,6 @@ export interface EmbeddedDevtoolsSource {
   clearLocalData(): Promise<void>;
   deleteDocument(table: string, id: string): Promise<void>;
   dispose(): void;
-  exportQuarantine(options?: { cursor?: string; pageSize?: number }): Promise<QuarantinePage>;
   refresh(): Promise<void>;
   getSnapshot(view: EmbeddedDevtoolsView): EmbeddedDevtoolsSnapshot;
   listTableRows(

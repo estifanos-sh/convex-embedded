@@ -1,4 +1,5 @@
 import { StoreAdapter, type StoreBinding } from "../storage/binding";
+import { normalizeStorageError } from "../error";
 
 /**
  * Options for opening the native embedded store adapter.
@@ -42,8 +43,12 @@ export class NativeStore extends StoreAdapter {
   ): Promise<NativeStore> {
     const selectorKey = options.selectorKey ?? options.identityKey;
     const defaultIdentityKey = options.defaultIdentityKey ?? options.identityKey;
-    return new NativeStore(
-      (await Store.open(path, selectorKey, defaultIdentityKey)) as StoreBinding,
-    );
+    try {
+      return new NativeStore(
+        (await Store.open(path, selectorKey, defaultIdentityKey)) as StoreBinding,
+      );
+    } catch (error) {
+      throw normalizeStorageError(error);
+    }
   }
 }

@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vite-plus/test";
 
 import { defineLocal, isLocalFunction, local, type LocalBuilders } from "../../src/local";
+import { localFunctionSchema } from "../../src/local/internal";
 import { NativeStore } from "../../src/node/native";
 import { createWriter, toSchema } from "../../src/runtime/database";
 import { defineFunctions } from "../../src/runtime/functions";
@@ -365,7 +366,13 @@ describe("device-only namespace typing", () => {
     expectTypeOf(local.internalQuery).parameter(0).toEqualTypeOf<UnregisteredSchema>();
     expectTypeOf(local.internalMutation).parameter(0).toEqualTypeOf<UnregisteredSchema>();
     expectTypeOf(local.query).returns.toBeNever();
-    expect(Object.keys(local)).toEqual(["query", "mutation", "internalQuery", "internalMutation"]);
+    expect(Object.keys(local)).toEqual([
+      "query",
+      "mutation",
+      "internalQuery",
+      "internalMutation",
+      "internalAction",
+    ]);
   });
 
   test("binds a declared schema to builders over its device data model", () => {
@@ -381,10 +388,21 @@ describe("device-only namespace typing", () => {
     });
     expect(isLocalFunction(setCompact)).toBe(true);
   });
+
+  test("treats generated-registration builders as runtime-schema neutral", () => {
+    const registered = local as unknown as LocalBuilders<DeviceDataModel<typeof deviceSchema>>;
+    const read = registered.query({
+      args: {},
+      handler: async () => null,
+    });
+
+    expect(localFunctionSchema(read)).toBeUndefined();
+    expect(localFunctionSchema(undefined)).toBeUndefined();
+  });
 });
 
 type UnregisteredSchema =
-  'Declare your schema in convex/schema.ts: declare module "@convex-dev/embedded/local" { interface Register { schema: typeof schema } }';
+  "The Embedded bundler plugin registers your schema through the module it generates in your convex directory; wire the plugin and include that module in this TypeScript program";
 
 const deviceSchema = defineEmbeddedSchema({
   documents: replicatedTable({

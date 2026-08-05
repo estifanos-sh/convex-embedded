@@ -22,7 +22,10 @@ export const webkitProject = {
   optimizeDeps: {
     include: ["convex-helpers/server/pagination", "convex/browser", "convex/server"],
   },
-  plugins: [convexEmbedded({ convexDir: browserConvexDir, schema }), browserRuntimeLog()],
+  plugins: [
+    convexEmbedded({ convexDir: browserConvexDir, registerSchema: false, schema }),
+    browserRuntimeLog(),
+  ],
   resolve: {
     dedupe: ["solid-js"],
     alias: [

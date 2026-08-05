@@ -42,6 +42,7 @@ export interface WorkerRunnerInit {
   requestTimeoutMs?: number;
   storagePath: string;
   storageOwner?: boolean | Promise<boolean>;
+  setup?: { graphHash: string; reference: string };
 }
 
 interface PendingRequest {
@@ -169,6 +170,7 @@ export class WorkerRunner implements Runner {
               debug: init.debug ?? debugHook() !== undefined,
               id: this.allocateId(),
               identity: init.identity,
+              setup: init.setup,
               remote: init.remote
                 ? {
                     authFetchToken: init.remoteAuth !== undefined,
@@ -338,11 +340,22 @@ export class WorkerRunner implements Runner {
   }
 
   async runAction(
-    _ref: FunctionReference,
-    _args: Record<string, unknown> = {},
-    _options: RunOptions = {},
+    ref: FunctionReference,
+    args: Record<string, unknown> = {},
+    options: RunOptions = {},
   ): Promise<unknown> {
-    throw new Error("Actions are hosted-only and cannot execute in the embedded browser worker.");
+    await this.ready;
+    return this.request(
+      {
+        args,
+        auth: options.auth,
+        clientId: this.clientId,
+        id: this.allocateId(),
+        name: functionName(ref),
+        op: WorkerCommand.Action,
+      },
+      { timeoutMs: this.requestTimeoutMs, timeoutPolicy: "reject" },
+    );
   }
 
   async handleUpload(url: string, blob: Blob): Promise<{ storageId: string }> {
@@ -797,6 +810,7 @@ function commandName(op: WorkerCommandCode): string {
 const workerCommandNames = new Map<WorkerCommandCode, string>([
   [WorkerCommand.Init, "init"],
   [WorkerCommand.Query, "query"],
+  [WorkerCommand.Action, "action"],
   [WorkerCommand.Mutation, "mutation"],
   [WorkerCommand.Upload, "upload"],
   [WorkerCommand.Devtools, "devtools"],

@@ -16,10 +16,15 @@ import { makeFunctionReference } from "convex/server";
 
 import type { WasmSource } from "../../src/browser/artifact";
 import type { EmbeddedRuntimeEvent } from "../../src/events";
+import { openCandidate } from "../../src/candidate";
 import { OpfsDirectory, registerTursoFiles } from "../../src/browser/opfs";
-import { initRuntime, type WorkerState } from "../../src/browser/runtime";
+import { initRuntime, openStoreInstance, type WorkerState } from "../../src/browser/runtime";
 import type { StoreSchema } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
+import { fixtureTargetSchema, portableOracle, portableOracleJson } from "../fixture/oracle";
+
+import fixtureManifest from "../../../../crates/storage/tests/fixtures/preview2/manifest.json";
+import fixtureUrl from "../../../../crates/storage/tests/fixtures/preview2/store.sqlite3?url";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
 import wasmUrl from "../../dist/wasm/index.wasm?url";
@@ -83,6 +88,31 @@ interface InspectRequest {
   storageId: string;
 }
 
+interface FixtureRequest {
+  op: "fixture";
+  storageId: string;
+}
+
+interface FixtureInstallRequest {
+  op: "fixtureInstall";
+  storageId: string;
+}
+
+interface FixtureInspectRequest {
+  op: "fixtureInspect";
+  storageId: string;
+}
+
+interface CandidateWoundRequest {
+  op: "candidateWound";
+  storageId: string;
+}
+
+interface FixtureResumeRequest {
+  op: "fixtureResume";
+  storageId: string;
+}
+
 type BootPhaseTimings = Record<string, number>;
 
 interface BootResult {
@@ -109,7 +139,12 @@ self.onmessage = (
     | WoundStageRequest
     | HoldRequest
     | ReleaseRequest
+    | CandidateWoundRequest
     | DamageRequest
+    | FixtureRequest
+    | FixtureInstallRequest
+    | FixtureInspectRequest
+    | FixtureResumeRequest
     | InspectRequest
   >,
 ) => {
@@ -123,17 +158,27 @@ self.onmessage = (
   const handler =
     request.op === "seed"
       ? seed(request)
-      : request.op === "damage"
-        ? damage(request)
-        : request.op === "inspect"
-          ? inspect(request)
-          : request.op === "boot"
-            ? boot(request)
-            : request.op === "hold"
-              ? hold(request)
-              : request.op === "woundStage"
-                ? woundStage(request)
-                : wound(request);
+      : request.op === "fixture"
+        ? fixture(request)
+        : request.op === "fixtureInstall"
+          ? fixtureInstall(request)
+          : request.op === "fixtureInspect"
+            ? fixtureInspect(request)
+            : request.op === "fixtureResume"
+              ? fixtureResume(request)
+              : request.op === "candidateWound"
+                ? candidateWound(request)
+                : request.op === "damage"
+                  ? damage(request)
+                  : request.op === "inspect"
+                    ? inspect(request)
+                    : request.op === "boot"
+                      ? boot(request)
+                      : request.op === "hold"
+                        ? hold(request)
+                        : request.op === "woundStage"
+                          ? woundStage(request)
+                          : wound(request);
   void handler
     .then((result) => self.postMessage({ ok: true, result }))
     .catch((error: unknown) =>
@@ -143,6 +188,115 @@ self.onmessage = (
       }),
     );
 };
+
+async function fixture(request: FixtureRequest): Promise<{
+  cold: unknown;
+  warm: unknown;
+}> {
+  const path = storagePath(request.storageId);
+  await fixtureInstall(path);
+
+  const cold = await fixtureOpen(path);
+  const warm = await fixtureOpen(path);
+  const expected = fixtureManifest.portableOracle;
+  assertFixtureOracle("cold", cold, expected);
+  assertFixtureOracle("warm", warm, expected);
+  return { cold, warm };
+}
+
+async function fixtureInstall(request: FixtureInstallRequest): Promise<{ installed: true }>;
+async function fixtureInstall(path: string): Promise<void>;
+async function fixtureInstall(
+  requestOrPath: FixtureInstallRequest | string,
+): Promise<{ installed: true } | void> {
+  const path =
+    typeof requestOrPath === "string" ? requestOrPath : storagePath(requestOrPath.storageId);
+  const response = await fetch(fixtureUrl);
+  if (!response.ok) throw new Error(`failed to load Preview2 fixture: ${response.status}`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const opfs = new OpfsDirectory();
+  try {
+    await registerTursoFiles(opfs, path);
+    const handle = opfs.getFileHandle(path);
+    if (handle === null) throw new Error("fixture database handle was not registered");
+    opfs.truncate(handle, 0);
+    opfs.write(handle, bytes, 0);
+    opfs.sync(handle);
+    if (typeof requestOrPath !== "string") return { installed: true };
+  } finally {
+    opfs.closeAll();
+  }
+}
+
+async function fixtureInspect(request: FixtureInspectRequest): Promise<{ oracle: unknown }> {
+  const { modules, storeSchema, wasm } = await loadModules();
+  const state = await initRuntime({
+    modules,
+    setupSchema: storeSchema,
+    storagePath: storagePath(request.storageId),
+    storeSchema,
+    wasm,
+  });
+  try {
+    return { oracle: await portableOracle(state.store) };
+  } finally {
+    await state.store.close().catch(() => undefined);
+    state.opfs.closeAll();
+  }
+}
+
+async function fixtureResume(request: FixtureResumeRequest): Promise<{ oracle: unknown }> {
+  const oracle = await fixtureOpen(storagePath(request.storageId));
+  const expected = fixtureManifest.portableOracle;
+  assertFixtureOracle("resumed", oracle, expected);
+  return { oracle };
+}
+
+async function candidateWound(request: CandidateWoundRequest): Promise<never> {
+  const path = storagePath(request.storageId);
+  await fixtureInstall(path);
+  const { wasm } = await loadModules();
+  const opfs = new OpfsDirectory();
+  const opened = await openStoreInstance(opfs, { storagePath: path, wasm });
+  await openCandidate(opened.store, {
+    checkpoint: async (phase) => {
+      if (phase !== "materialize") return;
+      self.postMessage({ ok: true, result: { phase, wounding: true } });
+      await new Promise<never>(() => undefined);
+    },
+    createRunner: () => ({}),
+    localReady: async () => undefined,
+    remote: false,
+    runnerSchema: fixtureTargetSchema,
+    targetSchema: fixtureTargetSchema,
+  });
+  throw new Error("unreachable");
+}
+
+function assertFixtureOracle(phase: string, actual: unknown, expected: unknown): void {
+  if (portableOracleJson(actual) !== portableOracleJson(expected)) {
+    throw new Error(
+      `${phase} browser fixture oracle mismatch\nexpected=${JSON.stringify(expected)}\nactual=${JSON.stringify(actual)}`,
+    );
+  }
+}
+
+async function fixtureOpen(path: string): Promise<unknown> {
+  const { modules, wasm } = await loadModules();
+  const state = await initRuntime({
+    modules,
+    setupSchema: fixtureTargetSchema,
+    storagePath: path,
+    storeSchema: fixtureTargetSchema,
+    wasm,
+  });
+  try {
+    return await portableOracle(state.store);
+  } finally {
+    await state.store.close().catch(() => undefined);
+    state.opfs.closeAll();
+  }
+}
 
 const damageBytes = new TextEncoder().encode("embedded-corrupt-database");
 

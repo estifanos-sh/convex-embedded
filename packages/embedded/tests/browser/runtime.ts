@@ -9,6 +9,8 @@ import { read as readTime } from "../testkit/time";
 import schema from "./convex/schema";
 import { documentCount } from "./local/insights";
 import { documentTitles, scope } from "./local/mixed";
+import { failingSetup, otherSetup, setup, setupVersions } from "./local/setup";
+import { timestamp } from "./local/timestamp";
 
 declare const __CONVEX_EMBEDDED_HOSTED_URL__: string | null;
 declare const __CONVEX_EMBEDDED_BROWSER_BENCH__: boolean;
@@ -84,6 +86,7 @@ interface DocumentClient extends RuntimeClient {
 
 interface RuntimeClient {
   close(): Promise<void>;
+  open(): Promise<void>;
   subscribeInternalEvents?(listener: (event: EmbeddedEvent) => void): () => void;
 }
 
@@ -143,6 +146,36 @@ interface WalResult {
 type WalMessage = { error: string; ok: false } | { ok: true; result: WalResult };
 
 describe("browser runtime", () => {
+  test("opens through a typed setup action and keeps failed candidate writes unpublished", async () => {
+    useIsolatedBrowserStorage("setup-success");
+    const { ConvexEmbeddedClient } = await withTimeout(
+      import("@convex-dev/embedded/browser"),
+      "browser package import",
+    );
+    const client = track(new ConvexEmbeddedClient());
+    const initialSetup = setup as unknown as Parameters<typeof client.open>[0];
+    const mismatchSetup = otherSetup as Parameters<typeof client.open>[0];
+    await expect(client.query(setupVersions, {})).rejects.toMatchObject({
+      code: "EMBEDDED_NOT_OPEN",
+    });
+    await Promise.all([client.open(initialSetup), client.open(initialSetup)]);
+    await expect(client.open(mismatchSetup)).rejects.toMatchObject({
+      code: "EMBEDDED_OPEN_MISMATCH",
+    });
+    await expect(client.query(setupVersions, {})).resolves.toEqual([1]);
+
+    useIsolatedBrowserStorage("setup-failure");
+    const failing = track(new ConvexEmbeddedClient());
+    await expect(
+      failing.open(failingSetup as unknown as Parameters<typeof failing.open>[0]),
+    ).rejects.toThrow("browser setup failed after a durable batch");
+    await failing.close();
+    clients.delete(failing);
+
+    const reopened = await openClient(new ConvexEmbeddedClient());
+    await expect(reopened.query(setupVersions, {})).resolves.toEqual([]);
+  });
+
   test("starts the packaged dedicated runtime worker", async () => {
     useIsolatedBrowserStorage("capability");
     installDebugLogHook();
@@ -151,13 +184,36 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const convex = track(new ConvexEmbeddedClient());
+    const convex = await openClient(new ConvexEmbeddedClient());
 
     const result = await settle(withTimeout(convex.query(listDocuments, {}), "capability query"));
     if (!result.ok) throw result.error;
     expect(Array.isArray(result.value)).toBe(true);
     expect(debugEvents.some((event) => event.phase === "worker:bundle:import:done")).toBe(true);
     expect(debugEvents.some((event) => event.phase === "worker:opfs:register:done")).toBe(true);
+  });
+
+  test("resolves commit timestamps through packaged WASM and preserves the floor across reopen", async () => {
+    useIsolatedBrowserStorage("commit-timestamp");
+    const { ConvexEmbeddedClient } = await withTimeout(
+      import("@convex-dev/embedded/browser"),
+      "browser package import",
+    );
+    const client = await openClient(new ConvexEmbeddedClient());
+    const first = await client.mutation(timestamp, {});
+    const second = await client.mutation(timestamp, {});
+
+    if (typeof first !== "bigint" || typeof second !== "bigint") {
+      throw new Error("committed timestamps must resolve to bigint values");
+    }
+    expect(second).toBeGreaterThan(first);
+
+    await client.close();
+    clients.delete(client);
+    const reopened = await openClient(new ConvexEmbeddedClient());
+    const third = await reopened.mutation(timestamp, {});
+    if (typeof third !== "bigint") throw new Error("reopened timestamp must resolve to a bigint");
+    expect(third).toBeGreaterThan(second);
   });
 
   test("runs packaged browser client through worker, WASM, OPFS, and virtual Convex modules", async () => {
@@ -170,8 +226,8 @@ describe("browser runtime", () => {
     );
     const prefix = `runtime-${getTimerTime()}-${Math.random().toString(36).slice(2)}:`;
     await mark("construct clients", { prefix });
-    const convexA = track(new ConvexEmbeddedClient());
-    const convexB = track(new ConvexEmbeddedClient());
+    const convexA = await openClient(new ConvexEmbeddedClient());
+    const convexB = await openClient(new ConvexEmbeddedClient());
 
     await mark("first mutation");
     const firstMutation = await settle(writeDocument(convexA, `${prefix}hi`, "first mutation"));
@@ -225,7 +281,7 @@ describe("browser runtime", () => {
     clients.delete(convexB);
 
     await mark("reopen");
-    const reopened = track(new ConvexEmbeddedClient());
+    const reopened = await openClient(new ConvexEmbeddedClient());
     await expectPrefixedDocuments(reopened, prefix, ["after-close", "again", "hi"]);
   }, 45_000);
 
@@ -235,7 +291,7 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const convex = track(new ConvexEmbeddedClient());
+    const convex = await openClient(new ConvexEmbeddedClient());
     const operations: EmbeddedOperationEvent[] = [];
     convex.subscribeInternalEvents?.((event) => {
       if (event.type === "operation") operations.push(event);
@@ -312,7 +368,7 @@ describe("browser runtime", () => {
     const importMs = getTimerTime() - importStartedAt;
 
     const constructStartedAt = getTimerTime();
-    const convex = track(new ConvexEmbeddedClient());
+    const convex = await openClient(new ConvexEmbeddedClient());
     const constructMs = getTimerTime() - constructStartedAt;
 
     const readyStartedAt = getTimerTime();
@@ -348,7 +404,7 @@ describe("browser runtime", () => {
     debugEvents.length = 0;
 
     const warmConstructStartedAt = getTimerTime();
-    const warm = track(new ConvexEmbeddedClient());
+    const warm = await openClient(new ConvexEmbeddedClient());
     const warmConstructMs = getTimerTime() - warmConstructStartedAt;
 
     const warmReadyStartedAt = getTimerTime();
@@ -369,7 +425,7 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const convex = track(new ConvexEmbeddedClient());
+    const convex = await openClient(new ConvexEmbeddedClient());
     const runtimeEvents: RuntimeEvent[] = [];
     const stop = convex.onRuntimeEvent?.((event) => runtimeEvents.push(event as RuntimeEvent));
 
@@ -396,7 +452,7 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const convex = track(new ConvexEmbeddedClient());
+    const convex = await openClient(new ConvexEmbeddedClient());
     await expect(
       withTimeout(convex.query(listDocuments, {}), "inert channel ready query"),
     ).resolves.toEqual([]);
@@ -408,7 +464,7 @@ describe("browser runtime", () => {
       withTimeout(import("@convex-dev/embedded/browser"), "browser package import"),
       withTimeout(import("@convex-dev/embedded/devtools"), "devtools package import"),
     ]);
-    const convex = track(new ConvexEmbeddedClient());
+    const convex = await openClient(new ConvexEmbeddedClient());
     const mounted = mountEmbeddedDevtools(convex, { defaultOpen: true });
     const operations: EmbeddedOperationEvent[] = [];
     convex.subscribeInternalEvents?.((event) => {
@@ -459,7 +515,7 @@ describe("browser runtime", () => {
     );
     const prefix = `timing-reopen-${getTimerTime()}-${Math.random().toString(36).slice(2)}:`;
 
-    const first = track(new ConvexEmbeddedClient());
+    const first = await openClient(new ConvexEmbeddedClient());
     const firstOperations: EmbeddedOperationEvent[] = [];
     first.subscribeInternalEvents?.((event) => {
       if (event.type === "operation") firstOperations.push(event);
@@ -470,7 +526,7 @@ describe("browser runtime", () => {
     await withTimeout(first.close(), "close first timing client");
     clients.delete(first);
 
-    const reopened = track(new ConvexEmbeddedClient());
+    const reopened = await openClient(new ConvexEmbeddedClient());
     const reopenedOperations: EmbeddedOperationEvent[] = [];
     reopened.subscribeInternalEvents?.((event) => {
       if (event.type === "operation") reopenedOperations.push(event);
@@ -507,6 +563,7 @@ describe("browser runtime", () => {
         url: "http://127.0.0.1:3214",
       }),
     );
+    const opened = convex.open();
     const operations: EmbeddedOperationEvent[] = [];
     const remoteEvents: unknown[] = [];
     convex.subscribeInternalEvents?.((event) => {
@@ -515,6 +572,7 @@ describe("browser runtime", () => {
     });
 
     expect(convex.connectionState()).toMatchObject({ local: "starting", remote: "starting" });
+    await opened;
     const prefix = `timing-dead-remote-${getTimerTime()}-${Math.random().toString(36).slice(2)}:`;
     const samples = [];
     for (let i = 0; i < 12; i += 1) {
@@ -649,7 +707,7 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const convex = track(new ConvexEmbeddedClient());
+    const convex = await openClient(new ConvexEmbeddedClient());
     const uploadFetch = createConvexEmbeddedUploadFetch(convex);
     const uploadUrl = await withTimeout(
       convex.mutation(generateUploadUrl, {}),
@@ -689,7 +747,7 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const convex = track(new ConvexEmbeddedClient()) as unknown as LocalInsightsClient;
+    const convex = (await openClient(new ConvexEmbeddedClient())) as unknown as LocalInsightsClient;
     await expect(withTimeout(convex.query(documentCount, {}), "local query")).resolves.toBe(0);
     const watch = convex.watchQuery(documentCount, {});
     const updated = new Promise<void>((resolve) => {
@@ -778,7 +836,7 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const convex = track(new ConvexEmbeddedClient({ url: remoteUrl }));
+    const convex = await openClient(new ConvexEmbeddedClient({ url: remoteUrl }));
 
     expect(await convex.action(hostedEcho, { value: "hosted" })).toBe("hosted");
   });
@@ -792,7 +850,7 @@ describe("browser runtime", () => {
       "browser package import",
     );
     const text = `browser-remote-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
-    const convex = track(
+    const convex = await openClient(
       new ConvexEmbeddedClient({
         url: remoteUrl,
       }),
@@ -869,7 +927,7 @@ describe("browser runtime", () => {
     );
     const text = `browser-remote-first-edit-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
     await browserCommands().embeddedRemoteDocumentCreate(remoteUrl, text, "abc");
-    const convex = track(new ConvexEmbeddedClient({ url: remoteUrl }));
+    const convex = await openClient(new ConvexEmbeddedClient({ url: remoteUrl }));
     const remoteEvents: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
     convex.subscribeInternalEvents?.((event) => {
       if (event.type === "remote") remoteEvents.push(event);
@@ -914,12 +972,12 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const open = (storageId: string) => {
+    const open = async (storageId: string) => {
       localStorage.setItem("convex-embedded.storageId", storageId);
-      return track(new ConvexEmbeddedClient({ url: remoteUrl })) as DocumentClient;
+      return (await openClient(new ConvexEmbeddedClient({ url: remoteUrl }))) as DocumentClient;
     };
-    let first = open(storageIds[0]!);
-    let second = open(storageIds[1]!);
+    let first = await open(storageIds[0]!);
+    let second = await open(storageIds[1]!);
     let firstId: string | undefined;
     let secondId: string | undefined;
     const firstRemoteEvents: EmbeddedRemoteEvent[] = [];
@@ -1001,8 +1059,8 @@ describe("browser runtime", () => {
       await Promise.all([first.close(), second.close()]);
       clients.delete(first);
       clients.delete(second);
-      first = open(storageIds[0]!);
-      second = open(storageIds[1]!);
+      first = await open(storageIds[0]!);
+      second = await open(storageIds[1]!);
       const reopenedWatches = [first, second].map((client) => {
         const watch = client.watchQuery(listDocuments, { limit: 40 });
         return watch.onUpdate(() => undefined);
@@ -1054,12 +1112,12 @@ describe("browser runtime", () => {
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
-    const open = (suffix: string) => {
+    const open = async (suffix: string) => {
       localStorage.setItem("convex-embedded.storageId", `${runId}-${suffix}`);
-      return track(new ConvexEmbeddedClient({ url: remoteUrl })) as DocumentClient;
+      return (await openClient(new ConvexEmbeddedClient({ url: remoteUrl }))) as DocumentClient;
     };
-    const first = open("a");
-    const second = open("b");
+    const first = await open("a");
+    const second = await open("b");
     const firstRemoteEvents: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
     const remoteEvents: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
     first.subscribeInternalEvents?.((event) => {
@@ -1544,6 +1602,12 @@ describe("browser store-instance recovery", () => {
 
 function track<T extends RuntimeClient>(client: T): T {
   clients.add(client);
+  return client;
+}
+
+async function openClient<T extends RuntimeClient>(client: T): Promise<T> {
+  track(client);
+  await client.open();
   return client;
 }
 

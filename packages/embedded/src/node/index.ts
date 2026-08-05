@@ -16,12 +16,15 @@
  *   modules: {},
  *   path: ".convex-embedded/db.sqlite3",
  * });
+ * await client.open();
  * await client.query(api.todos.list, {});
  * ```
  *
  * @packageDocumentation
  */
 export { ConvexEmbeddedClient } from "./client";
+export { EMBEDDED_ERROR_CODES, EmbeddedError, isEmbeddedError } from "../error";
+export type { EmbeddedErrorCode } from "../error";
 export {
   EMBEDDED_UPLOAD_PATH,
   createConvexEmbeddedUploadFetch,
@@ -41,7 +44,6 @@ export type {
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,
-  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,

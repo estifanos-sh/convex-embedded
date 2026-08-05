@@ -36,17 +36,8 @@ where
 pub(crate) struct Schema {
     pub hash: String,
     #[serde(default)]
-    pub migrations: Vec<MigrationDefinition>,
-    #[serde(default)]
-    pub migration_code_hash: String,
+    pub setup_hash: String,
     pub tables: Vec<Table>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct MigrationDefinition {
-    pub id: String,
-    pub definition_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +116,8 @@ pub(crate) struct Scalar {
     #[serde(rename = "bool")]
     pub boolean: Option<bool>,
     pub undef: Option<bool>,
+    #[serde(rename = "commitTs")]
+    pub commit_ts: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +151,7 @@ pub(crate) struct DocWrite {
     pub data: String,
     pub cols: Vec<ColValue>,
     pub creation_time: f64,
+    pub pending_commit_ts: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +167,7 @@ pub(crate) struct LocalFieldWrite {
     pub id: String,
     pub field: String,
     pub value_json: String,
+    pub pending_commit_ts: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +187,8 @@ pub(crate) struct ColValue {
     #[serde(rename = "bool")]
     pub boolean: Option<bool>,
     pub undef: Option<bool>,
+    #[serde(rename = "commitTs")]
+    pub commit_ts: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,13 +232,16 @@ pub(crate) struct IdMapping {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CommitOptions {
+    pub commit_ts: Option<bool>,
     pub source: Option<String>,
     pub mutation_id: Option<String>,
     pub mutation_name: Option<String>,
     pub mutation_args: Option<String>,
     pub mutation_result: Option<String>,
+    pub mutation_result_commit_ts: Option<bool>,
     pub push_envelope_json: Option<String>,
     pub push_envelope_now_ms: Option<f64>,
+    pub push_after_images_commit_ts: Option<bool>,
     pub mutation_is_fresh: Option<bool>,
     pub include_changes: Option<bool>,
 }

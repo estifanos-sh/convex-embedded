@@ -16,8 +16,8 @@ use crate::types::RevFrontier;
 use crate::types::{
     AuthoritativeRow, ColValue, CommitOptions, DocWrite, FileMetadata, IdMapping, IdMappingContent,
     MutationRecord, MutationStatus, PendingUpload, RevKey, RevState, RowChange, RowChangeOp,
-    RowHead, RowKey, ScheduledFunctionKind, ScheduledJob, ScheduledState, StoreSchema, TableDef,
-    UploadLease, WriteBatch,
+    RowHead, RowKey, ScheduledFunctionKind, ScheduledJob, ScheduledState, TableDef, UploadLease,
+    WriteBatch,
 };
 
 use super::{DirtyHead, TableRuntime, PATH_LOCKS};
@@ -104,11 +104,6 @@ pub(crate) fn path_lock(path: &str) -> Arc<Mutex<()>> {
 pub(crate) fn commit_seq_key(path_key: &str, identity_key: &str) -> String {
     format!("{path_key}\0{identity_key}")
 }
-
-pub(crate) fn schema_signature(schema: &StoreSchema) -> String {
-    schema.hash.clone()
-}
-
 pub(crate) fn hex(bytes: &[u8]) -> String {
     const LUT: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

@@ -25,6 +25,11 @@ pub enum StorageError {
     #[error("incompatible store: {0}")]
     IncompatibleStore(String),
 
+    #[error(
+        "store epoch {found} predates the supported library baseline {minimum}; the store was preserved"
+    )]
+    PreBaselineStore { found: i64, minimum: i64 },
+
     #[error("unsatisfiable: {0}")]
     Unsatisfiable(String),
 
@@ -46,6 +51,15 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// Stable cross-binding category for errors whose callers need release/repair policy.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::PreBaselineStore { .. } => "EMBEDDED_PRE_BASELINE_STORE",
+            _ => "EMBEDDED_STORAGE",
+        }
+    }
+
     /// True when retrying the same storage operation may succeed without changing its input.
     ///
     /// Busy/locking/schema races are ordinary concurrency outcomes, and an I/O step can fail while
@@ -62,6 +76,7 @@ impl StorageError {
             Self::Clock
             | Self::Decode { .. }
             | Self::IncompatibleStore(_)
+            | Self::PreBaselineStore { .. }
             | Self::InvalidCursor(_)
             | Self::InvalidIdent(_)
             | Self::ReservedColumn(_)

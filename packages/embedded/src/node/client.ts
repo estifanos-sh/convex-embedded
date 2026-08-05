@@ -12,10 +12,12 @@ import {
   EmbeddedClient,
   type ConvexLocalModules,
   type ConvexModules,
+  validateLoadedSetupIdentity,
 } from "../client";
 import type { ConvexEmbeddedSchema } from "../schema";
-import type { DeviceMigrationManifest } from "../migrations";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
+import { localReferenceName } from "../local";
+import { localFunctionSchema, localGraphHash } from "../local/internal";
 import { loadNativeModule, validateNativeModule, type NativeModule } from "./artifact";
 import { NativeStore } from "./native";
 
@@ -30,7 +32,6 @@ export type {
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,
-  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,
@@ -90,9 +91,6 @@ export interface ConvexEmbeddedClientOptions {
    */
   local?: Record<string, () => Promise<unknown>>;
 
-  /** Ordered device migration manifest for this store. */
-  migrations?: DeviceMigrationManifest;
-
   /**
    * Filesystem path for the embedded database.
    *
@@ -122,35 +120,67 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
    * Creates a Node embedded client backed by the Rust/NAPI storage artifact.
    *
    * @param options - Schema, function modules, and database path for the client.
-   * @throws If the native artifact cannot be loaded or has an incompatible API
-   * version. Runtime initialization may also reject if schema setup or database
-   * opening fails.
+   * Native artifact loading, schema setup, and database opening are deferred to
+   * {@link EmbeddedClient.open}, which rejects if any of them fails.
    */
   constructor(options: ConvexEmbeddedClientOptions) {
-    const native = validateNativeModule(
-      nativeOverrides.get(options) ?? loadNativeModule(),
-      "ConvexEmbeddedClient native artifact",
-    );
-    nativeOverrides.delete(options);
     const authState = createEmbeddedAuthState();
     super({
-      schema: options.schema,
-      modules: options.modules,
-      localModules: options.local && namespaceLocalModules(options.local),
-      store: openStore(native, options.path),
       authState,
-      remote: options.url === undefined ? undefined : { url: options.url },
-      deviceMigrations: options.migrations,
+      hosted: options.url === undefined ? undefined : { url: options.url },
+      start: async (setup) => {
+        const local = options.local ? await namespaceLocalModules(options.local) : undefined;
+        validateLoadedSetupIdentity(setup, local?.setupIdentities);
+        const native = validateNativeModule(
+          nativeOverrides.get(options) ?? loadNativeModule(),
+          "ConvexEmbeddedClient native artifact",
+        );
+        nativeOverrides.delete(options);
+        return {
+          schema: options.schema,
+          modules: options.modules,
+          localModules: local?.modules,
+          localSchemas: local?.schemas,
+          localSetupIdentities: local?.setupIdentities,
+          store: openStore(native, options.path),
+          authState,
+          remote: options.url === undefined ? undefined : { url: options.url },
+        };
+      },
     });
   }
 }
 
-function namespaceLocalModules(
+async function namespaceLocalModules(
   local: NonNullable<ConvexEmbeddedClientOptions["local"]>,
-): ConvexLocalModules {
-  return Object.fromEntries(
-    Object.entries(local).map(([modulePath, load]) => [`local/${modulePath}`, load]),
+): Promise<{
+  modules: ConvexLocalModules;
+  schemas: ConvexEmbeddedSchema[];
+  setupIdentities: Record<string, string>;
+}> {
+  const schemas = new Set<ConvexEmbeddedSchema>();
+  const setupIdentities: Record<string, string> = {};
+  const entries = await Promise.all(
+    Object.entries(local).map(async ([modulePath, load]) => {
+      const loaded = await load();
+      // Setup identity must originate in a generated local registry. Node deliberately does not
+      // accept a caller-provided graph token or derive one from executable text: an unstamped
+      // registration remains usable as a normal local function but fails closed for `open(setup)`.
+      if (typeof loaded === "object" && loaded !== null) {
+        for (const value of Object.values(loaded as Record<string, unknown>)) {
+          const schema = localFunctionSchema(value);
+          if (schema !== undefined) schemas.add(schema);
+          const reference = localReferenceName(value);
+          const graphHash = localGraphHash(value);
+          if (reference !== undefined && graphHash !== undefined) {
+            setupIdentities[reference] = graphHash;
+          }
+        }
+      }
+      return [`local/${modulePath}`, async () => loaded] as const;
+    }),
   );
+  return { modules: Object.fromEntries(entries), schemas: [...schemas], setupIdentities };
 }
 
 function openStore(native: NativeModule, path: string): Promise<NativeStore> {

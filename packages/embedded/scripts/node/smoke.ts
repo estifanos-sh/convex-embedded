@@ -18,7 +18,7 @@ const { ConvexEmbeddedClient } = (await import(
     modules: Record<string, unknown>;
     path: string;
     schema: typeof schema;
-  }) => { close(): Promise<void> };
+  }) => { close(): Promise<void>; open(): Promise<void> };
 };
 
 process.env.CONVEX_EMBEDDED_NATIVE = new URL(
@@ -30,6 +30,7 @@ const path = join(tmpdir(), `embedded_node_entrypoint_smoke_${process.pid}.db`);
 for (const file of [path, `${path}-wal`, `${path}-shm`]) rmSync(file, { force: true });
 
 const client = new ConvexEmbeddedClient({ schema, modules: {}, path });
+await client.open();
 await client.close();
 
 function nativeTarget(): string {

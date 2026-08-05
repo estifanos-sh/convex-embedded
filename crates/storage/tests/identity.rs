@@ -87,6 +87,7 @@ fn envelope_options(mutation_id: &str, partition: &str, now_ms: i64) -> CommitOp
                 r#"{{"mutationId":"{mutation_id}","commitSeq":0,"crdt":[],"partition":"{partition}"}}"#
             ),
             now_ms,
+            after_images_commit_ts: false,
         }),
     )
 }

@@ -18,6 +18,7 @@ interface ConnectionState {
 interface SmokeClient {
   close(): Promise<void>;
   connectionState(): ConnectionState;
+  open(): Promise<void>;
   query(
     name: ReturnType<typeof makeFunctionReference>,
     args: Record<string, unknown>,
@@ -89,6 +90,8 @@ describe("webkit runtime smoke", () => {
       }
     });
 
+    await convex.open().catch(() => undefined);
+
     let queryError: unknown;
     const rows = await convex.query(listDocuments, {}).catch((error: unknown) => {
       queryError = error;
@@ -134,6 +137,8 @@ describe("webkit runtime smoke", () => {
         const tick = (event as { tick?: { received?: number; rowsApplied?: number } }).tick;
         if (tick) delivered += (tick.received ?? 0) + (tick.rowsApplied ?? 0);
       });
+
+      await convex.open();
 
       const args = { limit: 1, prefix: marker };
       const stop = convex.watchQuery(listDocuments, args).onUpdate(() => undefined);

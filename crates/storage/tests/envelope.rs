@@ -78,6 +78,7 @@ fn push_envelope_queue_reads_in_ordinal_order_and_drains_on_complete() {
                         mutation_id: op_id.into(),
                         json: format!(r#"{{"mutationId":"{op_id}","commitSeq":0,"crdt":[]}}"#),
                         now_ms: 5,
+                        after_images_commit_ts: false,
                     }),
                 ),
             )
@@ -172,6 +173,7 @@ fn reopen_seeds_commit_sequence_after_the_durable_push_tail() {
                     mutation_id: "after-reopen".into(),
                     json: r#"{"mutationId":"after-reopen","commitSeq":0,"crdt":[]}"#.into(),
                     now_ms: 6,
+                    after_images_commit_ts: false,
                 }),
             ),
         )
@@ -200,6 +202,7 @@ fn local_commit_writes_its_push_envelope_atomically() {
             mutation_id: "mutation-1".into(),
             json: r#"{"mutationId":"mutation-1","commitSeq":0,"crdt":[]}"#.into(),
             now_ms: 5,
+            after_images_commit_ts: false,
         }),
     );
 
@@ -228,6 +231,7 @@ fn local_commit_writes_its_push_envelope_atomically() {
                 mutation_id: "mutation-2".into(),
                 json: r#"{"mutationId":"mutation-2"}"#.into(),
                 now_ms: 6,
+                after_images_commit_ts: false,
             }),
         ),
     );

@@ -5,7 +5,14 @@ import { join } from "node:path";
 import { describe, expect, test } from "vite-plus/test";
 
 import { NativeStore } from "../../src/node/native";
-import type { DocWrite, StorageBackend, StoredDoc, StoreSchema } from "../../src/storage/types";
+import { commitTsPlaceholder } from "../../src/runtime/pending";
+import {
+  PENDING_COMMIT_TS,
+  type DocWrite,
+  type StorageBackend,
+  type StoredDoc,
+  type StoreSchema,
+} from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { defineConformance } from "../testkit/conformance";
 import { nativeModule } from "../testkit/native";
@@ -553,6 +560,50 @@ describe("native storage details", () => {
     expect(new Uint8Array(third.bytes)).toEqual(new Uint8Array([1, 2, 3]));
     expect(store.readCacheStats().unshareableReturns).toBeGreaterThanOrEqual(3);
 
+    await store.close();
+  });
+
+  test("resolves timestamped cache rows before updating primed doc and page caches", async () => {
+    const store = await open(tmp("native_read_cache_commit_timestamp.db"));
+    await store.setup(cacheSchema);
+    await store.commit({ docWrites: [issue("a", "before", "open")], deletes: [] });
+    await store.doc.read("issues", "a");
+    await store.doc.page.read({
+      table: "issues",
+      index: "by_status",
+      bounds: [{ kind: "eq", value: "open" }],
+      order: "asc",
+    });
+
+    const committed = await store.commit(
+      {
+        docWrites: [
+          {
+            table: "issues",
+            id: "a",
+            data: { status: commitTsPlaceholder, title: "after" },
+            cols: [["status", PENDING_COMMIT_TS]],
+            creationTime: 1,
+            pendingCommitTs: true,
+          },
+        ],
+        deletes: [],
+        pendingCommitTs: true,
+      },
+      { changes: "include", source: "remote", commitTs: true },
+    );
+    expect(committed.commitTs).toBeTypeOf("bigint");
+    expect(await store.doc.read("issues", "a")).toMatchObject({
+      status: committed.commitTs,
+      title: "after",
+    });
+    const page = await store.doc.page.read({
+      table: "issues",
+      index: "by_status",
+      bounds: [{ kind: "eq", value: committed.commitTs }],
+      order: "asc",
+    });
+    expect(page.docs).toMatchObject([{ status: committed.commitTs, title: "after" }]);
     await store.close();
   });
 });

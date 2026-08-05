@@ -12,6 +12,8 @@ run("vp", ["pack"]);
 run("node", ["scripts/wasm.ts"]);
 run("vp", ["test", "run", ...testConfig, "--project", "browser", "tests/browser/runtime.ts"]);
 run("vp", ["test", "run", ...testConfig, "--project", "browser", "tests/browser/memory.ts"]);
+run("vp", ["test", "run", ...testConfig, "--project", "browser", "tests/browser/fixture.ts"]);
+run("vp", ["test", "run", ...testConfig, "--project", "browser", "tests/browser/stress.ts"]);
 run("vp", ["test", "run", ...testConfig, "--project", "browser", "tests/browser/protocol.ts"]);
 run("vp", [
   "test",

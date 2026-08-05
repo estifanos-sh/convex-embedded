@@ -39,16 +39,14 @@ import {
   localReferenceName,
   type LocalFunctionArgs,
   type LocalFunctionReturns,
+  type LocalAction,
   type LocalMutation,
   type LocalQuery,
 } from "./local";
+import { localGraphHash, localFunctionSchema } from "./local/internal";
 import { consumeRemoteTick, remotePendingIsEmpty, REMOTE_PULL_DIAGNOSTIC_ERROR } from "./rev";
 import { toRuntimeStoreSchema, type ConvexEmbeddedSchema } from "./schema";
-import {
-  withDeviceMigrations,
-  type DeviceMigrationManifest,
-  type DeviceMigrationReport,
-} from "./migrations";
+import { openCandidate } from "./candidate";
 import type {
   RemoteStartOptions,
   RemoteSurface,
@@ -57,10 +55,11 @@ import type {
   StoreSchema,
 } from "./storage/types";
 import { getElapsedTime, getTimerTime } from "./time";
-import { hashValue } from "./hash";
 import {
   EmbeddedClientRetiredError,
   EmbeddedClosedError,
+  EmbeddedNotOpenError,
+  EmbeddedOpenMismatchError,
   EmbeddedHostedDependencyError,
   EmbeddedHostedWriteIndeterminateError,
   EmbeddedOfflineError,
@@ -91,7 +90,6 @@ export type {
   EmbeddedDataDelete,
   EmbeddedDataEvent,
   EmbeddedDataWrite,
-  EmbeddedMigrationEvent,
   EmbeddedMutationTiming,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
@@ -209,6 +207,21 @@ export type ConvexModules = ModuleMap;
  */
 export type ConvexLocalModules = LocalModuleMap;
 
+/**
+ * The only application code accepted by {@link EmbeddedClient.open}. It is an imported, stamped,
+ * private local action with no arguments and a `null` result; arbitrary callbacks and hosted
+ * function references are intentionally not representable here.
+ *
+ * @public
+ */
+export type LocalSetupAction = LocalAction<"internal", any, any>;
+
+type ValidLocalSetup<Setup extends LocalSetupAction> = keyof LocalFunctionArgs<Setup> extends never
+  ? Awaited<LocalFunctionReturns<Setup>> extends null
+    ? Setup
+    : never
+  : never;
+
 /** Arguments accepted by a device-only function at the app surface. @public */
 export type LocalArgs<Fn> =
   LocalFunctionArgs<Fn> extends Record<string, never>
@@ -264,14 +277,16 @@ interface EmbeddedClientBaseOptions {
   modules: ConvexModules;
   /** Device-only function modules imported when the runtime starts. */
   localModules?: ConvexLocalModules;
+  /** Schemas carried by imported local registrations, collected by platform adapters. @internal */
+  localSchemas?: readonly ConvexEmbeddedSchema[];
+  /** Build-stamped setup identities actually present in the loaded local registry. @internal */
+  localSetupIdentities?: Readonly<Record<string, string>>;
   /** Storage backend, or a promise for one, owned by the client. */
   store: StorageBackend | Promise<StorageBackend>;
   /** Mutable auth state shared with the remote driver. */
   authState?: EmbeddedAuthState;
   /** Optional native remote replication configuration. */
   remote?: ConvexEmbeddedRemoteOptions;
-  /** Ordered device migration manifest for direct (non-bundled) runtimes. */
-  deviceMigrations?: DeviceMigrationManifest;
 }
 
 /** Platform-neutral embedded client configuration. @internal */
@@ -322,6 +337,14 @@ export interface EmbeddedRuntimeClientOptions {
   remoteConfigured?: boolean;
 }
 
+/** A platform adapter whose expensive runtime acquisition is deferred to `client.open()`. @internal */
+export interface DeferredEmbeddedClientOptions {
+  authState?: EmbeddedAuthState;
+  /** Hosted configuration recorded before opening; no network work starts until `open()`. */
+  hosted?: ConvexEmbeddedRemoteOptions;
+  start(setup?: LocalSetupAction): Promise<EmbeddedClientOptions | EmbeddedRuntimeClientOptions>;
+}
+
 interface ClientState {
   close: () => Promise<void> | void;
   remote?: RemoteSurface;
@@ -336,7 +359,7 @@ interface ClientState {
 }
 
 /** Local and remote readiness reported by {@link EmbeddedClient.connectionState}. @public */
-type EmbeddedLocalConnectionState = "starting" | "ready" | "failed" | "closed";
+type EmbeddedLocalConnectionState = "idle" | "starting" | "ready" | "failed" | "closed";
 
 export type EmbeddedConnectionState = {
   local: EmbeddedLocalConnectionState;
@@ -427,12 +450,18 @@ const REMOTE_REPLICATE_ERROR_MAX_DELAY_MS = 60_000;
  */
 export class EmbeddedClient {
   private closed = false;
+  private opened = false;
   private clientId = randomId("client");
   private closePromise: Promise<void> | undefined;
   private nextMutationId = 1;
   private readonly localRoutes = new Map<string, "replicated" | "local">();
   private readonly queries = new Map<string, QueryState>();
-  private readonly state: Promise<ClientState>;
+  private state!: Promise<ClientState>;
+  private readonly start: (
+    setup?: LocalSetupAction,
+  ) => Promise<EmbeddedClientOptions | EmbeddedRuntimeClientOptions>;
+  private openIdentity: string | undefined;
+  private openSetup: LocalSetupAction | undefined;
   private readonly auth: EmbeddedAuthState;
   private readonly hosted: ConvexEmbeddedRemoteOptions | undefined;
   private hostedClient: ConvexClient | undefined;
@@ -440,7 +469,7 @@ export class EmbeddedClient {
   private acceptedAuthGeneration = -1;
   private identityReady: Promise<void> = Promise.resolve();
   private identityRefresh: { generation: number; promise: Promise<boolean> } | undefined;
-  private localState: EmbeddedConnectionState["local"] = "starting";
+  private localState: EmbeddedConnectionState["local"] = "idle";
   private remoteState: EmbeddedConnectionState["remote"] = "disabled";
   private remoteError: string | undefined;
   private remotePullError: string | undefined;
@@ -454,14 +483,74 @@ export class EmbeddedClient {
   private readonly eventListeners = new Set<EmbeddedInternalEventListener>();
   private readonly debugOperations: EmbeddedClientDebugOperation[] = [];
   private readonly debugUploads: EmbeddedClientDebugUpload[] = [];
-  constructor(options: EmbeddedClientOptions | EmbeddedRuntimeClientOptions) {
+  constructor(
+    options: EmbeddedClientOptions | EmbeddedRuntimeClientOptions | DeferredEmbeddedClientOptions,
+  ) {
     this.auth = options.authState ?? createEmbeddedAuthState();
-    const hostedOptions = "runner" in options ? options.hosted : options.remote;
+    const hostedOptions =
+      "start" in options ? options.hosted : "runner" in options ? options.hosted : options.remote;
     this.hosted = hostedOptions;
-    const remoteConfigured =
-      "runner" in options ? options.remoteConfigured === true : options.remote !== undefined;
-    this.remoteState = remoteConfigured ? "starting" : "disabled";
-    this.state = this.init(options);
+    this.start = "start" in options ? (setup) => options.start(setup) : async () => options;
+    this.remoteState = "disabled";
+    // A prebuilt runner is an internal handoff from a worker/lifecycle owner that has already
+    // acquired its resources. Keep that test/adapter seam eager; all public platform clients use
+    // the deferred `start` form and remain inert until `open()`.
+    if ("runner" in options) {
+      this.opened = true;
+      this.localState = "starting";
+      this.openSetup = undefined;
+      this.openIdentity = "none";
+      this.remoteState = options.remoteConfigured === true ? "starting" : "disabled";
+      this.state = this.init(options);
+      void this.state.then(
+        () => {
+          this.localState = "ready";
+        },
+        (error) => {
+          this.localState = "failed";
+          this.localError = errorMessage(error);
+        },
+      );
+      void this.state.catch(() => undefined);
+    }
+  }
+
+  /**
+   * Opens storage and starts the local runtime. Construction is inert: no worker, native store,
+   * scheduler, or remote connection is created before this call.
+   */
+  open(): Promise<void>;
+  open<Setup extends LocalSetupAction>(setup: ValidLocalSetup<Setup>): Promise<void>;
+  open(setup?: LocalSetupAction): Promise<void> {
+    if (this.closed) return Promise.reject(new EmbeddedClosedError());
+    if (this.opened) {
+      const same =
+        this.openIdentity === undefined
+          ? this.openSetup === setup
+          : this.openIdentity === setupIdentity(setup);
+      if (!same) return Promise.reject(new EmbeddedOpenMismatchError());
+      return this.state.then(() => undefined);
+    }
+    let identity: string;
+    try {
+      // Validate the semantic setup identity before a platform adapter can acquire a worker,
+      // storage lease, or native handle. A rejected setup must leave this client unopened.
+      identity = setupIdentity(setup);
+      this.configureOpen(setup, identity);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    this.opened = true;
+    this.localState = "starting";
+    this.openSetup = setup;
+    this.openIdentity = identity;
+    this.remoteState = this.hosted === undefined ? "disabled" : "starting";
+    this.state = Promise.resolve()
+      .then(async () => {
+        if (this.closed) throw new EmbeddedClosedError();
+        return await this.start(setup);
+      })
+      .then((options) => this.init(options, setup));
     void this.state.then(
       () => {
         this.localState = "ready";
@@ -475,31 +564,33 @@ export class EmbeddedClient {
         }
       },
     );
-    // Keep the floating init promise from surfacing as an unhandled rejection. Callers of
-    // query/mutation/close still observe the real rejection through `await this.state`.
     void this.state.catch(() => undefined);
+    return this.state.then(() => undefined);
   }
+
+  /** Platform adapters may snapshot a validated setup before deferred resources are acquired. */
+  protected configureOpen(_setup: LocalSetupAction | undefined, _identity: string): void {}
 
   /** Uses the normal Convex token fetcher for future hosted exchanges. */
   setAuth(fetchToken: AuthTokenFetcher, onChange?: (isAuthenticated: boolean) => void): void {
-    this.ensureOpen();
+    this.ensureNotClosed();
     this.auth.fetchToken = fetchToken;
     this.auth.onChange = onChange;
     this.hostedClient?.setAuth(fetchToken);
     const generation = ++this.authGeneration;
-    void this.refreshIdentity(generation);
+    if (this.opened) void this.refreshIdentity(generation);
   }
 
   /** Immediately switches local execution to the unauthenticated partition. */
   clearAuth(): void {
-    this.ensureOpen();
+    this.ensureNotClosed();
     this.auth.fetchToken = undefined;
     this.auth.identity = null;
     this.auth.onChange?.(false);
     this.auth.onChange = undefined;
     this.hostedClient?.setAuth(async () => null);
     const generation = ++this.authGeneration;
-    this.identityReady = this.clearIdentity(generation);
+    if (this.opened) this.identityReady = this.clearIdentity(generation);
   }
 
   /** Returns the current local and remote readiness snapshot. */
@@ -888,11 +979,13 @@ export class EmbeddedClient {
       state.callbacks.clear();
     }
     this.queries.clear();
-    this.closePromise = this.state
-      .then(async ({ close }) => {
-        await Promise.all([close(), this.hostedClient?.close()]);
-      })
-      .catch(() => undefined);
+    this.closePromise = (
+      this.opened
+        ? this.state.then(async ({ close }) => {
+            await Promise.all([close(), this.hostedClient?.close()]);
+          })
+        : Promise.resolve(this.hostedClient?.close()).then(() => undefined)
+    ).catch(() => undefined);
     return this.closePromise;
   }
 
@@ -953,6 +1046,7 @@ export class EmbeddedClient {
 
   private async init(
     options: EmbeddedClientOptions | EmbeddedRuntimeClientOptions,
+    setup?: LocalSetupAction,
   ): Promise<ClientState> {
     if ("runner" in options) {
       const eagerUnsubscribe = options.eagerRunner?.subscribeEvents?.((event) =>
@@ -967,6 +1061,8 @@ export class EmbeddedClient {
         throw new EmbeddedClosedError();
       }
       await this.readCachedIdentity(runner, this.authGeneration);
+      // Worker-backed runtimes execute candidate setup as part of their Init protocol before this
+      // runner resolves. Never execute it again against the now-published generation.
       if (options.remoteConfigured === true) {
         void this.refreshRunnerIdentity(runner, this.authGeneration);
       }
@@ -982,37 +1078,64 @@ export class EmbeddedClient {
     }
 
     const baseSchema = options.storeSchema ?? toRuntimeStoreSchema(options.schema);
+    // This is persisted as a store-contract setup identity, not derived from executable source.
+    // It makes a changed imported setup graph create a new candidate without changing hosted schema
+    // identity or hashing `Function#toString()`.
     const schema =
-      options.deviceMigrations === undefined
-        ? baseSchema
-        : withDeviceMigrations(baseSchema, options.deviceMigrations);
+      setup === undefined ? baseSchema : { ...baseSchema, setupHash: this.openIdentity ?? "" };
+    const moduleGraphHash = options.moduleGraphHash ?? "direct-runtime";
+    validateLoadedSetupIdentity(setup, options.localSetupIdentities, options.moduleGraphHash);
     const store = await options.store;
-    const moduleGraphHash = options.moduleGraphHash ?? (await hashModuleGraph(options.modules));
+    let runner: Runner;
     try {
-      await store.setup(schema);
-      const migrationReport = (
-        store as StorageBackend & { migrationReport?: DeviceMigrationReport }
-      ).migrationReport;
-      if (migrationReport) {
-        this.emitEvent({ at: getTimerTime(), type: "migration", ...migrationReport });
-      }
+      const localSchemas =
+        setup === undefined
+          ? []
+          : [
+              ...(options.localSchemas ?? []),
+              ...[localFunctionSchema(setup)].filter(
+                (value): value is ConvexEmbeddedSchema => value !== undefined,
+              ),
+            ];
+      const opened = await openCandidate<Runner>(store, {
+        createRunner: (runnerSchema, remote) =>
+          createRunner(options.modules, store, runnerSchema, {
+            emit: (event) => this.emitEvent(event),
+            hasEventListeners: () => this.eventListeners.size > 0,
+            localModules: options.localModules,
+            manifest: options.manifest,
+            moduleGraphHash,
+            remote,
+          }),
+        localReady: async (candidateRunner) => {
+          await candidateRunner.localReady;
+        },
+        remote: options.remote !== undefined,
+        runnerSchema: schema,
+        setup:
+          setup === undefined
+            ? undefined
+            : {
+                localSchemas,
+                run: async (setupRunner) => {
+                  await setupRunner.runAction(
+                    toReference(setup, setupRunner.localConfigured),
+                    {},
+                    { allowInternal: true, auth: null },
+                  );
+                },
+              },
+        targetSchema: schema,
+      });
+      runner = opened.runner;
     } catch (error) {
       await store.close();
       throw error;
     }
-    const runner = createRunner(options.modules, store, schema, {
-      emit: (event) => this.emitEvent(event),
-      hasEventListeners: () => this.eventListeners.size > 0,
-      localModules: options.localModules,
-      manifest: options.manifest,
-      moduleGraphHash,
-      remote: options.remote !== undefined,
-    });
     let stopRemoteLoop: (() => void) | undefined;
     let remoteRetryTimer: ReturnType<typeof setTimeout> | undefined;
     let remoteStartAttempt = 0;
     try {
-      await runner.localReady;
       const generation = this.authGeneration;
       await this.readCachedIdentity(runner, generation);
       if (options.remote) {
@@ -1393,9 +1516,12 @@ export class EmbeddedClient {
   }
 
   private ensureOpen(): void {
-    if (this.closed) {
-      throw new EmbeddedClosedError();
-    }
+    this.ensureNotClosed();
+    if (!this.opened) throw new EmbeddedNotOpenError();
+  }
+
+  private ensureNotClosed(): void {
+    if (this.closed) throw new EmbeddedClosedError();
   }
 
   private async resolveRoute(
@@ -1595,22 +1721,6 @@ class HostedTransportError extends Error {
     super(`Hosted transport failed: ${errorMessage(cause)}`, { cause });
     this.name = "ConvexEmbeddedHostedTransportError";
   }
-}
-
-async function hashModuleGraph(modules: ConvexModules): Promise<string> {
-  const seen = new WeakSet<object>();
-  const fingerprint = (value: unknown, depth: number): unknown => {
-    if (typeof value === "function") return value.toString();
-    if (value === null || typeof value !== "object") return value;
-    if (depth === 0 || seen.has(value)) return Object.prototype.toString.call(value);
-    seen.add(value);
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, child]) => [key, fingerprint(child, depth - 1)]),
-    );
-  };
-  return await hashValue(fingerprint(modules, 6));
 }
 
 export function startRemoteLoop(
@@ -1889,6 +1999,55 @@ function toReference(ref: unknown, localConfigured: boolean): FunctionReference<
     );
   }
   return name as unknown as FunctionReference<any>;
+}
+
+function setupIdentity(setup: LocalSetupAction | undefined): string {
+  if (setup === undefined) return "none";
+  if (!isLocalFunction(setup) || setup.kind !== "action" || setup.visibility !== "internal") {
+    throw new TypeError("client.open() accepts only a stamped internal local action.");
+  }
+  const definition = setup as unknown as { args?: unknown; returns?: { kind?: unknown } };
+  if (!isEmptySetupArgs(definition.args) || definition.returns?.kind !== "null") {
+    throw new TypeError(
+      "client.open() setup must declare empty arguments and a null return validator.",
+    );
+  }
+  const reference = localReferenceName(setup);
+  const graphHash = localGraphHash(setup);
+  if (reference === undefined || graphHash === undefined) {
+    throw new TypeError(
+      "client.open() setup must be imported from a bundled local module; callbacks and unstamped references are not supported.",
+    );
+  }
+  return `${reference}\u0000${graphHash}`;
+}
+
+/** Verify that setup is the stamped registration loaded by this platform runtime. @internal */
+export function validateLoadedSetupIdentity(
+  setup: LocalSetupAction | undefined,
+  loaded: Readonly<Record<string, string>> | undefined,
+  moduleGraphHash?: string,
+): void {
+  if (setup === undefined) return;
+  const reference = localReferenceName(setup)!;
+  const graphHash = localGraphHash(setup)!;
+  if (loaded?.[reference] !== graphHash) {
+    throw new Error(
+      `Candidate setup ${reference} does not match the loaded local module graph. Import the setup action from this application build.`,
+    );
+  }
+  if (moduleGraphHash !== undefined && graphHash !== moduleGraphHash) {
+    throw new Error("Candidate setup graph identity does not match the native runtime.");
+  }
+}
+
+function isEmptySetupArgs(args: unknown): boolean {
+  return (
+    typeof args === "object" &&
+    args !== null &&
+    !Array.isArray(args) &&
+    Object.keys(args).length === 0
+  );
 }
 
 function toDebugValue(value: unknown): unknown {

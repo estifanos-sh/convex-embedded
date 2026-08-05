@@ -1,6 +1,6 @@
 {
   "name": "@convex-dev/embedded",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Embedded runtime and Convex server wrapper for local-first Convex apps.",
   "files": [
     "dist/*-*.cjs",
@@ -129,10 +129,6 @@
       "types": "./dist/local.d.mts",
       "import": "./dist/local.mjs"
     },
-    "./migrations": {
-      "types": "./dist/migrations.d.mts",
-      "import": "./dist/migrations.mjs"
-    },
     "./internal/text": {
       "types": "./dist/internal/text.d.mts",
       "import": "./dist/internal/text.mjs"
@@ -163,6 +159,9 @@
     "native": "node scripts/native.ts",
     "size": "node scripts/size.ts",
     "test:node": "node scripts/node/smoke.ts",
+    "test:fixture:node": "node scripts/node/fixture.ts",
+    "test:stress:node": "node scripts/node/stress.ts",
+    "test:kill:node": "node scripts/node/kill.ts",
     "wasm": "node scripts/wasm.ts",
     "style": "node scripts/style.ts",
     "dev": "vp pack --watch",
@@ -229,7 +228,7 @@
     "vitest": "catalog:"
   },
   "peerDependencies": {
-    "convex": "^1.42.1",
+    "convex": "^1.43.0",
     "expo": ">=54.0.0",
     "expo-crypto": ">=15.0.0",
     "react-native": ">=0.81.0"

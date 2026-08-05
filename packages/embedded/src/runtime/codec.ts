@@ -1,5 +1,7 @@
 import { compareValues, ConvexError, convexToJson, jsonToConvex } from "convex/values";
 import type { JSONValue, Value } from "convex/values";
+import { hasPendingCommitTs, isPendingCommitTs, markPendingTree } from "./pending";
+import { isPendingCommitTsColumn } from "../storage/types";
 
 /**
  * Values already normalized and validated by {@link normalizeCopy}. Downstream stages trust the
@@ -118,6 +120,7 @@ export function decodeError(encoded: string): Error {
  */
 export function isNormalized(value: unknown): boolean {
   if (value === null) return true;
+  if (isPendingCommitTs(value)) return true;
   if (typeof value !== "object") return typeof value !== "bigint";
   return normalized.has(value);
 }
@@ -157,6 +160,7 @@ function markNormalized<T>(value: T): T {
  */
 export function freezeNormalizedTree(value: unknown): boolean {
   if (value === null || typeof value !== "object") return true;
+  if (isPendingCommitTs(value)) return true;
   markNormalized(value);
   if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return false;
   let shareable = true;
@@ -195,6 +199,7 @@ export function freezeNormalizedTreeWithEstimate(value: unknown): FrozenNormaliz
     default:
       return { bytes: 16, shareable: true };
   }
+  if (isPendingCommitTs(value)) return { bytes: 16, shareable: true };
   if (value instanceof ArrayBuffer) {
     markNormalized(value);
     return { bytes: 24 + value.byteLength, shareable: false };
@@ -244,6 +249,7 @@ function normalizeCopyInner(
 ): unknown {
   if (value === undefined) return topLevel ? null : undefined;
   if (value === null) return null;
+  if (isPendingCommitTs(value)) return value;
   switch (typeof value) {
     case "string":
       assertWellFormed(value, path);
@@ -277,16 +283,19 @@ function normalizeCopyInner(
         `${path}: array has ${value.length} values, exceeding the maximum ${MAX_ARRAY_LENGTH}.`,
       );
     }
-    return markNormalized(
-      value.map((entry, index) => {
-        if (entry === undefined) throw new Error(`undefined array element at ${path}[${index}]`);
-        return normalizeCopyInner(entry, false, `${path}[${index}]`, depth + 1);
-      }),
-    );
+    let pending = false;
+    const out = value.map((entry, index) => {
+      if (entry === undefined) throw new Error(`undefined array element at ${path}[${index}]`);
+      const normalized = normalizeCopyInner(entry, false, `${path}[${index}]`, depth + 1);
+      pending ||= hasPendingCommitTs(normalized);
+      return normalized;
+    });
+    return markPendingTree(markNormalized(out), pending);
   }
   if (!isSimpleObject(value)) throw new Error(`${path} must be a plain Convex object`);
 
   const out: Record<string, unknown> = {};
+  let pending = false;
   let fields = 0;
   for (const [key, v] of Object.entries(value)) {
     if (v === undefined) continue;
@@ -294,9 +303,11 @@ function normalizeCopyInner(
     if ((fields += 1) > MAX_OBJECT_FIELDS) {
       throw new Error(`${path}: object has more than the maximum ${MAX_OBJECT_FIELDS} fields.`);
     }
-    out[key] = normalizeCopyInner(v, false, `${path}.${key}`, depth + 1);
+    const normalized = normalizeCopyInner(v, false, `${path}.${key}`, depth + 1);
+    pending ||= hasPendingCommitTs(normalized);
+    out[key] = normalized;
   }
-  return markNormalized(out);
+  return markPendingTree(markNormalized(out), pending);
 }
 
 /**
@@ -316,6 +327,7 @@ function assertValueInner(value: unknown, topLevel: boolean, path: string, depth
     return;
   }
   if (value === null) return;
+  if (isPendingCommitTs(value)) return;
   switch (typeof value) {
     case "string":
       assertWellFormed(value, path);
@@ -393,26 +405,38 @@ function assertFieldName(key: string, path: string): void {
  * @internal
  */
 export function reviveDoc(doc: Record<string, unknown>): void {
+  let pending = false;
   for (const key of Object.keys(doc)) {
-    doc[key] = reviveValue(doc[key]);
+    const revived = reviveValue(doc[key]);
+    pending ||= hasPendingCommitTs(revived);
+    doc[key] = revived;
   }
+  markPendingTree(doc, pending);
 }
 
 function reviveValue(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i += 1) value[i] = reviveValue(value[i]);
-    return value;
+    let pending = false;
+    for (let i = 0; i < value.length; i += 1) {
+      const revived = reviveValue(value[i]);
+      pending ||= hasPendingCommitTs(revived);
+      value[i] = revived;
+    }
+    return markPendingTree(value, pending);
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
   if (keys.length === 1 && keys[0].startsWith("$")) {
     return fromJson(record as JSONValue);
   }
+  let pending = false;
   for (const key of keys) {
-    record[key] = reviveValue(record[key]);
+    const revived = reviveValue(record[key]);
+    pending ||= hasPendingCommitTs(revived);
+    record[key] = revived;
   }
-  return record;
+  return markPendingTree(record, pending);
 }
 
 /**
@@ -427,11 +451,20 @@ export function cloneTree<T>(value: T): T {
 
 function cloneTreeInner(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
+  if (isPendingCommitTs(value)) return value;
   if (value instanceof ArrayBuffer) return markNormalized(value.slice(0));
-  if (Array.isArray(value)) return markNormalized(value.map(cloneTreeInner));
+  if (Array.isArray(value)) {
+    const out = value.map(cloneTreeInner);
+    return markPendingTree(markNormalized(out), value.some(hasPendingCommitTs));
+  }
   const out: Record<string, unknown> = {};
-  for (const [key, v] of Object.entries(value)) out[key] = cloneTreeInner(v);
-  return markNormalized(out);
+  let pending = false;
+  for (const [key, v] of Object.entries(value)) {
+    const copied = cloneTreeInner(v);
+    pending ||= hasPendingCommitTs(copied);
+    out[key] = copied;
+  }
+  return markPendingTree(markNormalized(out), pending);
 }
 
 /**
@@ -460,6 +493,21 @@ export function equals(a: unknown, b: unknown): boolean {
  * @internal
  */
 export function compare(a: unknown, b: unknown): number {
+  // A pending commit timestamp is a logical transaction value, not the physical MAX_INT64 key
+  // used to seek SQLite. Give it a stable virtual position immediately before literal MAX_INT64:
+  // this preserves bigint type ordering while ensuring an equality read cannot alias the literal.
+  const aPending = isPendingCommitTs(a) || isPendingCommitTsColumn(a as never);
+  const bPending = isPendingCommitTs(b) || isPendingCommitTsColumn(b as never);
+  const maxInt64 = (1n << 63n) - 1n;
+  if (aPending) {
+    if (bPending) return 0;
+    if (b === maxInt64) return -1;
+    return compareValues(maxInt64, b as Value | undefined);
+  }
+  if (bPending) {
+    if (a === maxInt64) return 1;
+    return compareValues(a as Value | undefined, maxInt64);
+  }
   return compareValues(a as Value | undefined, b as Value | undefined);
 }
 

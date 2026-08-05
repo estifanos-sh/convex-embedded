@@ -1,4 +1,4 @@
-const VERSION = 2;
+const VERSION = 9;
 const BUFFER = "$buffer";
 const FLOAT = "$float";
 const INTEGER = "$integer";

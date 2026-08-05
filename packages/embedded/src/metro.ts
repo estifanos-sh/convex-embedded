@@ -88,6 +88,7 @@ export async function withConvexEmbedded<Config extends object>(
     convexDir: options.convexDir,
     generatedPath: options.generatedPath,
     local: options.local,
+    registerSchema: options.registerSchema,
     root,
     schemaPath: options.schemaPath,
   });

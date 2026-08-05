@@ -11,9 +11,12 @@
 import {
   createEmbeddedAuthState,
   EmbeddedClient,
+  type LocalSetupAction,
   type ConvexModules,
   type EmbeddedAuthState,
 } from "../client";
+import { localReferenceName } from "../local";
+import { localGraphHash } from "../local/internal";
 import type { ConvexEmbeddedSchema } from "../schema";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { loadWasmModule, type WasmModule, type WasmSource } from "./artifact";
@@ -27,6 +30,7 @@ import {
 } from "./lifecycle";
 import { WorkerRunner } from "./proxy";
 import type { EmbeddedWorkerSource, RuntimeIdentity } from "./protocol";
+import type { LocalModuleMap } from "../runtime/runner";
 import { browserStorageId, browserStoragePath } from "./storage";
 import { WasmStore } from "./store";
 
@@ -43,7 +47,6 @@ export type {
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,
-  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,
@@ -103,6 +106,12 @@ const localRuntimeCache = new Map<string, CachedBrowserRuntime>();
 const LOCAL_RUNTIME_IDLE_CLOSE_MS = 1_000;
 /** OPFS reclaim uses a shared 5s sub-budget, leaving the rest for WASM and store setup. */
 const BROWSER_WORKER_INIT_TIMEOUT_MS = 15_000;
+let browserLocalModules: LocalModuleMap | undefined;
+
+/** Installs the generated local registry used to reject stale setup references before a worker. */
+export function setBrowserLocalModules(modules: LocalModuleMap | undefined): void {
+  browserLocalModules = modules;
+}
 
 /**
  * Embedded Convex client for browsers.
@@ -120,51 +129,113 @@ const BROWSER_WORKER_INIT_TIMEOUT_MS = 15_000;
  * import { api } from "../convex/_generated/api";
  *
  * const client = new ConvexEmbeddedClient();
+ * await client.open();
  * const todos = await client.query(api.todos.list, {});
  * ```
  *
  * @public
  */
 export class ConvexEmbeddedClient extends EmbeddedClient {
+  private readonly setSetup: (setup: { graphHash: string; reference: string } | undefined) => void;
   /**
    * Creates a browser embedded client backed by the package-owned worker.
    *
-   * @param _options - Reserved browser client options.
+   * @param options - Browser client options.
    * @throws If Dedicated Worker support is unavailable. Worker initialization
    * may also fail asynchronously if the Vite/unplugin adapter, cross-origin
    * isolation, WASM artifact, schema, or module graph cannot be loaded.
    */
   constructor(options: ConvexEmbeddedClientOptions = {}) {
     const authState = createEmbeddedAuthState();
-    assertDedicatedWorkerSupport();
-    requestStoragePersistence();
-    const identity = createRuntimeIdentity();
+    // These are pure bundle/environment reads; ownership, worker creation, event handlers, and
+    // persistence requests are all deferred until the validated first `open()`.
+    const baseIdentity = createRuntimeIdentity();
     const storagePath = browserStoragePath();
-    const runtime = new BrowserLifecycleRunner(() =>
-      defaultBrowserRuntime(options, authState, identity, storagePath),
-    );
-    const cleanupLifecycle = installPageLifecycle(
-      () => runtime.suspend(),
-      () => void runtime.resume(),
-    );
-    let cleanupNetwork: () => void = () => undefined;
+    let browserSetup: { graphHash: string; reference: string } | undefined;
     super({
-      close: async () => {
-        cleanupLifecycle();
-        cleanupNetwork();
-        await runtime.close();
-      },
-      eagerRunner: runtime,
-      runner: runtime,
       authState,
       hosted: options.url === undefined ? undefined : { url: options.url },
-      remoteConfigured: options.url !== undefined,
+      start: async () => {
+        if (browserSetup !== undefined) await validateBrowserSetupReference(browserSetup);
+        assertDedicatedWorkerSupport();
+        requestStoragePersistence();
+        const identity: RuntimeIdentity = {
+          ...baseIdentity,
+          ...(browserSetup === undefined
+            ? {}
+            : {
+                setupGraphHash: browserSetup.graphHash,
+                setupReference: browserSetup.reference,
+              }),
+        };
+        const runtime = new BrowserLifecycleRunner(() =>
+          defaultBrowserRuntime(options, authState, identity, storagePath, browserSetup),
+        );
+        const cleanupLifecycle = installPageLifecycle(
+          () => runtime.suspend(),
+          () => void runtime.resume(),
+        );
+        const cleanupNetwork =
+          options.url === undefined
+            ? () => undefined
+            : installBrowserNetworkLifecycle(options.url, (online) => {
+                void runtime.remote.network.write(online).catch(() => undefined);
+              });
+        return {
+          close: async () => {
+            cleanupLifecycle();
+            cleanupNetwork();
+            await runtime.close();
+          },
+          eagerRunner: runtime,
+          runner: runtime,
+          authState,
+          hosted: options.url === undefined ? undefined : { url: options.url },
+          remoteConfigured: options.url !== undefined,
+        };
+      },
     });
-    if (options.url !== undefined) {
-      cleanupNetwork = installBrowserNetworkLifecycle(options.url, (online) => {
-        void runtime.remote.network.write(online).catch(() => undefined);
-      });
+    this.setSetup = (setup) => {
+      browserSetup = setup;
+    };
+  }
+
+  protected override configureOpen(setup: LocalSetupAction | undefined): void {
+    if (setup === undefined) return;
+    // `EmbeddedClient` has already checked kind, visibility, and branded identity before this
+    // hook runs, so this cannot mutate future browser configuration for a rejected call.
+    const graphHash = localGraphHash(setup)!;
+    if (graphHash !== createRuntimeIdentity().moduleGraphHash) {
+      throw new Error(
+        "Candidate setup does not match the loaded browser module graph. Import it from this application build.",
+      );
     }
+    this.setSetup({
+      graphHash,
+      reference: localReferenceName(setup)!,
+    });
+  }
+}
+
+async function validateBrowserSetupReference(
+  setup: { graphHash: string; reference: string } | undefined,
+): Promise<void> {
+  if (setup === undefined) return;
+  const separator = setup.reference.lastIndexOf(":");
+  const moduleId = separator < 0 ? "" : setup.reference.slice(0, separator);
+  const exportName = separator < 0 ? "" : setup.reference.slice(separator + 1);
+  const load = browserLocalModules?.[moduleId];
+  if (load === undefined || exportName.length === 0) {
+    throw new Error(
+      `Candidate setup ${setup.reference} is not registered in the loaded browser module graph.`,
+    );
+  }
+  const loaded = (await load()) as Record<string, unknown>;
+  const value = loaded[exportName];
+  if (localReferenceName(value) !== setup.reference || localGraphHash(value) !== setup.graphHash) {
+    throw new Error(
+      `Candidate setup ${setup.reference} does not match the loaded browser module graph.`,
+    );
   }
 }
 
@@ -173,10 +244,11 @@ function defaultBrowserRuntime(
   authState: EmbeddedAuthState,
   identity: RuntimeIdentity,
   storagePath: string,
+  setup: { graphHash: string; reference: string } | undefined,
 ): BrowserRunnerHandle {
   const remote = options.url === undefined ? undefined : { url: options.url };
   if (remote === undefined) {
-    return cachedLocalBrowserRuntime(identity, storagePath);
+    return cachedLocalBrowserRuntime(identity, storagePath, setup);
   }
   const ownership = createBrowserStorageOwnership(identity);
   const runner = new WorkerRunner(defaultRuntimeWorker(), {
@@ -187,6 +259,7 @@ function defaultBrowserRuntime(
     remoteAuth: async (args) => (await authState.fetchToken?.(args)) ?? null,
     storagePath,
     storageOwner: ownership.initial,
+    setup,
   });
   let stopTemporaryStorage: (() => void) | undefined;
   stopTemporaryStorage = runner.subscribeEvents((event) => {
@@ -331,8 +404,9 @@ export function createBrowserStorageOwnership(
 function cachedLocalBrowserRuntime(
   identity: RuntimeIdentity,
   storagePath: string,
+  setup: { graphHash: string; reference: string } | undefined,
 ): BrowserRunnerHandle {
-  const key = localRuntimeCacheKey(identity, storagePath);
+  const key = localRuntimeCacheKey(identity, storagePath, setup);
   let cached = localRuntimeCache.get(key);
   if (!cached) {
     const ownership = createBrowserStorageOwnership(identity);
@@ -342,6 +416,7 @@ function cachedLocalBrowserRuntime(
       onDispose: () => ownership.close(),
       storagePath,
       storageOwner: ownership.initial,
+      setup,
     });
     let stopTemporaryStorage: (() => void) | undefined;
     stopTemporaryStorage = runner.subscribeEvents((event) => {
@@ -414,7 +489,11 @@ function cachedLocalBrowserRuntime(
   };
 }
 
-function localRuntimeCacheKey(identity: RuntimeIdentity, storagePath: string): string {
+function localRuntimeCacheKey(
+  identity: RuntimeIdentity,
+  storagePath: string,
+  setup: { graphHash: string; reference: string } | undefined,
+): string {
   return [
     identity.schemaHash,
     identity.moduleGraphHash,
@@ -423,6 +502,8 @@ function localRuntimeCacheKey(identity: RuntimeIdentity, storagePath: string): s
     identity.storageId,
     identity.wasmAbiVersion,
     storagePath,
+    setup?.reference ?? "",
+    setup?.graphHash ?? "",
   ].join("|");
 }
 

@@ -68,6 +68,7 @@ export async function installEmbeddedPage(
       };
       const { ConvexEmbeddedClient } = await import(browserUrl);
       const client = new ConvexEmbeddedClient();
+      await client.open();
       const errors: string[] = [];
       const updates: Array<Array<{ text: string }>> = [];
       let observedData = false;
@@ -145,6 +146,7 @@ export async function installMetalDevicePage(
       type BrowserClient = {
         close(): Promise<void>;
         connectionState(): { local: string; remote: string };
+        open(): Promise<void>;
         mutation(name: string, args: Record<string, unknown>): Promise<unknown>;
         query(name: string, args: Record<string, unknown>): Promise<unknown>;
         __devtoolsRuntime?(
@@ -477,6 +479,7 @@ export async function installMetalDevicePage(
           const summary = summarizeEvent(event);
           pushEvent(summary);
         });
+        await created.open();
         startWatch();
         const initialRows = await rows();
         return {
@@ -759,6 +762,7 @@ export async function installBrowserRemoteBenchPage(
       localStorage.setItem("convex-embedded.storageId", storageId);
       const { ConvexEmbeddedClient } = await import(browserUrl);
       const client = new ConvexEmbeddedClient({ url: remoteUrl });
+      await client.open();
       type Summary = { _id: string; title: string; updatedAt: number };
       type Document = { _id: string; body: string; title: string };
       type Tick = BrowserRemoteTickEvidence;
@@ -1053,6 +1057,7 @@ export async function installBrowserScalePage(
       localStorage.setItem("convex-embedded.storageId", storageId);
       const { ConvexEmbeddedClient } = await import(browserUrl);
       const client = new ConvexEmbeddedClient();
+      await client.open();
       const waiters = new Set<() => void>();
       let latestTitles: string[] = [];
       let updateCount = 0;
@@ -1232,6 +1237,7 @@ export async function installBrowserBenchPage(
           });
         }
       });
+      await client.open();
       const formatError = (error: unknown) =>
         error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       let devtoolsMountError: string | undefined;

@@ -409,18 +409,26 @@ fn encode_crdt_read_witness(witness: &CrdtReadWitness) -> Value {
 }
 
 fn encode_read_equality(equality: &ReadEquality) -> RemoteResult<Value> {
-    Ok(Value::Object(BTreeMap::from([
+    let mut fields = BTreeMap::from([
         ("field".to_owned(), Value::String(equality.field.clone())),
         ("value".to_owned(), json_to_convex(equality.value.clone())?),
-    ])))
+    ]);
+    if equality.commit_ts {
+        fields.insert("commitTs".to_owned(), Value::Boolean(true));
+    }
+    Ok(Value::Object(fields))
 }
 
 fn encode_bound(bound: &ReadBound) -> RemoteResult<Value> {
-    Ok(Value::Object(BTreeMap::from([
+    let mut fields = BTreeMap::from([
         ("value".to_owned(), json_to_convex(bound.value.clone())?),
         ("field".to_owned(), Value::String(bound.field.clone())),
         ("inclusive".to_owned(), Value::Boolean(bound.inclusive)),
-    ])))
+    ]);
+    if bound.commit_ts {
+        fields.insert("commitTs".to_owned(), Value::Boolean(true));
+    }
+    Ok(Value::Object(fields))
 }
 
 fn encode_crdt_effect(effect: &CrdtEffect) -> RemoteResult<Value> {
@@ -809,20 +817,26 @@ fn decode_crdt_read_witness(value: &serde_json::Value) -> RemoteResult<CrdtReadW
 
 fn decode_read_equality(value: &serde_json::Value) -> RemoteResult<ReadEquality> {
     let fields = json_object(value, "read equality")?;
-    exact_json_fields(fields, &["field", "value"], &[], "read equality")?;
+    exact_json_fields(fields, &["field", "value"], &["commitTs"], "read equality")?;
     Ok(ReadEquality {
         field: json_string(fields, "field")?,
         value: fields
             .get("value")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        commit_ts: optional_true(fields, "commitTs", "read equality")?,
     })
 }
 
 fn decode_bound(value: Option<&serde_json::Value>) -> RemoteResult<Option<ReadBound>> {
     let Some(value) = value else { return Ok(None) };
     let fields = json_object(value, "read bound")?;
-    exact_json_fields(fields, &["field", "value", "inclusive"], &[], "read bound")?;
+    exact_json_fields(
+        fields,
+        &["field", "value", "inclusive"],
+        &["commitTs"],
+        "read bound",
+    )?;
     Ok(Some(ReadBound {
         field: json_string(fields, "field")?,
         value: fields
@@ -833,7 +847,22 @@ fn decode_bound(value: Option<&serde_json::Value>) -> RemoteResult<Option<ReadBo
             .get("inclusive")
             .and_then(serde_json::Value::as_bool)
             .ok_or_else(|| RemoteError::Protocol("read bound missing inclusive".to_owned()))?,
+        commit_ts: optional_true(fields, "commitTs", "read bound")?,
     }))
+}
+
+fn optional_true(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> RemoteResult<bool> {
+    match fields.get(field) {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(true)) => Ok(true),
+        Some(_) => Err(RemoteError::Protocol(format!(
+            "{context} {field} must be a boolean"
+        ))),
+    }
 }
 
 fn decode_crdt_effect(value: &serde_json::Value) -> RemoteResult<CrdtEffect> {
@@ -1228,7 +1257,10 @@ fn json_to_convex(value: serde_json::Value) -> RemoteResult<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_envelope, RemoteError};
+    use convex::Value;
+    use storage::BaseVersion;
+
+    use super::{decode_envelope, mutation_args, RemoteError};
 
     fn envelope_with_after_images(after_images: &serde_json::Value) -> String {
         serde_json::json!({
@@ -1283,5 +1315,57 @@ mod tests {
         let json = envelope_with_after_images(&serde_json::json!(7));
         let error = decode_envelope(&json).unwrap_err();
         assert!(matches!(error, RemoteError::Protocol(_)), "{error:?}");
+    }
+
+    #[test]
+    fn commit_timestamp_witness_flag_round_trips_as_ordinary_convex_values() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&envelope_with_after_images(&serde_json::json!([]))).unwrap();
+        value["reads"] = serde_json::json!([{
+            "kind": "range",
+            "table": "issues",
+            "index": "by_stamp",
+            "equality": [{
+                "field": "stamp",
+                "value": { "$integer": "/////////38=" },
+                "commitTs": true,
+            }],
+            "lower": {
+                "field": "stamp",
+                "value": { "$integer": "/////////38=" },
+                "inclusive": true,
+                "commitTs": true,
+            },
+            "order": "asc",
+            "membersHash": "members",
+            "members": [],
+            "memberHashes": [],
+        }]);
+
+        let envelope = decode_envelope(&value.to_string()).unwrap();
+        let BaseVersion::Range(range) = &envelope.read_set[0] else {
+            panic!("expected range witness");
+        };
+        assert!(range.equality[0].commit_ts);
+        assert!(range.lower.as_ref().unwrap().commit_ts);
+
+        let encoded = mutation_args(&envelope, "client", None).unwrap();
+        let Value::Object(request) = &encoded["request"] else {
+            panic!("request must be an object");
+        };
+        let Value::Array(reads) = &request["reads"] else {
+            panic!("reads must be an array");
+        };
+        let Value::Object(range) = &reads[0] else {
+            panic!("range must be an object");
+        };
+        let Value::Array(equality) = &range["equality"] else {
+            panic!("equality must be an array");
+        };
+        let Value::Object(equality) = &equality[0] else {
+            panic!("equality must be an object");
+        };
+        assert_eq!(equality["commitTs"], Value::Boolean(true));
+        assert_eq!(equality["value"], Value::Int64(i64::MAX));
     }
 }

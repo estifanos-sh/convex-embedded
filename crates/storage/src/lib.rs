@@ -49,6 +49,8 @@ pub(crate) fn log_open_phase(_phase: &str, _start: std::time::Instant) {}
 pub use error::StorageError;
 pub use sql::{DEFAULT_READ_PAGE, READ_CAP};
 pub use store::EmbeddedStore;
+#[cfg(any(test, feature = "testkit"))]
+pub use types::{origin_adapter_applies_debug, origin_codec_manifest_debug};
 pub use types::{
     ArchivedRev, ArgRef, AuthoritativeApplyResult, AuthoritativeChange, AuthoritativeRow,
     BaseVersion, Bound, ColValue, ColumnDef, CommitChanges, CommitMutation, CommitOptions,
@@ -57,12 +59,11 @@ pub use types::{
     CrdtRemoteEffect, CrdtRemoteState, CrdtRemoteWrite, CrdtRestore, CrdtSnapshot, CrdtWireOp,
     DeleteIn, DeleteResult, DirtyHeadDebug, DirtyHeadToken, DocWrite, FileMetadata, FileStore,
     IdMapping, IdMappingContent, IndexDef, InsertRef, LocalFieldDef, LocalFieldDelete,
-    LocalFieldWrite, MembershipRange, MigrationCandidate, MigrationDefinition,
-    MigrationDisposition, MigrationProgress, MigrationRecordTarget, MutationCall, MutationRecord,
-    MutationStatus, Order, OriginCursor, OriginKind, OriginPage, OriginRecord, Page, PendingUpload,
-    PushEnvelope, PushOutcome, PushResponse, RangeVersion, ReadBound, ReadEquality, ReadSpec,
-    RemoteBlob, RemoteCrdtChange, RemoteIdMapping, RemoteMember, RemotePageWrite,
-    RemotePageWriteResult, RemotePending, RemoteRowTarget, RemoteScheduleMapping,
+    LocalFieldWrite, MembershipRange, MigrationCandidate, MigrationStep, MutationCall,
+    MutationRecord, MutationStatus, Order, OriginCursor, OriginKind, OriginPage, OriginRecord,
+    Page, PendingUpload, PushEnvelope, PushOutcome, PushResponse, RangeVersion, ReadBound,
+    ReadEquality, ReadSpec, RemoteBlob, RemoteCrdtChange, RemoteIdMapping, RemoteMember,
+    RemotePageWrite, RemotePageWriteResult, RemotePending, RemoteRowTarget, RemoteScheduleMapping,
     RemoteSettlementOutcome, RemoteSettlementWrite, RemoteSettlementWriteResult, ResultEntry,
     RetainedRevision, RevFrontier, RevKey, RevLifecycle, RevState, RevWriteResult,
     RevisionCandidate, RevisionCheckpoint, RevisionCheckpointOperation, RevisionContent, RowChange,

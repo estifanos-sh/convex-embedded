@@ -3,6 +3,7 @@ import type { EmbeddedEventListener } from "../events";
 import type { RuntimeStorageWriter, ScheduledJob } from "../storage/types";
 import { getTimerTime } from "../time";
 import { decode, encode, normalizeCopy } from "./codec";
+import { assertNoPendingCommitTs } from "./pending";
 import { createId } from "./doc";
 import { emitSchedulerUpsert } from "./emit";
 import type { FunctionReference } from "./functions";
@@ -30,6 +31,12 @@ type SchedulerTimer = ReturnType<typeof setTimeout> & { unref?(): void };
 
 const MAX_SCHEDULER_TIMER_MS = 2_147_483_647;
 const SCHEDULER_RETRY_MS = 1_000;
+
+function scheduleArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const normalized = normalizeCopy(args) as Record<string, unknown>;
+  assertNoPendingCommitTs(normalized, "scheduled function arguments");
+  return normalized;
+}
 
 export function createSchedulerService(
   store: RuntimeStorageWriter,
@@ -66,7 +73,7 @@ export function createSchedulerService(
       jobId: createId("_scheduled_functions"),
       kind,
       name: functionName(ref),
-      args: encode(normalizeCopy(args)),
+      args: encode(scheduleArgs(args)),
       dueTime: absolute ? delayOrTime : now + delayOrTime,
       state: "pending",
       createdTime: now,

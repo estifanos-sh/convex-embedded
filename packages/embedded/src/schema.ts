@@ -287,6 +287,7 @@ export function defineEmbeddedSchema<Tables extends GenericSchema>(
  * ```ts
  * // `schema` is your app's Convex schema definition
  * const client = new ConvexEmbeddedClient({ schema, modules, path: "local.db" });
+ * await client.open();
  * ```
  *
  * @public
@@ -418,10 +419,10 @@ function sourceTables(schema: AnalyzableSchema): GenericSchema {
   return meta?.tables ?? schema.tables;
 }
 
-export function hasEmbeddedSchemaMeta(schema: AnalyzableSchema): boolean {
+export function hasEmbeddedSchemaMeta(schema: unknown): schema is ConvexEmbeddedSchema {
+  if (typeof schema !== "object" || schema === null) return false;
   return (
-    (schema as unknown as { [EMBEDDED_SCHEMA]?: EmbeddedSchemaRuntimeMeta })[EMBEDDED_SCHEMA] !==
-    undefined
+    (schema as { [EMBEDDED_SCHEMA]?: EmbeddedSchemaRuntimeMeta })[EMBEDDED_SCHEMA] !== undefined
   );
 }
 

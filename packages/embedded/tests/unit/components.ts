@@ -5,6 +5,7 @@ import {
   mutationReplayMatches,
   mutationReplaySettlement,
 } from "../../src/component/compatibility";
+import { isAcknowledged } from "../../src/component/settlement";
 import { namespaceBatch } from "../../src/runtime/components";
 import type { ScheduledJob, WriteBatch } from "../../src/storage/types";
 
@@ -172,5 +173,17 @@ describe("mutationReplaySettlement", () => {
       ...settlement,
       outcome: "conflict",
     });
+  });
+});
+
+describe("settlement acknowledgement", () => {
+  test("uses an exact acknowledged row rather than the legacy client high-water mark", () => {
+    const legacyClient = { retired: false, acknowledgedThrough: Number.MAX_SAFE_INTEGER };
+    expect(isAcknowledged({ clientId: "device", acknowledgedAt: undefined }, legacyClient)).toBe(
+      false,
+    );
+    expect(isAcknowledged({ clientId: "device", acknowledgedAt: 1n }, { retired: false })).toBe(
+      true,
+    );
   });
 });

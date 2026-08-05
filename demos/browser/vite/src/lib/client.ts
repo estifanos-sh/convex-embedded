@@ -17,7 +17,7 @@ declare global {
 }
 
 // The demo is unreleased: protocol changes select a fresh store instead of replaying stale work.
-const DEMO_STORAGE_ID = "document-demo-p21";
+const DEMO_STORAGE_ID = "document-demo-p22";
 const remoteUrl = __CONVEX_EMBEDDED_CONVEX_URL__.trim();
 if (!remoteUrl) {
   throw new Error(
@@ -40,6 +40,9 @@ try {
 export const client =
   globalThis.__convexEmbeddedDemoClient ??
   (globalThis.__convexEmbeddedDemoClient = new ConvexEmbeddedClient({ url: remoteUrl }));
+
+/** Await before rendering consumers that issue queries. */
+export const clientReady = client.open();
 
 export function subscribeBrowserDebug(listener: (event: BrowserDebugEvent) => void): () => void {
   const handler = (event: Event) => listener((event as CustomEvent<BrowserDebugEvent>).detail);

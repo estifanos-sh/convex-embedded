@@ -104,6 +104,7 @@ export class RuntimeIdentityMismatchError extends Error {
 function identityFieldLabel(field: keyof RuntimeIdentity): string {
   if (field === "moduleGraphHash") return "app code";
   if (field === "schemaHash") return "schema";
+  if (field === "setupGraphHash" || field === "setupReference") return "setup action";
   if (field === "packageVersion") return "package";
   if (field === "protocolVersion") return "protocol";
   if (field === "wasmAbiVersion") return "WASM runtime";

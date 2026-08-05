@@ -196,6 +196,7 @@ function indeterminateOperationError(request: WorkerRequest): Error {
 function isOwnershipReplaySafe(request: WorkerRequest): boolean {
   switch (request.op) {
     case WorkerCommand.Query:
+    case WorkerCommand.Action:
     case WorkerCommand.Mutation:
     case WorkerCommand.WatchStart:
     case WorkerCommand.WatchStop:

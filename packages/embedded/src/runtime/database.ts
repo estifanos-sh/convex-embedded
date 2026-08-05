@@ -42,6 +42,7 @@ import {
   type StagedDoc,
   tableFromId,
 } from "./doc";
+import { assertNoPendingCommitTs, commitTsPlaceholder, hasPendingCommitTs } from "./pending";
 
 /**
  * Runtime lookup map for storage table definitions.
@@ -84,6 +85,8 @@ export interface DatabaseReader<DM extends GenericDataModel> {
  * @internal
  */
 export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseReader<DM> {
+  /** Values assigned atomically by the durable transaction. */
+  vars: { readonly commitTs: import("convex/values").CommitTsPlaceholder };
   count: {
     add<T extends TableNamesInDataModel<DM>>(
       table: T,
@@ -372,7 +375,13 @@ export function createWriter<DM extends GenericDataModel>(
   const idMappings: IdMapping[] = [];
   const localFieldWrites = new Map<
     string,
-    { table: string; id: string; field: string; value: unknown }
+    {
+      table: string;
+      id: string;
+      field: string;
+      value: unknown;
+      pendingCommitTs?: true;
+    }
   >();
   const localFieldDeletes = new Map<string, { table: string; id: string; field: string }>();
   const deviceViewsByTable = new Map<string, Map<string, RawDoc>>();
@@ -380,6 +389,8 @@ export function createWriter<DM extends GenericDataModel>(
     string,
     { table: string; rowId: string; deleted: boolean; value?: Record<string, unknown> }
   >();
+  // Updated at each staging transition so the ordinary commit path never rescans payload trees.
+  let pendingCommitTsCount = 0;
 
   const tableUpserts = (
     table: string,
@@ -413,6 +424,9 @@ export function createWriter<DM extends GenericDataModel>(
     deletesByTable.get(def.name)?.delete(id);
     const docWrites = tableUpserts(def.name);
     const previous = docWrites.get(id);
+    const pendingCommitTs = hasPendingCommitTs(data);
+    if (previous?.input.pendingCommitTs === true) pendingCommitTsCount -= 1;
+    if (pendingCommitTs) pendingCommitTsCount += 1;
     docWrites.set(id, {
       crdtOnly: options.crdtOnly === true && previous?.crdtOnly !== false,
       dataOnly: options.dataOnly === true,
@@ -422,6 +436,7 @@ export function createWriter<DM extends GenericDataModel>(
         data,
         cols: options.cols ?? (options.dataOnly === true ? [] : extractColEntries(def, data)),
         creationTime,
+        ...(pendingCommitTs ? { pendingCommitTs: true } : {}),
       },
       doc: { _id: id, _creationTime: creationTime, data },
     });
@@ -468,6 +483,7 @@ export function createWriter<DM extends GenericDataModel>(
   });
 
   const db: DatabaseWriter<DM> = {
+    vars: { commitTs: commitTsPlaceholder },
     count: {
       async add(
         table: TableNamesInDataModel<DM>,
@@ -579,11 +595,21 @@ export function createWriter<DM extends GenericDataModel>(
           if (!local.has(field)) continue;
           const key = `${table}\u0000${id}\u0000${field}`;
           if (value === undefined) {
+            if (localFieldWrites.get(key)?.pendingCommitTs === true) pendingCommitTsCount -= 1;
             localFieldWrites.delete(key);
             localFieldDeletes.set(key, { table, id, field });
           } else {
             localFieldDeletes.delete(key);
-            localFieldWrites.set(key, { table, id, field, value: cloneTree(value) });
+            const pendingCommitTs = hasPendingCommitTs(value);
+            if (localFieldWrites.get(key)?.pendingCommitTs === true) pendingCommitTsCount -= 1;
+            if (pendingCommitTs) pendingCommitTsCount += 1;
+            localFieldWrites.set(key, {
+              table,
+              id,
+              field,
+              value: cloneTree(value),
+              ...(pendingCommitTs ? { pendingCommitTs: true } : {}),
+            });
           }
         }
         const next = { ...current, ...partial };
@@ -655,6 +681,7 @@ export function createWriter<DM extends GenericDataModel>(
         if (tableFromId(id) !== table) throw new Error(`set.add: id is not in ${table}`);
         const def = tableDef(schema, table);
         assertCrdtField(def, field, "set");
+        assertNoPendingCommitTs(value, "CRDT set values");
         const current = await read(id);
         const next = [...validateSetField("set.add", table, id, field, current)];
         if (!next.some((member) => equals(member, value))) next.push(cloneTree(value));
@@ -674,6 +701,7 @@ export function createWriter<DM extends GenericDataModel>(
         if (tableFromId(id) !== table) throw new Error(`set.delete: id is not in ${table}`);
         const def = tableDef(schema, table);
         assertCrdtField(def, field, "set");
+        assertNoPendingCommitTs(value, "CRDT set values");
         const current = await read(id);
         const next = validateSetField("set.delete", table, id, field, current).filter(
           (member) => !equals(member, value),
@@ -735,6 +763,8 @@ export function createWriter<DM extends GenericDataModel>(
           ? existingMapping.convexId
           : undefined;
       const restore = revisionRestores.get(`${table}\u0000${id}`);
+      const deletedWrite = docWritesByTable.get(table)?.get(id);
+      if (deletedWrite?.input.pendingCommitTs === true) pendingCommitTsCount -= 1;
       docWritesByTable.get(table)?.delete(id);
       tableDeletes(table).add(id);
       for (let index = crdtOps.length - 1; index >= 0; index -= 1) {
@@ -809,6 +839,7 @@ export function createWriter<DM extends GenericDataModel>(
       localFieldDeletes: [...localFieldDeletes.values()],
       localFieldWrites: [...localFieldWrites.values()],
       docWrites,
+      ...(pendingCommitTsCount > 0 ? { pendingCommitTs: true } : {}),
     };
   };
 
@@ -828,6 +859,9 @@ export function createWriter<DM extends GenericDataModel>(
     if (!entries || entries.size !== 1) return undefined;
     const entry = [...entries.values()][0];
     if (!entry) return undefined;
+    // The encoded shortcut has no typed pending-column representation. Preserve it for the
+    // common path, but route commit timestamps through the generic transaction allocator.
+    if (entry.input.pendingCommitTs === true) return undefined;
     const fresh =
       freshIds.length === 0
         ? false
@@ -855,6 +889,7 @@ export function createWriter<DM extends GenericDataModel>(
     deviceViews: new Map([...deviceViewsByTable].map(([table, docs]) => [table, new Map(docs)])),
     revisionRestores: new Map(revisionRestores),
     docWrites: new Map([...docWritesByTable].map(([table, map]) => [table, new Map(map)])),
+    pendingCommitTsCount,
   });
 
   const restore = (snapshot: WriterSnapshot): void => {
@@ -882,6 +917,7 @@ export function createWriter<DM extends GenericDataModel>(
     for (const [key, expectation] of snapshot.revisionRestores) {
       revisionRestores.set(key, expectation);
     }
+    pendingCommitTsCount = snapshot.pendingCommitTsCount;
   };
 
   const revisionRestore = (expectation: {
@@ -966,7 +1002,17 @@ export interface WriterSnapshot {
   freshIds: DeleteIn[];
   idMappings: IdMapping[];
   localFieldDeletes: Map<string, { table: string; id: string; field: string }>;
-  localFieldWrites: Map<string, { table: string; id: string; field: string; value: unknown }>;
+  localFieldWrites: Map<
+    string,
+    {
+      table: string;
+      id: string;
+      field: string;
+      value: unknown;
+      pendingCommitTs?: true;
+    }
+  >;
+  pendingCommitTsCount: number;
   deviceViews: Map<string, Map<string, RawDoc>>;
   revisionRestores: Map<
     string,

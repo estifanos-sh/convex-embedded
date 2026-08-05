@@ -10,8 +10,7 @@ use storage::{
 fn schema() -> StoreSchema {
     StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "vals".into(),
             placement: TablePlacement::Replicated,
@@ -58,6 +57,8 @@ fn batch_from(store: &EmbeddedStore, rows: usize, start: usize) -> WriteBatch {
         deletes: vec![],
         fresh_ids: vec![],
         data_only_ids: vec![],
+        commit_ts_doc_writes: vec![],
+        commit_ts_local_field_writes: vec![],
         id_mappings: vec![],
         schedules: vec![],
     }
@@ -109,6 +110,8 @@ fn rewrite_batch(store: &EmbeddedStore, value: usize, data_only: bool) -> WriteB
         } else {
             vec![]
         },
+        commit_ts_doc_writes: vec![],
+        commit_ts_local_field_writes: vec![],
         id_mappings: vec![],
         schedules: vec![],
     }

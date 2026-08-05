@@ -15,6 +15,7 @@ import {
   DEFAULT_READ_PAGE,
   type Bound,
   type ColValue,
+  PENDING_COMMIT_TS,
   type RuntimeStorageReader,
   type TableDef,
 } from "../storage/types";
@@ -23,6 +24,7 @@ import type { ReadAuthority } from "./cache";
 import { compare as compareConvex, equals as equalsConvex, freezeNormalizedTree } from "./codec";
 import type { Doc } from "./model";
 import { compileFieldPath, readFieldPath, type RawDoc } from "./doc";
+import { isPendingCommitTs } from "./pending";
 
 /**
  * One index-range bound on the wire. `value` is a Convex value serialized as JSON, matching the
@@ -34,11 +36,15 @@ export interface ReadBound {
   field: string;
   value: JSONValue;
   inclusive: boolean;
+  /** Rebind `value` to hosted `ctx.db.vars.commitTs`; `value` is only its physical local key. */
+  commitTs?: true;
 }
 
 export interface ReadEquality {
   field: string;
   value: JSONValue;
+  /** Distinguishes a logical commit timestamp from a literal maximum int64. */
+  commitTs?: true;
 }
 
 /**
@@ -613,6 +619,7 @@ export class QueryBuilder<
     bounds: Bound[] | undefined = this.buildBounds(),
   ): AsyncGenerator<readonly RawDoc[], void, undefined> {
     const resumeAfterKey = after?.map((value) => value as ColValue);
+    const hasPendingBound = boundsHavePendingCommitTs(bounds);
     let cursor: string | undefined;
     let pageSize = firstPage;
     while (true) {
@@ -627,7 +634,10 @@ export class QueryBuilder<
       });
       for (const doc of page.docs) this.tracker?.doc?.(doc._id);
       this.tracker?.authority?.readRange(this.indexName !== undefined);
-      await this.captureRange(bounds, page.docs, page.versions);
+      const witnessed = hasPendingBound
+        ? page.docs.filter((doc) => this.matchesBounds(doc))
+        : page.docs;
+      await this.captureRange(bounds, witnessed, page.versions);
       const docs = this.deviceDocs(page.docs, page.deviceFields);
       if (docs.length) yield docs;
       if (page.cursor === null) return;
@@ -763,6 +773,14 @@ export class QueryBuilder<
 
   private wireBound(field: string, value: ColValue, inclusive: boolean): ReadBound | undefined {
     if (value === undefined) return undefined;
+    if (value === PENDING_COMMIT_TS) {
+      return {
+        field,
+        value: convexToJson(((1n << 63n) - 1n) as Value),
+        inclusive,
+        commitTs: true,
+      };
+    }
     return { field, value: convexToJson(value as Value), inclusive };
   }
 
@@ -784,7 +802,15 @@ export class QueryBuilder<
     for (let index = 0; index < (bounds?.length ?? 0); index += 1) {
       const bound = bounds![index]!;
       if (bound.kind !== "eq") break;
-      range.equality.push({ field: fields[index]!, value: convexToJson(bound.value as Value) });
+      range.equality.push(
+        bound.value === PENDING_COMMIT_TS
+          ? {
+              field: fields[index]!,
+              value: convexToJson(((1n << 63n) - 1n) as Value),
+              commitTs: true,
+            }
+          : { field: fields[index]!, value: convexToJson(bound.value as Value) },
+      );
     }
     const last = bounds?.[bounds.length - 1];
     if (last?.kind === "range") {
@@ -954,9 +980,23 @@ function boundsAreExact(bounds: Bound[] | undefined): boolean {
   // `matchesBounds`). The endpoint was set iff its inclusivity flag is present.
   return !bounds?.some(
     (bound) =>
-      bound.kind === "range" &&
-      ((bound.lower === undefined && bound.lowerInclusive !== undefined) ||
-        (bound.upper === undefined && bound.upperInclusive !== undefined)),
+      (bound.kind === "eq" && bound.value === PENDING_COMMIT_TS) ||
+      (bound.kind === "range" &&
+        (bound.lower === PENDING_COMMIT_TS ||
+          bound.upper === PENDING_COMMIT_TS ||
+          (bound.lower === undefined && bound.lowerInclusive !== undefined) ||
+          (bound.upper === undefined && bound.upperInclusive !== undefined))),
+  );
+}
+
+function boundsHavePendingCommitTs(bounds: Bound[] | undefined): boolean {
+  return (
+    bounds?.some(
+      (bound) =>
+        (bound.kind === "eq" && bound.value === PENDING_COMMIT_TS) ||
+        (bound.kind === "range" &&
+          (bound.lower === PENDING_COMMIT_TS || bound.upper === PENDING_COMMIT_TS)),
+    ) === true
   );
 }
 
@@ -1210,6 +1250,7 @@ function asBoolean(value: unknown): boolean {
 }
 
 function toColValue(value: unknown): ColValue {
+  if (isPendingCommitTs(value)) return PENDING_COMMIT_TS;
   // `undefined` is a valid bound — `q.eq("field", undefined)` queries documents missing that
   // field (Convex orders a missing field as `undefined`). `null`, NaN, ±Infinity and -0 are
   // valid too. Composite values cannot be bound.

@@ -562,6 +562,8 @@ fn seeded_vals(rows: usize) -> EmbeddedStore {
                 deletes: vec![],
                 fresh_ids: vec![],
                 data_only_ids: vec![],
+                commit_ts_doc_writes: vec![],
+                commit_ts_local_field_writes: vec![],
                 id_mappings: vec![],
                 schedules: vec![],
             },

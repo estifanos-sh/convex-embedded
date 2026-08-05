@@ -9,12 +9,16 @@ pub struct ReadBound {
     pub field: String,
     pub value: JsonValue,
     pub inclusive: bool,
+    /// Rebind the physical value to hosted `db.vars.commitTs` before executing the range.
+    pub commit_ts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadEquality {
     pub field: String,
     pub value: JsonValue,
+    /// Distinguishes the logical timestamp marker from a literal maximum `i64`.
+    pub commit_ts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +389,8 @@ pub struct CommitPush {
     pub mutation_id: String,
     pub json: String,
     pub now_ms: i64,
+    /// Resolve markers only under `afterImages[].value`, preserving the logical replay envelope.
+    pub after_images_commit_ts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +414,11 @@ pub struct CommitOptions {
     pub mutation: CommitMutation,
     pub push: Option<CommitPush>,
     pub changes: CommitChanges,
+    /// Request transaction-local allocation and substitution of `db.vars.commitTs`.
+    /// The floor is store-global rather than identity or generation scoped.
+    pub commit_ts: bool,
+    /// Resolve the encoded terminal/existing result; omitted results pay no JSON parse.
+    pub mutation_result_commit_ts: bool,
 }
 
 impl Default for CommitOptions {
@@ -417,6 +428,8 @@ impl Default for CommitOptions {
             mutation: CommitMutation::None,
             push: None,
             changes: CommitChanges::Include,
+            commit_ts: false,
+            mutation_result_commit_ts: false,
         }
     }
 }
@@ -447,6 +460,7 @@ impl CommitOptions {
                 mutation_id: mutation_id.clone(),
                 json,
                 now_ms,
+                after_images_commit_ts: false,
             }),
             _ => return None,
         };
@@ -490,6 +504,8 @@ impl CommitOptions {
             } else {
                 CommitChanges::Omit
             },
+            commit_ts: false,
+            mutation_result_commit_ts: false,
         })
     }
 
@@ -592,6 +608,8 @@ impl CommitOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitResult {
     pub commit_seq: i64,
+    /// Allocated only for a transaction which requested `commit_ts`.
+    pub commit_ts: Option<i64>,
     pub changed_tables: Vec<String>,
     pub changes: Vec<RowChange>,
     /// CRDT-field edits this local commit produced, each carrying the Loro update delta the driver

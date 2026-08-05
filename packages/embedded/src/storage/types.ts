@@ -8,7 +8,19 @@ import type { EmbeddedCrdtMeta } from "../meta";
  *
  * @internal
  */
-export type ColValue = string | number | bigint | boolean | null | undefined;
+/** A transient indexed value which must be substituted by the storage transaction. @internal */
+export interface PendingCommitTs {
+  readonly kind: "commitTs";
+}
+
+/** The typed marker is never persisted as a durable column value. @internal */
+export const PENDING_COMMIT_TS: PendingCommitTs = Object.freeze({ kind: "commitTs" });
+
+export function isPendingCommitTsColumn(value: ColValue): value is PendingCommitTs {
+  return typeof value === "object" && value !== null && value.kind === "commitTs";
+}
+
+export type ColValue = string | number | bigint | boolean | null | undefined | PendingCommitTs;
 
 /**
  * Ordered extracted column entries. Runtime writes use this shape so the native binding can marshal
@@ -92,14 +104,8 @@ export interface LocalFieldDef {
  */
 export interface StoreSchema {
   hash: string;
-  migrations?: MigrationDefinition[];
-  migrationCodeHash?: string;
+  setupHash?: string;
   tables: TableDef[];
-}
-
-export interface MigrationDefinition {
-  id: string;
-  definitionHash: string;
 }
 
 /**
@@ -125,6 +131,8 @@ export interface DocWrite {
   data: StoredDocData;
   cols: ColValues;
   creationTime: number;
+  /** The encoded payload/columns contain a transaction-local commit timestamp marker. */
+  pendingCommitTs?: true;
 }
 
 /**
@@ -175,6 +183,8 @@ export interface WriteBatch {
   idMappings?: IdMapping[];
   /** Local-only schedule rows folded into the mutation's commit transaction for crash atomicity. */
   schedules?: ScheduledJob[];
+  /** Set during normalization; lets the durable layer avoid an unused-path parse or walk. */
+  pendingCommitTs?: boolean;
 }
 
 export interface LocalFieldWrite {
@@ -182,6 +192,8 @@ export interface LocalFieldWrite {
   id: string;
   field: string;
   value: unknown;
+  /** The encoded field value contains a transaction-local commit timestamp marker. */
+  pendingCommitTs?: true;
 }
 
 export interface LocalFieldDelete {
@@ -201,8 +213,21 @@ export interface CrdtRestore extends CrdtSnapshot {
  * @internal
  */
 type CommitChanges = { changes: "include" | "omit" };
+type CommitTimestampOption = {
+  commitTs?: boolean;
+  /** Only the encoded mutation result needs timestamp substitution. */
+  mutationResultCommitTs?: true;
+};
+
+type CommitPush = {
+  json: string;
+  nowMs: number;
+  /** Only `afterImages[].value` contains timestamp markers; other envelope values stay logical. */
+  afterImagesCommitTs?: true;
+};
 
 export type CommitOptions = CommitChanges &
+  CommitTimestampOption &
   (
     | { source: "remote" }
     | { source: "device" }
@@ -211,7 +236,7 @@ export type CommitOptions = CommitChanges &
         source: "local";
         mutation: "push";
         mutationId: string;
-        push: { json: string; nowMs: number };
+        push: CommitPush;
       }
     | {
         source: "local";
@@ -227,7 +252,7 @@ export type CommitOptions = CommitChanges &
         mutationArgs: string;
         mutationResult: string;
         mutationIsFresh: boolean;
-        push?: { json: string; nowMs: number };
+        push?: CommitPush;
       }
   );
 
@@ -285,6 +310,8 @@ export interface CommitResult {
   changedTables: string[];
   changes: StorageRowChange[];
   commitSeq: number;
+  /** Decimal-safe int64 returned only when this transaction allocated `db.vars.commitTs`. */
+  commitTs?: bigint;
   /** CRDT-field edits this commit produced; `update` is base64 Loro bytes carried on the one push. */
   crdtOps?: CommitCrdtWireOp[];
 }
@@ -651,26 +678,6 @@ export interface LedgerSurface {
    * are never touched. Future replication calls this with its delivered watermark.
    */
   delete(upToSeq: number): Promise<DeleteResult>;
-  quarantine?: {
-    read(options?: { cursor?: string; pageSize?: number }): Promise<QuarantinePage>;
-  };
-}
-
-/** Raw retained record returned only through an explicit local quarantine export. @internal */
-export interface QuarantineRecord {
-  codec: number;
-  identityKey: string;
-  kind: number;
-  migrationId: string;
-  payload: Uint8Array;
-  reason: string;
-  recordKey: Uint8Array;
-}
-
-/** Bounded page of raw quarantined records. @internal */
-export interface QuarantinePage {
-  cursor?: string;
-  records: QuarantineRecord[];
 }
 
 /**
@@ -1038,6 +1045,10 @@ export interface StorageBackend extends RuntimeStorage {
   readonly remote?: RemoteSurface;
   dirtyHeadsDebugRead?(): Promise<DirtyHeadDebug[]>;
   remoteDocDebugRead?(table: string, localId: string): Promise<RemoteDocDebug | undefined>;
+  remoteCursorDebugRead?(subscription: string): Promise<string | undefined>;
+  remoteMemberDebugRead?(
+    subscription: string,
+  ): Promise<Array<{ serverDocumentId: string; table: string }>>;
   setup(schema: StoreSchema): Promise<void>;
   clear(): Promise<void>;
   close(): Promise<void>;

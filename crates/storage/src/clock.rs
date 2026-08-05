@@ -68,3 +68,13 @@ pub fn wall_ms() -> Result<f64, StorageError> {
         .map_err(|_| StorageError::Clock)?
         .as_millis() as f64)
 }
+
+/// Wall clock in signed nanoseconds since the Unix epoch. Commit timestamps use this only as a
+/// lower bound; the durable floor supplies monotonicity across processes and clock regressions.
+pub fn wall_ns() -> Result<i64, StorageError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StorageError::Clock)?
+        .as_nanos();
+    i64::try_from(nanos).map_err(|_| StorageError::Clock)
+}

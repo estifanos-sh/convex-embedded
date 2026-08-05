@@ -109,11 +109,79 @@ fn rows(store: &EmbeddedStore) -> Vec<serde_json::Value> {
     )
 }
 
+#[test]
+fn large_subscription_cursor_and_candidate_upgrade_stay_within_native_budget() {
+    const MEMBER_COUNT: usize = 512;
+    const CURSOR_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+    const UPGRADE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+    let store =
+        EmbeddedStore::open(tmp_path("membership_large_budget.db").to_str().unwrap()).unwrap();
+    let active = schema();
+    store.setup(&active).unwrap();
+    let mut members = Vec::with_capacity(MEMBER_COUNT);
+    let mut projections = Vec::with_capacity(MEMBER_COUNT);
+    for index in 0..MEMBER_COUNT {
+        let server_id = format!("{index:032x}");
+        members.push(member(&server_id));
+        projections.push(projection(&server_id, "bulk", index as f64, 1));
+    }
+    store
+        .remote_page_write(&snapshot(
+            "issues:large",
+            members,
+            projections,
+            "cursor:seed",
+            1,
+        ))
+        .unwrap();
+
+    let cursor_started = std::time::Instant::now();
+    store
+        .remote_cursor_write("issues:large", Some("cursor:next".into()), 2)
+        .unwrap();
+    let cursor_elapsed = cursor_started.elapsed();
+    assert!(
+        cursor_elapsed <= CURSOR_BUDGET,
+        "binding a {MEMBER_COUNT}-member cursor took {cursor_elapsed:?}, budget {CURSOR_BUDGET:?}"
+    );
+
+    let mut target = active.clone();
+    target.hash = "1".repeat(64);
+    target.tables[0].local_fields.push(LocalFieldDef {
+        field: "migrated".into(),
+    });
+    let upgrade_started = std::time::Instant::now();
+    let candidate = store.migration_begin(&target).unwrap();
+    let mut policy = r#"{"collectComplete":true,"thresholds":[]}"#.to_owned();
+    while !store
+        .migration_queue_policy_write(candidate.candidate_generation, &policy)
+        .unwrap()
+    {
+        policy = r#"{"collectComplete":true,"thresholds":[]}"#.to_owned();
+    }
+    store
+        .migration_commit(&target, candidate.candidate_generation)
+        .unwrap();
+    let upgrade_elapsed = upgrade_started.elapsed();
+    assert!(
+        upgrade_elapsed <= UPGRADE_BUDGET,
+        "upgrading a {MEMBER_COUNT}-member subscription took {upgrade_elapsed:?}, budget {UPGRADE_BUDGET:?}"
+    );
+    assert_eq!(
+        store.remote_member_read("issues:large").unwrap().len(),
+        MEMBER_COUNT
+    );
+    assert_eq!(
+        store.remote_cursor_read("issues:large").unwrap().as_deref(),
+        Some("cursor:next")
+    );
+}
+
 fn crdt_schema() -> StoreSchema {
     StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "issues".into(),
             placement: TablePlacement::Replicated,
@@ -1217,6 +1285,103 @@ fn rejected_push_settlement_is_one_crash_atomic_state() {
     let reopened = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     reopened.setup(&schema()).unwrap();
     assert_rejected_settlement_after(&reopened, mutation_id, &local_id);
+}
+
+#[test]
+fn rejected_local_resurrection_deletes_the_carried_tombstone_projection() {
+    let store =
+        EmbeddedStore::open(tmp_path("push_rejected_resurrection.db").to_str().unwrap()).unwrap();
+    store.setup(&schema()).unwrap();
+    store
+        .remote_page_write(&snapshot(
+            "issues:resurrection:{}",
+            vec![member(SERVER_ID)],
+            vec![projection(SERVER_ID, "present", 1.0, 1)],
+            "cursor:present",
+            1,
+        ))
+        .unwrap();
+    let local_id = rows(&store)[0]["_id"].as_str().unwrap().to_owned();
+    let delete_seq = store
+        .commit(
+            WriteBatch {
+                deletes: vec![DeleteIn {
+                    table: "issues".into(),
+                    id: local_id.clone(),
+                }],
+                ..WriteBatch::default()
+            },
+            &CommitOptions::default(),
+        )
+        .unwrap()
+        .commit_seq;
+    store
+        .remote_push_envelope_write("settle-tombstone", delete_seq, "{}", 2)
+        .unwrap();
+    let mut tombstone = projection(SERVER_ID, "gone", 2.0, 2);
+    tombstone.local_document_id = Some(local_id.clone());
+    tombstone.row = None;
+    store
+        .remote_settlement_write(&RemoteSettlementWrite {
+            mutation_id: "settle-tombstone".into(),
+            expected_commit_seq: delete_seq,
+            now_ms: 2,
+            outcome: RemoteSettlementOutcome::Applied {
+                ids: vec![],
+                schedules: vec![],
+                projections: vec![tombstone],
+                crdt: vec![],
+            },
+        })
+        .unwrap();
+    assert!(store
+        .origin_page_read(1, None, 1_000)
+        .unwrap()
+        .records
+        .iter()
+        .any(|record| record.kind == OriginKind::RemoteProjection as i64));
+
+    let commit_seq = store
+        .commit(
+            doc_writes(vec![DocWrite {
+                table: "issues".into(),
+                id: local_id.clone(),
+                data: r#"{"title":"resurrected"}"#.into(),
+                cols: vec![("status".into(), ColValue::Text("open".into()))],
+                creation_time: 2.0,
+            }]),
+            &CommitOptions::default(),
+        )
+        .unwrap()
+        .commit_seq;
+    store
+        .remote_push_envelope_write("reject-resurrection", commit_seq, "{}", 2)
+        .unwrap();
+    store
+        .remote_settlement_write(&RemoteSettlementWrite {
+            mutation_id: "reject-resurrection".into(),
+            expected_commit_seq: commit_seq,
+            now_ms: 3,
+            outcome: RemoteSettlementOutcome::Rejected {
+                schedules: vec![],
+                targets: vec![RemoteRowTarget {
+                    table: "issues".into(),
+                    local_document_id: local_id.clone(),
+                    server_rev_id: None,
+                    retain: false,
+                }],
+                projections: vec![],
+            },
+        })
+        .unwrap();
+
+    assert!(rows(&store).is_empty());
+    assert!(!store
+        .origin_page_read(1, None, 1_000)
+        .unwrap()
+        .records
+        .iter()
+        .any(|record| record.kind == OriginKind::RemoteProjection as i64));
 }
 
 fn rejected_settlement(

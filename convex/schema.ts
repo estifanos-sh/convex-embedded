@@ -1,4 +1,3 @@
-import type {} from "@convex-dev/embedded/local";
 import { defineEmbeddedSchema, localTable, replicatedTable } from "@convex-dev/embedded/schema";
 import { v } from "convex/values";
 import { e } from "@convex-dev/embedded/values";
@@ -25,15 +24,20 @@ const schema = defineEmbeddedSchema({
     .index("by_slug", ["slug"])
     .index("by_title", ["title"])
     .index("by_updatedAt", ["updatedAt"]),
+  issues: replicatedTable({
+    expanded: e.local(v.boolean()),
+    body: e.text(),
+    title: v.string(),
+  }).index("by_title", ["title"]),
   pins: localTable({
     documentId: v.id("documents"),
   }).index("by_documentId", ["documentId"]),
+  preferences: localTable({
+    theme: v.string(),
+  }),
+  setupState: localTable({
+    version: v.number(),
+  }),
 });
 
 export default schema;
-
-declare module "@convex-dev/embedded/local" {
-  interface Register {
-    schema: typeof schema;
-  }
-}

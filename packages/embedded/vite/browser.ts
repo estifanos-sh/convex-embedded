@@ -47,7 +47,12 @@ export const browserProject = {
     __CONVEX_EMBEDDED_HOSTED_URL__: JSON.stringify(hostedRemoteUrl ?? null),
   },
   plugins: [
-    convexEmbedded({ convexDir: browserConvexDir, local: browserLocalDir, schema }),
+    convexEmbedded({
+      convexDir: browserConvexDir,
+      local: browserLocalDir,
+      registerSchema: false,
+      schema,
+    }),
     browserRuntimeLog(),
   ],
   optimizeDeps: {
@@ -81,9 +86,11 @@ export const browserProject = {
       provider: playwright() as never,
     },
     include: [
+      "tests/browser/fixture.ts",
       "tests/browser/memory.ts",
       "tests/browser/protocol.ts",
       "tests/browser/runtime.ts",
+      "tests/browser/stress.ts",
       "tests/bench/browser/remote.ts",
       "tests/bench/browser/scale.ts",
     ],

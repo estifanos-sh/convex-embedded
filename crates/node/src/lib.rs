@@ -54,14 +54,13 @@ use storage::{
     CrdtFieldKind, CrdtOp, CrdtOperation, CrdtRestore, CrdtSnapshot, CrdtWireOp, DeleteIn,
     DeleteResult, DirtyHeadDebug, DocWrite, EmbeddedStore, FileMetadata, FileStore, IdMapping,
     IdMappingContent, IndexDef, LocalFieldDef, LocalFieldDelete, LocalFieldWrite,
-    MigrationCandidate, MigrationDefinition, MigrationDisposition, MigrationProgress,
-    MigrationRecordTarget, MutationCall, MutationRecord, MutationStatus, Order, OriginCursor,
-    OriginPage, OriginRecord, Page, PendingUpload, ReadSpec, ResultEntry, RowChange, RowHead,
+    MigrationCandidate, MigrationStep, MutationCall, MutationRecord, MutationStatus, Order,
+    OriginCursor, OriginPage, Page, PendingUpload, ReadSpec, ResultEntry, RowChange, RowHead,
     RowKey, ScheduledFunctionKind, ScheduledJob, ScheduledState, StorageError, StoreSchema,
     TableDef, TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch,
 };
 
-const API_VERSION: u32 = 23;
+const API_VERSION: u32 = 31;
 
 #[napi(js_name = "apiVersion")]
 #[must_use]
@@ -114,19 +113,12 @@ pub struct JsCrdtField {
 #[napi(object)]
 pub struct JsSchema {
     pub hash: String,
-    pub migrations: Option<Vec<JsMigrationDefinition>>,
-    pub migration_code_hash: Option<String>,
+    pub setup_hash: Option<String>,
     pub tables: Vec<JsTable>,
 }
 
-#[napi(object)]
-pub struct JsMigrationDefinition {
-    pub id: String,
-    pub definition_hash: String,
-}
-
 /// An extracted column value, tagged by which field is set. At most one of
-/// `text`/`real`/`int`/`bool` may be present; `undef = true` means the field was absent
+/// `text`/`real`/`int`/`bool`/`commitTs` may be present; `undef = true` means the field was absent
 /// (Convex `undefined`); all absent means SQL `null`.
 #[napi(object)]
 pub struct JsColValue {
@@ -136,10 +128,11 @@ pub struct JsColValue {
     pub int: Option<String>,
     pub r#bool: Option<bool>,
     pub undef: Option<bool>,
+    pub commit_ts: Option<bool>,
 }
 
 /// A tagged scalar value for bounds and cursor keys. At most one of `text`/`real`/`int`/`bool`
-/// may be present; `undef = true` means Convex `undefined`; all absent means `null`.
+/// /`commitTs` may be present; `undef = true` means Convex `undefined`; all absent means `null`.
 #[napi(object)]
 pub struct JsScalar {
     pub text: Option<String>,
@@ -147,6 +140,7 @@ pub struct JsScalar {
     pub int: Option<String>,
     pub r#bool: Option<bool>,
     pub undef: Option<bool>,
+    pub commit_ts: Option<bool>,
 }
 
 #[napi(object)]
@@ -188,6 +182,7 @@ pub struct JsDocWrite {
     pub data: String,
     pub cols: Vec<JsColValue>,
     pub creation_time: f64,
+    pub pending_commit_ts: Option<bool>,
 }
 
 #[napi(object)]
@@ -216,6 +211,7 @@ pub struct JsLocalFieldWrite {
     pub id: String,
     pub field: String,
     pub value_json: String,
+    pub pending_commit_ts: Option<bool>,
 }
 
 #[napi(object)]
@@ -252,13 +248,16 @@ pub struct JsCrdtOp {
 
 #[napi(object)]
 pub struct JsCommitOptions {
+    pub commit_ts: Option<bool>,
     pub source: Option<String>,
     pub mutation_id: Option<String>,
     pub mutation_name: Option<String>,
     pub mutation_args: Option<String>,
     pub mutation_result: Option<String>,
+    pub mutation_result_commit_ts: Option<bool>,
     pub push_envelope_json: Option<String>,
     pub push_envelope_now_ms: Option<f64>,
+    pub push_after_images_commit_ts: Option<bool>,
     pub mutation_is_fresh: Option<bool>,
     pub include_changes: Option<bool>,
 }
@@ -268,6 +267,8 @@ pub struct JsCommitResult {
     pub changed_tables: Vec<String>,
     pub changes: Vec<JsRowChange>,
     pub commit_seq: i64,
+    /// Decimal signed int64 allocated atomically for a commit that used `db.vars.commitTs`.
+    pub commit_ts: Option<String>,
     /// CRDT-field edits this commit produced (§1/§8-A). `update` is base64 Loro bytes; the client
     /// carries them on the one push (`crdtOps`) — a pure-CRDT commit forms a `fn:""` push call.
     pub crdt_ops: Vec<JsCrdtWireOp>,
@@ -716,10 +717,40 @@ impl Store {
     pub async fn migration_begin(&self, schema: JsSchema) -> napi::Result<String> {
         let schema = to_schema(schema)?;
         self.run(move |store| {
-            let candidate = store.migration_begin(&schema)?;
+            let candidate = store.migration_prepare(&schema)?;
             migration_candidate_json(&candidate)
         })
         .await
+    }
+
+    #[napi]
+    pub async fn migration_copy_step(&self, generation: i64) -> napi::Result<String> {
+        self.run(move |store| migration_step_json(store.migration_copy_step(generation)?))
+            .await
+    }
+
+    #[napi]
+    pub async fn migration_bind(&self, schema: JsSchema, generation: i64) -> napi::Result<()> {
+        let schema = to_schema(schema)?;
+        self.run(move |store| store.migration_bind_prepare(&schema, generation))
+            .await
+    }
+
+    #[napi]
+    pub async fn migration_materialize_step(&self, generation: i64) -> napi::Result<String> {
+        self.run(move |store| migration_step_json(store.migration_materialize_step(generation)?))
+            .await
+    }
+
+    #[napi]
+    pub async fn migration_unbind(&self) -> napi::Result<()> {
+        self.run(storage::EmbeddedStore::migration_unbind).await
+    }
+
+    #[napi]
+    pub async fn migration_setup_complete(&self, generation: i64) -> napi::Result<()> {
+        self.run(move |store| store.migration_setup_complete(generation))
+            .await
     }
 
     #[napi]
@@ -751,44 +782,6 @@ impl Store {
     }
 
     #[napi]
-    pub async fn migration_step_begin(
-        &self,
-        generation: i64,
-        migration_id: String,
-    ) -> napi::Result<String> {
-        self.run(move |store| {
-            let progress = store.migration_step_begin(generation, &migration_id)?;
-            migration_progress_json(&progress)
-        })
-        .await
-    }
-
-    #[napi]
-    pub async fn migration_record_write(
-        &self,
-        generation: i64,
-        record_json: String,
-    ) -> napi::Result<()> {
-        let record = origin_record_from_json(&record_json)?;
-        self.run(move |store| store.migration_record_write(generation, &record))
-            .await
-    }
-
-    #[napi]
-    pub async fn migration_record_delete(
-        &self,
-        generation: i64,
-        identity_key: String,
-        kind: i64,
-        record_key: Uint8Array,
-    ) -> napi::Result<()> {
-        self.run(move |store| {
-            store.migration_record_delete(generation, &identity_key, kind, record_key.as_ref())
-        })
-        .await
-    }
-
-    #[napi]
     #[allow(clippy::too_many_arguments)]
     pub async fn migration_record_disposition_write(
         &self,
@@ -815,42 +808,42 @@ impl Store {
     }
 
     #[napi]
-    pub async fn migration_page_write(
-        &self,
-        generation: i64,
-        migration_id: String,
-        page_json: String,
-    ) -> napi::Result<()> {
-        let (cursor, writes, deletes, dispositions) = migration_page_from_json(&page_json)?;
-        self.run(move |store| {
-            store.migration_page_write(
-                generation,
-                &migration_id,
-                &cursor,
-                &writes,
-                &deletes,
-                &dispositions,
-            )
-        })
-        .await
+    pub async fn migration_queue_policy_state_read(&self, generation: i64) -> napi::Result<String> {
+        self.run(move |store| store.migration_queue_policy_state_read(generation))
+            .await
     }
 
     #[napi]
-    pub async fn migration_step_complete(
+    pub async fn migration_queue_policy_write(
         &self,
         generation: i64,
-        applied_migrations: u32,
+        policy_json: String,
+    ) -> napi::Result<bool> {
+        self.run(move |store| store.migration_queue_policy_write(generation, &policy_json))
+            .await
+    }
+
+    #[napi]
+    pub async fn migration_finalize_prepare(
+        &self,
+        schema: JsSchema,
+        generation: i64,
     ) -> napi::Result<()> {
-        self.run(move |store| {
-            store.migration_step_complete(generation, applied_migrations as usize)
-        })
-        .await
+        let schema = to_schema(schema)?;
+        self.run(move |store| store.migration_finalize_prepare(&schema, generation))
+            .await
     }
 
     #[napi]
     pub async fn migration_commit(&self, schema: JsSchema, generation: i64) -> napi::Result<()> {
         let schema = to_schema(schema)?;
-        self.run(move |store| store.migration_commit(&schema, generation))
+        self.run(move |store| store.migration_cutover(&schema, generation))
+            .await
+    }
+
+    #[napi]
+    pub async fn migration_retire_step(&self, generation: i64) -> napi::Result<String> {
+        self.run(move |store| migration_step_json(store.migration_retire_step(generation)?))
             .await
     }
 
@@ -1282,6 +1275,35 @@ impl Store {
     }
 
     #[napi]
+    pub async fn remote_cursor_debug_read(
+        &self,
+        subscription: String,
+    ) -> napi::Result<Option<String>> {
+        self.run(move |store| store.remote_cursor_read(&subscription))
+            .await
+    }
+
+    #[napi]
+    pub async fn remote_member_debug_read(&self, subscription: String) -> napi::Result<String> {
+        self.run(move |store| {
+            let members = store.remote_member_read(&subscription)?;
+            serde_json::to_string(
+                &members
+                    .iter()
+                    .map(|member| {
+                        serde_json::json!({
+                            "table": member.table,
+                            "serverDocumentId": member.server_document_id,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))
+        })
+        .await
+    }
+
+    #[napi]
     pub async fn id_delete(&self, table: String, local_id: String) -> napi::Result<()> {
         self.run(move |store| store.id_delete(&table, &local_id))
             .await
@@ -1624,9 +1646,35 @@ impl Store {
     pub fn migration_begin(&self, schema: JsSchema) -> napi::Result<String> {
         let schema = to_schema(schema)?;
         self.run(|store| {
-            let candidate = store.migration_begin(&schema)?;
+            let candidate = store.migration_prepare(&schema)?;
             migration_candidate_json(&candidate)
         })
+    }
+
+    #[napi]
+    pub fn migration_copy_step(&self, generation: i64) -> napi::Result<String> {
+        self.run(|store| migration_step_json(store.migration_copy_step(generation)?))
+    }
+
+    #[napi]
+    pub fn migration_bind(&self, schema: JsSchema, generation: i64) -> napi::Result<()> {
+        let schema = to_schema(schema)?;
+        self.run(|store| store.migration_bind_prepare(&schema, generation))
+    }
+
+    #[napi]
+    pub fn migration_materialize_step(&self, generation: i64) -> napi::Result<String> {
+        self.run(|store| migration_step_json(store.migration_materialize_step(generation)?))
+    }
+
+    #[napi]
+    pub fn migration_unbind(&self) -> napi::Result<()> {
+        self.run(|store| store.migration_unbind())
+    }
+
+    #[napi]
+    pub fn migration_setup_complete(&self, generation: i64) -> napi::Result<()> {
+        self.run(|store| store.migration_setup_complete(generation))
     }
 
     #[napi]
@@ -1657,37 +1705,6 @@ impl Store {
     }
 
     #[napi]
-    pub fn migration_step_begin(
-        &self,
-        generation: i64,
-        migration_id: String,
-    ) -> napi::Result<String> {
-        self.run(|store| {
-            let progress = store.migration_step_begin(generation, &migration_id)?;
-            migration_progress_json(&progress)
-        })
-    }
-
-    #[napi]
-    pub fn migration_record_write(&self, generation: i64, record_json: String) -> napi::Result<()> {
-        let record = origin_record_from_json(&record_json)?;
-        self.run(|store| store.migration_record_write(generation, &record))
-    }
-
-    #[napi]
-    pub fn migration_record_delete(
-        &self,
-        generation: i64,
-        identity_key: String,
-        kind: i64,
-        record_key: Uint8Array,
-    ) -> napi::Result<()> {
-        self.run(|store| {
-            store.migration_record_delete(generation, &identity_key, kind, record_key.as_ref())
-        })
-    }
-
-    #[napi]
     #[allow(clippy::too_many_arguments)]
     pub fn migration_record_disposition_write(
         &self,
@@ -1713,38 +1730,38 @@ impl Store {
     }
 
     #[napi]
-    pub fn migration_page_write(
-        &self,
-        generation: i64,
-        migration_id: String,
-        page_json: String,
-    ) -> napi::Result<()> {
-        let (cursor, writes, deletes, dispositions) = migration_page_from_json(&page_json)?;
-        self.run(|store| {
-            store.migration_page_write(
-                generation,
-                &migration_id,
-                &cursor,
-                &writes,
-                &deletes,
-                &dispositions,
-            )
-        })
+    pub fn migration_queue_policy_state_read(&self, generation: i64) -> napi::Result<String> {
+        self.run(|store| store.migration_queue_policy_state_read(generation))
     }
 
     #[napi]
-    pub fn migration_step_complete(
+    pub fn migration_queue_policy_write(
         &self,
         generation: i64,
-        applied_migrations: u32,
+        policy_json: String,
+    ) -> napi::Result<bool> {
+        self.run(|store| store.migration_queue_policy_write(generation, &policy_json))
+    }
+
+    #[napi]
+    pub fn migration_finalize_prepare(
+        &self,
+        schema: JsSchema,
+        generation: i64,
     ) -> napi::Result<()> {
-        self.run(|store| store.migration_step_complete(generation, applied_migrations as usize))
+        let schema = to_schema(schema)?;
+        self.run(|store| store.migration_finalize_prepare(&schema, generation))
     }
 
     #[napi]
     pub fn migration_commit(&self, schema: JsSchema, generation: i64) -> napi::Result<()> {
         let schema = to_schema(schema)?;
-        self.run(|store| store.migration_commit(&schema, generation))
+        self.run(|store| store.migration_cutover(&schema, generation))
+    }
+
+    #[napi]
+    pub fn migration_retire_step(&self, generation: i64) -> napi::Result<String> {
+        self.run(|store| migration_step_json(store.migration_retire_step(generation)?))
     }
 
     #[napi]
@@ -2025,6 +2042,30 @@ impl Store {
             store
                 .remote_doc_read(&table, &local_id)
                 .map(|row| row.map(js_remote_doc_debug))
+        })
+    }
+
+    #[napi]
+    pub fn remote_cursor_debug_read(&self, subscription: String) -> napi::Result<Option<String>> {
+        self.run(|store| store.remote_cursor_read(&subscription))
+    }
+
+    #[napi]
+    pub fn remote_member_debug_read(&self, subscription: String) -> napi::Result<String> {
+        self.run(|store| {
+            let members = store.remote_member_read(&subscription)?;
+            serde_json::to_string(
+                &members
+                    .iter()
+                    .map(|member| {
+                        serde_json::json!({
+                            "table": member.table,
+                            "serverDocumentId": member.server_document_id,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))
         })
     }
 
@@ -3442,16 +3483,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn to_schema(schema: JsSchema) -> napi::Result<StoreSchema> {
     let hash = schema.hash;
-    let migrations = schema
-        .migrations
-        .unwrap_or_default()
-        .into_iter()
-        .map(|migration| MigrationDefinition {
-            id: migration.id,
-            definition_hash: migration.definition_hash,
-        })
-        .collect();
-    let migration_code_hash = schema.migration_code_hash.unwrap_or_default();
+    let setup_hash = schema.setup_hash.unwrap_or_default();
     let mut tables = Vec::with_capacity(schema.tables.len());
     for t in schema.tables {
         let mut columns = Vec::with_capacity(t.columns.len());
@@ -3494,8 +3526,7 @@ fn to_schema(schema: JsSchema) -> napi::Result<StoreSchema> {
     }
     Ok(StoreSchema {
         hash,
-        migrations,
-        migration_code_hash,
+        setup_hash,
         tables,
     })
 }
@@ -3504,18 +3535,22 @@ fn migration_candidate_json(candidate: &MigrationCandidate) -> Result<String, St
     serde_json::to_string(&serde_json::json!({
         "activeGeneration": candidate.active_generation,
         "candidateGeneration": candidate.candidate_generation,
+        "cleanupGeneration": candidate.cleanup_generation,
+        "sourceSchema": candidate.source_schema,
+        "setupComplete": candidate.setup_complete,
         "sourceContractHash": candidate.source_contract_hash,
         "targetContractHash": candidate.target_contract_hash,
         "retiredGenerations": candidate.retired_generations,
-        "appliedMigrations": candidate.applied_migrations,
         "required": candidate.required,
         "resumed": candidate.resumed,
-        "progressMigrationId": candidate.progress_migration_id,
-        "progressCursor": candidate.progress_cursor.as_ref().map(|cursor| serde_json::json!({
-            "identityKey": cursor.identity_key,
-            "kind": cursor.kind,
-            "recordKey": base64::encode(&cursor.record_key),
-        })),
+    }))
+    .map_err(|error| StorageError::Unsatisfiable(error.to_string()))
+}
+
+fn migration_step_json(step: MigrationStep) -> Result<String, StorageError> {
+    serde_json::to_string(&serde_json::json!({
+        "done": step.done,
+        "records": step.records,
     }))
     .map_err(|error| StorageError::Unsatisfiable(error.to_string()))
 }
@@ -3540,22 +3575,6 @@ fn origin_page_json(page: &OriginPage) -> Result<String, StorageError> {
     .map_err(|error| StorageError::Unsatisfiable(error.to_string()))
 }
 
-fn migration_progress_json(progress: &MigrationProgress) -> Result<String, StorageError> {
-    serde_json::to_string(&serde_json::json!({
-        "cursor": progress.cursor.as_ref().map(|cursor| serde_json::json!({
-            "identityKey": cursor.identity_key,
-            "kind": cursor.kind,
-            "recordKey": base64::encode(&cursor.record_key),
-        })),
-        "upperBound": progress.upper_bound.as_ref().map(|cursor| serde_json::json!({
-            "identityKey": cursor.identity_key,
-            "kind": cursor.kind,
-            "recordKey": base64::encode(&cursor.record_key),
-        })),
-    }))
-    .map_err(|error| StorageError::Unsatisfiable(error.to_string()))
-}
-
 fn origin_cursor_from_json(json: &str) -> napi::Result<OriginCursor> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|error| napi::Error::from_reason(error.to_string()))?;
@@ -3565,103 +3584,6 @@ fn origin_cursor_from_json(json: &str) -> napi::Result<OriginCursor> {
         record_key: base64::decode(json_str(&value, "recordKey")?)
             .map_err(|error| napi::Error::from_reason(error.to_string()))?,
     })
-}
-
-fn origin_record_from_json(json: &str) -> napi::Result<OriginRecord> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|error| napi::Error::from_reason(error.to_string()))?;
-    Ok(OriginRecord {
-        identity_key: json_string(&value, "identityKey")?,
-        kind: json_i64(&value, "kind")?,
-        record_key: base64::decode(json_str(&value, "recordKey")?)
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-        codec: json_i64(&value, "codec")?,
-        flags: json_i64(&value, "flags")?,
-        payload: base64::decode(json_str(&value, "payload")?)
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-        payload_hash: Vec::new(),
-    })
-}
-
-type MigrationPage = (
-    OriginCursor,
-    Vec<OriginRecord>,
-    Vec<MigrationRecordTarget>,
-    Vec<MigrationDisposition>,
-);
-
-fn migration_page_from_json(json: &str) -> napi::Result<MigrationPage> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|error| napi::Error::from_reason(error.to_string()))?;
-    let cursor = origin_cursor_from_value(
-        value
-            .get("cursor")
-            .ok_or_else(|| napi::Error::from_reason("missing migration page cursor"))?,
-    )?;
-    let writes = json_array(&value, "writes")?
-        .iter()
-        .map(origin_record_from_value)
-        .collect::<napi::Result<Vec<_>>>()?;
-    let deletes = json_array(&value, "deletes")?
-        .iter()
-        .map(migration_target_from_value)
-        .collect::<napi::Result<Vec<_>>>()?;
-    let dispositions = json_array(&value, "dispositions")?
-        .iter()
-        .map(|value| {
-            Ok(MigrationDisposition {
-                target: migration_target_from_value(value)?,
-                reason: json_string(value, "reason")?,
-                discard: value
-                    .get("discard")
-                    .and_then(serde_json::Value::as_bool)
-                    .ok_or_else(|| napi::Error::from_reason("missing boolean field discard"))?,
-            })
-        })
-        .collect::<napi::Result<Vec<_>>>()?;
-    Ok((cursor, writes, deletes, dispositions))
-}
-
-fn origin_cursor_from_value(value: &serde_json::Value) -> napi::Result<OriginCursor> {
-    Ok(OriginCursor {
-        identity_key: json_string(value, "identityKey")?,
-        kind: json_i64(value, "kind")?,
-        record_key: base64::decode(json_str(value, "recordKey")?)
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-    })
-}
-
-fn origin_record_from_value(value: &serde_json::Value) -> napi::Result<OriginRecord> {
-    Ok(OriginRecord {
-        identity_key: json_string(value, "identityKey")?,
-        kind: json_i64(value, "kind")?,
-        record_key: base64::decode(json_str(value, "recordKey")?)
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-        codec: json_i64(value, "codec")?,
-        flags: json_i64(value, "flags")?,
-        payload: base64::decode(json_str(value, "payload")?)
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-        payload_hash: Vec::new(),
-    })
-}
-
-fn migration_target_from_value(value: &serde_json::Value) -> napi::Result<MigrationRecordTarget> {
-    Ok(MigrationRecordTarget {
-        identity_key: json_string(value, "identityKey")?,
-        kind: json_i64(value, "kind")?,
-        record_key: base64::decode(json_str(value, "recordKey")?)
-            .map_err(|error| napi::Error::from_reason(error.to_string()))?,
-    })
-}
-
-fn json_array<'a>(
-    value: &'a serde_json::Value,
-    field: &str,
-) -> napi::Result<&'a Vec<serde_json::Value>> {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| napi::Error::from_reason(format!("missing array field {field}")))
 }
 
 fn json_str<'a>(value: &'a serde_json::Value, field: &str) -> napi::Result<&'a str> {
@@ -3787,6 +3709,18 @@ fn to_write_batch(batch: JsWriteBatch) -> napi::Result<WriteBatch> {
         doc_writes,
     } = batch;
 
+    let commit_ts_doc_writes = doc_writes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, write)| (write.pending_commit_ts == Some(true)).then_some(index))
+        .collect();
+    let local_field_writes = local_field_writes.unwrap_or_default();
+    let commit_ts_local_field_writes = local_field_writes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, write)| (write.pending_commit_ts == Some(true)).then_some(index))
+        .collect();
+
     Ok(WriteBatch {
         doc_writes: doc_writes
             .into_iter()
@@ -3800,7 +3734,6 @@ fn to_write_batch(batch: JsWriteBatch) -> napi::Result<WriteBatch> {
             })
             .collect(),
         local_field_writes: local_field_writes
-            .unwrap_or_default()
             .into_iter()
             .map(|write| {
                 Ok(LocalFieldWrite {
@@ -3858,6 +3791,8 @@ fn to_write_batch(batch: JsWriteBatch) -> napi::Result<WriteBatch> {
             .into_iter()
             .map(to_scheduled_job)
             .collect::<napi::Result<Vec<_>>>()?,
+        commit_ts_doc_writes,
+        commit_ts_local_field_writes,
     })
 }
 
@@ -3925,17 +3860,28 @@ fn to_crdt_restore(restore: JsCrdtRestore) -> napi::Result<CrdtRestore> {
 
 fn to_commit_options(options: Option<JsCommitOptions>) -> napi::Result<CommitOptions> {
     match options {
-        Some(options) => decode_commit_options(
-            options.source.as_deref(),
-            options.mutation_id,
-            options.mutation_name,
-            options.mutation_args,
-            options.mutation_result,
-            options.push_envelope_json,
-            options.push_envelope_now_ms.map(|value| value as i64),
-            options.mutation_is_fresh,
-            options.include_changes,
-        ),
+        Some(options) => {
+            let commit_ts = options.commit_ts.unwrap_or(false);
+            let mutation_result_commit_ts = options.mutation_result_commit_ts.unwrap_or(false);
+            let push_after_images_commit_ts = options.push_after_images_commit_ts.unwrap_or(false);
+            let mut decoded = decode_commit_options(
+                options.source.as_deref(),
+                options.mutation_id,
+                options.mutation_name,
+                options.mutation_args,
+                options.mutation_result,
+                options.push_envelope_json,
+                options.push_envelope_now_ms.map(|value| value as i64),
+                options.mutation_is_fresh,
+                options.include_changes,
+            )?;
+            decoded.commit_ts = commit_ts;
+            decoded.mutation_result_commit_ts = mutation_result_commit_ts;
+            if let Some(push) = &mut decoded.push {
+                push.after_images_commit_ts = push_after_images_commit_ts;
+            }
+            Ok(decoded)
+        }
         None => Ok(CommitOptions::default()),
     }
 }
@@ -3994,6 +3940,7 @@ fn to_col(c: JsColValue) -> napi::Result<(String, ColValue)> {
         int: c.int,
         r#bool: c.r#bool,
         undef: c.undef,
+        commit_ts: c.commit_ts,
     })
     .map_err(|e| napi::Error::from_reason(format!("column value {name}: {e}")))?;
     Ok((name, value))
@@ -4046,22 +3993,27 @@ fn to_value(v: JsScalar) -> napi::Result<ColValue> {
     let set = usize::from(v.text.is_some())
         + usize::from(v.real.is_some())
         + usize::from(v.int.is_some())
-        + usize::from(v.r#bool.is_some());
+        + usize::from(v.r#bool.is_some())
+        + usize::from(v.commit_ts.is_some());
     if set > 1 || (set == 1 && v.undef == Some(true)) {
         return Err(napi::Error::from_reason("multiple value tags set"));
     }
     if v.undef == Some(true) {
         return Ok(ColValue::Undefined);
     }
-    let value = match (v.text, v.real, v.int, v.r#bool) {
-        (Some(t), None, None, None) => ColValue::Text(t),
-        (None, Some(r), None, None) => ColValue::Real(r),
-        (None, None, Some(i), None) => ColValue::Integer(
+    let value = match (v.text, v.real, v.int, v.r#bool, v.commit_ts) {
+        (Some(t), None, None, None, None) => ColValue::Text(t),
+        (None, Some(r), None, None, None) => ColValue::Real(r),
+        (None, None, Some(i), None, None) => ColValue::Integer(
             i.parse()
                 .map_err(|_| napi::Error::from_reason(format!("invalid i64 value: {i}")))?,
         ),
-        (None, None, None, Some(b)) => ColValue::Bool(b),
-        (None, None, None, None) => ColValue::Null,
+        (None, None, None, Some(b), None) => ColValue::Bool(b),
+        (None, None, None, None, Some(true)) => ColValue::PendingCommitTs,
+        (None, None, None, None, None) => ColValue::Null,
+        (None, None, None, None, Some(false)) => {
+            return Err(napi::Error::from_reason("commitTs marker must be true"));
+        }
         _ => unreachable!("multiple JsColValue tags already rejected"),
     };
     Ok(value)
@@ -4096,6 +4048,7 @@ fn js_commit_result(result: CommitResult, include_changes: bool) -> JsCommitResu
             Vec::new()
         },
         commit_seq: result.commit_seq,
+        commit_ts: result.commit_ts.map(|timestamp| timestamp.to_string()),
         crdt_ops: result.crdt_ops.into_iter().map(js_crdt_wire_op).collect(),
     }
 }
@@ -4374,7 +4327,7 @@ fn js_scheduled_job(job: ScheduledJob) -> JsScheduledJob {
     reason = "passed as a fn item to Result::map_err, which hands over the error by value"
 )]
 fn map_err(e: StorageError) -> napi::Error {
-    napi::Error::from_reason(e.to_string())
+    napi::Error::from_reason(format!("[convex-embedded:{}] {e}", e.code()))
 }
 
 #[expect(
@@ -4463,14 +4416,23 @@ fn parse_remote_scope(scope_json: &str) -> napi::Result<RemoteScope> {
 mod tests {
     use storage::{
         AuthoritativeRow, ColValue, ColumnDef, CommitOptions, DocWrite, EmbeddedStore, IndexDef,
-        Order, ReadSpec, RevLifecycle, RowKey, StoreSchema, TableDef, TablePlacement, WriteBatch,
+        Order, ReadSpec, RevLifecycle, RowKey, StorageError, StoreSchema, TableDef, TablePlacement,
+        WriteBatch,
     };
+
+    #[test]
+    fn prebaseline_storage_error_keeps_its_cross_binding_marker() {
+        let error = super::map_err(StorageError::PreBaselineStore {
+            found: 46,
+            minimum: 47,
+        });
+        assert!(error.reason.contains("EMBEDDED_PRE_BASELINE_STORE"));
+    }
 
     fn reroot_schema() -> StoreSchema {
         StoreSchema {
             hash: "0".repeat(64),
-            migrations: vec![],
-            migration_code_hash: String::new(),
+            setup_hash: String::new(),
             tables: vec![TableDef {
                 name: "issues".into(),
                 placement: TablePlacement::Replicated,

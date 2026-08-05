@@ -39,19 +39,8 @@ export function renderEmbeddedBundle(bundle: EmbeddedBundleResult): string {
     )
     .join("\n");
 
-  const migrationImport =
-    bundle.migrationsPath === undefined
-      ? ""
-      : `import deviceMigrations from ${JSON.stringify(toVirtualSourceId(bundle.migrationsPath))};
-import { withDeviceMigrations } from "@convex-dev/embedded/migrations";
-`;
-  const runtimeSchema =
-    bundle.migrationsPath === undefined
-      ? "embeddedSchemaBase"
-      : `{ ...embeddedSchemaBase, runtimeStoreSchema: withDeviceMigrations(embeddedSchemaBase.runtimeStoreSchema, deviceMigrations) }`;
-
-  return `${migrationImport}const embeddedSchemaBase = ${JSON.stringify(bundle.embeddedSchema)};
-export const embeddedSchema = ${runtimeSchema};
+  return `const embeddedSchemaBase = ${JSON.stringify(bundle.embeddedSchema)};
+export const embeddedSchema = embeddedSchemaBase;
 export const embeddedManifest = ${JSON.stringify(bundle.manifest)};
 export const modules = {
 ${moduleEntries}
@@ -68,6 +57,7 @@ ${localEntries}
  */
 export function renderLocalStamp(
   moduleId: string,
+  graphHash: string,
   source: string,
   exports: Array<[string, string]>,
 ): string {
@@ -79,7 +69,7 @@ export function renderLocalStamp(
     .join(", ");
   return `
 import { stampLocal as ${stamp} } from "@convex-dev/embedded/local";
-${stamp}(${JSON.stringify(moduleId)}, { ${named} });
+${stamp}(${JSON.stringify(moduleId)}, ${JSON.stringify(graphHash)}, { ${named} });
 `;
 }
 

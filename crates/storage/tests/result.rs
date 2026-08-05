@@ -51,6 +51,19 @@ fn result_write_zero_write_fast_path_skips_matching_skeletonhash() {
         store.result_read("key-a").unwrap().unwrap(),
         entry("key-a", "hash-a", 1.0)
     );
+    let origin = store
+        .origin_page_read(1, None, 100)
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|record| record.kind == OriginKind::RemoteResult as i64)
+        .unwrap();
+    let carried: serde_json::Value = serde_json::from_slice(&origin.payload).unwrap();
+    assert_eq!(carried["clock"], 1.0);
+    assert_eq!(
+        base64::decode(carried["skeleton"].as_str().unwrap()).unwrap(),
+        b"skeleton::hash-a"
+    );
 
     assert!(store.result_write(&entry("key-a", "hash-b", 2.0)).unwrap());
     assert_eq!(

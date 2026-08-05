@@ -13,6 +13,8 @@ export function errorMessage(error: unknown): string {
  * @public
  */
 export const EMBEDDED_ERROR_CODES = {
+  EMBEDDED_NOT_OPEN: "method called before the client was opened",
+  EMBEDDED_OPEN_MISMATCH: "open called with a different setup action",
   EMBEDDED_CLOSED: "method called after shutdown began",
   EMBEDDED_OFFLINE: "hosted-only work has no reachable deployment",
   EMBEDDED_CONFLICT: "a plain point, range, or target witness moved",
@@ -28,6 +30,8 @@ export const EMBEDDED_ERROR_CODES = {
   EMBEDDED_PROTOCOL_MISMATCH: "client and deployment protocol versions differ",
   EMBEDDED_CRDT_CORRUPT: "opaque history fails import, continuity, or projection-hash checks",
   EMBEDDED_STORAGE: "local durable storage could not open or commit",
+  EMBEDDED_PRE_BASELINE_STORE:
+    "the existing store predates the supported migration baseline and was preserved",
   EMBEDDED_UNSUPPORTED: "a local-capable function used a primitive V5 cannot reproduce",
 } as const;
 
@@ -57,6 +61,16 @@ export class EmbeddedError extends Error {
   }
 }
 
+/** Convert stable Rust/native markers into the public typed error surface. @internal */
+export function normalizeStorageError(error: unknown): Error {
+  const message = errorMessage(error);
+  const marker = /\[convex-embedded:([A-Z_]+)\]/.exec(message)?.[1];
+  if (marker !== undefined && marker in EMBEDDED_ERROR_CODES) {
+    return new EmbeddedError(marker as EmbeddedErrorCode, message, { cause: error });
+  }
+  return error instanceof Error ? error : new EmbeddedError("EMBEDDED_STORAGE", message);
+}
+
 /** True when `error` is an {@link EmbeddedError} carrying `code`. @public */
 export function isEmbeddedError(error: unknown, code?: EmbeddedErrorCode): error is EmbeddedError {
   return error instanceof EmbeddedError && (code === undefined || error.code === code);
@@ -67,6 +81,22 @@ export class EmbeddedClosedError extends EmbeddedError {
   constructor(message = "ConvexEmbeddedClient has already been closed.") {
     super("EMBEDDED_CLOSED", message);
     this.name = "ConvexEmbeddedClosedError";
+  }
+}
+
+/** A method requiring the runtime was called before `client.open()`. @public */
+export class EmbeddedNotOpenError extends EmbeddedError {
+  constructor(message = "Call await client.open() before using ConvexEmbeddedClient.") {
+    super("EMBEDDED_NOT_OPEN", message);
+    this.name = "ConvexEmbeddedNotOpenError";
+  }
+}
+
+/** Concurrent `open()` calls supplied different setup identities. @public */
+export class EmbeddedOpenMismatchError extends EmbeddedError {
+  constructor(message = "ConvexEmbeddedClient is already opening with a different setup action.") {
+    super("EMBEDDED_OPEN_MISMATCH", message);
+    this.name = "ConvexEmbeddedOpenMismatchError";
   }
 }
 

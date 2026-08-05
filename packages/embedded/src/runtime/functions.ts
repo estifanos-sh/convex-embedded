@@ -27,7 +27,7 @@ export interface MutationCtx<DM extends GenericDataModel> {
   storage: Record<string, unknown>;
 }
 
-/** Action context used by hosted-only test/runtime registrations. @internal */
+/** Action context used by runtime registrations. Local actions deliberately lack durable services. @internal */
 export interface ActionCtx<_DM extends GenericDataModel> {
   auth: { getUserIdentity(): Promise<UserIdentity | null> };
   meta: Record<string, never>;
@@ -41,7 +41,7 @@ export interface ActionCtx<_DM extends GenericDataModel> {
 /** Function reference accepted by the Embedded runner. @internal */
 export type FunctionReference =
   | string
-  | { kind: "query" | "mutation"; placement: "local" }
+  | { kind: "query" | "mutation" | "action"; placement: "local" }
   | import("convex/server").FunctionReference<"query" | "mutation" | "action", any, any, any, any>;
 
 /** Public/internal visibility for runtime functions. @internal */
@@ -66,10 +66,10 @@ export interface RegisteredMutation extends RegisteredBase {
   handler: (ctx: MutationCtx<GenericDataModel>, args: Record<string, unknown>) => unknown;
 }
 
-/** Runtime representation of a hosted action. @internal */
+/** Runtime representation of an action. @internal */
 export interface RegisteredAction extends RegisteredBase {
   kind: "action";
-  placement: "remote";
+  placement: "remote" | "local";
   handler: (ctx: ActionCtx<GenericDataModel>, args: Record<string, unknown>) => unknown;
 }
 

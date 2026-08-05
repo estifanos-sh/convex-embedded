@@ -1,6 +1,7 @@
 import { ConvexError } from "convex/values";
 
 import { decodeError, encodeError } from "../runtime/codec";
+import { EmbeddedError, isEmbeddedError, type EmbeddedErrorCode } from "../error";
 import type { RunnerDevtoolsRequest, RunMutationTiming } from "../runtime/runner";
 import type { EmbeddedEvent } from "../events";
 
@@ -37,6 +38,8 @@ export interface RuntimeIdentity {
   packageVersion: string;
   protocolVersion: number;
   schemaHash: string;
+  setupGraphHash?: string;
+  setupReference?: string;
   storageId: string;
   storeFormatVersion: number;
   wasmAbiVersion: number;
@@ -58,6 +61,7 @@ export const WorkerCommand = {
   RemoteIdentityRead: 15,
   RemoteNetworkWrite: 16,
   StorageOwnerWrite: 17,
+  Action: 18,
 } as const;
 
 export type WorkerCommandCode = (typeof WorkerCommand)[keyof typeof WorkerCommand];
@@ -82,6 +86,7 @@ export type WorkerRequest =
       id: number;
       identity?: RuntimeIdentity;
       op: typeof WorkerCommand.Init;
+      setup?: { graphHash: string; reference: string };
       remote?: {
         authFetchToken: boolean;
         clientId?: string;
@@ -110,6 +115,14 @@ export type WorkerRequest =
       id: number;
       name: string;
       op: typeof WorkerCommand.Query;
+    }
+  | {
+      args: Record<string, unknown>;
+      auth?: unknown;
+      clientId?: string;
+      id: number;
+      name: string;
+      op: typeof WorkerCommand.Action;
     }
   | {
       args: Record<string, unknown>;
@@ -245,6 +258,7 @@ export type WorkerResponse =
     };
 
 export interface SerializedError {
+  embeddedCode?: EmbeddedErrorCode;
   message: string;
   name?: string;
   stack?: string;
@@ -260,6 +274,11 @@ export type WatchPatch = {
 export function deserializeError(error: SerializedError): Error {
   if (error.convex !== undefined) {
     const out = decodeError(error.convex);
+    if (error.stack !== undefined) out.stack = error.stack;
+    return out;
+  }
+  if (error.embeddedCode !== undefined) {
+    const out = new EmbeddedError(error.embeddedCode, error.message);
     if (error.stack !== undefined) out.stack = error.stack;
     return out;
   }
@@ -280,6 +299,7 @@ export function serializeError(error: unknown): SerializedError {
   }
   if (error instanceof Error) {
     return {
+      embeddedCode: isEmbeddedError(error) ? error.code : undefined,
       message: error.message,
       name: error.name,
       stack: error.stack,

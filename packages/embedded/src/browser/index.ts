@@ -12,16 +12,22 @@
  * import { ConvexEmbeddedClient } from "@convex-dev/embedded/browser";
  *
  * const client = new ConvexEmbeddedClient();
+ * await client.open();
  * ```
  *
  * @packageDocumentation
  */
 import { embeddedIdentity } from "virtual:convex-embedded/identity";
+import { localModules } from "virtual:convex-embedded";
 import { setEmbeddedIdentity } from "./identity";
+import { setBrowserLocalModules } from "./client";
 
 setEmbeddedIdentity(embeddedIdentity);
+setBrowserLocalModules(localModules);
 
 export { ConvexEmbeddedClient } from "./client";
+export { EMBEDDED_ERROR_CODES, EmbeddedError, isEmbeddedError } from "../error";
+export type { EmbeddedErrorCode } from "../error";
 export {
   EMBEDDED_UPLOAD_PATH,
   createConvexEmbeddedUploadFetch,
@@ -39,7 +45,6 @@ export type {
   EmbeddedConnectionState,
   EmbeddedEvent,
   EmbeddedEventListener,
-  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,

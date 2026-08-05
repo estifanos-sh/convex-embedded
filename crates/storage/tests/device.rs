@@ -14,6 +14,8 @@ fn device_options() -> CommitOptions {
         mutation: CommitMutation::None,
         push: None,
         changes: CommitChanges::Include,
+        commit_ts: false,
+        mutation_result_commit_ts: false,
     }
 }
 
@@ -24,8 +26,7 @@ fn schema() -> StoreSchema {
     }];
     StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![
             issues,
             TableDef {
@@ -38,6 +39,12 @@ fn schema() -> StoreSchema {
             },
         ],
     }
+}
+
+fn complete_empty_queue_policy(store: &EmbeddedStore, generation: i64) {
+    assert!(store
+        .migration_queue_policy_write(generation, r#"{"collectComplete":true,"thresholds":[]}"#,)
+        .unwrap());
 }
 
 #[test]
@@ -100,6 +107,41 @@ fn overlay_is_a_separate_identity_scoped_page_sidecar() {
 }
 
 #[test]
+fn local_field_commit_timestamp_is_resolved_in_the_same_transaction() {
+    let store =
+        EmbeddedStore::open(tmp_path("device_overlay_commit_ts.db").to_str().unwrap()).unwrap();
+    store.setup(&schema()).unwrap();
+    store
+        .commit(
+            doc_writes(vec![issue(&store, "i1", "first", "open")]),
+            &CommitOptions::remote(),
+        )
+        .unwrap();
+    let mut batch = WriteBatch {
+        local_field_writes: vec![LocalFieldWrite {
+            table: "issues".into(),
+            id: "i1".into(),
+            field: "expanded".into(),
+            value: serde_json::json!({ "at": { "$commitTs": null } }),
+        }],
+        ..WriteBatch::default()
+    };
+    batch.commit_ts_local_field_writes.push(0);
+    let mut options = device_options();
+    options.commit_ts = true;
+    let timestamp = store
+        .commit(batch, &options)
+        .unwrap()
+        .commit_ts
+        .expect("timestamp allocated");
+
+    assert_eq!(
+        store.local_fields_read("issues", "i1").unwrap()["expanded"]["at"]["$integer"],
+        base64::encode(timestamp.to_le_bytes())
+    );
+}
+
+#[test]
 fn device_table_crud_requires_device_source_and_creates_no_dirty_head() {
     let store = EmbeddedStore::open(tmp_path("device_table.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
@@ -121,7 +163,7 @@ fn device_table_crud_requires_device_source_and_creates_no_dirty_head() {
 }
 
 #[test]
-fn removing_a_local_field_from_schema_clears_every_overlay_partition() {
+fn removed_local_field_origins_remain_dormant_without_blocking_cutover() {
     let store =
         EmbeddedStore::open(tmp_path("device_schema_cleanup.db").to_str().unwrap()).unwrap();
     store.setup(&schema()).unwrap();
@@ -159,31 +201,23 @@ fn removing_a_local_field_from_schema_clears_every_overlay_partition() {
     next.hash = "1".repeat(64);
     next.tables[0].local_fields.clear();
     let candidate = store.migration_begin(&next).unwrap();
-    for record in store
-        .origin_page_read(candidate.candidate_generation, None, 100)
-        .unwrap()
-        .records
-        .into_iter()
-        .filter(|record| record.kind == 3)
-    {
-        store
-            .migration_record_disposition_write(
-                candidate.candidate_generation,
-                &record.identity_key,
-                record.kind,
-                &record.record_key,
-                "__finalize__",
-                "unclaimed",
-                false,
-            )
-            .unwrap();
-    }
+    complete_empty_queue_policy(&store, candidate.candidate_generation);
     store
         .migration_commit(&next, candidate.candidate_generation)
         .unwrap();
     assert!(store.local_fields_read("issues", "i1").unwrap().is_empty());
     store.identity_write("", Some("null")).unwrap();
     assert!(store.local_fields_read("issues", "i1").unwrap().is_empty());
+    assert_eq!(
+        store
+            .origin_page_read(candidate.candidate_generation, None, 100)
+            .unwrap()
+            .records
+            .into_iter()
+            .filter(|record| record.kind == 3)
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -509,6 +543,7 @@ fn adding_a_device_field_uses_a_new_generation() {
         Err(storage::StorageError::IncompatibleStore(_))
     ));
     let candidate = store.migration_begin(&after).unwrap();
+    complete_empty_queue_policy(&store, candidate.candidate_generation);
     store
         .migration_commit(&after, candidate.candidate_generation)
         .unwrap();

@@ -6,6 +6,8 @@
 import "./crypto";
 
 export { ConvexEmbeddedClient } from "./client";
+export { EMBEDDED_ERROR_CODES, EmbeddedError, isEmbeddedError } from "../error";
+export type { EmbeddedErrorCode } from "../error";
 export type {
   AuthTokenFetcher,
   ConvexEmbeddedClientOptions,
@@ -17,7 +19,6 @@ export type {
   EmbeddedDataWrite,
   EmbeddedEvent,
   EmbeddedEventListener,
-  EmbeddedMigrationEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
   EmbeddedOperationPhase,

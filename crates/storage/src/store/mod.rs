@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Instant;
@@ -8,7 +9,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 use turso_core::Value;
 
-use crate::clock::{wall_ms, Clock};
+use crate::clock::{wall_ms, wall_ns, Clock};
 use crate::driver::TursoDriver;
 use crate::error::StorageError;
 use crate::sql::{
@@ -19,17 +20,17 @@ use crate::sql::{
 #[cfg(any(test, feature = "testkit"))]
 use crate::types::RevFrontier;
 use crate::types::{
-    AuthoritativeApplyResult, AuthoritativeRow, ColValue, CommitOptions, CommitResult,
-    CommitSource, CountSpec, CrdtOp, CrdtOperation, DeleteIn, DeleteResult, DirtyHeadDebug,
-    DocWrite, FileMetadata, FileStore, IdMapping, IdMappingContent, MembershipRange,
-    MigrationCandidate, MigrationDisposition, MigrationProgress, MigrationRecordTarget,
-    MutationCall, MutationRecord, MutationStatus, OriginCursor, OriginKind, OriginPage,
-    OriginRecord, Page, PendingUpload, ReadSpec, RemoteMember, RemotePageWrite,
-    RemotePageWriteResult, RemotePending, RemoteSettlementOutcome, RemoteSettlementWrite,
-    RemoteSettlementWriteResult, ResultEntry, RevKey, RevState, RevWriteResult, RowChange,
-    RowChangeOp, RowHead, RowKey, ScheduledJob, ScheduledState, StoreContract, StoreSchema,
-    TableDef, TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch, ORIGIN_FLAG_DISCARDED,
-    ORIGIN_FLAG_QUARANTINED,
+    origin_adapt, origin_current_codec, origin_decode, origin_encode_current,
+    AuthoritativeApplyResult, AuthoritativeRow, ColValue, CommitMutation, CommitOptions,
+    CommitResult, CommitSource, CountSpec, CrdtOp, CrdtOperation, DeleteIn, DeleteResult,
+    DirtyHeadDebug, DocWrite, FileMetadata, FileStore, IdMapping, IdMappingContent,
+    MembershipRange, MigrationCandidate, MigrationStep, MutationCall, MutationRecord,
+    MutationStatus, OriginCursor, OriginKind, OriginPage, OriginRecord, Page, PendingUpload,
+    ReadSpec, RemoteMember, RemotePageWrite, RemotePageWriteResult, RemotePending,
+    RemoteSettlementOutcome, RemoteSettlementWrite, RemoteSettlementWriteResult, ResultEntry,
+    RevKey, RevState, RevWriteResult, RowChange, RowChangeOp, RowHead, RowKey, ScheduledJob,
+    ScheduledState, StoreContract, StoreSchema, TableDef, TablePlacement, UploadLease,
+    UploadLeaseWrite, WriteBatch, ORIGIN_FLAG_DISCARDED, ORIGIN_FLAG_QUARANTINED,
 };
 
 static PATH_LOCKS: LazyLock<Mutex<FxHashMap<String, Weak<Mutex<()>>>>> =
@@ -48,8 +49,11 @@ const IDENTITY_STATE_META: &str = "identity_state";
 const REMOTE_RECEIPT_PREFIX: &str = "settlement_ack:";
 const REMOTE_RECEIPT_PREFIX_END: &str = "settlement_ack;";
 const REMOTE_CURSOR_PREFIX: &str = "pull:";
-const ORIGIN_CODEC_V1: i64 = 1;
 const ORIGIN_FLAGS_NONE: i64 = 0;
+/// Codec for quarantine/discard metadata. It is deliberately not any semantic record codec: a
+/// future semantic codec may be binary and must never be asked to decode this JSON envelope.
+const ORIGIN_DISPOSITION_CODEC: i64 = 1;
+const MIN_SUPPORTED_EPOCH: i64 = 47;
 
 fn remote_cursor_key_encode(subscription: &str) -> String {
     format!("{REMOTE_CURSOR_PREFIX}{subscription}")
@@ -67,12 +71,16 @@ struct ProjectionRemoteIdMapping {
     stale_document_ids: FxHashSet<String>,
 }
 
-struct LegacyOriginSeed {
-    identity_key: String,
-    kind: OriginKind,
-    record_key: Vec<u8>,
-    payload: Vec<u8>,
+#[derive(Default)]
+struct QueuePolicyCursor {
+    origin: OriginCursor,
+    /// Next derived association within `origin` to write. `None` means the origin itself is fully
+    /// processed and the following page starts after it.
+    association_offset: Option<usize>,
 }
+
+const QUEUE_POLICY_PAGE_SIZE: usize = 256;
+const QUEUE_POLICY_MAX_REQUEST_BYTES: usize = 256 * 1024;
 
 #[cfg(not(target_arch = "wasm32"))]
 struct OwnerLease {
@@ -108,6 +116,28 @@ struct DirtyHead {
     logical_clock: f64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct SubscriptionStateDigest {
+    xor: [u8; 32],
+    count: u64,
+}
+
+impl SubscriptionStateDigest {
+    fn write(&mut self, member_hash: &[u8; 32]) {
+        for (target, source) in self.xor.iter_mut().zip(member_hash) {
+            *target ^= source;
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let mut hash = Sha256::new();
+        hash.update(b"convex-embedded-remote-subscription-state-v1");
+        hash.update(self.count.to_be_bytes());
+        hash.update(self.xor);
+        hash.finalize().to_vec()
+    }
+}
+
 #[allow(
     clippy::struct_field_names,
     reason = "the base prefix distinguishes server-confirmed state from the visible local edit"
@@ -116,6 +146,12 @@ struct PendingLocalEdit {
     base_root_id: Option<String>,
     base_node_id: Option<String>,
     base_projection_hash: Option<String>,
+}
+
+struct RemoteSeedRecord {
+    doc: DocWrite,
+    mapping: IdMapping,
+    head: RowHead,
 }
 
 struct TableRuntime {
@@ -164,6 +200,7 @@ pub struct EmbeddedStore {
     clock: Mutex<Clock>,
     peer_id: Mutex<Option<u64>>,
     absent_mutations: Mutex<FxHashMap<String, MutationCall>>,
+    remote_state_cache: Mutex<FxHashMap<(i64, String, String), SubscriptionStateDigest>>,
 }
 
 struct MutableKey(Mutex<String>);
@@ -196,16 +233,38 @@ impl EmbeddedStore {
             let _guard = lock(&operation_lock);
             TursoDriver::open(path)?
         };
+        let mut has_tables = false;
         let mut has_bootstrap = false;
         driver.run_rows(sql::LIST_TABLES, Vec::new(), |row| {
+            has_tables = true;
             if text_ref_at(row, 0)? == sql::BOOTSTRAP {
                 has_bootstrap = true;
             }
             Ok(())
         })?;
+        let stored_epoch = if has_tables {
+            let stored_epoch = driver
+                .run_row(sql::READ_USER_VERSION, Vec::new(), |row| int_at(row, 0))?
+                .unwrap_or(0);
+            if stored_epoch < MIN_SUPPORTED_EPOCH {
+                return Err(StorageError::PreBaselineStore {
+                    found: stored_epoch,
+                    minimum: MIN_SUPPORTED_EPOCH,
+                });
+            }
+            if stored_epoch > sql::EMBEDDED_EPOCH {
+                return Err(StorageError::IncompatibleStore(format!(
+                    "store epoch {stored_epoch} is newer than runtime epoch {}; the store was preserved",
+                    sql::EMBEDDED_EPOCH
+                )));
+            }
+            stored_epoch
+        } else {
+            0
+        };
         if has_bootstrap {
-            let bootstrap_version =
-                bootstrap_i64_read(&driver, sql::BOOTSTRAP_VERSION_KEY)?.ok_or_else(|| {
+            let bootstrap_version = bootstrap_i64_read(&driver, sql::BOOTSTRAP_VERSION_KEY)?
+                .ok_or_else(|| {
                     StorageError::IncompatibleStore(
                         "bootstrap has no format version; the store was preserved".to_owned(),
                     )
@@ -215,8 +274,34 @@ impl EmbeddedStore {
                     "unsupported bootstrap version {bootstrap_version}; the store was preserved"
                 )));
             }
-            let generation = bootstrap_i64_read(&driver, sql::ACTIVE_GENERATION_KEY)?
+            let active_contract = driver
+                .run_row(
+                    sql::READ_BOOTSTRAP,
+                    vec![text_value(sql::ACTIVE_CONTRACT_KEY.to_owned())],
+                    |row| {
+                        let bytes = blob_at(row, 0)?;
+                        serde_json::from_slice::<StoreContract>(&bytes).map_err(|error| {
+                            StorageError::IncompatibleStore(format!(
+                                "bootstrap active contract is corrupt: {error}; the store was preserved"
+                            ))
+                        })
+                    },
+                )?
                 .ok_or_else(|| {
+                    StorageError::IncompatibleStore(
+                        "bootstrap has no active contract; the store was preserved".to_owned(),
+                    )
+                })?;
+            if active_contract.package_epoch != stored_epoch
+                || active_contract.bootstrap_version != bootstrap_version
+            {
+                return Err(StorageError::IncompatibleStore(format!(
+                    "active contract epoch/bootstrap ({}/{}) does not match SQLite/bootstrap ({stored_epoch}/{bootstrap_version}); the store was preserved",
+                    active_contract.package_epoch, active_contract.bootstrap_version
+                )));
+            }
+            let generation =
+                bootstrap_i64_read(&driver, sql::ACTIVE_GENERATION_KEY)?.ok_or_else(|| {
                     StorageError::IncompatibleStore(
                         "bootstrap has no active generation; the store was preserved".to_owned(),
                     )
@@ -237,6 +322,7 @@ impl EmbeddedStore {
             clock: Mutex::new(Clock::new()),
             peer_id: Mutex::new(None),
             absent_mutations: Mutex::new(FxHashMap::default()),
+            remote_state_cache: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -289,7 +375,7 @@ impl EmbeddedStore {
             Some(_) => {
                 return Err(StorageError::IncompatibleStore(
                     "the cached identity key does not match the active partition".to_owned(),
-                ))
+                ));
             }
             None => None,
         };
@@ -349,7 +435,7 @@ impl EmbeddedStore {
 
     fn setup_inner(&self, schema: &StoreSchema) -> Result<(), StorageError> {
         validate_store_schema(schema)?;
-        let current_signature = schema_signature(schema);
+        let current_signature = schema.hash.clone();
         let schema_manifest = serde_json::to_string(schema)
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
         let _guard = lock(&self.operation_lock);
@@ -388,19 +474,24 @@ impl EmbeddedStore {
                 schema,
                 &current_signature,
                 &schema_manifest,
-                stored_version,
                 &existing_tables,
             )?;
             return self.activate_schema_unlocked(schema);
         }
-        if stored_version != sql::EMBEDDED_EPOCH {
+        if stored_version < MIN_SUPPORTED_EPOCH {
+            return Err(StorageError::PreBaselineStore {
+                found: stored_version,
+                minimum: MIN_SUPPORTED_EPOCH,
+            });
+        }
+        if stored_version > sql::EMBEDDED_EPOCH {
             return Err(StorageError::IncompatibleStore(format!(
                 "unsupported store epoch {stored_version}; the existing store was preserved"
             )));
         }
         if !has_bootstrap {
             return Err(StorageError::IncompatibleStore(
-                "the legacy store requires the device migration runner; the existing store was preserved"
+                "the store has no epoch-47 bootstrap plane; the existing store was preserved"
                     .to_owned(),
             ));
         }
@@ -411,7 +502,22 @@ impl EmbeddedStore {
                     "bootstrap has no active contract; the existing store was preserved".to_owned(),
                 )
             })?;
-        if active != StoreContract::for_schema(schema) {
+        if active.package_epoch != stored_version
+            || active.bootstrap_version != sql::BOOTSTRAP_VERSION
+        {
+            return Err(StorageError::IncompatibleStore(
+                "the active contract does not match the SQLite/bootstrap versions; the existing store was preserved"
+                    .to_owned(),
+            ));
+        }
+        let mut requested = StoreContract::for_schema(schema);
+        // A plain open may retire the executable setup hook while the store deliberately retains
+        // its completed identity. Treat omission as accepting that identity; a different non-empty
+        // setup hash still requires the candidate protocol.
+        if requested.setup_hash.is_empty() {
+            requested.setup_hash.clone_from(&active.setup_hash);
+        }
+        if !active.has_same_candidate_identity(&requested) {
             return Err(StorageError::IncompatibleStore(
                 "the store contract changed; use the device migration runner instead of direct setup"
                     .to_owned(),
@@ -419,20 +525,6 @@ impl EmbeddedStore {
         }
         self.validate_physical_schema_unlocked(schema)?;
         self.activate_schema_unlocked(schema)
-    }
-
-    fn stored_schema_signature_unlocked(
-        &self,
-        stored_version: i64,
-        existing_tables: &[String],
-    ) -> Result<Option<String>, StorageError> {
-        let meta_table = sql::generation_identifier(sql::META_TABLE, self.driver.generation());
-        let has_meta = existing_tables.iter().any(|name| name == &meta_table);
-        if stored_version == sql::EMBEDDED_EPOCH && has_meta {
-            self.read_meta_unlocked(SCHEMA_SIGNATURE_KEY)
-        } else {
-            Ok(None)
-        }
     }
 
     fn stored_schema_manifest_unlocked(&self) -> Result<Option<StoreSchema>, StorageError> {
@@ -452,7 +544,6 @@ impl EmbeddedStore {
         schema: &StoreSchema,
         schema_signature: &str,
         schema_manifest: &str,
-        stored_version: i64,
         existing_tables: &[String],
     ) -> Result<(), StorageError> {
         let previous_generation = self.driver.generation();
@@ -479,10 +570,8 @@ impl EmbeddedStore {
             let contract = serde_json::to_vec(&StoreContract::for_schema(schema))
                 .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
             self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
-            if stored_version != sql::EMBEDDED_EPOCH {
-                self.driver
-                    .execute(&sql::write_user_version(), Vec::new())?;
-            }
+            self.driver
+                .execute(&sql::write_user_version(), Vec::new())?;
             Ok(())
         })();
         match written {
@@ -528,23 +617,41 @@ impl EmbeddedStore {
         record_key: &[u8],
         payload: &[u8],
     ) -> Result<(), StorageError> {
+        self.origin_write_for_generation_identity_unlocked(
+            self.driver.generation(),
+            identity_key,
+            kind,
+            record_key,
+            payload,
+        )
+    }
+
+    fn origin_write_for_generation_identity_unlocked(
+        &self,
+        generation: i64,
+        identity_key: &str,
+        kind: OriginKind,
+        record_key: &[u8],
+        payload: &[u8],
+    ) -> Result<(), StorageError> {
+        let codec = origin_current_codec(kind);
         let kind = kind as i64;
         let payload_hash = origin_hash(
             identity_key,
             kind,
             record_key,
-            ORIGIN_CODEC_V1,
+            codec,
             ORIGIN_FLAGS_NONE,
             payload,
         );
         self.driver.execute(
             sql::WRITE_ORIGIN,
             vec![
-                Value::from_i64(self.driver.generation()),
+                Value::from_i64(generation),
                 text_value(identity_key.to_owned()),
                 Value::from_i64(kind),
                 Value::Blob(record_key.to_vec()),
-                Value::from_i64(ORIGIN_CODEC_V1),
+                Value::from_i64(codec),
                 Value::from_i64(ORIGIN_FLAGS_NONE),
                 Value::Blob(payload.to_vec()),
                 Value::Blob(payload_hash),
@@ -593,24 +700,7 @@ impl EmbeddedStore {
         let after = after.cloned().unwrap_or_default();
         let mut records = Vec::with_capacity(page_size);
         let _guard = lock(&self.operation_lock);
-        let has_snapshot = self
-            .migration_progress_read_unlocked()?
-            .is_some_and(|(_, progress)| progress.snapshot_complete)
-            && self.bootstrap_i64_read_unlocked(sql::CANDIDATE_GENERATION_KEY)? == Some(generation);
-        let (query, params) = if has_snapshot {
-            (
-                sql::READ_MIGRATION_SNAPSHOT,
-                vec![
-                    text_value(after.identity_key.clone()),
-                    text_value(after.identity_key.clone()),
-                    Value::from_i64(after.kind),
-                    text_value(after.identity_key),
-                    Value::from_i64(after.kind),
-                    Value::Blob(after.record_key),
-                    Value::from_i64(page_size as i64),
-                ],
-            )
-        } else if let Some(upper) = upper_bound {
+        let (query, params) = if let Some(upper) = upper_bound {
             (
                 sql::READ_ORIGIN_BOUNDED,
                 vec![
@@ -686,9 +776,180 @@ impl EmbeddedStore {
         record_key: &[u8],
         value: &serde_json::Value,
     ) -> Result<(), StorageError> {
-        let payload = serde_json::to_vec(value)
-            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        let (_, payload) = origin_encode_current(kind, value)?;
         self.origin_write_unlocked(kind, record_key, &payload)
+    }
+
+    fn origin_json_batch_write_unlocked(
+        &self,
+        records: Vec<(OriginKind, Vec<u8>, serde_json::Value)>,
+    ) -> Result<(), StorageError> {
+        const CHUNK_SIZE: usize = 256;
+        let generation = self.driver.generation();
+        let identity_key = self.identity_key.clone();
+        for chunk in records.chunks(CHUNK_SIZE) {
+            let mut params = Vec::with_capacity(chunk.len() * 8);
+            for (kind, record_key, value) in chunk {
+                let codec = origin_current_codec(*kind);
+                let (_, payload) = origin_encode_current(*kind, value)?;
+                let payload_hash = origin_hash(
+                    &identity_key,
+                    *kind as i64,
+                    record_key,
+                    codec,
+                    ORIGIN_FLAGS_NONE,
+                    &payload,
+                );
+                params.extend([
+                    Value::from_i64(generation),
+                    text_value(identity_key.clone()),
+                    Value::from_i64(*kind as i64),
+                    Value::Blob(record_key.clone()),
+                    Value::from_i64(codec),
+                    Value::from_i64(ORIGIN_FLAGS_NONE),
+                    Value::Blob(payload),
+                    Value::Blob(payload_hash),
+                ]);
+            }
+            self.driver
+                .execute(&sql::write_origins(chunk.len()), params)?;
+        }
+        Ok(())
+    }
+
+    fn origin_remote_projection_write_unlocked(&self, head: &RowHead) -> Result<(), StorageError> {
+        self.origin_json_write_unlocked(
+            OriginKind::RemoteProjection,
+            &origin_key(&[head.table.as_bytes(), head.local_document_id.as_bytes()]),
+            &serde_json::json!({
+                "table": head.table,
+                "localDocumentId": head.local_document_id,
+                "currentRevId": head.current_rev_id,
+                "serverDocumentId": head.server_document_id,
+                "projectionHash": head.projection_hash,
+                "currentRootId": head.current_root_id,
+                "currentNodeId": head.current_node_id,
+                "serverBase": head.server_base,
+                "serverRow": head.server_row,
+                "logicalClock": head.logical_clock,
+                "updatedTime": head.updated_time,
+            }),
+        )
+    }
+
+    fn origin_remote_memberships_write_unlocked(
+        &self,
+        subscription: &str,
+        members: &[RemoteMember],
+    ) -> Result<(), StorageError> {
+        const CHUNK_SIZE: usize = 256;
+        let generation = self.driver.generation();
+        let identity_key = self.identity_key.clone();
+        let kind = OriginKind::RemoteMembership;
+        let codec = origin_current_codec(kind);
+        for chunk in members.chunks(CHUNK_SIZE) {
+            let mut params = Vec::with_capacity(chunk.len() * 8);
+            for member in chunk {
+                let record_key = origin_key(&[
+                    subscription.as_bytes(),
+                    member.table.as_bytes(),
+                    member.server_document_id.as_bytes(),
+                ]);
+                let value = serde_json::json!({
+                    "subscription": subscription,
+                    "table": member.table,
+                    "serverDocumentId": member.server_document_id,
+                    "rangeLower": null,
+                    "rangeUpper": null,
+                    "rangeOrder": null,
+                });
+                let (_, payload) = origin_encode_current(kind, &value)?;
+                let payload_hash = origin_hash(
+                    &identity_key,
+                    kind as i64,
+                    &record_key,
+                    codec,
+                    ORIGIN_FLAGS_NONE,
+                    &payload,
+                );
+                params.extend([
+                    Value::from_i64(generation),
+                    text_value(identity_key.clone()),
+                    Value::from_i64(kind as i64),
+                    Value::Blob(record_key),
+                    Value::from_i64(codec),
+                    Value::from_i64(ORIGIN_FLAGS_NONE),
+                    Value::Blob(payload),
+                    Value::Blob(payload_hash),
+                ]);
+            }
+            self.driver
+                .execute(&sql::write_origins(chunk.len()), params)?;
+        }
+        Ok(())
+    }
+
+    fn origin_remote_result_write_unlocked(&self, entry: &ResultEntry) -> Result<(), StorageError> {
+        self.origin_json_write_unlocked(
+            OriginKind::RemoteResult,
+            entry.key.as_bytes(),
+            &serde_json::json!({
+                "key": entry.key,
+                "function": entry.function,
+                "args": entry.args,
+                "schemaHash": entry.schema_hash,
+                "moduleHash": entry.module_hash,
+                "skeleton": base64::encode(&entry.skeleton),
+                "paths": base64::encode(&entry.paths),
+                "skeletonHash": entry.skeleton_hash,
+                "clock": entry.clock,
+            }),
+        )
+    }
+
+    fn origin_remote_cursor_write_unlocked(
+        &self,
+        subscription: &str,
+        cursor: Option<&str>,
+        result_key: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        let state_hash = self.remote_subscription_state_hash_unlocked(subscription)?;
+        let result_hash = result_key
+            .map(|key| {
+                self.result_read_unlocked(key)?
+                    .as_ref()
+                    .map(remote_result_content_hash)
+                    .ok_or_else(|| {
+                        StorageError::IncompatibleStore(format!(
+                            "retained result {key} is missing; cursor was not written"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let result_projection_hash = result_key
+            .map(|key| {
+                let result = self.result_read_unlocked(key)?.ok_or_else(|| {
+                    StorageError::IncompatibleStore(format!(
+                        "retained result {key} is missing; cursor was not written"
+                    ))
+                })?;
+                self.remote_result_projection_hash_unlocked(&result)
+            })
+            .transpose()?;
+        self.origin_json_write_unlocked(
+            OriginKind::RemoteCursor,
+            subscription.as_bytes(),
+            &serde_json::json!({
+                "subscription": subscription,
+                "cursor": cursor,
+                "resultKey": result_key,
+                "resultHash": result_hash.map(base64::encode),
+                "resultProjectionHash": result_projection_hash.map(base64::encode),
+                "stateHash": base64::encode(state_hash),
+                "updatedTime": now_ms,
+            }),
+        )
     }
 
     fn origin_device_document_write_unlocked(&self, write: &DocWrite) -> Result<(), StorageError> {
@@ -928,572 +1189,74 @@ impl EmbeddedStore {
             .transpose()
     }
 
-    /// Seed the frozen originated ledger from the only generation-zero layout
-    /// that existed before the ledger was introduced.
+    /// Seed the frozen originated ledger from the generation-zero layout that
+    /// existed before the ledger was introduced.
     ///
     /// This is intentionally a one-time adapter. Once the bootstrap table is
     /// present, all later releases locate originated state exclusively through
     /// the frozen ledger rather than through old application tables.
-    fn legacy_seed_unlocked(
-        &self,
-        stored_version: i64,
-        existing_tables: &[String],
-    ) -> Result<(), StorageError> {
-        if stored_version != sql::EMBEDDED_EPOCH {
-            return Err(StorageError::IncompatibleStore(format!(
-                "unsupported legacy store epoch {stored_version}; the store was preserved"
-            )));
-        }
-        if !existing_tables.iter().any(|table| table == sql::META_TABLE) {
-            return Err(StorageError::IncompatibleStore(
-                "legacy store has no schema manifest table; the store was preserved".to_owned(),
-            ));
-        }
-        self.driver.generation_write(0);
-        let schema = self.stored_schema_manifest_unlocked()?.ok_or_else(|| {
-            StorageError::IncompatibleStore(
-                "legacy store has no schema manifest; the store was preserved".to_owned(),
-            )
-        })?;
-        let stored_signature = self
-            .stored_schema_signature_unlocked(stored_version, existing_tables)?
-            .ok_or_else(|| {
-                StorageError::IncompatibleStore(
-                    "legacy store has no schema signature; the store was preserved".to_owned(),
-                )
-            })?;
-        if schema_signature(&schema) != stored_signature {
-            return Err(StorageError::IncompatibleStore(
-                "legacy schema manifest does not match its signature; the store was preserved"
-                    .to_owned(),
-            ));
-        }
-
-        let (records, payloads) = self.legacy_origin_records_read_unlocked(&schema)?;
-        let mut contract = StoreContract::for_schema(&schema);
-        contract.core_layout_hash = hex(&Sha256::digest(b"generation-zero-layout"));
-        let contract = serde_json::to_vec(&contract)
-            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-
-        self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let seeded = (|| {
-            self.driver.execute(sql::CREATE_BOOTSTRAP, Vec::new())?;
-            self.driver.execute(sql::CREATE_ORIGIN, Vec::new())?;
-            self.driver
-                .execute(sql::CREATE_ORIGIN_PAYLOAD, Vec::new())?;
-            self.write_bootstrap_unlocked(
-                sql::BOOTSTRAP_VERSION_KEY,
-                sql::BOOTSTRAP_VERSION.to_string().as_bytes(),
-            )?;
-            self.write_bootstrap_unlocked(sql::ACTIVE_GENERATION_KEY, b"0")?;
-            self.write_bootstrap_unlocked(sql::NEXT_GENERATION_KEY, b"1")?;
-            self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
-            for (hash, bytes) in payloads {
-                self.driver.execute(
-                    sql::WRITE_ORIGIN_PAYLOAD,
-                    vec![Value::Blob(hash), Value::Blob(bytes)],
-                )?;
-            }
-            for record in records {
-                self.origin_write_for_identity_unlocked(
-                    &record.identity_key,
-                    record.kind,
-                    &record.record_key,
-                    &record.payload,
-                )?;
-            }
-            Ok(())
-        })();
-        match seeded {
-            Ok(()) => self.commit_transaction_unlocked(),
-            Err(error) => {
-                let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
-                Err(combine_rollback(error, rolled))
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[allow(clippy::type_complexity)]
-    fn legacy_origin_records_read_unlocked(
-        &self,
-        schema: &StoreSchema,
-    ) -> Result<(Vec<LegacyOriginSeed>, Vec<(Vec<u8>, Vec<u8>)>), StorageError> {
-        let mut records = Vec::new();
-        let mut payloads = Vec::new();
-
-        self.driver.run_rows(
-            "SELECT identity_key, value FROM __embedded_meta \
-             WHERE key = 'identity_state' ORDER BY identity_key",
-            Vec::new(),
-            |row| {
-                let selector = text_at(row, 0)?;
-                let state = text_at(row, 1)?;
-                let (identity_key, _): (String, Option<String>) = serde_json::from_str(&state)
-                    .map_err(|error| {
-                        StorageError::IncompatibleStore(format!(
-                            "legacy identity state is corrupt: {error}"
-                        ))
-                    })?;
-                records.push(legacy_origin_seed(
-                    identity_key,
-                    OriginKind::Identity,
-                    selector.into_bytes(),
-                    state.into_bytes(),
-                ));
-                Ok(())
-            },
-        )?;
-
-        for table in schema
-            .tables
-            .iter()
-            .filter(|table| table.placement == TablePlacement::Device)
-        {
-            self.driver
-                .run_rows(&sql::read_legacy_doc_rows(table)?, Vec::new(), |row| {
-                    let identity_key = text_at(row, 0)?;
-                    let id = text_at(row, 1)?;
-                    let creation_time = real_at(row, 2)?;
-                    let data = text_at(row, 3)?;
-                    let mut columns = Vec::with_capacity(table.columns.len());
-                    for (index, column) in table.columns.iter().enumerate() {
-                        columns.push(serde_json::json!([
-                            column.name,
-                            base64::encode(blob_at(row, index + 4)?)
-                        ]));
-                    }
-                    records.push(legacy_json_seed(
-                        identity_key,
-                        OriginKind::DeviceDocument,
-                        origin_key(&[table.name.as_bytes(), id.as_bytes()]),
-                        serde_json::json!({
-                            "table": table.name,
-                            "id": id,
-                            "data": data,
-                            "columns": columns,
-                            "creationTime": creation_time,
-                        }),
-                    )?);
-                    Ok(())
-                })?;
-        }
-
-        self.driver.run_rows(
-            "SELECT identity_key, table_name, document_id, field, value_json \
-             FROM __embedded_local_fields ORDER BY identity_key, table_name, document_id, field",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let table = text_at(row, 1)?;
-                let id = text_at(row, 2)?;
-                let field = text_at(row, 3)?;
-                let value: serde_json::Value =
-                    serde_json::from_str(&text_at(row, 4)?).map_err(|error| {
-                        StorageError::Decode {
-                            expected: "legacy local field JSON",
-                            index: 4,
-                            got: error.to_string(),
-                        }
-                    })?;
-                records.push(legacy_json_seed(
-                    identity_key,
-                    OriginKind::LocalField,
-                    origin_key(&[table.as_bytes(), id.as_bytes(), field.as_bytes()]),
-                    serde_json::json!({
-                        "table": table,
-                        "id": id,
-                        "field": field,
-                        "value": value,
-                    }),
-                )?);
-                Ok(())
-            },
-        )?;
-
-        self.driver.run_rows(
-            "SELECT identity_key, mutation_id, name, args, status, result, error, commit_seq \
-             FROM __embedded_mutations ORDER BY identity_key, mutation_id",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let mutation_id = text_at(row, 1)?;
-                records.push(legacy_json_seed(
-                    identity_key,
-                    OriginKind::Mutation,
-                    mutation_id.as_bytes().to_vec(),
-                    serde_json::json!({
-                        "mutationId": mutation_id,
-                        "name": text_at(row, 2)?,
-                        "args": text_at(row, 3)?,
-                        "status": text_at(row, 4)?,
-                        "result": optional_text_at(row, 5)?,
-                        "error": optional_text_at(row, 6)?,
-                        "commitSeq": optional_int_at(row, 7)?,
-                    }),
-                )?);
-                Ok(())
-            },
-        )?;
-
-        self.driver.run_rows(
-            "SELECT identity_key, watermark, commit_seq, cursor FROM __embedded_remote \
-             WHERE cursor IS NOT NULL AND \
-             (watermark >= 'push_envelope:' AND watermark < 'push_envelope;' OR \
-              watermark >= 'settlement_ack:' AND watermark < 'settlement_ack;') \
-             ORDER BY identity_key, watermark",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let watermark = text_at(row, 1)?;
-                let commit_seq = int_at(row, 2)?;
-                let cursor = text_at(row, 3)?;
-                if let Some(mutation_id) = watermark.strip_prefix(REMOTE_PUSH_ENVELOPE_PREFIX) {
-                    records.push(legacy_origin_seed(
-                        identity_key,
-                        OriginKind::PushEnvelope,
-                        mutation_id.as_bytes().to_vec(),
-                        cursor.into_bytes(),
-                    ));
-                } else if let Some(replay_id) = watermark.strip_prefix(REMOTE_RECEIPT_PREFIX) {
-                    records.push(legacy_json_seed(
-                        identity_key,
-                        OriginKind::SettlementReceipt,
-                        replay_id.as_bytes().to_vec(),
-                        serde_json::json!({
-                            "replayId": replay_id,
-                            "mutationId": replay_id,
-                            "commitSeq": commit_seq,
-                        }),
-                    )?);
-                }
-                Ok(())
-            },
-        )?;
-
-        self.legacy_schedule_records_read_unlocked(&mut records)?;
-        self.legacy_upload_records_read_unlocked(&mut records)?;
-        self.legacy_blob_records_read_unlocked(&mut records, &mut payloads)?;
-        self.legacy_revision_records_read_unlocked(&mut records, &mut payloads)?;
-        self.legacy_crdt_records_read_unlocked(&mut records, &mut payloads)?;
-        self.legacy_id_mapping_records_read_unlocked(&mut records)?;
-        Ok((records, payloads))
-    }
-
-    fn legacy_schedule_records_read_unlocked(
-        &self,
-        records: &mut Vec<LegacyOriginSeed>,
-    ) -> Result<(), StorageError> {
-        self.driver.run_rows(
-            "SELECT identity_key, job_id, kind, name, args, due_time_ms, state, \
-             lease_until_ms, created_time_ms, updated_time_ms \
-             FROM __embedded_schedules ORDER BY identity_key, job_id",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let job_id = text_at(row, 1)?;
-                records.push(legacy_json_seed(
-                    identity_key,
-                    OriginKind::Schedule,
-                    job_id.as_bytes().to_vec(),
-                    serde_json::json!({
-                        "jobId": job_id,
-                        "kind": text_at(row, 2)?,
-                        "name": text_at(row, 3)?,
-                        "args": text_at(row, 4)?,
-                        "dueTime": int_at(row, 5)?,
-                        "state": text_at(row, 6)?,
-                        "leaseUntil": optional_int_at(row, 7)?,
-                        "createdTime": int_at(row, 8)?,
-                        "updatedTime": int_at(row, 9)?,
-                    }),
-                )?);
-                Ok(())
-            },
-        )
-    }
-
-    fn legacy_upload_records_read_unlocked(
-        &self,
-        records: &mut Vec<LegacyOriginSeed>,
-    ) -> Result<(), StorageError> {
-        self.driver.run_rows(
-            "SELECT identity_key, local_storage_id, sha256, size, content_type, state, owner, \
-             lease_until_ms, created_time_ms, updated_time_ms \
-             FROM __embedded_uploads ORDER BY identity_key, local_storage_id",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let local_storage_id = text_at(row, 1)?;
-                records.push(legacy_json_seed(
-                    identity_key,
-                    OriginKind::Upload,
-                    local_storage_id.as_bytes().to_vec(),
-                    serde_json::json!({
-                        "localStorageId": local_storage_id,
-                        "sha256": text_at(row, 2)?,
-                        "size": int_at(row, 3)?,
-                        "contentType": optional_text_at(row, 4)?,
-                        "lease": text_at(row, 5)?,
-                        "owner": optional_text_at(row, 6)?,
-                        "leaseUntil": optional_int_at(row, 7)?,
-                        "createdTime": int_at(row, 8)?,
-                        "updatedTime": int_at(row, 9)?,
-                    }),
-                )?);
-                Ok(())
-            },
-        )
-    }
-
-    fn legacy_blob_records_read_unlocked(
-        &self,
-        records: &mut Vec<LegacyOriginSeed>,
-        payloads: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), StorageError> {
-        self.driver.run_rows(
-            "SELECT file.identity_key, file.local_storage_id, file.sha256, file.size, \
-             file.content_type, file.source, file.created_time_ms, file.updated_time_ms, blob.bytes \
-             FROM __embedded_files AS file \
-             JOIN __embedded_blobs AS blob \
-             ON blob.identity_key = file.identity_key AND blob.key = file.local_storage_id \
-             ORDER BY file.identity_key, file.local_storage_id",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let storage_id = text_at(row, 1)?;
-                let bytes = blob_at(row, 8)?;
-                let bytes_hash = Sha256::digest(&bytes).to_vec();
-                payloads.push((bytes_hash.clone(), bytes));
-                records.push(legacy_json_seed(
-                    identity_key,
-                    OriginKind::Blob,
-                    storage_id.as_bytes().to_vec(),
-                    serde_json::json!({
-                        "storageId": storage_id,
-                        "sha256": text_at(row, 2)?,
-                        "size": int_at(row, 3)?,
-                        "contentType": optional_text_at(row, 4)?,
-                        "source": optional_text_at(row, 5)?,
-                        "createdTime": int_at(row, 6)?,
-                        "updatedTime": int_at(row, 7)?,
-                        "bytesHash": base64::encode(bytes_hash),
-                    }),
-                )?);
-                Ok(())
-            },
-        )
-    }
-
-    fn legacy_revision_records_read_unlocked(
-        &self,
-        records: &mut Vec<LegacyOriginSeed>,
-        payloads: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), StorageError> {
-        let mut revisions = Vec::new();
-        self.driver.run_rows(
-            "SELECT identity_key, table_name, document_id, rev_id, snapshot, frontier, status, \
-             parent, server_rev_id, rev_root_id, rev_node_id, base_root_id, base_node_id, \
-             updated_time_ms FROM __embedded_revs \
-             ORDER BY identity_key, table_name, document_id, rev_id",
-            Vec::new(),
-            |row| {
-                revisions.push((
-                    text_at(row, 0)?,
-                    RevState {
-                        key: RevKey {
-                            row: RowKey {
-                                table: text_at(row, 1)?,
-                                document_id: text_at(row, 2)?,
-                            },
-                            rev_id: text_at(row, 3)?,
-                        },
-                        snapshot: blob_at(row, 4)?,
-                        frontier: blob_at(row, 5)?,
-                        lifecycle: rev_lifecycle_at(row, 6)?,
-                        log: Vec::new(),
-                        updated_time: int_at(row, 13)?,
-                    },
-                ));
-                Ok(())
-            },
-        )?;
-        for (identity_key, mut state) in revisions {
-            self.driver.run_rows(
-                "SELECT bytes FROM __embedded_rev_log \
-                 WHERE identity_key = ? AND table_name = ? AND document_id = ? AND rev_id = ? \
-                 ORDER BY seq",
-                vec![
-                    text_value(identity_key.clone()),
-                    text_value(state.key.row.table.clone()),
-                    text_value(state.key.row.document_id.clone()),
-                    text_value(state.key.rev_id.clone()),
-                ],
-                |row| {
-                    state.log.push(blob_at(row, 0)?);
-                    Ok(())
-                },
-            )?;
-            let snapshot_hash = Sha256::digest(&state.snapshot).to_vec();
-            payloads.push((snapshot_hash.clone(), state.snapshot.clone()));
-            let mut log_hashes = Vec::with_capacity(state.log.len());
-            for delta in &state.log {
-                let hash = Sha256::digest(delta).to_vec();
-                payloads.push((hash.clone(), delta.clone()));
-                log_hashes.push(base64::encode(hash));
-            }
-            let archived = state.lifecycle.archived();
-            records.push(legacy_json_seed(
-                identity_key,
-                OriginKind::Revision,
-                origin_key(&[
-                    state.key.row.table.as_bytes(),
-                    state.key.row.document_id.as_bytes(),
-                    state.key.rev_id.as_bytes(),
-                ]),
-                serde_json::json!({
-                    "table": state.key.row.table,
-                    "id": state.key.row.document_id,
-                    "revId": state.key.rev_id,
-                    "frontier": base64::encode(&state.frontier),
-                    "snapshotHash": base64::encode(snapshot_hash),
-                    "logHashes": log_hashes,
-                    "lifecycle": state.lifecycle.as_str(),
-                    "parent": archived.map(|value| value.parent.as_str()),
-                    "serverRevId": archived.and_then(|value| value.server_rev_id.as_deref()),
-                    "serverRootId": archived.and_then(|value| value.server_root_id.as_deref()),
-                    "serverNodeId": archived.and_then(|value| value.server_node_id.as_deref()),
-                    "baseRootId": archived.and_then(|value| value.base_root_id.as_deref()),
-                    "baseNodeId": archived.and_then(|value| value.base_node_id.as_deref()),
-                    "updatedTime": state.updated_time,
-                }),
-            )?);
-        }
-        Ok(())
-    }
-
-    fn legacy_crdt_records_read_unlocked(
-        &self,
-        records: &mut Vec<LegacyOriginSeed>,
-        payloads: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), StorageError> {
-        self.driver.run_rows(
-            "SELECT op.identity_key, op.table_name, op.document_id, op.commit_seq, op.field, \
-             field.kind, field.bytes \
-             FROM __embedded_crdt_ops AS op \
-             JOIN __embedded_crdt_field AS field \
-             ON field.identity_key = op.identity_key AND field.table_name = op.table_name \
-             AND field.document_id = op.document_id AND field.field = op.field \
-             ORDER BY op.identity_key, op.commit_seq, op.ordinal",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let table = text_at(row, 1)?;
-                let id = text_at(row, 2)?;
-                let commit_seq = int_at(row, 3)?;
-                let field = text_at(row, 4)?;
-                let state = blob_at(row, 6)?;
-                let state_hash = Sha256::digest(&state).to_vec();
-                payloads.push((state_hash.clone(), state));
-                records.push(legacy_json_seed(
-                    identity_key,
-                    OriginKind::CrdtEffect,
-                    origin_key(&[
-                        commit_seq.to_be_bytes().as_slice(),
-                        table.as_bytes(),
-                        id.as_bytes(),
-                        field.as_bytes(),
-                    ]),
-                    serde_json::json!({
-                        "commitSeq": commit_seq,
-                        "table": table,
-                        "id": id,
-                        "field": field,
-                        "kind": text_at(row, 5)?,
-                        "stateHash": base64::encode(state_hash),
-                        "update": "",
-                        "checkpoint": null,
-                    }),
-                )?);
-                Ok(())
-            },
-        )
-    }
-
-    fn legacy_id_mapping_records_read_unlocked(
-        &self,
-        records: &mut Vec<LegacyOriginSeed>,
-    ) -> Result<(), StorageError> {
-        self.driver.run_rows(
-            "SELECT identity_key, table_name, local_id, convex_id, state, \
-             created_time_ms, updated_time_ms FROM __embedded_id_mappings \
-             ORDER BY identity_key, table_name, local_id",
-            Vec::new(),
-            |row| {
-                let identity_key = text_at(row, 0)?;
-                let table = text_at(row, 1)?;
-                let local_id = text_at(row, 2)?;
-                records.push(legacy_json_seed(
-                    identity_key,
-                    OriginKind::IdMapping,
-                    origin_key(&[table.as_bytes(), local_id.as_bytes()]),
-                    serde_json::json!({
-                        "table": table,
-                        "localId": local_id,
-                        "convexId": optional_text_at(row, 3)?,
-                        "state": text_at(row, 4)?,
-                        "createdTime": int_at(row, 5)?,
-                        "updatedTime": int_at(row, 6)?,
-                    }),
-                )?);
-                Ok(())
-            },
-        )
-    }
-
     /// Create or resume an isolated generation carrying the active originated ledger.
     #[allow(clippy::too_many_lines)]
-    pub fn migration_begin(
+    pub fn migration_prepare(
         &self,
         schema: &StoreSchema,
     ) -> Result<MigrationCandidate, StorageError> {
         validate_store_schema(schema)?;
-        let target = StoreContract::for_schema(schema);
-        let target_contract_hash = target
+        let mut target = StoreContract::for_schema(schema);
+        let mut target_contract_hash = target
             .hash()
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-        let _guard = lock(&self.operation_lock);
+        let guard = lock(&self.operation_lock);
         let existing_tables = self.read_tables()?;
         if existing_tables.is_empty() {
-            let stored_version = self.read_user_version()?;
-            let signature = schema_signature(schema);
-            let manifest = serde_json::to_string(schema)
+            // A first-install setup action still needs an unpublished generation: seed an empty
+            // active base contract, then re-enter normal candidate creation below. The action can
+            // therefore fail or be interrupted without ever publishing partial seed data.
+            let mut base_schema = schema.clone();
+            let has_setup = !base_schema.setup_hash.is_empty();
+            if has_setup {
+                base_schema.setup_hash.clear();
+            }
+            let signature = base_schema.hash.clone();
+            let manifest = serde_json::to_string(&base_schema)
                 .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-            self.replace_store_unlocked(
-                schema,
-                &signature,
-                &manifest,
-                stored_version,
-                &existing_tables,
-            )?;
-            self.validate_physical_schema_unlocked(schema)?;
-            self.activate_schema_unlocked(schema)?;
+            self.replace_store_unlocked(&base_schema, &signature, &manifest, &existing_tables)?;
+            self.validate_physical_schema_unlocked(&base_schema)?;
+            self.activate_schema_unlocked(&base_schema)?;
+            if has_setup {
+                drop(guard);
+                return self.migration_prepare(schema);
+            }
             return Ok(MigrationCandidate {
                 active_generation: self.driver.generation(),
                 candidate_generation: self.driver.generation(),
+                cleanup_generation: None,
+                source_schema: base_schema,
+                setup_complete: true,
                 source_contract_hash: target_contract_hash.clone(),
                 target_contract_hash,
                 retired_generations: Vec::new(),
-                applied_migrations: schema.migrations.len(),
                 required: false,
                 resumed: false,
-                progress_migration_id: None,
-                progress_cursor: None,
             });
         }
+        let stored_version = self.read_user_version()?;
+        if stored_version < MIN_SUPPORTED_EPOCH {
+            return Err(StorageError::PreBaselineStore {
+                found: stored_version,
+                minimum: MIN_SUPPORTED_EPOCH,
+            });
+        }
+        if stored_version > sql::EMBEDDED_EPOCH {
+            return Err(StorageError::IncompatibleStore(format!(
+                "store epoch {stored_version} is newer than runtime epoch {}; the store was preserved",
+                sql::EMBEDDED_EPOCH
+            )));
+        }
         if !existing_tables.iter().any(|table| table == sql::BOOTSTRAP) {
-            let stored_version = self.read_user_version()?;
-            self.legacy_seed_unlocked(stored_version, &existing_tables)?;
+            return Err(StorageError::IncompatibleStore(
+                "the store has no epoch-47 bootstrap plane; the store was preserved".to_owned(),
+            ));
         }
         let resolved_generation = self
             .bootstrap_i64_read_unlocked(sql::ACTIVE_GENERATION_KEY)?
@@ -1504,27 +1267,60 @@ impl EmbeddedStore {
             })?;
         self.driver.generation_write(resolved_generation);
         let active_generation = self.driver.generation();
+        let source_schema = self.stored_schema_manifest_unlocked()?.ok_or_else(|| {
+            StorageError::IncompatibleStore(
+                "active generation has no stored schema manifest; the store was preserved"
+                    .to_owned(),
+            )
+        })?;
         let retired_generations = self.retired_generations_read_unlocked()?;
         let active = self
             .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
-            .unwrap_or_else(|| target.clone());
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "bootstrap has no active contract; the store was preserved".to_owned(),
+                )
+            })?;
+        if active.package_epoch != stored_version
+            || active.bootstrap_version != sql::BOOTSTRAP_VERSION
+        {
+            return Err(StorageError::IncompatibleStore(
+                "the active contract does not match the SQLite/bootstrap versions; the store was preserved"
+                    .to_owned(),
+            ));
+        }
+        // Omitting setup retires its executable hook without erasing its durable identity. This
+        // lets applications return to plain `open()` while preventing an older build from
+        // treating the same setup action as new work and rerunning it against a later store.
+        if target.setup_hash.is_empty() && !active.setup_hash.is_empty() {
+            target.setup_hash.clone_from(&active.setup_hash);
+        }
+        target_contract_hash = target
+            .hash()
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
         let source_contract_hash = active
             .hash()
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-        if active == target {
+        if active.kernel_layout_hash != target.kernel_layout_hash {
+            return Err(StorageError::IncompatibleStore(
+                "the epoch-47 kernel layout fingerprint changed; the store was preserved"
+                    .to_owned(),
+            ));
+        }
+        if active.has_same_candidate_identity(&target) {
             self.validate_physical_schema_unlocked(schema)?;
             self.activate_schema_unlocked(schema)?;
             return Ok(MigrationCandidate {
                 active_generation,
                 candidate_generation: active_generation,
+                cleanup_generation: None,
+                source_schema,
+                setup_complete: true,
                 source_contract_hash,
                 target_contract_hash,
                 retired_generations,
-                applied_migrations: active.migrations.len(),
                 required: false,
                 resumed: false,
-                progress_migration_id: None,
-                progress_cursor: None,
             });
         }
         if target.package_epoch < active.package_epoch {
@@ -1533,19 +1329,12 @@ impl EmbeddedStore {
                 active.package_epoch, target.package_epoch
             )));
         }
-        if active_generation != 0
-            && (target.core_layout_hash != active.core_layout_hash
-                || target.codec_set_hash != active.codec_set_hash)
+        if (target.generation_layout_hash != active.generation_layout_hash
+            || target.origin_writer_hash != active.origin_writer_hash)
             && target.package_epoch <= active.package_epoch
         {
             return Err(StorageError::IncompatibleStore(
-                "the core layout or codec contract changed without advancing the package epoch; the store was preserved"
-                    .to_owned(),
-            ));
-        }
-        if !target.has_migration_prefix(&active) {
-            return Err(StorageError::IncompatibleStore(
-                "MigrationHistoryDiverged: the active migration manifest is not a prefix of the target"
+                "the generation layout or origin writer changed without advancing the package epoch; the store was preserved"
                     .to_owned(),
             ));
         }
@@ -1563,38 +1352,89 @@ impl EmbeddedStore {
                     == Some(target_json.as_slice())
             })
             .filter(|_| {
-                self.bootstrap_read_unlocked(sql::CANDIDATE_CODE_HASH_KEY)
+                self.bootstrap_read_unlocked(sql::CANDIDATE_SETUP_HASH_KEY)
                     .ok()
                     .flatten()
                     .as_deref()
-                    == Some(schema.migration_code_hash.as_bytes())
+                    == Some(schema.setup_hash.as_bytes())
+            })
+            .filter(|_| {
+                self.bootstrap_read_unlocked(sql::CANDIDATE_RETIRE_STATE_KEY)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != Some(b"authorized")
             });
         if let Some((candidate_generation, _)) = resume {
-            self.candidate_origin_copy_unlocked(active_generation, candidate_generation)?;
-            let applied_migrations = self
-                .bootstrap_i64_read_unlocked(sql::CANDIDATE_APPLIED_KEY)?
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(active.migrations.len());
-            let progress = self.migration_progress_read_unlocked()?;
+            // A process can die while finalization is rebuilding the candidate projection. Origins
+            // remain authoritative, so discard every unpublished generation table and recreate an
+            // empty target projection before the next bind. Resetting only the cursor would replay
+            // non-idempotent system records (notably mutations) over their partial prior copies.
+            if self
+                .bootstrap_read_unlocked(sql::CANDIDATE_FINALIZE_STATE_KEY)?
+                .as_deref()
+                == Some(b"running")
+            {
+                let previous_generation = self.driver.generation();
+                self.driver.generation_write(candidate_generation);
+                let rebuilt =
+                    self.reset_candidate_projection_unlocked(schema, candidate_generation);
+                self.driver.generation_write(previous_generation);
+                rebuilt?;
+                self.write_bootstrap_unlocked(sql::CANDIDATE_FINALIZE_STATE_KEY, b"pending")?;
+            }
             return Ok(MigrationCandidate {
                 active_generation,
                 candidate_generation,
+                cleanup_generation: None,
+                source_schema,
+                setup_complete: matches!(
+                    self.bootstrap_read_unlocked(sql::CANDIDATE_SETUP_STATE_KEY)?
+                        .as_deref(),
+                    Some(b"complete" | b"skipped")
+                ),
                 source_contract_hash,
                 target_contract_hash,
                 retired_generations,
-                applied_migrations,
                 required: true,
                 resumed: true,
-                progress_migration_id: progress.as_ref().map(|(id, _)| id.clone()),
-                progress_cursor: progress.and_then(|(_, progress)| progress.cursor),
             });
         }
 
         let stale_candidate = self.bootstrap_i64_read_unlocked(sql::CANDIDATE_GENERATION_KEY)?;
+        if let Some(stale) = stale_candidate {
+            if stale <= active_generation {
+                return Err(StorageError::IncompatibleStore(
+                    "candidate generation metadata is not ahead of the active generation; the store was preserved"
+                        .to_owned(),
+                ));
+            }
+            if self
+                .bootstrap_read_unlocked(sql::CANDIDATE_RETIRE_STATE_KEY)?
+                .as_deref()
+                != Some(b"authorized")
+            {
+                self.transaction_unlocked(|| {
+                    self.write_bootstrap_unlocked(sql::CANDIDATE_RETIRE_STATE_KEY, b"authorized")
+                })?;
+            }
+            return Ok(MigrationCandidate {
+                active_generation,
+                candidate_generation: stale,
+                cleanup_generation: Some(stale),
+                source_schema,
+                setup_complete: true,
+                source_contract_hash,
+                target_contract_hash,
+                retired_generations,
+                required: false,
+                resumed: false,
+            });
+        }
         let candidate_generation = self
             .bootstrap_i64_read_unlocked(sql::NEXT_GENERATION_KEY)?
             .unwrap_or_else(|| active_generation.saturating_add(1));
-        if stale_candidate == Some(active_generation) || candidate_generation <= active_generation {
+        if candidate_generation <= active_generation {
             return Err(StorageError::IncompatibleStore(
                 "candidate generation metadata is not ahead of the active generation; the store was preserved"
                     .to_owned(),
@@ -1603,9 +1443,6 @@ impl EmbeddedStore {
         let schema_manifest = serde_json::to_string(schema)
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
         let previous_generation = self.driver.generation();
-        if let Some(stale) = stale_candidate {
-            self.generation_cleanup_unlocked(stale)?;
-        }
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
         let written = (|| {
             self.driver.generation_write(candidate_generation);
@@ -1623,17 +1460,24 @@ impl EmbeddedStore {
             )?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_CONTRACT_KEY, &target_json)?;
             self.write_bootstrap_unlocked(
-                sql::CANDIDATE_CODE_HASH_KEY,
-                schema.migration_code_hash.as_bytes(),
+                sql::CANDIDATE_SETUP_HASH_KEY,
+                schema.setup_hash.as_bytes(),
             )?;
-            self.write_bootstrap_unlocked(sql::CANDIDATE_STATE_KEY, b"created")?;
+            self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_STATE_KEY, b"pending")?;
+            self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"pending")?;
             self.write_bootstrap_unlocked(
-                sql::CANDIDATE_APPLIED_KEY,
-                active.migrations.len().to_string().as_bytes(),
+                sql::CANDIDATE_SETUP_STATE_KEY,
+                if schema.setup_hash.is_empty() {
+                    b"skipped"
+                } else {
+                    b"pending"
+                },
             )?;
+            self.write_bootstrap_unlocked(sql::CANDIDATE_FINALIZE_STATE_KEY, b"pending")?;
+            self.write_bootstrap_unlocked(sql::CANDIDATE_QUEUE_POLICY_STATE_KEY, b"collecting")?;
             self.driver.execute(
                 sql::DELETE_BOOTSTRAP,
-                vec![text_value(sql::CANDIDATE_PROGRESS_KEY.to_owned())],
+                vec![text_value(sql::CANDIDATE_RETIRE_STATE_KEY.to_owned())],
             )?;
             self.driver.execute(
                 sql::DELETE_BOOTSTRAP,
@@ -1642,6 +1486,12 @@ impl EmbeddedStore {
             self.driver.execute(
                 sql::DELETE_BOOTSTRAP,
                 vec![text_value(sql::CANDIDATE_MATERIALIZE_CURSOR_KEY.to_owned())],
+            )?;
+            self.driver.execute(
+                sql::DELETE_BOOTSTRAP,
+                vec![text_value(
+                    sql::CANDIDATE_QUEUE_POLICY_CURSOR_KEY.to_owned(),
+                )],
             )?;
             self.write_bootstrap_unlocked(
                 sql::NEXT_GENERATION_KEY,
@@ -1660,34 +1510,201 @@ impl EmbeddedStore {
                 return Err(combine_rollback(error, rolled));
             }
         }
-        self.candidate_origin_copy_unlocked(active_generation, candidate_generation)?;
         Ok(MigrationCandidate {
             active_generation,
             candidate_generation,
+            cleanup_generation: None,
+            source_schema,
+            setup_complete: schema.setup_hash.is_empty(),
             source_contract_hash,
             target_contract_hash,
             retired_generations,
-            applied_migrations: active.migrations.len(),
             required: true,
             resumed: false,
-            progress_migration_id: None,
-            progress_cursor: None,
         })
     }
 
-    fn candidate_origin_copy_unlocked(
+    /// Compatibility wrapper for direct Rust callers. Production bindings use
+    /// [`Self::migration_prepare`] and advance each bounded copy step explicitly.
+    pub fn migration_begin(
+        &self,
+        schema: &StoreSchema,
+    ) -> Result<MigrationCandidate, StorageError> {
+        let mut candidate = self.migration_prepare(schema)?;
+        while let Some(generation) = candidate.cleanup_generation {
+            while !self.migration_retire_step(generation)?.done {}
+            candidate = self.migration_prepare(schema)?;
+        }
+        if candidate.required {
+            while !self
+                .migration_copy_step(candidate.candidate_generation)?
+                .done
+            {}
+        }
+        Ok(candidate)
+    }
+
+    /// Bind ordinary store reads and commits to a prepared candidate generation.
+    ///
+    /// The caller must unbind before committing or abandoning the candidate. This is deliberately
+    /// a store phase, rather than a second raw-record API: a setup runner sees the usual document
+    /// store and every one of its transactions is written into the unpublished generation.
+    pub fn migration_bind_prepare(
+        &self,
+        schema: &StoreSchema,
+        generation: i64,
+    ) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.ensure_candidate_unlocked(generation)?;
+        let active_generation = self
+            .bootstrap_i64_read_unlocked(sql::ACTIVE_GENERATION_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "bootstrap has no active generation; the store was preserved".to_owned(),
+                )
+            })?;
+        if self.driver.generation() != active_generation {
+            return Err(StorageError::Unsatisfiable(
+                "cannot bind a candidate while another store generation is active".to_owned(),
+            ));
+        }
+        let active_tables = lock(&self.tables).clone();
+        self.driver.generation_write(generation);
+        if let Err(error) = self.create_doc_schema_unlocked(schema) {
+            self.driver.generation_write(active_generation);
+            return Err(error);
+        }
+        if let Err(error) = self.activate_schema_unlocked(schema) {
+            self.driver.generation_write(active_generation);
+            *lock(&self.tables) = active_tables;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Compatibility wrapper for Rust callers. Production bindings call
+    /// [`Self::migration_bind_prepare`] and yield after every durable materialization page.
+    pub fn migration_bind(
+        &self,
+        schema: &StoreSchema,
+        generation: i64,
+    ) -> Result<(), StorageError> {
+        self.migration_bind_prepare(schema, generation)?;
+        let materialized = (|| {
+            while !self.migration_materialize_step(generation)?.done {}
+            Ok::<_, StorageError>(())
+        })();
+        if let Err(error) = materialized {
+            drop(self.migration_unbind());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Restore ordinary store reads and commits to the published generation after setup work.
+    pub fn migration_unbind(&self) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let bound_generation = self.driver.generation();
+        let bound_tables = lock(&self.tables).clone();
+        let active_generation = self
+            .bootstrap_i64_read_unlocked(sql::ACTIVE_GENERATION_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "bootstrap has no active generation; the store was preserved".to_owned(),
+                )
+            })?;
+        self.driver.generation_write(active_generation);
+        let active_schema = self.stored_schema_manifest_unlocked()?.ok_or_else(|| {
+            StorageError::IncompatibleStore(
+                "active generation has no stored schema manifest; the store was preserved"
+                    .to_owned(),
+            )
+        })?;
+        if let Err(error) = self.activate_schema_unlocked(&active_schema) {
+            self.driver.generation_write(bound_generation);
+            *lock(&self.tables) = bound_tables;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Durably records that the app setup action returned successfully for this candidate.
+    /// A crash before this transition reruns the idempotent action; a crash after it resumes at
+    /// target finalization without repeating already-completed application work.
+    pub fn migration_setup_complete(&self, generation: i64) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.ensure_candidate_unlocked(generation)?;
+        if self.driver.generation() != generation {
+            return Err(StorageError::Unsatisfiable(
+                "candidate setup can complete only while that generation is bound".to_owned(),
+            ));
+        }
+        self.transaction_unlocked(|| {
+            self.write_bootstrap_unlocked(sql::CANDIDATE_SETUP_STATE_KEY, b"complete")
+        })
+    }
+
+    /// Copy at most one ledger page into an unpublished candidate.
+    pub fn migration_copy_step(&self, generation: i64) -> Result<MigrationStep, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.ensure_candidate_unlocked(generation)?;
+        let source_generation = self
+            .bootstrap_i64_read_unlocked(sql::CANDIDATE_SOURCE_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "candidate source generation is missing; the active store was preserved"
+                        .to_owned(),
+                )
+            })?;
+        let source = self
+            .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "active contract is missing; the active store was preserved".to_owned(),
+                )
+            })?;
+        let target = self
+            .bootstrap_contract_read_unlocked(sql::CANDIDATE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "candidate contract is missing; the active store was preserved".to_owned(),
+                )
+            })?;
+        self.candidate_origin_copy_step_unlocked(
+            source_generation,
+            generation,
+            source.package_epoch,
+            target.package_epoch,
+        )
+    }
+
+    fn candidate_origin_copy_step_unlocked(
         &self,
         source_generation: i64,
         candidate_generation: i64,
-    ) -> Result<(), StorageError> {
-        if self
-            .bootstrap_read_unlocked(sql::CANDIDATE_STATE_KEY)?
+        source_epoch: i64,
+        target_epoch: i64,
+    ) -> Result<MigrationStep, StorageError> {
+        let copy_complete = self
+            .bootstrap_read_unlocked(sql::CANDIDATE_COPY_STATE_KEY)?
             .as_deref()
-            == Some(b"copied")
-        {
-            return Ok(());
+            == Some(b"complete")
+            // Candidates created by the previous unreleased layout had one overloaded state.
+            // Its later values still mean origin copying completed, so never re-copy them.
+            || (self
+                .bootstrap_read_unlocked(sql::CANDIDATE_COPY_STATE_KEY)?
+                .is_none()
+                && matches!(
+                    self.bootstrap_read_unlocked(sql::CANDIDATE_STATE_KEY)?.as_deref(),
+                    Some(b"copied" | b"materializing" | b"ready")
+                ));
+        if copy_complete {
+            return Ok(MigrationStep {
+                done: true,
+                records: 0,
+            });
         }
-        let mut cursor = self
+        let cursor = self
             .bootstrap_read_unlocked(sql::CANDIDATE_COPY_CURSOR_KEY)?
             .map(|bytes| -> Result<OriginCursor, StorageError> {
                 let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -1703,178 +1720,80 @@ impl EmbeddedStore {
             })
             .transpose()?
             .unwrap_or_default();
-        loop {
-            let mut page = Vec::with_capacity(512);
-            self.driver.run_rows(
-                sql::READ_ORIGIN,
-                vec![
-                    Value::from_i64(source_generation),
-                    text_value(cursor.identity_key.clone()),
-                    text_value(cursor.identity_key.clone()),
-                    Value::from_i64(cursor.kind),
-                    text_value(cursor.identity_key.clone()),
-                    Value::from_i64(cursor.kind),
-                    Value::Blob(cursor.record_key.clone()),
-                    Value::from_i64(512),
-                ],
-                |row| {
-                    page.push(OriginRecord {
-                        identity_key: text_at(row, 0)?,
-                        kind: int_at(row, 1)?,
-                        record_key: blob_at(row, 2)?,
-                        codec: int_at(row, 3)?,
-                        flags: int_at(row, 4)?,
-                        payload: blob_at(row, 5)?,
-                        payload_hash: blob_at(row, 6)?,
-                    });
-                    Ok(())
-                },
-            )?;
-            if page.is_empty() {
-                self.transaction_unlocked(|| {
-                    self.write_bootstrap_unlocked(sql::CANDIDATE_STATE_KEY, b"copied")?;
-                    self.driver.execute(
-                        sql::DELETE_BOOTSTRAP,
-                        vec![text_value(sql::CANDIDATE_COPY_CURSOR_KEY.to_owned())],
-                    )
-                })?;
-                return Ok(());
-            }
-            let next = page.last().map(|record| OriginCursor {
+        let mut page = Vec::with_capacity(512);
+        self.driver.run_rows(
+            sql::READ_ORIGIN,
+            vec![
+                Value::from_i64(source_generation),
+                text_value(cursor.identity_key.clone()),
+                text_value(cursor.identity_key.clone()),
+                Value::from_i64(cursor.kind),
+                text_value(cursor.identity_key.clone()),
+                Value::from_i64(cursor.kind),
+                Value::Blob(cursor.record_key),
+                Value::from_i64(512),
+            ],
+            |row| {
+                page.push(OriginRecord {
+                    identity_key: text_at(row, 0)?,
+                    kind: int_at(row, 1)?,
+                    record_key: blob_at(row, 2)?,
+                    codec: int_at(row, 3)?,
+                    flags: int_at(row, 4)?,
+                    payload: blob_at(row, 5)?,
+                    payload_hash: blob_at(row, 6)?,
+                });
+                Ok(())
+            },
+        )?;
+        if page.is_empty() {
+            self.transaction_unlocked(|| {
+                self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_STATE_KEY, b"complete")?;
+                self.driver.execute(
+                    sql::DELETE_BOOTSTRAP,
+                    vec![text_value(sql::CANDIDATE_COPY_CURSOR_KEY.to_owned())],
+                )
+            })?;
+            return Ok(MigrationStep {
+                done: true,
+                records: 0,
+            });
+        }
+        for record in &mut page {
+            *record = origin_record_encode_current(record, source_epoch, target_epoch)?;
+        }
+        let next = page
+            .last()
+            .map(|record| OriginCursor {
                 identity_key: record.identity_key.clone(),
                 kind: record.kind,
                 record_key: record.record_key.clone(),
-            });
-            let encoded = serde_json::to_vec(
-                &next
-                    .as_ref()
-                    .map(origin_cursor_json)
-                    .expect("non-empty candidate copy page"),
-            )
+            })
+            .expect("non-empty candidate copy page");
+        let encoded = serde_json::to_vec(&origin_cursor_json(&next))
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-            self.transaction_unlocked(|| {
-                for record in &page {
-                    self.driver.execute(
-                        sql::WRITE_ORIGIN,
-                        vec![
-                            Value::from_i64(candidate_generation),
-                            text_value(record.identity_key.clone()),
-                            Value::from_i64(record.kind),
-                            Value::Blob(record.record_key.clone()),
-                            Value::from_i64(record.codec),
-                            Value::from_i64(record.flags),
-                            Value::Blob(record.payload.clone()),
-                            Value::Blob(record.payload_hash.clone()),
-                        ],
-                    )?;
-                }
-                self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_CURSOR_KEY, &encoded)
-            })?;
-            cursor = next.expect("non-empty candidate copy page");
-        }
-    }
-
-    fn generation_cleanup_unlocked(&self, generation: i64) -> Result<(), StorageError> {
-        loop {
-            let deleted = self.transaction_unlocked(|| {
-                self.driver.execute(
-                    sql::DELETE_ORIGIN_GENERATION_PAGE,
-                    vec![Value::from_i64(generation)],
-                )?;
-                Ok(self.driver.changes())
-            })?;
-            if deleted == 0 {
-                break;
-            }
-        }
-        let prefix = format!("g{generation}__");
-        for table in self
-            .read_tables()?
-            .into_iter()
-            .filter(|table| table.starts_with(&prefix))
-        {
-            self.transaction_unlocked(|| {
-                self.driver.execute(&sql::drop_table(&table), Vec::new())
-            })?;
-        }
-        Ok(())
-    }
-
-    pub fn migration_record_write(
-        &self,
-        generation: i64,
-        record: &OriginRecord,
-    ) -> Result<(), StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.ensure_candidate_unlocked(generation)?;
-        self.transaction_unlocked(|| self.migration_record_write_unlocked(generation, record))
-    }
-
-    fn migration_record_write_unlocked(
-        &self,
-        generation: i64,
-        record: &OriginRecord,
-    ) -> Result<(), StorageError> {
-        if record.codec <= 0
-            || record.flags & !(ORIGIN_FLAG_QUARANTINED | ORIGIN_FLAG_DISCARDED) != 0
-        {
-            return Err(StorageError::Unsatisfiable(
-                "invalid originated record codec or flags".to_owned(),
-            ));
-        }
-        let payload_hash = origin_hash(
-            &record.identity_key,
-            record.kind,
-            &record.record_key,
-            record.codec,
-            record.flags,
-            &record.payload,
-        );
-        self.driver.execute(
-            sql::WRITE_ORIGIN,
-            vec![
-                Value::from_i64(generation),
-                text_value(record.identity_key.clone()),
-                Value::from_i64(record.kind),
-                Value::Blob(record.record_key.clone()),
-                Value::from_i64(record.codec),
-                Value::from_i64(record.flags),
-                Value::Blob(record.payload.clone()),
-                Value::Blob(payload_hash),
-            ],
-        )
-    }
-
-    pub fn migration_record_delete(
-        &self,
-        generation: i64,
-        identity_key: &str,
-        kind: i64,
-        record_key: &[u8],
-    ) -> Result<(), StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.ensure_candidate_unlocked(generation)?;
         self.transaction_unlocked(|| {
-            self.migration_record_delete_unlocked(generation, identity_key, kind, record_key)
+            for record in &page {
+                self.driver.execute(
+                    sql::WRITE_ORIGIN,
+                    vec![
+                        Value::from_i64(candidate_generation),
+                        text_value(record.identity_key.clone()),
+                        Value::from_i64(record.kind),
+                        Value::Blob(record.record_key.clone()),
+                        Value::from_i64(record.codec),
+                        Value::from_i64(record.flags),
+                        Value::Blob(record.payload.clone()),
+                        Value::Blob(record.payload_hash.clone()),
+                    ],
+                )?;
+            }
+            self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_CURSOR_KEY, &encoded)
+        })?;
+        Ok(MigrationStep {
+            done: false,
+            records: page.len(),
         })
-    }
-
-    fn migration_record_delete_unlocked(
-        &self,
-        generation: i64,
-        identity_key: &str,
-        kind: i64,
-        record_key: &[u8],
-    ) -> Result<(), StorageError> {
-        self.driver.execute(
-            sql::DELETE_ORIGIN,
-            vec![
-                Value::from_i64(generation),
-                text_value(identity_key.to_owned()),
-                Value::from_i64(kind),
-                Value::Blob(record_key.to_vec()),
-            ],
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1919,11 +1838,20 @@ impl EmbeddedStore {
             .ok_or_else(|| {
                 StorageError::Unsatisfiable("originated record is missing".to_owned())
             })?;
+        if record.flags != ORIGIN_FLAGS_NONE {
+            return Err(StorageError::Unsatisfiable(
+                "originated record already has a disposition".to_owned(),
+            ));
+        }
         let flags = if discard {
             ORIGIN_FLAG_DISCARDED
         } else {
             ORIGIN_FLAG_QUARANTINED
         };
+        OriginKind::try_from(kind).map_err(|unknown| {
+            StorageError::IncompatibleStore(format!("unknown originated record kind {unknown}"))
+        })?;
+        let codec = ORIGIN_DISPOSITION_CODEC;
         let payload = serde_json::to_vec(&serde_json::json!({
             "migrationId": migration_id,
             "reason": reason,
@@ -1937,14 +1865,7 @@ impl EmbeddedStore {
             "priorPayloadHash": base64::encode(&record.payload_hash),
         }))
         .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-        let payload_hash = origin_hash(
-            identity_key,
-            kind,
-            record_key,
-            ORIGIN_CODEC_V1,
-            flags,
-            &payload,
-        );
+        let payload_hash = origin_hash(identity_key, kind, record_key, codec, flags, &payload);
         self.driver.execute(
             sql::WRITE_ORIGIN,
             vec![
@@ -1952,7 +1873,7 @@ impl EmbeddedStore {
                 text_value(identity_key.to_owned()),
                 Value::from_i64(kind),
                 Value::Blob(record_key.to_vec()),
-                Value::from_i64(ORIGIN_CODEC_V1),
+                Value::from_i64(codec),
                 Value::from_i64(flags),
                 Value::Blob(payload),
                 Value::Blob(payload_hash),
@@ -1960,256 +1881,511 @@ impl EmbeddedStore {
         )
     }
 
-    /// Commit one migration handler page and its resume cursor atomically.
-    pub fn migration_page_write(
+    /// Advances one bounded page of the durable queued-mutation policy.
+    ///
+    /// JavaScript first contributes validator-derived causal thresholds in bounded pages, then
+    /// marks collection complete. Storage persists those thresholds as temporary candidate origin
+    /// records and advances association, disposition, and cleanup phases with a durable cursor.
+    /// Every transaction writes at most 256 threshold or association records. Association fanout
+    /// within one envelope has its own durable offset, so even an unusually large mutation cannot
+    /// create an unbounded write transaction.
+    pub fn migration_queue_policy_write(
         &self,
         generation: i64,
-        migration_id: &str,
-        cursor: &OriginCursor,
-        writes: &[OriginRecord],
-        deletes: &[MigrationRecordTarget],
-        dispositions: &[MigrationDisposition],
-    ) -> Result<(), StorageError> {
+        policy_json: &str,
+    ) -> Result<bool, StorageError> {
         let _guard = lock(&self.operation_lock);
         self.ensure_candidate_unlocked(generation)?;
-        let (_, mut current_progress) = self
-            .migration_progress_read_unlocked()?
-            .filter(|(current_id, _)| current_id == migration_id)
-            .ok_or_else(|| {
-                StorageError::Unsatisfiable(
-                    "migration page does not match the active migration step".to_owned(),
-                )
-            })?;
-        current_progress.cursor = Some(cursor.clone());
-        self.transaction_unlocked(|| {
-            for record in writes {
-                self.migration_record_write_unlocked(generation, record)?;
-            }
-            for target in deletes {
-                self.migration_record_delete_unlocked(
-                    generation,
-                    &target.identity_key,
-                    target.kind,
-                    &target.record_key,
-                )?;
-            }
-            for disposition in dispositions {
-                self.migration_record_disposition_write_unlocked(
-                    generation,
-                    &disposition.target.identity_key,
-                    disposition.target.kind,
-                    &disposition.target.record_key,
-                    migration_id,
-                    &disposition.reason,
-                    disposition.discard,
-                )?;
-            }
-            self.migration_progress_write_unlocked(migration_id, &current_progress)
-        })
-    }
-
-    /// Initialize or resume one migration's immutable ledger scan window.
-    pub fn migration_step_begin(
-        &self,
-        generation: i64,
-        migration_id: &str,
-    ) -> Result<MigrationProgress, StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.ensure_candidate_unlocked(generation)?;
-        let progress =
-            if let Some((current_id, progress)) = self.migration_progress_read_unlocked()? {
-                if current_id != migration_id {
-                    return Err(StorageError::Unsatisfiable(format!(
-                        "candidate is already running migration {current_id}"
-                    )));
-                }
-                progress
-            } else {
-                let progress = MigrationProgress {
-                    cursor: None,
-                    upper_bound: self.origin_tail_read_unlocked(generation)?,
-                    snapshot_cursor: None,
-                    snapshot_complete: false,
-                };
-                self.transaction_unlocked(|| {
-                    self.driver
-                        .execute(sql::CLEAR_MIGRATION_SNAPSHOT, Vec::new())?;
-                    self.migration_progress_write_unlocked(migration_id, &progress)
-                })?;
-                progress
-            };
-        if progress.snapshot_complete {
-            return Ok(progress);
+        if policy_json.len() > QUEUE_POLICY_MAX_REQUEST_BYTES {
+            return Err(StorageError::Unsatisfiable(
+                "candidate queue policy request exceeds the bounded input size".to_owned(),
+            ));
         }
-        self.migration_snapshot_write_unlocked(generation, migration_id, progress)
-    }
-
-    fn migration_snapshot_write_unlocked(
-        &self,
-        generation: i64,
-        migration_id: &str,
-        mut progress: MigrationProgress,
-    ) -> Result<MigrationProgress, StorageError> {
-        loop {
-            let after = progress.snapshot_cursor.clone().unwrap_or_default();
-            let mut page = Vec::with_capacity(512);
-            self.driver.run_rows(
-                sql::READ_ORIGIN,
-                vec![
-                    Value::from_i64(generation),
-                    text_value(after.identity_key.clone()),
-                    text_value(after.identity_key.clone()),
-                    Value::from_i64(after.kind),
-                    text_value(after.identity_key),
-                    Value::from_i64(after.kind),
-                    Value::Blob(after.record_key),
-                    Value::from_i64(512),
-                ],
-                |row| {
-                    page.push(OriginRecord {
-                        identity_key: text_at(row, 0)?,
-                        kind: int_at(row, 1)?,
-                        record_key: blob_at(row, 2)?,
-                        codec: int_at(row, 3)?,
-                        flags: int_at(row, 4)?,
-                        payload: blob_at(row, 5)?,
-                        payload_hash: blob_at(row, 6)?,
-                    });
-                    Ok(())
-                },
-            )?;
-            if page.is_empty() {
-                progress.snapshot_complete = true;
-                self.transaction_unlocked(|| {
-                    self.migration_progress_write_unlocked(migration_id, &progress)
-                })?;
-                return Ok(progress);
-            }
-            progress.snapshot_cursor = page.last().map(|record| OriginCursor {
-                identity_key: record.identity_key.clone(),
-                kind: record.kind,
-                record_key: record.record_key.clone(),
-            });
-            self.transaction_unlocked(|| {
-                for record in &page {
-                    self.driver.execute(
-                        sql::WRITE_MIGRATION_SNAPSHOT,
-                        vec![
-                            text_value(record.identity_key.clone()),
-                            Value::from_i64(record.kind),
-                            Value::Blob(record.record_key.clone()),
-                            Value::from_i64(record.codec),
-                            Value::from_i64(record.flags),
-                            Value::Blob(record.payload.clone()),
-                            Value::Blob(record.payload_hash.clone()),
-                        ],
-                    )?;
-                }
-                self.migration_progress_write_unlocked(migration_id, &progress)
+        let policy: serde_json::Value =
+            serde_json::from_str(policy_json).map_err(|error| StorageError::Decode {
+                expected: "candidate queue policy JSON",
+                index: 0,
+                got: error.to_string(),
             })?;
+        let threshold_values = policy
+            .get("thresholds")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| json_decode("candidate queue policy thresholds"))?;
+        if threshold_values.len() > QUEUE_POLICY_PAGE_SIZE {
+            return Err(StorageError::Unsatisfiable(format!(
+                "candidate queue policy accepts at most {QUEUE_POLICY_PAGE_SIZE} thresholds per call"
+            )));
         }
-    }
-
-    fn origin_tail_read_unlocked(
-        &self,
-        generation: i64,
-    ) -> Result<Option<OriginCursor>, StorageError> {
-        self.driver.run_row(
-            sql::READ_ORIGIN_TAIL,
-            vec![Value::from_i64(generation)],
-            |row| {
+        let thresholds = threshold_values
+            .iter()
+            .map(|entry| {
+                Ok((
+                    json_str(entry, "identityKey")?.to_owned(),
+                    json_i64(entry, "commitSeq")?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, StorageError>>()?;
+        let collect_complete = policy
+            .get("collectComplete")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| json_decode("candidate queue policy collection state"))?;
+        let collection_cursor = policy
+            .get("cursor")
+            .filter(|cursor| !cursor.is_null())
+            .map(|cursor| -> Result<OriginCursor, StorageError> {
                 Ok(OriginCursor {
-                    identity_key: text_at(row, 0)?,
-                    kind: int_at(row, 1)?,
-                    record_key: blob_at(row, 2)?,
+                    identity_key: json_str(cursor, "identityKey")?.to_owned(),
+                    kind: json_i64(cursor, "kind")?,
+                    record_key: decode_base64_field(cursor, "recordKey")?,
                 })
-            },
+            })
+            .transpose()?;
+        let state = self
+            .bootstrap_read_unlocked(sql::CANDIDATE_QUEUE_POLICY_STATE_KEY)?
+            .and_then(|value| String::from_utf8(value).ok())
+            .unwrap_or_else(|| "collecting".to_owned());
+        if state == "complete" {
+            return Ok(true);
+        }
+        if state == "collecting" {
+            return self.transaction_unlocked(|| {
+                for (identity, commit_seq) in &thresholds {
+                    self.queue_policy_threshold_write_unlocked(generation, identity, *commit_seq)?;
+                }
+                if let Some(cursor) = &collection_cursor {
+                    self.queue_policy_cursor_write_unlocked(cursor, None)?;
+                }
+                if !collect_complete {
+                    return Ok(false);
+                }
+                let has_threshold = self.driver.run_row(
+                    sql::HAS_ORIGIN_KIND,
+                    vec![
+                        Value::from_i64(generation),
+                        Value::from_i64(OriginKind::CandidatePolicy as i64),
+                    ],
+                    |_| Ok(()),
+                )?;
+                let complete = has_threshold.is_none();
+                self.write_bootstrap_unlocked(
+                    sql::CANDIDATE_QUEUE_POLICY_STATE_KEY,
+                    if complete { b"complete" } else { b"associate" },
+                )?;
+                Ok(complete)
+            });
+        }
+        if !thresholds.is_empty() || collection_cursor.is_some() {
+            return Err(StorageError::IncompatibleStore(
+                "candidate queue policy received collection data after collection completed"
+                    .to_owned(),
+            ));
+        }
+
+        match state.as_str() {
+            "associate" => self.queue_policy_association_page_unlocked(generation),
+            "apply" => self.queue_policy_apply_page_unlocked(generation),
+            "cleanup" => self.queue_policy_cleanup_page_unlocked(generation),
+            other => Err(StorageError::IncompatibleStore(format!(
+                "candidate queue policy phase is invalid: {other}"
+            ))),
+        }
+    }
+
+    /// Read the durable queue-policy phase and validator-collection cursor.
+    pub fn migration_queue_policy_state_read(
+        &self,
+        generation: i64,
+    ) -> Result<String, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.ensure_candidate_unlocked(generation)?;
+        let state = self
+            .bootstrap_read_unlocked(sql::CANDIDATE_QUEUE_POLICY_STATE_KEY)?
+            .and_then(|value| String::from_utf8(value).ok())
+            .unwrap_or_else(|| "collecting".to_owned());
+        let cursor = self.queue_policy_cursor_read_unlocked()?;
+        serde_json::to_string(&serde_json::json!({
+            "done": state == "complete",
+            "state": state,
+            "cursor": (cursor.origin != OriginCursor::default())
+                .then(|| origin_cursor_json(&cursor.origin)),
+        }))
+        .map_err(|error| StorageError::Unsatisfiable(error.to_string()))
+    }
+
+    fn queue_policy_threshold_write_unlocked(
+        &self,
+        generation: i64,
+        identity: &str,
+        commit_seq: i64,
+    ) -> Result<(), StorageError> {
+        let key = origin_key(&[b"threshold"]);
+        let previous = self
+            .origin_record_read_unlocked(
+                generation,
+                identity,
+                OriginKind::CandidatePolicy as i64,
+                &key,
+            )?
+            .map(|record| -> Result<i64, StorageError> {
+                let value: serde_json::Value = serde_json::from_slice(&record.payload)
+                    .map_err(|error| json_decode(&error.to_string()))?;
+                json_i64(&value, "commitSeq")
+            })
+            .transpose()?;
+        let commit_seq = previous.map_or(commit_seq, |previous| previous.min(commit_seq));
+        let payload = serde_json::to_vec(&serde_json::json!({ "commitSeq": commit_seq }))
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        self.origin_write_for_generation_identity_unlocked(
+            generation,
+            identity,
+            OriginKind::CandidatePolicy,
+            &key,
+            &payload,
         )
     }
 
-    /// Mark one migration definition complete after its final page.
-    pub fn migration_step_complete(
+    fn queue_policy_threshold_read_unlocked(
         &self,
         generation: i64,
-        applied_migrations: usize,
+        identity: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        self.origin_record_read_unlocked(
+            generation,
+            identity,
+            OriginKind::CandidatePolicy as i64,
+            &origin_key(&[b"threshold"]),
+        )?
+        .map(|record| {
+            let value: serde_json::Value = serde_json::from_slice(&record.payload)
+                .map_err(|error| json_decode(&error.to_string()))?;
+            json_i64(&value, "commitSeq")
+        })
+        .transpose()
+    }
+
+    fn queue_policy_marker_write_unlocked(
+        &self,
+        generation: i64,
+        identity: &str,
+        parts: &[&[u8]],
     ) -> Result<(), StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.ensure_candidate_unlocked(generation)?;
-        let target = self
-            .bootstrap_contract_read_unlocked(sql::CANDIDATE_CONTRACT_KEY)?
-            .ok_or_else(|| {
-                StorageError::IncompatibleStore("candidate contract is missing".to_owned())
-            })?;
-        let current = self
-            .bootstrap_i64_read_unlocked(sql::CANDIDATE_APPLIED_KEY)?
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0);
-        if applied_migrations != current.saturating_add(1)
-            || applied_migrations > target.migrations.len()
-        {
-            return Err(StorageError::Unsatisfiable(
-                "migration completion is not the next target manifest entry".to_owned(),
-            ));
+        self.origin_write_for_generation_identity_unlocked(
+            generation,
+            identity,
+            OriginKind::CandidatePolicy,
+            &origin_key(parts),
+            b"{}",
+        )
+    }
+
+    fn queue_policy_marker_has_unlocked(
+        &self,
+        generation: i64,
+        identity: &str,
+        parts: &[&[u8]],
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .origin_record_read_unlocked(
+                generation,
+                identity,
+                OriginKind::CandidatePolicy as i64,
+                &origin_key(parts),
+            )?
+            .is_some())
+    }
+
+    fn queue_policy_cursor_read_unlocked(&self) -> Result<QueuePolicyCursor, StorageError> {
+        self.bootstrap_read_unlocked(sql::CANDIDATE_QUEUE_POLICY_CURSOR_KEY)?
+            .map(|bytes| {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|error| json_decode(&error.to_string()))?;
+                let association_offset = value
+                    .get("associationOffset")
+                    .map(|offset| {
+                        offset
+                            .as_u64()
+                            .and_then(|offset| usize::try_from(offset).ok())
+                            .ok_or_else(|| json_decode("associationOffset"))
+                    })
+                    .transpose()?;
+                Ok(QueuePolicyCursor {
+                    origin: OriginCursor {
+                        identity_key: json_str(&value, "identityKey")?.to_owned(),
+                        kind: json_i64(&value, "kind")?,
+                        record_key: decode_base64_field(&value, "recordKey")?,
+                    },
+                    association_offset,
+                })
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    fn queue_policy_cursor_write_unlocked(
+        &self,
+        cursor: &OriginCursor,
+        association_offset: Option<usize>,
+    ) -> Result<(), StorageError> {
+        let mut value = origin_cursor_json(cursor);
+        if let Some(offset) = association_offset {
+            value
+                .as_object_mut()
+                .expect("origin cursor JSON is an object")
+                .insert("associationOffset".to_owned(), serde_json::json!(offset));
         }
+        let encoded = serde_json::to_vec(&value)
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        self.write_bootstrap_unlocked(sql::CANDIDATE_QUEUE_POLICY_CURSOR_KEY, &encoded)
+    }
+
+    fn queue_policy_phase_write_unlocked(&self, phase: &str) -> Result<(), StorageError> {
         self.transaction_unlocked(|| {
-            self.write_bootstrap_unlocked(
-                sql::CANDIDATE_APPLIED_KEY,
-                applied_migrations.to_string().as_bytes(),
-            )?;
+            self.write_bootstrap_unlocked(sql::CANDIDATE_QUEUE_POLICY_STATE_KEY, phase.as_bytes())?;
             self.driver.execute(
                 sql::DELETE_BOOTSTRAP,
-                vec![text_value(sql::CANDIDATE_PROGRESS_KEY.to_owned())],
-            )?;
-            self.driver
-                .execute(sql::CLEAR_MIGRATION_SNAPSHOT, Vec::new())
+                vec![text_value(
+                    sql::CANDIDATE_QUEUE_POLICY_CURSOR_KEY.to_owned(),
+                )],
+            )
         })
     }
 
-    fn migration_progress_read_unlocked(
+    fn queue_policy_association_page_unlocked(
         &self,
-    ) -> Result<Option<(String, MigrationProgress)>, StorageError> {
-        let Some(bytes) = self.bootstrap_read_unlocked(sql::CANDIDATE_PROGRESS_KEY)? else {
-            return Ok(None);
+        generation: i64,
+    ) -> Result<bool, StorageError> {
+        let cursor = self.queue_policy_cursor_read_unlocked()?;
+        if let Some(offset) = cursor.association_offset {
+            let record = self
+                .origin_record_read_unlocked(
+                    generation,
+                    &cursor.origin.identity_key,
+                    cursor.origin.kind,
+                    &cursor.origin.record_key,
+                )?
+                .ok_or_else(|| {
+                    StorageError::IncompatibleStore(
+                        "candidate queue association record disappeared".to_owned(),
+                    )
+                })?;
+            return self
+                .queue_policy_association_record_write_unlocked(generation, &record, offset);
+        }
+        let page =
+            self.origin_page_read_unlocked(generation, &cursor.origin, QUEUE_POLICY_PAGE_SIZE)?;
+        let Some(next) = page.last().map(|record| OriginCursor {
+            identity_key: record.identity_key.clone(),
+            kind: record.kind,
+            record_key: record.record_key.clone(),
+        }) else {
+            self.queue_policy_phase_write_unlocked("apply")?;
+            return Ok(false);
         };
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-            StorageError::IncompatibleStore(format!(
-                "candidate migration progress is corrupt: {error}"
-            ))
-        })?;
-        Ok(Some((
-            json_str(&value, "migrationId")?.to_owned(),
-            MigrationProgress {
-                cursor: json_optional_origin_cursor(&value, "cursor")?,
-                upper_bound: json_optional_origin_cursor(&value, "upperBound")?,
-                snapshot_cursor: json_optional_origin_cursor(&value, "snapshotCursor")?,
-                snapshot_complete: value
-                    .get("snapshotComplete")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-            },
-        )))
+        for record in page.iter().filter(|record| {
+            record.flags == ORIGIN_FLAGS_NONE && record.kind == OriginKind::PushEnvelope as i64
+        }) {
+            let Some(threshold) =
+                self.queue_policy_threshold_read_unlocked(generation, &record.identity_key)?
+            else {
+                continue;
+            };
+            let value: serde_json::Value = serde_json::from_slice(&record.payload)
+                .map_err(|error| json_decode(&error.to_string()))?;
+            if json_i64(&value, "commitSeq")? >= threshold {
+                return self.queue_policy_association_record_write_unlocked(generation, record, 0);
+            }
+        }
+        self.transaction_unlocked(|| self.queue_policy_cursor_write_unlocked(&next, None))?;
+        Ok(false)
     }
 
-    fn migration_progress_write_unlocked(
+    fn queue_policy_association_record_write_unlocked(
         &self,
-        migration_id: &str,
-        progress: &MigrationProgress,
-    ) -> Result<(), StorageError> {
-        let encoded = serde_json::to_vec(&serde_json::json!({
-            "migrationId": migration_id,
-            "cursor": progress.cursor.as_ref().map(origin_cursor_json),
-            "upperBound": progress.upper_bound.as_ref().map(origin_cursor_json),
-            "snapshotCursor": progress.snapshot_cursor.as_ref().map(origin_cursor_json),
-            "snapshotComplete": progress.snapshot_complete,
-        }))
-        .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-        self.write_bootstrap_unlocked(sql::CANDIDATE_PROGRESS_KEY, &encoded)
+        generation: i64,
+        record: &OriginRecord,
+        offset: usize,
+    ) -> Result<bool, StorageError> {
+        let value: serde_json::Value = serde_json::from_slice(&record.payload)
+            .map_err(|error| json_decode(&error.to_string()))?;
+        let origin = OriginCursor {
+            identity_key: record.identity_key.clone(),
+            kind: record.kind,
+            record_key: record.record_key.clone(),
+        };
+        self.transaction_unlocked(|| {
+            let mut ordinal = 0_usize;
+            let mut written = 0_usize;
+            let mut write = |parts: &[&[u8]]| -> Result<(), StorageError> {
+                if ordinal >= offset && written < QUEUE_POLICY_PAGE_SIZE {
+                    self.queue_policy_marker_write_unlocked(
+                        generation,
+                        &record.identity_key,
+                        parts,
+                    )?;
+                    written += 1;
+                }
+                ordinal = ordinal.saturating_add(1);
+                Ok(())
+            };
+            for entry in json_array_values(&value, "localSchedules")? {
+                let id = entry
+                    .as_str()
+                    .ok_or_else(|| json_decode("localSchedules"))?;
+                write(&[b"schedule", id.as_bytes()])?;
+            }
+            for entry in json_array_values(&value, "localInserts")? {
+                let id = entry.as_str().ok_or_else(|| json_decode("localInserts"))?;
+                write(&[b"local", id.as_bytes()])?;
+            }
+            for field in ["afterImages", "crdt", "revisionCheckpoints"] {
+                for item in json_array_values(&value, field)? {
+                    if let (Some(table), Some(id)) = (
+                        item.get("table").and_then(serde_json::Value::as_str),
+                        item.get("rowId").and_then(serde_json::Value::as_str),
+                    ) {
+                        write(&[b"row", table.as_bytes(), id.as_bytes()])?;
+                        if id.starts_with("local:") {
+                            write(&[b"local", id.as_bytes()])?;
+                        }
+                    }
+                }
+            }
+            if offset > ordinal {
+                return Err(StorageError::IncompatibleStore(
+                    "candidate queue association offset exceeds its envelope".to_owned(),
+                ));
+            }
+            let next = offset.saturating_add(written);
+            self.queue_policy_cursor_write_unlocked(&origin, (next < ordinal).then_some(next))
+        })?;
+        Ok(false)
+    }
+
+    fn queue_policy_apply_page_unlocked(&self, generation: i64) -> Result<bool, StorageError> {
+        let cursor = self.queue_policy_cursor_read_unlocked()?;
+        let page =
+            self.origin_page_read_unlocked(generation, &cursor.origin, QUEUE_POLICY_PAGE_SIZE)?;
+        let Some(next) = page.last().map(|record| OriginCursor {
+            identity_key: record.identity_key.clone(),
+            kind: record.kind,
+            record_key: record.record_key.clone(),
+        }) else {
+            self.queue_policy_phase_write_unlocked("cleanup")?;
+            return Ok(false);
+        };
+        self.transaction_unlocked(|| {
+            for record in page
+                .iter()
+                .filter(|record| record.flags == ORIGIN_FLAGS_NONE)
+            {
+                let Some(threshold) =
+                    self.queue_policy_threshold_read_unlocked(generation, &record.identity_key)?
+                else {
+                    continue;
+                };
+                let kind = OriginKind::try_from(record.kind).map_err(|unknown| {
+                    StorageError::IncompatibleStore(format!(
+                        "unknown originated record kind {unknown}"
+                    ))
+                })?;
+                let value = || -> Result<serde_json::Value, StorageError> {
+                    serde_json::from_slice(&record.payload)
+                        .map_err(|error| json_decode(&error.to_string()))
+                };
+                let selected = match kind {
+                    OriginKind::PushEnvelope | OriginKind::CrdtEffect => {
+                        json_i64(&value()?, "commitSeq")? >= threshold
+                    }
+                    OriginKind::Schedule => {
+                        let value = value()?;
+                        self.queue_policy_marker_has_unlocked(
+                            generation,
+                            &record.identity_key,
+                            &[b"schedule", json_str(&value, "jobId")?.as_bytes()],
+                        )?
+                    }
+                    OriginKind::IdMapping | OriginKind::LocalField => {
+                        let value = value()?;
+                        let field = if kind == OriginKind::IdMapping {
+                            "localId"
+                        } else {
+                            "id"
+                        };
+                        self.queue_policy_marker_has_unlocked(
+                            generation,
+                            &record.identity_key,
+                            &[b"local", json_str(&value, field)?.as_bytes()],
+                        )?
+                    }
+                    OriginKind::Revision => {
+                        let value = value()?;
+                        self.queue_policy_marker_has_unlocked(
+                            generation,
+                            &record.identity_key,
+                            &[
+                                b"row",
+                                json_str(&value, "table")?.as_bytes(),
+                                json_str(&value, "id")?.as_bytes(),
+                            ],
+                        )?
+                    }
+                    _ => false,
+                };
+                if selected {
+                    self.migration_record_disposition_write_unlocked(
+                        generation,
+                        &record.identity_key,
+                        record.kind,
+                        &record.record_key,
+                        "__embedded_queue_contract__",
+                        "queued mutation depends on state rejected by the target contract",
+                        false,
+                    )?;
+                }
+            }
+            self.queue_policy_cursor_write_unlocked(&next, None)
+        })?;
+        Ok(false)
+    }
+
+    fn queue_policy_cleanup_page_unlocked(&self, generation: i64) -> Result<bool, StorageError> {
+        let deleted = self.transaction_unlocked(|| {
+            self.driver.execute(
+                sql::DELETE_ORIGIN_KIND_PAGE,
+                vec![
+                    Value::from_i64(generation),
+                    Value::from_i64(OriginKind::CandidatePolicy as i64),
+                ],
+            )?;
+            Ok(self.driver.changes())
+        })?;
+        if deleted != 0 {
+            return Ok(false);
+        }
+        self.queue_policy_phase_write_unlocked("complete")?;
+        Ok(true)
     }
 
     fn ensure_candidate_unlocked(&self, generation: i64) -> Result<(), StorageError> {
+        let active_generation = self
+            .bootstrap_i64_read_unlocked(sql::ACTIVE_GENERATION_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "bootstrap has no active generation; the store was preserved".to_owned(),
+                )
+            })?;
+        if self
+            .bootstrap_read_unlocked(sql::CANDIDATE_RETIRE_STATE_KEY)?
+            .as_deref()
+            == Some(b"authorized")
+        {
+            return Err(StorageError::Unsatisfiable(
+                "candidate generation is authorized only for retirement".to_owned(),
+            ));
+        }
         if self.bootstrap_i64_read_unlocked(sql::CANDIDATE_GENERATION_KEY)? == Some(generation)
             && self.bootstrap_i64_read_unlocked(sql::CANDIDATE_SOURCE_KEY)?
-                == Some(self.driver.generation())
+                == Some(active_generation)
         {
             return Ok(());
         }
@@ -2247,9 +2423,9 @@ impl EmbeddedStore {
         )
     }
 
-    /// Materialize and atomically activate a fully transformed candidate generation.
-    #[allow(clippy::too_many_lines)]
-    pub fn migration_commit(
+    /// Reset the unpublished projection to the exact target schema in one durable transaction.
+    /// Production callers then bind the target and advance bounded materialization steps.
+    pub fn migration_finalize_prepare(
         &self,
         schema: &StoreSchema,
         generation: i64,
@@ -2257,25 +2433,64 @@ impl EmbeddedStore {
         validate_store_schema(schema)?;
         let _guard = lock(&self.operation_lock);
         self.ensure_candidate_unlocked(generation)?;
-        let target = StoreContract::for_schema(schema);
-        if self.bootstrap_contract_read_unlocked(sql::CANDIDATE_CONTRACT_KEY)?
-            != Some(target.clone())
+        if self.bootstrap_i64_read_unlocked(sql::ACTIVE_GENERATION_KEY)?
+            != Some(self.driver.generation())
         {
+            return Err(StorageError::Unsatisfiable(
+                "candidate setup must be unbound before cutover".to_owned(),
+            ));
+        }
+        let candidate_target = self
+            .bootstrap_contract_read_unlocked(sql::CANDIDATE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "candidate target contract is missing; the active store was preserved"
+                        .to_owned(),
+                )
+            })?;
+        let mut target = StoreContract::for_schema(schema);
+        // Omitting a previously completed setup action retires its executable hook, not its
+        // durable identity. Carry that identity through any later automatic layout/schema upgrade
+        // so an older build cannot reinterpret the same store as never having run setup.
+        if target.setup_hash.is_empty() {
+            target.setup_hash.clone_from(&candidate_target.setup_hash);
+        }
+        if candidate_target != target {
             return Err(StorageError::IncompatibleStore(
                 "candidate contract no longer matches the target".to_owned(),
             ));
         }
-        let applied_migrations = self
-            .bootstrap_i64_read_unlocked(sql::CANDIDATE_APPLIED_KEY)?
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(0);
-        if applied_migrations != target.migrations.len() {
+        if !matches!(
+            self.bootstrap_read_unlocked(sql::CANDIDATE_SETUP_STATE_KEY)?
+                .as_deref(),
+            Some(b"complete" | b"skipped")
+        ) {
             return Err(StorageError::Unsatisfiable(
-                "candidate has unapplied device migrations".to_owned(),
+                "candidate app setup has not completed".to_owned(),
             ));
         }
-        let active_generation = self.driver.generation();
-        let previous_generation = active_generation;
+        if self
+            .bootstrap_read_unlocked(sql::CANDIDATE_QUEUE_POLICY_STATE_KEY)?
+            .as_deref()
+            != Some(b"complete")
+        {
+            return Err(StorageError::Unsatisfiable(
+                "candidate queued-mutation policy has not completed".to_owned(),
+            ));
+        }
+        let finalize_state = self
+            .bootstrap_read_unlocked(sql::CANDIDATE_FINALIZE_STATE_KEY)?
+            .unwrap_or_else(|| b"pending".to_vec());
+        if finalize_state.as_slice() == b"running" {
+            return Ok(());
+        }
+        if finalize_state.as_slice() != b"pending" {
+            return Err(StorageError::IncompatibleStore(
+                "candidate finalization state is invalid; the active store was preserved"
+                    .to_owned(),
+            ));
+        }
+        let previous_generation = self.driver.generation();
         let previous_tables = lock(&self.tables).clone();
         *lock(&self.tables) = schema
             .tables
@@ -2288,17 +2503,111 @@ impl EmbeddedStore {
             })
             .collect();
         self.driver.generation_write(generation);
-        let materialized = self.materialize_candidate_unlocked(generation);
-        if let Err(error) = materialized {
-            self.driver.generation_write(previous_generation);
-            *lock(&self.tables) = previous_tables;
-            return Err(error);
+        // Setup may have used source-only tables. Resetting, the materialization cursor, and the
+        // running marker commit together, so a killed process observes either the workspace or a
+        // clean target projection and never a half-reset generation.
+        let reset = self.transaction_unlocked(|| {
+            self.reset_candidate_projection_unlocked(schema, generation)?;
+            self.write_bootstrap_unlocked(sql::CANDIDATE_FINALIZE_STATE_KEY, b"running")
+        });
+        self.driver.generation_write(previous_generation);
+        *lock(&self.tables) = previous_tables;
+        reset
+    }
+
+    /// Atomically publish a fully materialized and validated target generation.
+    #[allow(clippy::too_many_lines)]
+    pub fn migration_cutover(
+        &self,
+        schema: &StoreSchema,
+        generation: i64,
+    ) -> Result<(), StorageError> {
+        validate_store_schema(schema)?;
+        let _guard = lock(&self.operation_lock);
+        self.ensure_candidate_unlocked(generation)?;
+        let active_generation = self
+            .bootstrap_i64_read_unlocked(sql::ACTIVE_GENERATION_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "bootstrap has no active generation; the active store was preserved".to_owned(),
+                )
+            })?;
+        if self.driver.generation() != active_generation {
+            return Err(StorageError::Unsatisfiable(
+                "candidate must be unbound before cutover".to_owned(),
+            ));
         }
+        if self
+            .bootstrap_read_unlocked(sql::CANDIDATE_FINALIZE_STATE_KEY)?
+            .as_deref()
+            != Some(b"running")
+            || self
+                .bootstrap_read_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY)?
+                .as_deref()
+                != Some(b"complete")
+        {
+            return Err(StorageError::Unsatisfiable(
+                "candidate target materialization has not completed".to_owned(),
+            ));
+        }
+        let candidate_target = self
+            .bootstrap_contract_read_unlocked(sql::CANDIDATE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "candidate target contract is missing; the active store was preserved"
+                        .to_owned(),
+                )
+            })?;
+        let mut target = StoreContract::for_schema(schema);
+        if target.setup_hash.is_empty() {
+            target.setup_hash.clone_from(&candidate_target.setup_hash);
+        }
+        if candidate_target != target {
+            return Err(StorageError::IncompatibleStore(
+                "candidate contract no longer matches the target".to_owned(),
+            ));
+        }
+        let previous_generation = self.driver.generation();
+        let previous_tables = lock(&self.tables).clone();
+        *lock(&self.tables) = schema
+            .tables
+            .iter()
+            .map(|table| {
+                (
+                    table.name.clone(),
+                    Arc::new(TableRuntime::new(table.clone())),
+                )
+            })
+            .collect();
+        self.driver.generation_write(generation);
         if let Err(error) = self.validate_physical_schema_unlocked(schema) {
             self.driver.generation_write(previous_generation);
             *lock(&self.tables) = previous_tables;
             return Err(error);
         }
+        // Capture every fallible activation read while the candidate is still unpublished. Once
+        // the pointer transaction commits, this function must return published semantics rather
+        // than an ordinary error that could be mistaken for "the old generation is still active".
+        let candidate_activation = (|| {
+            let max_commit_seq = self
+                .driver
+                .run_row(
+                    sql::max_commit_seq(),
+                    max_commit_seq_params(&self.identity_key.clone()),
+                    |row| int_at(row, 0),
+                )?
+                .unwrap_or(0);
+            Ok::<_, StorageError>((max_commit_seq, self.max_creation_time_unlocked()?))
+        })();
+        let (candidate_max_commit_seq, candidate_high) = match candidate_activation {
+            Ok(state) => state,
+            Err(error) => {
+                self.driver.generation_write(previous_generation);
+                *lock(&self.tables) = previous_tables;
+                return Err(error);
+            }
+        };
+        let candidate_tables = lock(&self.tables).clone();
         self.driver.generation_write(previous_generation);
 
         if let Err(error) = self.driver.execute("PRAGMA synchronous = FULL", Vec::new()) {
@@ -2329,6 +2638,11 @@ impl EmbeddedStore {
                 generation.to_string().as_bytes(),
             )?;
             self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
+            // The semantic contract and SQLite epoch describe one published store version. Keep
+            // them in the same cutover transaction so a process restart can never observe the new
+            // generation through the old runtime epoch (or vice versa).
+            self.driver
+                .execute(&sql::write_user_version(), Vec::new())?;
             let mut retired = self.retired_generations_read_unlocked()?;
             if !retired.contains(&active_generation) {
                 retired.push(active_generation);
@@ -2338,12 +2652,17 @@ impl EmbeddedStore {
                 sql::CANDIDATE_GENERATION_KEY,
                 sql::CANDIDATE_SOURCE_KEY,
                 sql::CANDIDATE_CONTRACT_KEY,
-                sql::CANDIDATE_CODE_HASH_KEY,
+                sql::CANDIDATE_SETUP_HASH_KEY,
                 sql::CANDIDATE_STATE_KEY,
-                sql::CANDIDATE_APPLIED_KEY,
-                sql::CANDIDATE_PROGRESS_KEY,
+                sql::CANDIDATE_COPY_STATE_KEY,
+                sql::CANDIDATE_MATERIALIZE_STATE_KEY,
+                sql::CANDIDATE_SETUP_STATE_KEY,
+                sql::CANDIDATE_FINALIZE_STATE_KEY,
                 sql::CANDIDATE_COPY_CURSOR_KEY,
                 sql::CANDIDATE_MATERIALIZE_CURSOR_KEY,
+                sql::CANDIDATE_QUEUE_POLICY_STATE_KEY,
+                sql::CANDIDATE_QUEUE_POLICY_CURSOR_KEY,
+                sql::CANDIDATE_RETIRE_STATE_KEY,
             ] {
                 self.driver
                     .execute(sql::DELETE_BOOTSTRAP, vec![text_value(key.to_owned())])?;
@@ -2357,23 +2676,77 @@ impl EmbeddedStore {
             *lock(&self.tables) = previous_tables;
             return Err(error);
         }
-        normal?;
+        // Durability was already provided by the FULL cutover transaction. Restoring the
+        // connection's performance mode is best-effort and cannot roll publication back.
+        drop(normal);
         self.driver.generation_write(generation);
-        self.activate_schema_unlocked(schema)?;
+        *lock(&self.tables) = candidate_tables;
+        lock(&self.plans).clear();
+        self.reset_commit_seq_cache(candidate_max_commit_seq);
+        lock(&self.clock).observe(candidate_high);
         *lock(&self.peer_id) = None;
         self.driver.clear_statements();
         Ok(())
     }
 
-    fn materialize_candidate_unlocked(&self, generation: i64) -> Result<(), StorageError> {
-        if self
-            .bootstrap_read_unlocked(sql::CANDIDATE_STATE_KEY)?
-            .as_deref()
-            == Some(b"ready")
-        {
-            return Ok(());
+    /// Compatibility wrapper for direct Rust callers. Production bindings use finalize-prepare,
+    /// bounded materialization steps, and cutover as separate event-loop turns.
+    pub fn migration_commit(
+        &self,
+        schema: &StoreSchema,
+        generation: i64,
+    ) -> Result<(), StorageError> {
+        self.migration_finalize_prepare(schema, generation)?;
+        self.migration_bind_prepare(schema, generation)?;
+        let materialized = (|| {
+            while !self.migration_materialize_step(generation)?.done {}
+            Ok::<_, StorageError>(())
+        })();
+        let unbound = self.migration_unbind();
+        if let Err(error) = materialized {
+            return Err(error);
         }
-        let mut cursor = self
+        unbound?;
+        self.migration_cutover(schema, generation)
+    }
+
+    /// Materialize at most one originated-record page into the bound candidate generation.
+    pub fn migration_materialize_step(
+        &self,
+        generation: i64,
+    ) -> Result<MigrationStep, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.ensure_candidate_unlocked(generation)?;
+        if self.driver.generation() != generation {
+            return Err(StorageError::Unsatisfiable(
+                "candidate materialization requires that generation to be bound".to_owned(),
+            ));
+        }
+        self.materialize_candidate_step_unlocked(generation)
+    }
+
+    fn materialize_candidate_step_unlocked(
+        &self,
+        generation: i64,
+    ) -> Result<MigrationStep, StorageError> {
+        let materialized = self
+            .bootstrap_read_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY)?
+            .as_deref()
+            == Some(b"complete")
+            || (self
+                .bootstrap_read_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY)?
+                .is_none()
+                && self
+                    .bootstrap_read_unlocked(sql::CANDIDATE_STATE_KEY)?
+                    .as_deref()
+                    == Some(b"ready"));
+        if materialized {
+            return Ok(MigrationStep {
+                done: true,
+                records: 0,
+            });
+        }
+        let cursor = self
             .bootstrap_read_unlocked(sql::CANDIDATE_MATERIALIZE_CURSOR_KEY)?
             .map(|bytes| -> Result<OriginCursor, StorageError> {
                 let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -2389,36 +2762,41 @@ impl EmbeddedStore {
             })
             .transpose()?
             .unwrap_or_default();
-        loop {
-            let page = self.origin_page_read_unlocked(generation, &cursor, 512)?;
-            if page.is_empty() {
-                return self.transaction_unlocked(|| {
-                    self.write_bootstrap_unlocked(sql::CANDIDATE_STATE_KEY, b"ready")?;
-                    self.driver.execute(
-                        sql::DELETE_BOOTSTRAP,
-                        vec![text_value(sql::CANDIDATE_MATERIALIZE_CURSOR_KEY.to_owned())],
-                    )
-                });
-            }
-            let next = page
-                .last()
-                .map(|record| OriginCursor {
-                    identity_key: record.identity_key.clone(),
-                    kind: record.kind,
-                    record_key: record.record_key.clone(),
-                })
-                .expect("non-empty materialization page");
-            let encoded = serde_json::to_vec(&origin_cursor_json(&next))
-                .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        let page = self.origin_page_read_unlocked(generation, &cursor, 512)?;
+        if page.is_empty() {
             self.transaction_unlocked(|| {
-                for record in &page {
-                    self.materialize_checked_origin_record_unlocked(record)?;
-                }
-                self.write_bootstrap_unlocked(sql::CANDIDATE_STATE_KEY, b"materializing")?;
-                self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_CURSOR_KEY, &encoded)
+                self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"complete")?;
+                self.driver.execute(
+                    sql::DELETE_BOOTSTRAP,
+                    vec![text_value(sql::CANDIDATE_MATERIALIZE_CURSOR_KEY.to_owned())],
+                )
             })?;
-            cursor = next;
+            return Ok(MigrationStep {
+                done: true,
+                records: 0,
+            });
         }
+        let next = page
+            .last()
+            .map(|record| OriginCursor {
+                identity_key: record.identity_key.clone(),
+                kind: record.kind,
+                record_key: record.record_key.clone(),
+            })
+            .expect("non-empty materialization page");
+        let encoded = serde_json::to_vec(&origin_cursor_json(&next))
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        self.transaction_unlocked(|| {
+            for record in &page {
+                self.materialize_checked_origin_record_unlocked(record)?;
+            }
+            self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"running")?;
+            self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_CURSOR_KEY, &encoded)
+        })?;
+        Ok(MigrationStep {
+            done: false,
+            records: page.len(),
+        })
     }
 
     fn origin_page_read_unlocked(
@@ -2474,23 +2852,10 @@ impl EmbeddedStore {
             ));
         }
         if record.flags & (ORIGIN_FLAG_QUARANTINED | ORIGIN_FLAG_DISCARDED) != 0 {
+            origin_disposition_decode(record)?;
             return Ok(());
         }
-        if record.codec != ORIGIN_CODEC_V1 {
-            return Err(StorageError::IncompatibleStore(format!(
-                "unsupported originated codec {} for kind {}",
-                record.codec, record.kind
-            )));
-        }
-        let kind = OriginKind::try_from(record.kind).map_err(|unknown| {
-            StorageError::IncompatibleStore(format!("unknown originated record kind {unknown}"))
-        })?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&record.payload).map_err(|error| StorageError::Decode {
-                expected: "originated record JSON",
-                index: 0,
-                got: error.to_string(),
-            })?;
+        let (kind, value) = origin_decode(record.kind, record.codec, &record.payload)?;
         let previous_identity = self.identity_key.clone();
         self.identity_key.write(record.identity_key.clone());
         let materialized = self.materialize_origin_record_unlocked(kind, record, &value);
@@ -2549,20 +2914,41 @@ impl EmbeddedStore {
                     false,
                 )
             }
-            OriginKind::LocalField => self.driver.execute(
-                sql::write_local_field(),
-                vec![
-                    text_value(record.identity_key.clone()),
-                    text_value(json_str(value, "table")?.to_owned()),
-                    text_value(json_str(value, "id")?.to_owned()),
-                    text_value(json_str(value, "field")?.to_owned()),
-                    text_value(
-                        serde_json::to_string(json_value(value, "value")?)
-                            .map_err(|error| json_decode(&error.to_string()))?,
-                    ),
-                    Value::from_f64(0.0),
-                ],
-            ),
+            OriginKind::LocalField => {
+                let table_name = json_str(value, "table")?;
+                let field = json_str(value, "field")?;
+                let table = lock(&self.tables).get(table_name).cloned();
+                // A local overlay is authoritative device state, but it is only a projection when
+                // the target still declares that exact replicated field. Keep incompatible
+                // origins dormant in the generation instead of making a removed table or field
+                // impossible to open. A later release can declare the field again and reclaim it.
+                let Some(table) = table else {
+                    return Ok(());
+                };
+                if table.def.placement != TablePlacement::Replicated
+                    || !table
+                        .def
+                        .local_fields
+                        .iter()
+                        .any(|candidate| candidate.field == field)
+                {
+                    return Ok(());
+                }
+                self.driver.execute(
+                    sql::write_local_field(),
+                    vec![
+                        text_value(record.identity_key.clone()),
+                        text_value(table_name.to_owned()),
+                        text_value(json_str(value, "id")?.to_owned()),
+                        text_value(field.to_owned()),
+                        text_value(
+                            serde_json::to_string(json_value(value, "value")?)
+                                .map_err(|error| json_decode(&error.to_string()))?,
+                        ),
+                        Value::from_f64(0.0),
+                    ],
+                )
+            }
             OriginKind::Mutation => self.materialize_mutation_unlocked(record, value),
             OriginKind::PushEnvelope => {
                 let commit_seq = json_i64(value, "commitSeq")?;
@@ -2586,11 +2972,11 @@ impl EmbeddedStore {
                 {
                     let table_name = json_str(after_image, "table")?;
                     let document_id = json_str(after_image, "rowId")?;
-                    let table = self.runtime(table_name)?;
+                    let Some(table) = lock(&self.tables).get(table_name).cloned() else {
+                        continue;
+                    };
                     if table.def.placement != TablePlacement::Replicated {
-                        return Err(StorageError::Unsatisfiable(format!(
-                            "push after-image targets non-replicated table {table_name}"
-                        )));
+                        continue;
                     }
                     let content = json_str(after_image, "content")?;
                     let op = match content {
@@ -2599,12 +2985,19 @@ impl EmbeddedStore {
                             let object = data
                                 .as_object()
                                 .ok_or_else(|| json_decode("push after-image value"))?;
+                            let Ok(cols) = crate::crdt::extract_cols(&table.def, object) else {
+                                // The queue envelope is the durable work item. Its optimistic
+                                // projection is derived and may no longer fit a narrowed target
+                                // schema, so omit only that projection and let normal push
+                                // settlement retire the preserved envelope.
+                                continue;
+                            };
                             let doc_write = DocWrite {
                                 table: table_name.to_owned(),
                                 id: document_id.to_owned(),
                                 data: serde_json::to_string(data)
                                     .map_err(|error| json_decode(&error.to_string()))?,
-                                cols: crate::crdt::extract_cols(&table.def, object)?,
+                                cols,
                                 creation_time: after_image
                                     .get("creationTime")
                                     .and_then(serde_json::Value::as_f64)
@@ -2700,17 +3093,32 @@ impl EmbeddedStore {
             OriginKind::Blob => self.materialize_blob_unlocked(record, value),
             OriginKind::Revision => self.materialize_revision_unlocked(record, value),
             OriginKind::CrdtEffect => {
+                let kind = crate::types::CrdtFieldKind::parse_wire(json_str(value, "kind")?)
+                    .ok_or_else(|| json_decode("CRDT kind"))?;
+                let table_name = json_str(value, "table")?;
+                let field = json_str(value, "field")?;
+                let table = lock(&self.tables).get(table_name).cloned();
+                let Some(table) = table else {
+                    return Ok(());
+                };
+                if table.def.placement != TablePlacement::Replicated
+                    || !table
+                        .def
+                        .crdt_fields
+                        .iter()
+                        .any(|candidate| candidate.field == field && candidate.kind == kind)
+                {
+                    return Ok(());
+                }
                 let state_hash = decode_base64_field(value, "stateHash")?;
                 let state_bytes = self
                     .origin_payload_read_unlocked(&state_hash)?
                     .ok_or_else(|| json_decode("CRDT state payload"))?;
                 let state = decode_crdt_field_state(&state_bytes)?;
-                let kind = crate::types::CrdtFieldKind::parse_wire(json_str(value, "kind")?)
-                    .ok_or_else(|| json_decode("CRDT kind"))?;
                 self.write_crdt_field_state_unlocked(
-                    json_str(value, "table")?,
+                    table_name,
                     json_str(value, "id")?,
-                    json_str(value, "field")?,
+                    field,
                     kind,
                     &state,
                     json_i64(value, "commitSeq")?,
@@ -2728,6 +3136,149 @@ impl EmbeddedStore {
                     updated_time: json_i64(value, "updatedTime")?,
                 })
             }
+            OriginKind::RemoteProjection => {
+                let table_name = json_str(value, "table")?;
+                let local_id = json_str(value, "localDocumentId")?;
+                let server_id = json_str(value, "serverDocumentId")?;
+                let definition = self.replicated_def(table_name)?;
+                let table = self.runtime(table_name)?;
+                let head = RowHead {
+                    table: table_name.to_owned(),
+                    local_document_id: local_id.to_owned(),
+                    current_rev_id: json_str(value, "currentRevId")?.to_owned(),
+                    server_document_id: server_id.to_owned(),
+                    projection_hash: json_str(value, "projectionHash")?.to_owned(),
+                    current_root_id: json_optional_str(value, "currentRootId")?.map(str::to_owned),
+                    current_node_id: json_optional_str(value, "currentNodeId")?.map(str::to_owned),
+                    server_base: json_optional_str(value, "serverBase")?.map(str::to_owned),
+                    server_row: json_optional_str(value, "serverRow")?.map(str::to_owned),
+                    logical_clock: json_f64(value, "logicalClock")?,
+                    updated_time: json_i64(value, "updatedTime")?,
+                };
+                if self
+                    .read_dirty_head_unlocked(table_name, local_id)?
+                    .is_none()
+                {
+                    if let Some(row) = head.server_row.as_deref() {
+                        let write =
+                            remote_doc_encode(&definition, local_id, row, head.updated_time)?;
+                        self.doc_write_unlocked(&write, &table, false)?;
+                    }
+                }
+                self.remote_doc_write_unlocked(&head)
+            }
+            OriginKind::RemoteMembership => {
+                let table_name = json_str(value, "table")?;
+                let server_id = json_str(value, "serverDocumentId")?;
+                self.replicated_def(table_name)?;
+                if self
+                    .remote_doc_id_read_unlocked(table_name, server_id)?
+                    .is_none()
+                {
+                    return Err(StorageError::IncompatibleStore(format!(
+                        "remote membership {table_name}:{server_id} has no carried projection"
+                    )));
+                }
+                self.driver.execute(
+                    sql::write_membership(),
+                    vec![
+                        text_value(record.identity_key.clone()),
+                        text_value(json_str(value, "subscription")?.to_owned()),
+                        text_value(table_name.to_owned()),
+                        text_value(server_id.to_owned()),
+                        json_optional_str(value, "rangeLower")?
+                            .map_or(Value::Null, |item| text_value(item.to_owned())),
+                        json_optional_str(value, "rangeUpper")?
+                            .map_or(Value::Null, |item| text_value(item.to_owned())),
+                        json_optional_str(value, "rangeOrder")?
+                            .map_or(Value::Null, |item| text_value(item.to_owned())),
+                    ],
+                )?;
+                self.remote_subscription_state_cache_invalidate_unlocked(json_str(
+                    value,
+                    "subscription",
+                )?);
+                Ok(())
+            }
+            OriginKind::RemoteResult => self
+                .result_write_unlocked(&ResultEntry {
+                    key: json_str(value, "key")?.to_owned(),
+                    function: json_str(value, "function")?.to_owned(),
+                    args: json_str(value, "args")?.to_owned(),
+                    schema_hash: json_str(value, "schemaHash")?.to_owned(),
+                    module_hash: json_str(value, "moduleHash")?.to_owned(),
+                    skeleton: decode_base64_field(value, "skeleton")?,
+                    paths: decode_base64_field(value, "paths")?,
+                    skeleton_hash: json_str(value, "skeletonHash")?.to_owned(),
+                    clock: json_f64(value, "clock")?,
+                })
+                .map(|_| ()),
+            OriginKind::RemoteCursor => {
+                let subscription = json_str(value, "subscription")?;
+                let expected = decode_base64_field(value, "stateHash")?;
+                let actual = self.remote_subscription_state_hash_unlocked(subscription)?;
+                if expected != actual {
+                    return Err(StorageError::IncompatibleStore(format!(
+                        "carried pull cursor for {subscription} does not match its projections and membership"
+                    )));
+                }
+                let result_key = json_optional_str(value, "resultKey")?;
+                let result_hash = json_optional_str(value, "resultHash")?;
+                let result_projection_hash = json_optional_str(value, "resultProjectionHash")?;
+                if result_key.is_some() != result_hash.is_some()
+                    || result_key.is_some() != result_projection_hash.is_some()
+                {
+                    return Err(StorageError::IncompatibleStore(format!(
+                        "carried pull cursor for {subscription} has an incomplete retained-result dependency"
+                    )));
+                }
+                if let (Some(result_key), Some(expected), Some(expected_projection)) =
+                    (result_key, result_hash, result_projection_hash)
+                {
+                    let result = self.result_read_unlocked(result_key)?.ok_or_else(|| {
+                        StorageError::IncompatibleStore(format!(
+                            "carried pull cursor for {subscription} is missing retained result {result_key}"
+                        ))
+                    })?;
+                    let expected = base64::decode(expected).map_err(|error| {
+                        StorageError::IncompatibleStore(format!(
+                            "carried pull cursor for {subscription} has an invalid retained-result hash: {error}"
+                        ))
+                    })?;
+                    if expected != remote_result_content_hash(&result) {
+                        return Err(StorageError::IncompatibleStore(format!(
+                            "carried pull cursor for {subscription} does not match retained result {result_key}"
+                        )));
+                    }
+                    let expected_projection = base64::decode(expected_projection)
+                        .map_err(|error| {
+                            StorageError::IncompatibleStore(format!(
+                                "carried pull cursor for {subscription} has an invalid result projection hash: {error}"
+                            ))
+                        })?;
+                    if expected_projection
+                        != self.remote_result_projection_hash_unlocked(&result)?
+                    {
+                        return Err(StorageError::IncompatibleStore(format!(
+                            "carried pull cursor for {subscription} does not match the retained result projections"
+                        )));
+                    }
+                }
+                self.driver.execute(
+                    sql::write_remote_cursor(),
+                    vec![
+                        text_value(record.identity_key.clone()),
+                        text_value(remote_cursor_key_encode(subscription)),
+                        Value::from_i64(0),
+                        json_optional_str(value, "cursor")?
+                            .map_or(Value::Null, |cursor| text_value(cursor.to_owned())),
+                        Value::from_i64(json_i64(value, "updatedTime")?),
+                    ],
+                )
+            }
+            OriginKind::CandidatePolicy => Err(StorageError::IncompatibleStore(
+                "candidate queue policy metadata reached materialization".to_owned(),
+            )),
         }
     }
 
@@ -2878,77 +3429,347 @@ impl EmbeddedStore {
     }
 
     /// Remove a retired generation after a later active generation has opened successfully.
-    pub fn migration_retire(&self, generation: i64) -> Result<(), StorageError> {
+    pub fn migration_retire_step(&self, generation: i64) -> Result<MigrationStep, StorageError> {
         let _guard = lock(&self.operation_lock);
-        if generation == self.driver.generation()
-            || self.bootstrap_i64_read_unlocked(sql::CANDIDATE_GENERATION_KEY)? == Some(generation)
-        {
+        if self.bootstrap_i64_read_unlocked(sql::ACTIVE_GENERATION_KEY)? == Some(generation) {
             return Err(StorageError::Unsatisfiable(
-                "active or candidate generation cannot be retired".to_owned(),
+                "published active generation cannot be retired".to_owned(),
             ));
         }
-        self.generation_cleanup_unlocked(generation)?;
-        self.origin_payload_cleanup_unlocked()?;
+        if generation == self.driver.generation() {
+            return Err(StorageError::Unsatisfiable(
+                "currently bound generation cannot be retired".to_owned(),
+            ));
+        }
+        let stale_candidate =
+            self.bootstrap_i64_read_unlocked(sql::CANDIDATE_GENERATION_KEY)? == Some(generation);
+        let retired_generation = self
+            .retired_generations_read_unlocked()?
+            .contains(&generation);
+        if !stale_candidate && !retired_generation {
+            return Err(StorageError::Unsatisfiable(
+                "generation is neither retired nor an authorized stale candidate".to_owned(),
+            ));
+        }
+        if stale_candidate
+            && self
+                .bootstrap_read_unlocked(sql::CANDIDATE_RETIRE_STATE_KEY)?
+                .as_deref()
+                != Some(b"authorized")
+        {
+            return Err(StorageError::Unsatisfiable(
+                "live candidate generation cannot be retired".to_owned(),
+            ));
+        }
+        let has_origins = self
+            .driver
+            .run_row(
+                sql::HAS_ORIGIN_GENERATION,
+                vec![Value::from_i64(generation)],
+                |_| Ok(()),
+            )?
+            .is_some();
+        if has_origins {
+            let deleted = self.transaction_unlocked(|| {
+                self.driver.execute(
+                    sql::DELETE_ORIGIN_GENERATION_PAGE,
+                    vec![Value::from_i64(generation)],
+                )?;
+                Ok(self.driver.changes())
+            })?;
+            return Ok(MigrationStep {
+                done: false,
+                records: usize::try_from(deleted).unwrap_or(usize::MAX),
+            });
+        }
+        let prefix = format!("g{generation}__");
+        if let Some(table) = self
+            .read_tables()?
+            .into_iter()
+            .find(|table| table.starts_with(&prefix))
+        {
+            self.transaction_unlocked(|| {
+                self.driver.execute(&sql::drop_table(&table), Vec::new())
+            })?;
+            return Ok(MigrationStep {
+                done: false,
+                records: 1,
+            });
+        }
+        let payload = self.origin_payload_cleanup_step_unlocked(generation)?;
+        if !payload.done {
+            return Ok(payload);
+        }
         self.transaction_unlocked(|| {
-            let mut retired = self.retired_generations_read_unlocked()?;
-            retired.retain(|candidate| *candidate != generation);
-            self.retired_generations_write_unlocked(&retired)
+            if stale_candidate {
+                if self.bootstrap_i64_read_unlocked(sql::CANDIDATE_GENERATION_KEY)?
+                    != Some(generation)
+                {
+                    return Err(StorageError::IncompatibleStore(
+                        "stale candidate changed during cleanup".to_owned(),
+                    ));
+                }
+                self.candidate_metadata_clear_unlocked()
+            } else {
+                let mut retired = self.retired_generations_read_unlocked()?;
+                retired.retain(|candidate| *candidate != generation);
+                self.retired_generations_write_unlocked(&retired)
+            }?;
+            for key in [
+                sql::PAYLOAD_CLEANUP_GENERATION_KEY,
+                sql::PAYLOAD_CLEANUP_STATE_KEY,
+                sql::PAYLOAD_CLEANUP_CURSOR_KEY,
+            ] {
+                self.driver
+                    .execute(sql::DELETE_BOOTSTRAP, vec![text_value(key.to_owned())])?;
+            }
+            self.driver
+                .execute(sql::CLEAR_ORIGIN_PAYLOAD_REACHABLE, Vec::new())
+        })?;
+        Ok(MigrationStep {
+            done: true,
+            records: 0,
         })
     }
 
-    /// Mark every immutable payload reachable from any retained ledger envelope before deleting a
-    /// bounded page of unreferenced bytes. A failed mark performs no deletes; a failed delete is
-    /// safe to retry from a fresh mark pass.
-    fn origin_payload_cleanup_unlocked(&self) -> Result<(), StorageError> {
+    pub fn migration_retire(&self, generation: i64) -> Result<(), StorageError> {
+        while !self.migration_retire_step(generation)?.done {}
+        Ok(())
+    }
+
+    fn candidate_metadata_clear_unlocked(&self) -> Result<(), StorageError> {
+        for key in [
+            sql::CANDIDATE_GENERATION_KEY,
+            sql::CANDIDATE_SOURCE_KEY,
+            sql::CANDIDATE_CONTRACT_KEY,
+            sql::CANDIDATE_SETUP_HASH_KEY,
+            sql::CANDIDATE_STATE_KEY,
+            sql::CANDIDATE_COPY_STATE_KEY,
+            sql::CANDIDATE_MATERIALIZE_STATE_KEY,
+            sql::CANDIDATE_SETUP_STATE_KEY,
+            sql::CANDIDATE_FINALIZE_STATE_KEY,
+            sql::CANDIDATE_COPY_CURSOR_KEY,
+            sql::CANDIDATE_MATERIALIZE_CURSOR_KEY,
+            sql::CANDIDATE_QUEUE_POLICY_STATE_KEY,
+            sql::CANDIDATE_QUEUE_POLICY_CURSOR_KEY,
+            sql::CANDIDATE_RETIRE_STATE_KEY,
+        ] {
+            self.driver
+                .execute(sql::DELETE_BOOTSTRAP, vec![text_value(key.to_owned())])?;
+        }
+        Ok(())
+    }
+
+    /// Mark or delete one bounded unit of immutable-payload cleanup. Reachability lives in a temp
+    /// table for speed; a sentinel proves it belongs to this connection. After a process restart
+    /// the missing sentinel durably rewinds marking before any delete can run.
+    fn origin_payload_cleanup_step_unlocked(
+        &self,
+        generation: i64,
+    ) -> Result<MigrationStep, StorageError> {
         self.driver
             .execute(sql::CREATE_ORIGIN_PAYLOAD_REACHABLE, Vec::new())?;
-        self.driver
-            .execute(sql::CLEAR_ORIGIN_PAYLOAD_REACHABLE, Vec::new())?;
-        let mut cursor = 0;
-        loop {
-            let mut page = Vec::with_capacity(512);
-            self.driver.run_rows(
-                sql::READ_ORIGIN_PAYLOAD_REFERENCE_PAGE,
-                vec![Value::from_i64(cursor)],
+        let cleanup_generation =
+            self.bootstrap_i64_read_unlocked(sql::PAYLOAD_CLEANUP_GENERATION_KEY)?;
+        if let Some(active) = cleanup_generation {
+            if active != generation {
+                return Err(StorageError::Unsatisfiable(format!(
+                    "payload cleanup for generation {active} must finish before generation {generation}"
+                )));
+            }
+        }
+        let state = self.bootstrap_read_unlocked(sql::PAYLOAD_CLEANUP_STATE_KEY)?;
+        let has_sentinel = self
+            .driver
+            .run_row(
+                sql::HAS_ORIGIN_PAYLOAD_REACHABLE_SENTINEL,
+                Vec::new(),
+                |_| Ok(()),
+            )?
+            .is_some();
+        if cleanup_generation.is_none() {
+            self.transaction_unlocked(|| {
+                self.driver
+                    .execute(sql::CLEAR_ORIGIN_PAYLOAD_REACHABLE, Vec::new())?;
+                self.driver
+                    .execute(sql::WRITE_ORIGIN_PAYLOAD_REACHABLE_SENTINEL, Vec::new())?;
+                self.write_bootstrap_unlocked(
+                    sql::PAYLOAD_CLEANUP_GENERATION_KEY,
+                    generation.to_string().as_bytes(),
+                )?;
+                self.write_bootstrap_unlocked(sql::PAYLOAD_CLEANUP_STATE_KEY, b"mark")?;
+                self.write_bootstrap_unlocked(
+                    sql::PAYLOAD_CLEANUP_CURSOR_KEY,
+                    br#"{"rowId":0,"offset":0}"#,
+                )
+            })?;
+            return Ok(MigrationStep {
+                done: false,
+                records: 0,
+            });
+        }
+
+        let state = state.ok_or_else(|| {
+            StorageError::IncompatibleStore(
+                "payload cleanup generation has no state; the store was preserved".to_owned(),
+            )
+        })?;
+        if state.as_slice() == b"complete" {
+            return Ok(MigrationStep {
+                done: true,
+                records: 0,
+            });
+        }
+        if !has_sentinel {
+            self.transaction_unlocked(|| {
+                self.driver
+                    .execute(sql::CLEAR_ORIGIN_PAYLOAD_REACHABLE, Vec::new())?;
+                self.driver
+                    .execute(sql::WRITE_ORIGIN_PAYLOAD_REACHABLE_SENTINEL, Vec::new())?;
+                self.write_bootstrap_unlocked(sql::PAYLOAD_CLEANUP_STATE_KEY, b"mark")?;
+                self.write_bootstrap_unlocked(
+                    sql::PAYLOAD_CLEANUP_CURSOR_KEY,
+                    br#"{"rowId":0,"offset":0}"#,
+                )
+            })?;
+            return Ok(MigrationStep {
+                done: false,
+                records: 0,
+            });
+        }
+        if state.as_slice() == b"mark" {
+            let cursor = self
+                .bootstrap_read_unlocked(sql::PAYLOAD_CLEANUP_CURSOR_KEY)?
+                .map(|bytes| {
+                    let value: serde_json::Value = serde_json::from_slice(&bytes)
+                        .map_err(|error| json_decode(&error.to_string()))?;
+                    let row_id = json_i64(&value, "rowId")?;
+                    let offset = value
+                        .get("offset")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .ok_or_else(|| json_decode("offset"))?;
+                    Ok::<_, StorageError>((row_id, offset))
+                })
+                .transpose()?
+                .unwrap_or((0, 0));
+            let mut records = Vec::with_capacity(if cursor.1 == 0 { 512 } else { 1 });
+            if cursor.1 == 0 {
+                self.driver.run_rows(
+                    sql::READ_ORIGIN_PAYLOAD_REFERENCE_PAGE,
+                    vec![Value::from_i64(cursor.0)],
+                    |row| {
+                        records.push((
+                            int_at(row, 0)?,
+                            int_at(row, 1)?,
+                            int_at(row, 2)?,
+                            int_at(row, 3)?,
+                            blob_at(row, 4)?,
+                        ));
+                        Ok(())
+                    },
+                )?;
+            } else if let Some(record) = self.driver.run_row(
+                sql::READ_ORIGIN_PAYLOAD_REFERENCE_ONE_AT,
+                vec![Value::from_i64(cursor.0)],
                 |row| {
-                    page.push((
+                    Ok((
                         int_at(row, 0)?,
                         int_at(row, 1)?,
                         int_at(row, 2)?,
                         int_at(row, 3)?,
                         blob_at(row, 4)?,
-                    ));
-                    Ok(())
+                    ))
                 },
-            )?;
-            if page.is_empty() {
-                break;
+            )? {
+                records.push(record);
+            }
+            if records.is_empty() {
+                self.transaction_unlocked(|| {
+                    self.write_bootstrap_unlocked(sql::PAYLOAD_CLEANUP_STATE_KEY, b"delete")?;
+                    self.driver.execute(
+                        sql::DELETE_BOOTSTRAP,
+                        vec![text_value(sql::PAYLOAD_CLEANUP_CURSOR_KEY.to_owned())],
+                    )
+                })?;
+                return Ok(MigrationStep {
+                    done: false,
+                    records: 0,
+                });
+            }
+            let mut reachable = Vec::with_capacity(512);
+            let mut next = cursor;
+            let mut touched = 0;
+            for (row_id, kind, codec, flags, payload) in records {
+                let references = origin_payload_references(kind, codec, flags, &payload)?;
+                let start = if row_id == cursor.0 { cursor.1 } else { 0 };
+                if start > references.len() {
+                    return Err(StorageError::IncompatibleStore(
+                        "payload cleanup reference offset exceeds its origin record".to_owned(),
+                    ));
+                }
+                let take = (512 - reachable.len()).min(references.len() - start);
+                reachable.extend_from_slice(&references[start..start + take]);
+                touched += 1;
+                next = if start + take == references.len() {
+                    (row_id, 0)
+                } else {
+                    (row_id, start + take)
+                };
+                if reachable.len() == 512 || next.1 != 0 {
+                    break;
+                }
+            }
+            let encoded = serde_json::to_vec(&serde_json::json!({
+                "rowId": next.0,
+                "offset": next.1,
+            }))
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+            self.transaction_unlocked(|| {
+                for hash in &reachable {
+                    self.driver.execute(
+                        sql::WRITE_ORIGIN_PAYLOAD_REACHABLE,
+                        vec![Value::Blob(hash.clone())],
+                    )?;
+                }
+                self.write_bootstrap_unlocked(sql::PAYLOAD_CLEANUP_CURSOR_KEY, &encoded)
+            })?;
+            return Ok(MigrationStep {
+                done: false,
+                records: touched,
+            });
+        }
+        if state.as_slice() == b"delete" {
+            let has_unreachable = self
+                .driver
+                .run_row(sql::HAS_UNREACHABLE_ORIGIN_PAYLOAD, Vec::new(), |_| Ok(()))?
+                .is_some();
+            if has_unreachable {
+                let deleted = self.transaction_unlocked(|| {
+                    self.driver
+                        .execute(sql::DELETE_UNREACHABLE_ORIGIN_PAYLOAD_PAGE, Vec::new())?;
+                    Ok(self.driver.changes())
+                })?;
+                return Ok(MigrationStep {
+                    done: false,
+                    records: usize::try_from(deleted).unwrap_or(usize::MAX),
+                });
             }
             self.transaction_unlocked(|| {
-                for (_, kind, codec, flags, payload) in &page {
-                    for hash in origin_payload_references(*kind, *codec, *flags, payload)? {
-                        self.driver.execute(
-                            sql::WRITE_ORIGIN_PAYLOAD_REACHABLE,
-                            vec![Value::Blob(hash)],
-                        )?;
-                    }
-                }
-                Ok(())
-            })?;
-            cursor = page.last().map_or(cursor, |record| record.0);
-        }
-        loop {
-            let deleted = self.transaction_unlocked(|| {
+                self.write_bootstrap_unlocked(sql::PAYLOAD_CLEANUP_STATE_KEY, b"complete")?;
                 self.driver.execute(
-                    sql::DELETE_UNREACHABLE_ORIGIN_PAYLOAD_PAGE,
-                    Vec::new(),
-                )?;
-                Ok(self.driver.changes())
+                    sql::DELETE_BOOTSTRAP,
+                    vec![text_value(sql::PAYLOAD_CLEANUP_CURSOR_KEY.to_owned())],
+                )
             })?;
-            if deleted == 0 {
-                return Ok(());
-            }
+            return Ok(MigrationStep {
+                done: false,
+                records: 0,
+            });
         }
+        Err(StorageError::IncompatibleStore(
+            "payload cleanup state is invalid".to_owned(),
+        ))
     }
 
     fn retired_generations_read_unlocked(&self) -> Result<Vec<i64>, StorageError> {
@@ -2979,6 +3800,7 @@ impl EmbeddedStore {
             Ok(()) => Ok(()),
             Err(error) => {
                 let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                self.remote_subscription_state_cache_clear_unlocked();
                 Err(combine_rollback(error, rolled))
             }
         }
@@ -2994,11 +3816,13 @@ impl EmbeddedStore {
                 Ok(()) => Ok(value),
                 Err(error) => {
                     let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                    self.remote_subscription_state_cache_clear_unlocked();
                     Err(combine_rollback(error, rolled))
                 }
             },
             Err(error) => {
                 let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                self.remote_subscription_state_cache_clear_unlocked();
                 Err(combine_rollback(error, rolled))
             }
         }
@@ -3016,6 +3840,30 @@ impl EmbeddedStore {
             self.create_doc_table_unlocked(table)?;
         }
         Ok(())
+    }
+
+    fn reset_candidate_projection_unlocked(
+        &self,
+        schema: &StoreSchema,
+        generation: i64,
+    ) -> Result<(), StorageError> {
+        let prefix = format!("g{generation}__");
+        for table in self.read_tables()? {
+            if table.starts_with(&prefix) {
+                self.driver.execute(&sql::drop_table(&table), Vec::new())?;
+            }
+        }
+        self.create_system_schema_unlocked()?;
+        self.create_doc_schema_unlocked(schema)?;
+        let manifest = serde_json::to_string(schema)
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        self.write_meta_unlocked(SCHEMA_SIGNATURE_KEY, &schema.hash)?;
+        self.write_meta_unlocked(SCHEMA_MANIFEST_KEY, &manifest)?;
+        self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"pending")?;
+        self.driver.execute(
+            sql::DELETE_BOOTSTRAP,
+            vec![text_value(sql::CANDIDATE_MATERIALIZE_CURSOR_KEY.to_owned())],
+        )
     }
 
     fn create_doc_table_unlocked(&self, table: &TableDef) -> Result<(), StorageError> {
@@ -3328,11 +4176,13 @@ impl EmbeddedStore {
                 Ok(()) => Ok(written),
                 Err(error) => {
                     let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                    self.remote_subscription_state_cache_clear_unlocked();
                     Err(combine_rollback(error, rolled))
                 }
             },
             Err(error) => {
                 let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                self.remote_subscription_state_cache_clear_unlocked();
                 Err(combine_rollback(error, rolled))
             }
         }
@@ -3403,11 +4253,13 @@ impl EmbeddedStore {
                 }
                 Err(e) => {
                     let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                    self.remote_subscription_state_cache_clear_unlocked();
                     Err(combine_rollback(e, rolled))
                 }
             },
             Err(e) => {
                 let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                self.remote_subscription_state_cache_clear_unlocked();
                 Err(combine_rollback(e, rolled))
             }
         }
@@ -3679,7 +4531,34 @@ impl EmbeddedStore {
     ) -> Result<CommitResult, StorageError> {
         let _guard = lock(&self.operation_lock);
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let written = self.commit_unlocked(&batch, options);
+        // The bootstrap floor is deliberately the first write in the same SQLite transaction as
+        // every document/index/result mutation. It is store-global, so identity changes and an
+        // unpublished candidate generation cannot fork the device timestamp domain.
+        // Keep the ordinary commit path allocation- and parse-free. `options.commit_ts` is set
+        // by the normalized TS batch bit, so only an actual `db.vars.commitTs` mutation pays for
+        // cloning exact commit metadata and walking the affected JSON trees.
+        let written = (|| {
+            let requires_commit_ts = options.commit_ts
+                || options.mutation_result_commit_ts
+                || options
+                    .push
+                    .as_ref()
+                    .is_some_and(|push| push.after_images_commit_ts)
+                || !batch.commit_ts_doc_writes.is_empty()
+                || !batch.commit_ts_local_field_writes.is_empty();
+            if requires_commit_ts {
+                let mut batch = batch;
+                let mut options = options.clone();
+                let timestamp = self.commit_ts_allocate_unlocked()?;
+                resolve_pending_commit_ts(&mut batch, &mut options, timestamp)?;
+                self.commit_unlocked(&batch, &options).map(|mut result| {
+                    result.commit_ts = Some(timestamp);
+                    result
+                })
+            } else {
+                self.commit_unlocked(&batch, options)
+            }
+        })();
 
         match written {
             Ok(result) => match self.driver.execute(sql::COMMIT, Vec::new()) {
@@ -3711,6 +4590,34 @@ impl EmbeddedStore {
         fresh: bool,
         data_only: bool,
     ) -> Result<CommitResult, StorageError> {
+        let pending_doc = doc_write.data.contains("\"$commitTs\"")
+            || doc_write
+                .cols
+                .iter()
+                .any(|(_, value)| matches!(value, ColValue::PendingCommitTs));
+        if pending_doc
+            || options.commit_ts
+            || options.mutation_result_commit_ts
+            || options
+                .push
+                .as_ref()
+                .is_some_and(|push| push.after_images_commit_ts)
+        {
+            let row = RowKey {
+                table: doc_write.table.clone(),
+                document_id: doc_write.id.clone(),
+            };
+            return self.commit(
+                WriteBatch {
+                    doc_writes: vec![doc_write],
+                    fresh_ids: fresh.then(|| row.clone()).into_iter().collect(),
+                    data_only_ids: data_only.then_some(row).into_iter().collect(),
+                    commit_ts_doc_writes: pending_doc.then_some(0).into_iter().collect(),
+                    ..WriteBatch::default()
+                },
+                options,
+            );
+        }
         let _guard = lock(&self.operation_lock);
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
         let written = self.commit_one_doc_write_unlocked(&doc_write, options, fresh, data_only);
@@ -3750,6 +4657,18 @@ impl EmbeddedStore {
         fresh: bool,
         data_only: bool,
     ) -> Result<CommitResult, StorageError> {
+        if data.contains("\"$commitTs\"")
+            || options.commit_ts
+            || options.mutation_result_commit_ts
+            || options
+                .push
+                .as_ref()
+                .is_some_and(|push| push.after_images_commit_ts)
+        {
+            return Err(StorageError::Unsatisfiable(
+                "encoded one-document commits cannot carry db.vars.commitTs".to_owned(),
+            ));
+        }
         let _guard = lock(&self.operation_lock);
         self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
         let written = self.commit_one_doc_write_encoded_unlocked(
@@ -3824,6 +4743,21 @@ impl EmbeddedStore {
         self.origin_committed_mutation_write_unlocked(options, &result)?;
         self.write_push_envelope_unlocked(options, &result)?;
         Ok(result)
+    }
+
+    /// Allocate a monotonic signed-i64 device timestamp in the already-open `SQLite` transaction.
+    /// `synchronous=NORMAL` retains its normal `SQLite` durability envelope: a committed return is
+    /// atomic in the database, while a power loss may still lose the most recent WAL frames.
+    fn commit_ts_allocate_unlocked(&self) -> Result<i64, StorageError> {
+        let floor = self
+            .bootstrap_i64_read_unlocked(sql::COMMIT_TS_FLOOR_KEY)?
+            .unwrap_or(0);
+        let next =
+            wall_ns()?.max(floor.checked_add(1).ok_or_else(|| {
+                StorageError::Unsatisfiable("commit timestamp overflow".to_owned())
+            })?);
+        self.write_bootstrap_unlocked(sql::COMMIT_TS_FLOOR_KEY, next.to_string().as_bytes())?;
+        Ok(next)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4595,16 +5529,23 @@ impl EmbeddedStore {
         now_ms: i64,
     ) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
-        self.driver.execute(
-            sql::write_remote_cursor(),
-            vec![
-                text_value(self.identity_key.clone()),
-                text_value(format!("{REMOTE_PUSH_ENVELOPE_PREFIX}{op_id}")),
-                Value::from_i64(ordinal),
-                text_value(envelope_json.to_owned()),
-                Value::from_i64(now_ms),
-            ],
-        )
+        self.transaction_unlocked(|| {
+            self.driver.execute(
+                sql::write_remote_cursor(),
+                vec![
+                    text_value(self.identity_key.clone()),
+                    text_value(format!("{REMOTE_PUSH_ENVELOPE_PREFIX}{op_id}")),
+                    Value::from_i64(ordinal),
+                    text_value(envelope_json.to_owned()),
+                    Value::from_i64(now_ms),
+                ],
+            )?;
+            self.origin_write_unlocked(
+                OriginKind::PushEnvelope,
+                op_id.as_bytes(),
+                envelope_json.as_bytes(),
+            )
+        })
     }
 
     /// Pending push envelope JSON in local commit order, bounded by `num_items` (§11 D2).
@@ -4731,9 +5672,14 @@ impl EmbeddedStore {
                 text_value(self.identity_key.clone()),
                 text_value(watermark),
                 Value::from_i64(commit_seq),
-                text_value(encoded),
+                text_value(encoded.clone()),
                 Value::from_i64(now_ms),
             ],
+        )?;
+        self.origin_write_unlocked(
+            OriginKind::PushEnvelope,
+            mutation_id.as_bytes(),
+            encoded.as_bytes(),
         )
     }
 
@@ -4793,11 +5739,13 @@ impl EmbeddedStore {
                 }
                 Err(error) => {
                     let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                    self.remote_subscription_state_cache_clear_unlocked();
                     Err(combine_rollback(error, rolled))
                 }
             },
             Err(error) => {
                 let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                self.remote_subscription_state_cache_clear_unlocked();
                 Err(combine_rollback(error, rolled))
             }
         }
@@ -5119,6 +6067,10 @@ impl EmbeddedStore {
     }
 
     #[cfg(any(test, feature = "testkit"))]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "testkit mirrors the owned binding cursor shape"
+    )]
     pub fn remote_cursor_write(
         &self,
         subscription: &str,
@@ -5126,16 +6078,19 @@ impl EmbeddedStore {
         now_ms: i64,
     ) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
-        self.driver.execute(
-            sql::write_remote_cursor(),
-            vec![
-                text_value(self.identity_key.clone()),
-                text_value(remote_cursor_key_encode(subscription)),
-                Value::from_i64(0),
-                cursor.map_or(Value::Null, text_value),
-                Value::from_i64(now_ms),
-            ],
-        )
+        self.transaction_unlocked(|| {
+            self.driver.execute(
+                sql::write_remote_cursor(),
+                vec![
+                    text_value(self.identity_key.clone()),
+                    text_value(remote_cursor_key_encode(subscription)),
+                    Value::from_i64(0),
+                    cursor.clone().map_or(Value::Null, text_value),
+                    Value::from_i64(now_ms),
+                ],
+            )?;
+            self.origin_remote_cursor_write_unlocked(subscription, cursor.as_deref(), None, now_ms)
+        })
     }
 
     /// Read a binary blob by key.
@@ -5208,7 +6163,7 @@ impl EmbeddedStore {
     /// equals the incoming one. The unlocked variant lets S3 call it inside the pull-page transaction.
     pub fn result_write(&self, entry: &ResultEntry) -> Result<bool, StorageError> {
         let _guard = lock(&self.operation_lock);
-        self.result_write_unlocked(entry)
+        self.transaction_unlocked(|| self.result_write_unlocked(entry))
     }
 
     pub(crate) fn result_write_unlocked(&self, entry: &ResultEntry) -> Result<bool, StorageError> {
@@ -5218,6 +6173,16 @@ impl EmbeddedStore {
             |row| text_at(row, 0),
         )?;
         if stored.as_deref() == Some(entry.skeleton_hash.as_str()) {
+            // `skeleton_hash` is the runtime's durable no-op key. Preserve the complete stored
+            // value in both planes: the incoming entry may carry different bytes or a newer clock
+            // even though this write is intentionally skipped.
+            let stored = self.result_read_unlocked(&entry.key)?.ok_or_else(|| {
+                StorageError::IncompatibleStore(format!(
+                    "retained result {} vanished during its no-op write",
+                    entry.key
+                ))
+            })?;
+            self.origin_remote_result_write_unlocked(&stored)?;
             return Ok(false);
         }
         self.driver.execute(
@@ -5235,18 +6200,20 @@ impl EmbeddedStore {
                 Value::from_f64(entry.clock),
             ],
         )?;
+        self.origin_remote_result_write_unlocked(entry)?;
         Ok(true)
     }
 
     /// Delete one retained authored-result entry by key (watch stop / runtime-driven orphan, §6).
     pub fn result_delete(&self, key: &str) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
-        self.result_delete_unlocked(key)
+        self.transaction_unlocked(|| self.result_delete_unlocked(key))
     }
 
     pub(crate) fn result_delete_unlocked(&self, key: &str) -> Result<(), StorageError> {
         self.driver
-            .execute(sql::delete_result(), vec![text_value(key.to_owned())])
+            .execute(sql::delete_result(), vec![text_value(key.to_owned())])?;
+        self.origin_delete_unlocked(OriginKind::RemoteResult, key.as_bytes())
     }
 
     /// Delete the identity's retained-result entries (§6), returning the count deleted: an entry goes
@@ -5276,9 +6243,12 @@ impl EmbeddedStore {
                 Ok(())
             },
         )?;
-        for key in &stale {
-            self.result_delete_unlocked(key)?;
-        }
+        self.transaction_unlocked(|| {
+            for key in &stale {
+                self.result_delete_unlocked(key)?;
+            }
+            Ok(())
+        })?;
         Ok(stale.len())
     }
 
@@ -5836,6 +6806,10 @@ impl EmbeddedStore {
             self.clear_current_rev_unlocked(table, local_id)?;
         } else {
             self.rev_delete_current_unlocked(table, local_id)?;
+            self.origin_delete_unlocked(
+                OriginKind::RemoteProjection,
+                &origin_key(&[table.as_bytes(), local_id.as_bytes()]),
+            )?;
         }
         self.crdt_reject_row_unlocked(table, local_id, now_ms)?;
         self.clear_pending_row_unlocked(table, local_id)?;
@@ -5853,6 +6827,9 @@ impl EmbeddedStore {
         &self,
         records: &[AuthoritativeRow],
     ) -> Result<AuthoritativeApplyResult, StorageError> {
+        if let Some(seed) = self.remote_doc_page_seed_unlocked(records)? {
+            return Ok(seed);
+        }
         let mut committed = Vec::new();
         let mut reroots = Vec::new();
         let mut archived_current_local_ids = FxHashSet::default();
@@ -5906,7 +6883,7 @@ impl EmbeddedStore {
                     continue;
                 }
                 RecordOrder::Known => {
-                    self.remote_doc_write_unlocked(&RowHead {
+                    let head = RowHead {
                         current_rev_id: existing_projection.as_ref().map_or_else(
                             || "main".to_owned(),
                             |state| state.current_rev_id.clone(),
@@ -5924,7 +6901,9 @@ impl EmbeddedStore {
                             record,
                             existing_projection.as_ref(),
                         ),
-                    })?;
+                    };
+                    self.remote_doc_write_unlocked(&head)?;
+                    self.origin_remote_projection_write_unlocked(&head)?;
                     self.clear_current_rev_unlocked(&record.table, &local_id)?;
                     if let Some(commit) = self
                         .delete_stale_projection_rows_unlocked(&record.table, &stale_document_ids)?
@@ -5949,6 +6928,8 @@ impl EmbeddedStore {
                     crdt_restores: vec![],
                     fresh_ids: vec![],
                     data_only_ids: vec![],
+                    commit_ts_doc_writes: vec![],
+                    commit_ts_local_field_writes: vec![],
                     schedules: vec![],
                     id_mappings: vec![IdMapping {
                         created_time: record.received_time,
@@ -5975,6 +6956,8 @@ impl EmbeddedStore {
                     crdt_restores: vec![],
                     fresh_ids: vec![],
                     data_only_ids: vec![],
+                    commit_ts_doc_writes: vec![],
+                    commit_ts_local_field_writes: vec![],
                     schedules: vec![],
                     id_mappings: vec![IdMapping {
                         created_time: record.received_time,
@@ -6038,7 +7021,7 @@ impl EmbeddedStore {
                 },
             )?;
             if record.row.is_some() {
-                self.remote_doc_write_unlocked(&RowHead {
+                let head = RowHead {
                     current_rev_id: "main".to_owned(),
                     server_base: Some(record.plain_hash.clone()),
                     server_row: record.row.clone(),
@@ -6050,14 +7033,248 @@ impl EmbeddedStore {
                     table: record.table.clone(),
                     updated_time: record.received_time,
                     logical_clock: projection_logical_clock(record, existing_projection.as_ref()),
-                })?;
+                };
+                self.remote_doc_write_unlocked(&head)?;
+                self.origin_remote_projection_write_unlocked(&head)?;
             } else {
                 self.rev_delete_current_unlocked(&record.table, &local_id)?;
+                let head = RowHead {
+                    current_rev_id: "main".to_owned(),
+                    server_base: Some(record.plain_hash.clone()),
+                    server_row: None,
+                    current_node_id: record.current_node_id.clone(),
+                    current_root_id: record.current_root_id.clone(),
+                    local_document_id: local_id.clone(),
+                    projection_hash: record.projection_hash.clone(),
+                    server_document_id: record.server_document_id.clone(),
+                    table: record.table.clone(),
+                    updated_time: record.received_time,
+                    logical_clock: projection_logical_clock(record, existing_projection.as_ref()),
+                };
+                self.remote_doc_write_unlocked(&head)?;
+                self.origin_remote_projection_write_unlocked(&head)?;
             }
             self.clear_current_rev_unlocked(&record.table, &local_id)?;
             committed.push(commit);
         }
         Ok(AuthoritativeApplyResult { committed, reroots })
+    }
+
+    /// Cold pulls contain no local conflicts, retained revisions, or prior ID choices. Treat the
+    /// page as one logical remote commit and batch its physical rows, while the general per-record
+    /// path above remains responsible for merges and re-roots.
+    fn remote_doc_page_seed_unlocked(
+        &self,
+        records: &[AuthoritativeRow],
+    ) -> Result<Option<AuthoritativeApplyResult>, StorageError> {
+        const MIN_BATCH: usize = 64;
+        const PARAMETER_BUDGET: usize = 900;
+        if records.len() < MIN_BATCH
+            || records
+                .iter()
+                .any(|record| record.row.is_none() || record.local_document_id.is_some())
+        {
+            return Ok(None);
+        }
+        let identity_key = self.identity_key.clone();
+        let has_state = self
+            .driver
+            .run_row(
+                sql::remote_seed_has_state(),
+                vec![
+                    text_value(identity_key.clone()),
+                    text_value(identity_key.clone()),
+                    text_value(identity_key.clone()),
+                ],
+                |row| int_at(row, 0),
+            )?
+            .unwrap_or(0)
+            != 0;
+        if has_state {
+            return Ok(None);
+        }
+
+        let mut unique = FxHashSet::default();
+        let mut prepared = Vec::with_capacity(records.len());
+        for record in records {
+            if !unique.insert((record.table.clone(), record.server_document_id.clone())) {
+                return Err(StorageError::Unsatisfiable(
+                    "remote projection page contains a duplicate row".to_owned(),
+                ));
+            }
+            let table = self.runtime(&record.table)?;
+            let local_id = remote_doc_id_encode(&record.table, &record.server_document_id);
+            let row = record.row.as_deref().ok_or_else(|| {
+                StorageError::Unsatisfiable("cold remote seed row is missing".to_owned())
+            })?;
+            let doc = remote_doc_encode(&table.def, &local_id, row, record.received_time)?;
+            let mapping = IdMapping {
+                created_time: record.received_time,
+                local_id: local_id.clone(),
+                mapping: IdMappingContent::Mapped {
+                    convex_id: record.server_document_id.clone(),
+                },
+                table: record.table.clone(),
+                updated_time: record.received_time,
+            };
+            let head = RowHead {
+                current_rev_id: "main".to_owned(),
+                server_base: Some(record.plain_hash.clone()),
+                server_row: record.row.clone(),
+                current_node_id: record.current_node_id.clone(),
+                current_root_id: record.current_root_id.clone(),
+                local_document_id: local_id,
+                projection_hash: record.projection_hash.clone(),
+                server_document_id: record.server_document_id.clone(),
+                table: record.table.clone(),
+                updated_time: record.received_time,
+                logical_clock: projection_logical_clock(record, None),
+            };
+            prepared.push(RemoteSeedRecord { doc, mapping, head });
+        }
+
+        let mut by_table = BTreeMap::<String, Vec<usize>>::new();
+        for (index, record) in prepared.iter().enumerate() {
+            by_table
+                .entry(record.doc.table.clone())
+                .or_default()
+                .push(index);
+        }
+        for (table_name, indexes) in &by_table {
+            let table = self.runtime(table_name)?;
+            let width = 4 + table.def.columns.len();
+            let chunk_size = (PARAMETER_BUDGET / width).max(1);
+            for chunk in indexes.chunks(chunk_size) {
+                let mut params = Vec::with_capacity(chunk.len() * width);
+                for &index in chunk {
+                    let doc = &prepared[index].doc;
+                    validate_replicated_doc_data(&table.def, &doc.data)?;
+                    params.extend([
+                        text_value(doc.id.clone()),
+                        text_value(identity_key.clone()),
+                        Value::from_f64(doc.creation_time),
+                        text_value(doc.data.clone()),
+                    ]);
+                    if cols_are_in_table_order(doc, &table) {
+                        for (_, value) in &doc.cols {
+                            params.push(Value::Blob(value.encode_key()));
+                        }
+                    } else {
+                        let mut columns = vec![ColValue::Undefined; table.def.columns.len()];
+                        for (name, value) in &doc.cols {
+                            if let Some(&position) = table.column_positions.get(name) {
+                                columns[position] = value.clone();
+                            }
+                        }
+                        params.extend(
+                            columns
+                                .into_iter()
+                                .map(|value| Value::Blob(value.encode_key())),
+                        );
+                    }
+                }
+                self.driver
+                    .execute(&sql::write_docs(&table.def, chunk.len()), params)?;
+            }
+        }
+
+        for chunk in prepared.chunks(PARAMETER_BUDGET / 7) {
+            let mut params = Vec::with_capacity(chunk.len() * 7);
+            for record in chunk {
+                params.extend([
+                    text_value(identity_key.clone()),
+                    text_value(record.mapping.table.clone()),
+                    text_value(record.mapping.local_id.clone()),
+                    record
+                        .mapping
+                        .convex_id()
+                        .map_or(Value::Null, |id| text_value(id.to_owned())),
+                    text_value(record.mapping.mapping.as_str().to_owned()),
+                    Value::from_i64(record.mapping.created_time),
+                    Value::from_i64(record.mapping.updated_time),
+                ]);
+            }
+            self.driver
+                .execute(&sql::write_id_mappings(chunk.len()), params)?;
+        }
+
+        let changed_tables = by_table.keys().cloned().collect::<Vec<_>>();
+        let commit = self.write_commit_unlocked(
+            changed_tables,
+            Vec::new(),
+            &CommitOptions {
+                source: CommitSource::Remote,
+                ..CommitOptions::default().omit_changes()
+            },
+        )?;
+
+        for chunk in prepared.chunks(PARAMETER_BUDGET / 12) {
+            let mut params = Vec::with_capacity(chunk.len() * 12);
+            for record in chunk {
+                let head = &record.head;
+                params.extend([
+                    text_value(identity_key.clone()),
+                    text_value(head.table.clone()),
+                    text_value(head.local_document_id.clone()),
+                    text_value(head.current_rev_id.clone()),
+                    text_value(head.server_document_id.clone()),
+                    text_value(head.projection_hash.clone()),
+                    head.current_root_id.clone().map_or(Value::Null, text_value),
+                    head.current_node_id.clone().map_or(Value::Null, text_value),
+                    head.server_base.clone().map_or(Value::Null, text_value),
+                    head.server_row.clone().map_or(Value::Null, text_value),
+                    Value::from_i64(head.updated_time),
+                    Value::from_f64(head.logical_clock),
+                ]);
+            }
+            self.driver
+                .execute(&sql::write_projections(chunk.len()), params)?;
+        }
+
+        let mut origins = Vec::with_capacity(prepared.len() * 2);
+        for record in &prepared {
+            origins.push((
+                OriginKind::IdMapping,
+                origin_key(&[
+                    record.mapping.table.as_bytes(),
+                    record.mapping.local_id.as_bytes(),
+                ]),
+                serde_json::json!({
+                    "table": record.mapping.table,
+                    "localId": record.mapping.local_id,
+                    "state": record.mapping.mapping.as_str(),
+                    "convexId": record.mapping.convex_id(),
+                    "createdTime": record.mapping.created_time,
+                    "updatedTime": record.mapping.updated_time,
+                }),
+            ));
+            origins.push((
+                OriginKind::RemoteProjection,
+                origin_key(&[
+                    record.head.table.as_bytes(),
+                    record.head.local_document_id.as_bytes(),
+                ]),
+                serde_json::json!({
+                    "table": record.head.table,
+                    "localDocumentId": record.head.local_document_id,
+                    "currentRevId": record.head.current_rev_id,
+                    "serverDocumentId": record.head.server_document_id,
+                    "projectionHash": record.head.projection_hash,
+                    "currentRootId": record.head.current_root_id,
+                    "currentNodeId": record.head.current_node_id,
+                    "serverBase": record.head.server_base,
+                    "serverRow": record.head.server_row,
+                    "logicalClock": record.head.logical_clock,
+                    "updatedTime": record.head.updated_time,
+                }),
+            ));
+        }
+        self.origin_json_batch_write_unlocked(origins)?;
+
+        Ok(Some(AuthoritativeApplyResult {
+            committed: std::iter::repeat_n(commit, records.len()).collect(),
+            reroots: Vec::new(),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6093,22 +7310,28 @@ impl EmbeddedStore {
                 "remote pull membership contains a duplicate row".to_owned(),
             ));
         }
+        let mut current = current.into_iter().collect::<Vec<_>>();
+        current.sort_by(|left, right| {
+            (&left.table, &left.server_document_id).cmp(&(&right.table, &right.server_document_id))
+        });
         for member in &current {
             self.def(&member.table)?;
-            if self
-                .remote_doc_id_read_unlocked(&member.table, &member.server_document_id)?
-                .is_none()
-            {
-                return Err(StorageError::Unsatisfiable(format!(
-                    "snapshot member {}:{} has no authoritative projection",
-                    member.table, member.server_document_id
-                )));
-            }
         }
-
-        if previous == current && released.is_empty() {
+        if previous.len() == current.len()
+            && previous.iter().all(|member| {
+                current
+                    .binary_search_by(|candidate| {
+                        (&candidate.table, &candidate.server_document_id)
+                            .cmp(&(&member.table, &member.server_document_id))
+                    })
+                    .is_ok()
+            })
+            && released.is_empty()
+        {
             return Ok(0);
         }
+
+        self.remote_subscription_state_cache_invalidate_unlocked(subscription);
 
         self.driver.execute(
             sql::delete_subscription_membership(),
@@ -6117,22 +7340,33 @@ impl EmbeddedStore {
                 text_value(subscription.to_owned()),
             ],
         )?;
-        for member in &current {
-            self.driver.execute(
-                sql::write_membership(),
-                vec![
+        for member in &previous {
+            self.origin_delete_unlocked(
+                OriginKind::RemoteMembership,
+                &origin_key(&[
+                    subscription.as_bytes(),
+                    member.table.as_bytes(),
+                    member.server_document_id.as_bytes(),
+                ]),
+            )?;
+        }
+        for chunk in current.chunks(256) {
+            let mut params = Vec::with_capacity(chunk.len() * 4);
+            for member in chunk {
+                params.extend([
                     text_value(self.identity_key.clone()),
                     text_value(subscription.to_owned()),
                     text_value(member.table.clone()),
                     text_value(member.server_document_id.clone()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                ],
-            )?;
+                ]);
+            }
+            self.driver
+                .execute(&sql::write_memberships(chunk.len()), params)?;
         }
+        self.origin_remote_memberships_write_unlocked(subscription, &current)?;
 
         let mut projection_deleted = 0;
+        let current = current.into_iter().collect::<FxHashSet<_>>();
         let mut exited = previous
             .difference(&current)
             .cloned()
@@ -6173,6 +7407,207 @@ impl EmbeddedStore {
                 |_| Ok(()),
             )?
             .is_some())
+    }
+
+    /// Content identity of every row a pull cursor authorizes. A cursor is carried only with this
+    /// digest, and candidate materialization recomputes it after projections and membership edges
+    /// have been restored. This makes "old cursor + empty projection" an invalid state rather than
+    /// a possible partial migration outcome.
+    fn remote_subscription_state_hash_unlocked(
+        &self,
+        subscription: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        let cache_key = (
+            self.driver.generation(),
+            self.identity_key.clone(),
+            subscription.to_owned(),
+        );
+        if let Some(cached) = lock(&self.remote_state_cache).get(&cache_key).copied() {
+            return Ok(cached.finish());
+        }
+        let mut members = Vec::new();
+        self.driver.run_rows(
+            sql::read_membership(),
+            vec![
+                text_value(self.identity_key.clone()),
+                text_value(subscription.to_owned()),
+            ],
+            |row| {
+                members.push(RemoteMember {
+                    table: text_at(row, 0)?,
+                    server_document_id: text_at(row, 1)?,
+                });
+                Ok(())
+            },
+        )?;
+        let digest = self.remote_members_projection_digest_unlocked(
+            members,
+            &format!("remote subscription {subscription}"),
+        )?;
+        lock(&self.remote_state_cache).insert(cache_key, digest);
+        Ok(digest.finish())
+    }
+
+    fn remote_subscription_state_cache_invalidate_unlocked(&self, subscription: &str) {
+        let generation = self.driver.generation();
+        let identity = self.identity_key.clone();
+        lock(&self.remote_state_cache).remove(&(generation, identity, subscription.to_owned()));
+    }
+
+    fn remote_subscription_state_cache_clear_unlocked(&self) {
+        lock(&self.remote_state_cache).clear();
+    }
+
+    fn remote_result_projection_hash_unlocked(
+        &self,
+        result: &ResultEntry,
+    ) -> Result<Vec<u8>, StorageError> {
+        let members = result_disclosed_rows_from_paths(&result.paths)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(self
+            .remote_members_projection_digest_unlocked(
+                members,
+                &format!("retained result {}", result.key),
+            )?
+            .finish())
+    }
+
+    fn remote_members_projection_digest_unlocked(
+        &self,
+        mut members: Vec<RemoteMember>,
+        owner: &str,
+    ) -> Result<SubscriptionStateDigest, StorageError> {
+        members.sort_by(|left, right| {
+            (&left.table, &left.server_document_id).cmp(&(&right.table, &right.server_document_id))
+        });
+        let mut digest = SubscriptionStateDigest::default();
+        let mut table_start = 0;
+        while table_start < members.len() {
+            let table = members[table_start].table.clone();
+            let table_end = members[table_start..]
+                .iter()
+                .position(|member| member.table != table)
+                .map_or(members.len(), |offset| table_start + offset);
+            let table_members = &members[table_start..table_end];
+            let total = self
+                .driver
+                .run_row(
+                    &sql::count_table_projections(),
+                    vec![
+                        text_value(self.identity_key.clone()),
+                        text_value(table.clone()),
+                    ],
+                    |row| int_at(row, 0),
+                )?
+                .unwrap_or(0) as usize;
+            if !table_members.is_empty() && table_members.len().saturating_mul(4) >= total {
+                let requested = table_members
+                    .iter()
+                    .map(|member| member.server_document_id.as_str())
+                    .collect::<FxHashSet<_>>();
+                let mut missing = table_members
+                    .iter()
+                    .map(|member| member.server_document_id.clone())
+                    .collect::<FxHashSet<_>>();
+                let mut found = 0;
+                self.driver.run_rows(
+                    &sql::read_table_projections(),
+                    vec![
+                        text_value(self.identity_key.clone()),
+                        text_value(table.clone()),
+                    ],
+                    |row| {
+                        let server_document_id = text_at(row, 1)?;
+                        if !requested.contains(server_document_id.as_str()) {
+                            return Ok(());
+                        }
+                        missing.remove(&server_document_id);
+                        let projection = RowHead {
+                            table: text_at(row, 0)?,
+                            server_document_id,
+                            local_document_id: text_at(row, 2)?,
+                            current_rev_id: text_at(row, 3)?,
+                            projection_hash: text_at(row, 4)?,
+                            current_root_id: optional_text_at(row, 5)?,
+                            current_node_id: optional_text_at(row, 6)?,
+                            server_base: optional_text_at(row, 7)?,
+                            server_row: optional_text_at(row, 8)?,
+                            logical_clock: real_at(row, 9)?,
+                            updated_time: int_at(row, 10)?,
+                        };
+                        digest.write(&remote_member_projection_hash(&projection));
+                        digest.count += 1;
+                        found += 1;
+                        Ok(())
+                    },
+                )?;
+                if let Some(server_document_id) = missing.into_iter().next() {
+                    return Err(StorageError::IncompatibleStore(format!(
+                        "{owner} references missing projection {table}:{server_document_id}"
+                    )));
+                }
+                if found != table_members.len() {
+                    return Err(StorageError::IncompatibleStore(format!(
+                        "{owner} references an ambiguous projection in table {table}"
+                    )));
+                }
+                table_start = table_end;
+                continue;
+            }
+            for chunk in table_members.chunks(896) {
+                let mut params = Vec::with_capacity(chunk.len().saturating_add(2));
+                params.push(text_value(self.identity_key.clone()));
+                params.push(text_value(table.clone()));
+                for member in chunk {
+                    params.push(text_value(member.server_document_id.clone()));
+                }
+                let mut missing = chunk
+                    .iter()
+                    .map(|member| member.server_document_id.clone())
+                    .collect::<FxHashSet<_>>();
+                let mut found = 0;
+                self.driver.run_rows(
+                    &sql::read_result_projections(chunk.len()),
+                    params,
+                    |row| {
+                        let table = text_at(row, 0)?;
+                        let server_document_id = text_at(row, 1)?;
+                        missing.remove(&server_document_id);
+                        let local_document_id = text_at(row, 2)?;
+                        let projection = RowHead {
+                            table,
+                            server_document_id,
+                            local_document_id,
+                            current_rev_id: text_at(row, 3)?,
+                            projection_hash: text_at(row, 4)?,
+                            current_root_id: optional_text_at(row, 5)?,
+                            current_node_id: optional_text_at(row, 6)?,
+                            server_base: optional_text_at(row, 7)?,
+                            server_row: optional_text_at(row, 8)?,
+                            logical_clock: real_at(row, 9)?,
+                            updated_time: int_at(row, 10)?,
+                        };
+                        digest.write(&remote_member_projection_hash(&projection));
+                        digest.count += 1;
+                        found += 1;
+                        Ok(())
+                    },
+                )?;
+                if let Some(server_document_id) = missing.into_iter().next() {
+                    return Err(StorageError::IncompatibleStore(format!(
+                        "{owner} references missing projection {table}:{server_document_id}"
+                    )));
+                }
+                if found != chunk.len() {
+                    return Err(StorageError::IncompatibleStore(format!(
+                        "{owner} references an ambiguous projection in table {table}"
+                    )));
+                }
+            }
+            table_start = table_end;
+        }
+        Ok(digest)
     }
 
     /// Rows disclosed by other retained authored results. Result disclosures are durable ownership
@@ -6269,6 +7704,10 @@ impl EmbeddedStore {
             },
         )?;
         self.rev_delete_current_unlocked(&member.table, &local_id)?;
+        self.origin_delete_unlocked(
+            OriginKind::RemoteProjection,
+            &origin_key(&[member.table.as_bytes(), local_id.as_bytes()]),
+        )?;
         projection.committed.push(commit);
         Ok(true)
     }
@@ -6549,6 +7988,11 @@ impl EmbeddedStore {
                 )?;
             }
 
+            let result_changed = match &pull.result {
+                Some(entry) if self.result_write_unlocked(entry)? => Some(entry.key.clone()),
+                _ => None,
+            };
+
             self.driver.execute(
                 sql::write_remote_cursor(),
                 vec![
@@ -6559,12 +8003,12 @@ impl EmbeddedStore {
                     Value::from_i64(pull.received_time),
                 ],
             )?;
-
-            let result_changed = match &pull.result {
-                Some(entry) if self.result_write_unlocked(entry)? => Some(entry.key.clone()),
-                _ => None,
-            };
-
+            self.origin_remote_cursor_write_unlocked(
+                &pull.subscription,
+                pull.cursor.as_deref(),
+                pull.result.as_deref().map(|entry| entry.key.as_str()),
+                pull.received_time,
+            )?;
             Ok(RemotePageWriteResult {
                 rev_write: RevWriteResult {
                     duplicates: 0,
@@ -6587,11 +8031,13 @@ impl EmbeddedStore {
                 }
                 Err(e) => {
                     let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                    self.remote_subscription_state_cache_clear_unlocked();
                     Err(combine_rollback(e, rolled))
                 }
             },
             Err(e) => {
                 let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                self.remote_subscription_state_cache_clear_unlocked();
                 Err(combine_rollback(e, rolled))
             }
         }
@@ -6626,6 +8072,7 @@ impl EmbeddedStore {
                     text_value(remote_cursor_key_encode(subscription)),
                 ],
             )?;
+            self.origin_delete_unlocked(OriginKind::RemoteCursor, subscription.as_bytes())?;
             Ok(RemotePageWriteResult {
                 rev_write: RevWriteResult {
                     duplicates: 0,
@@ -6645,11 +8092,13 @@ impl EmbeddedStore {
                 }
                 Err(error) => {
                     let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                    self.remote_subscription_state_cache_clear_unlocked();
                     Err(combine_rollback(error, rolled))
                 }
             },
             Err(error) => {
                 let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
+                self.remote_subscription_state_cache_clear_unlocked();
                 Err(combine_rollback(error, rolled))
             }
         }
@@ -6696,7 +8145,7 @@ impl EmbeddedStore {
     ) -> Result<(), StorageError> {
         let existing = self.remote_doc_read_unlocked(&record.table, local_id)?;
         let logical_clock = projection_logical_clock(record, existing.as_ref());
-        self.remote_doc_write_unlocked(&RowHead {
+        let head = RowHead {
             table: record.table.clone(),
             local_document_id: local_id.to_owned(),
             current_rev_id: existing
@@ -6713,8 +8162,9 @@ impl EmbeddedStore {
             server_row: record.row.clone(),
             logical_clock,
             updated_time: record.received_time,
-        })?;
-        Ok(())
+        };
+        self.remote_doc_write_unlocked(&head)?;
+        self.origin_remote_projection_write_unlocked(&head)
     }
 
     fn remote_pull_crdt_unlocked(
@@ -6806,6 +8256,7 @@ impl EmbeddedStore {
         let base_row = projection.server_row.as_deref().unwrap_or(&row_json);
         projection.server_row = Some(patch_row_field(base_row, &change.field, accepted_value)?);
         self.remote_doc_write_unlocked(&projection)?;
+        self.origin_remote_projection_write_unlocked(&projection)?;
         if pending_delete {
             return Ok(None);
         }
@@ -6917,6 +8368,52 @@ impl EmbeddedStore {
             .unwrap_or(0))
     }
 
+    /// Validates every content-addressed payload referenced by the active originated ledger and
+    /// returns the number of distinct references.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn origin_payload_references_debug_validate(&self) -> Result<usize, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let generation = self.driver.generation();
+        let mut cursor = OriginCursor::default();
+        let mut references = FxHashSet::default();
+        loop {
+            let page = self.origin_page_read_unlocked(generation, &cursor, 512)?;
+            if page.is_empty() {
+                break;
+            }
+            for record in &page {
+                for hash in origin_payload_references(
+                    record.kind,
+                    record.codec,
+                    record.flags,
+                    &record.payload,
+                )? {
+                    self.origin_payload_read_unlocked(&hash)?.ok_or_else(|| {
+                        StorageError::IncompatibleStore(
+                            "originated payload reference is missing".to_owned(),
+                        )
+                    })?;
+                    references.insert(hash);
+                }
+            }
+            cursor = page
+                .last()
+                .map_or_else(OriginCursor::default, |record| OriginCursor {
+                    identity_key: record.identity_key.clone(),
+                    kind: record.kind,
+                    record_key: record.record_key.clone(),
+                });
+        }
+        Ok(references.len())
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn active_contract_debug_read(&self) -> Result<StoreContract, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| StorageError::IncompatibleStore("active contract is missing".to_owned()))
+    }
+
     /// Corrupts one immutable payload row without changing its content address.
     #[cfg(any(test, feature = "testkit"))]
     pub fn origin_payload_corrupt_debug_write(&self) -> Result<(), StorageError> {
@@ -6925,6 +8422,84 @@ impl EmbeddedStore {
             "UPDATE __embedded_origin_payload SET bytes = X'00' \
              WHERE rowid = (SELECT rowid FROM __embedded_origin_payload LIMIT 1)",
             Vec::new(),
+        )
+    }
+
+    /// Writes a checksum-consistent unsupported codec for copy/coverage tests.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn origin_codec_debug_write(
+        &self,
+        generation: i64,
+        identity_key: &str,
+        kind: i64,
+        record_key: &[u8],
+        codec: i64,
+    ) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let record = self
+            .origin_record_read_unlocked(generation, identity_key, kind, record_key)?
+            .ok_or_else(|| {
+                StorageError::Unsatisfiable("originated record is missing".to_owned())
+            })?;
+        let payload_hash = origin_hash(
+            identity_key,
+            kind,
+            record_key,
+            codec,
+            record.flags,
+            &record.payload,
+        );
+        self.driver.execute(
+            "UPDATE __embedded_origin SET codec = ?, payload_hash = ? \
+             WHERE generation = ? AND identity_key = ? AND kind = ? AND record_key = ?",
+            vec![
+                Value::from_i64(codec),
+                Value::Blob(payload_hash),
+                Value::from_i64(generation),
+                text_value(identity_key.to_owned()),
+                Value::from_i64(kind),
+                Value::Blob(record_key.to_vec()),
+            ],
+        )
+    }
+
+    /// Replaces one originated payload while keeping its checksum internally consistent. This is
+    /// intentionally testkit-only: candidate tests use it to prove cross-record dependency guards
+    /// reject semantically inconsistent, individually valid records.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn origin_payload_debug_write(
+        &self,
+        generation: i64,
+        identity_key: &str,
+        kind: i64,
+        record_key: &[u8],
+        payload: &[u8],
+    ) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let record = self
+            .origin_record_read_unlocked(generation, identity_key, kind, record_key)?
+            .ok_or_else(|| {
+                StorageError::Unsatisfiable("originated record is missing".to_owned())
+            })?;
+        let payload_hash = origin_hash(
+            identity_key,
+            kind,
+            record_key,
+            record.codec,
+            record.flags,
+            payload,
+        );
+        self.driver.execute(
+            "UPDATE __embedded_origin SET payload = ?, payload_hash = ? \
+             WHERE generation = ? AND identity_key = ? AND kind = ? AND record_key = ?",
+            vec![
+                Value::Blob(payload.to_vec()),
+                Value::Blob(payload_hash),
+                Value::from_i64(generation),
+                text_value(identity_key.to_owned()),
+                Value::from_i64(kind),
+                Value::Blob(record_key.to_vec()),
+            ],
         )
     }
 
@@ -6955,67 +8530,38 @@ impl EmbeddedStore {
         })
     }
 
-    /// Rewrites a generation-one fixture into the last unreleased flat layout
-    /// so integration tests can exercise the one-time ledger seeder.
+    /// Overrides only retained reader coverage so tests can prove it is a runtime capability and
+    /// not a persisted migration trigger.
     #[cfg(any(test, feature = "testkit"))]
-    pub fn legacy_layout_debug_write(&self) -> Result<(), StorageError> {
+    pub fn contract_reader_hash_debug_write(&self, hash: &str) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
-        let mut indexes = Vec::new();
-        let mut tables = Vec::new();
-        self.driver.run_rows(
-            "SELECT type, name, tbl_name FROM sqlite_master \
-             WHERE (type = 'table' AND name LIKE 'g1__%') \
-             OR (type = 'index' AND tbl_name LIKE 'g1__%') \
-             ORDER BY type, name",
-            Vec::new(),
-            |row| {
-                let kind = text_at(row, 0)?;
-                let name = text_at(row, 1)?;
-                if kind == "table" {
-                    tables.push(name);
-                } else if !name.starts_with("sqlite_autoindex_") {
-                    indexes.push(name);
-                }
-                Ok(())
-            },
-        )?;
-        self.driver.generation_write(0);
-        self.driver.execute(sql::BEGIN_TRANSACTION, Vec::new())?;
-        let rewritten = (|| {
-            for index in indexes {
-                self.driver
-                    .execute(&format!("DROP INDEX \"{index}\""), Vec::new())?;
-            }
-            for table in tables {
-                let suffix = table.strip_prefix("g1__").ok_or_else(|| {
-                    StorageError::Unsatisfiable("unexpected generation-one table".to_owned())
-                })?;
-                let target = if suffix.starts_with("embedded_") {
-                    format!("__{suffix}")
-                } else {
-                    suffix.to_owned()
-                };
-                self.driver.execute(
-                    &format!("ALTER TABLE \"{table}\" RENAME TO \"{target}\""),
-                    Vec::new(),
-                )?;
-            }
-            for table in [sql::BOOTSTRAP, sql::ORIGIN, sql::ORIGIN_PAYLOAD] {
-                self.driver
-                    .execute(&format!("DROP TABLE \"{table}\""), Vec::new())?;
-            }
-            Ok(())
-        })();
-        match rewritten {
-            Ok(()) => self.commit_transaction_unlocked()?,
-            Err(error) => {
-                let rolled = self.driver.execute(sql::ROLLBACK, Vec::new());
-                self.driver.generation_write(1);
-                return Err(combine_rollback(error, rolled));
-            }
-        }
-        self.driver.clear_statements();
-        Ok(())
+        let mut contract = self
+            .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| StorageError::Unsatisfiable("active contract is missing".to_owned()))?;
+        hash.clone_into(&mut contract.origin_reader_hash);
+        let encoded = serde_json::to_vec(&contract)
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        self.transaction_unlocked(|| {
+            self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &encoded)
+        })
+    }
+
+    /// Checkpoint and truncate WAL bytes before a release fixture is captured.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn fixture_checkpoint(&self) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.driver
+            .execute("PRAGMA wal_checkpoint(TRUNCATE)", Vec::new())
+    }
+
+    /// Removes the active contract so tests can prove it is never fabricated from the target.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn active_contract_debug_delete(&self) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.driver.execute(
+            sql::DELETE_BOOTSTRAP,
+            vec![text_value(sql::ACTIVE_CONTRACT_KEY.to_owned())],
+        )
     }
 
     /// Persist a rev. An empty log is always a full-snapshot checkpoint (every insert and every
@@ -7241,6 +8787,20 @@ impl EmbeddedStore {
     }
 
     fn remote_doc_write_unlocked(&self, state: &RowHead) -> Result<(), StorageError> {
+        let previous = self.remote_doc_read_unlocked(&state.table, &state.local_document_id)?;
+        let mut subscriptions = Vec::new();
+        self.driver.run_rows(
+            sql::read_membership_subscriptions_for_row(),
+            vec![
+                text_value(self.identity_key.clone()),
+                text_value(state.table.clone()),
+                text_value(state.server_document_id.clone()),
+            ],
+            |row| {
+                subscriptions.push(text_at(row, 0)?);
+                Ok(())
+            },
+        )?;
         self.driver.execute(
             sql::write_projection(),
             vec![
@@ -7263,7 +8823,29 @@ impl EmbeddedStore {
                 Value::from_i64(state.updated_time),
                 Value::from_f64(state.logical_clock),
             ],
-        )
+        )?;
+        if previous.is_none() && !subscriptions.is_empty()
+            || previous
+                .as_ref()
+                .is_some_and(|head| head.server_document_id != state.server_document_id)
+        {
+            self.remote_subscription_state_cache_clear_unlocked();
+        } else if !subscriptions.is_empty() {
+            let generation = self.driver.generation();
+            let identity = self.identity_key.clone();
+            let previous_hash = previous.as_ref().map(remote_member_projection_hash);
+            let next_hash = remote_member_projection_hash(state);
+            let mut cache = lock(&self.remote_state_cache);
+            for subscription in subscriptions {
+                if let Some(digest) = cache.get_mut(&(generation, identity.clone(), subscription)) {
+                    if let Some(previous_hash) = previous_hash.as_ref() {
+                        digest.write(previous_hash);
+                    }
+                    digest.write(&next_hash);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn detach_stale_projection_document_unlocked(
@@ -7296,7 +8878,11 @@ impl EmbeddedStore {
                 }
             }
         }
-        self.rev_delete_current_unlocked(&record.table, stale_id)
+        self.rev_delete_current_unlocked(&record.table, stale_id)?;
+        self.origin_delete_unlocked(
+            OriginKind::RemoteProjection,
+            &origin_key(&[record.table.as_bytes(), stale_id.as_bytes()]),
+        )
     }
 
     /// Delete remap records that do not adopt: rows left under ids the mapping just detached
@@ -7448,6 +9034,7 @@ impl EmbeddedStore {
         };
         self.driver
             .execute(sql::delete_projection_row(), params())?;
+        self.remote_subscription_state_cache_clear_unlocked();
         Ok(())
     }
 
@@ -8950,7 +10537,7 @@ impl EmbeddedStore {
                     return Err(StorageError::Unsatisfiable(format!(
                         "cannot remotely complete schedule in {} state",
                         current.state.as_str()
-                    )))
+                    )));
                 }
             }
 
@@ -9249,6 +10836,7 @@ impl EmbeddedStore {
         }
         Ok(CommitResult {
             commit_seq,
+            commit_ts: None,
             changed_tables,
             changes,
             crdt_ops: Vec::new(),
@@ -9556,6 +11144,147 @@ fn validate_replicated_doc_data(table: &TableDef, data: &str) -> Result<(), Stor
     Ok(())
 }
 
+/// Replace the public Convex JSON representation of `db.vars.commitTs` with the ordinary int64
+/// representation before any durable document, extracted column, or mutation result is written.
+/// This runs only after the typed `CommitOptions::commit_ts` fast-path bit was set by the JS
+/// normalizer; ordinary commits do no JSON parse or recursive walk here.
+fn resolve_pending_commit_ts(
+    batch: &mut WriteBatch,
+    options: &mut CommitOptions,
+    timestamp: i64,
+) -> Result<(), StorageError> {
+    for index in std::mem::take(&mut batch.commit_ts_doc_writes) {
+        let write = batch.doc_writes.get_mut(index).ok_or_else(|| {
+            StorageError::Unsatisfiable(format!(
+                "commit timestamp document payload index {index} is out of range"
+            ))
+        })?;
+        write.data = resolve_pending_commit_ts_json(&write.data, timestamp)?;
+        for (_, column) in &mut write.cols {
+            if matches!(column, ColValue::PendingCommitTs) {
+                *column = ColValue::Integer(timestamp);
+            }
+        }
+    }
+    for index in std::mem::take(&mut batch.commit_ts_local_field_writes) {
+        let write = batch.local_field_writes.get_mut(index).ok_or_else(|| {
+            StorageError::Unsatisfiable(format!(
+                "commit timestamp local-field payload index {index} is out of range"
+            ))
+        })?;
+        resolve_pending_commit_ts_value(&mut write.value, timestamp)?;
+    }
+    if options.mutation_result_commit_ts {
+        match &mut options.mutation {
+            CommitMutation::Existing {
+                result: Some(result),
+                ..
+            } => *result = resolve_pending_commit_ts_json(result, timestamp)?,
+            CommitMutation::Terminal { result, .. } => {
+                *result = resolve_pending_commit_ts_json(result, timestamp)?;
+            }
+            CommitMutation::None | CommitMutation::Existing { result: None, .. } => {
+                return Err(StorageError::Unsatisfiable(
+                    "commit timestamp result flag requires an encoded mutation result".to_owned(),
+                ));
+            }
+        }
+        options.mutation_result_commit_ts = false;
+    }
+    if let Some(push) = &mut options.push {
+        if push.after_images_commit_ts {
+            push.json = resolve_push_after_images_commit_ts(&push.json, timestamp)?;
+            push.after_images_commit_ts = false;
+        }
+    }
+    options.commit_ts = false;
+    Ok(())
+}
+
+fn resolve_push_after_images_commit_ts(data: &str, timestamp: i64) -> Result<String, StorageError> {
+    let mut envelope =
+        serde_json::from_str::<serde_json::Value>(data).map_err(|error| StorageError::Decode {
+            expected: "push envelope JSON",
+            index: 0,
+            got: error.to_string(),
+        })?;
+    let after_images = envelope
+        .as_object_mut()
+        .and_then(|fields| fields.get_mut("afterImages"))
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            StorageError::Unsatisfiable(
+                "commit timestamp push flag requires an afterImages array".to_owned(),
+            )
+        })?;
+    for image in after_images {
+        let Some(fields) = image.as_object_mut() else {
+            return Err(StorageError::Unsatisfiable(
+                "push after-image must be an object".to_owned(),
+            ));
+        };
+        if fields.get("content").and_then(serde_json::Value::as_str) == Some("value") {
+            let value = fields.get_mut("value").ok_or_else(|| {
+                StorageError::Unsatisfiable(
+                    "value push after-image is missing its value".to_owned(),
+                )
+            })?;
+            resolve_pending_commit_ts_value(value, timestamp)?;
+        }
+    }
+    serde_json::to_string(&envelope).map_err(|error| StorageError::Decode {
+        expected: "encoded push envelope",
+        index: 0,
+        got: error.to_string(),
+    })
+}
+
+fn resolve_pending_commit_ts_json(data: &str, timestamp: i64) -> Result<String, StorageError> {
+    let mut value =
+        serde_json::from_str::<serde_json::Value>(data).map_err(|error| StorageError::Decode {
+            expected: "commit timestamp JSON",
+            index: 0,
+            got: error.to_string(),
+        })?;
+    resolve_pending_commit_ts_value(&mut value, timestamp)?;
+    serde_json::to_string(&value).map_err(|error| StorageError::Decode {
+        expected: "encoded commit timestamp JSON",
+        index: 0,
+        got: error.to_string(),
+    })
+}
+
+fn resolve_pending_commit_ts_value(
+    value: &mut serde_json::Value,
+    timestamp: i64,
+) -> Result<(), StorageError> {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                resolve_pending_commit_ts_value(item, timestamp)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            if fields.len() == 1 && fields.contains_key("$commitTs") {
+                if fields.get("$commitTs") != Some(&serde_json::Value::Null) {
+                    return Err(StorageError::Unsatisfiable(
+                        "malformed $commitTs marker in commit timestamp write".to_owned(),
+                    ));
+                }
+                *value = serde_json::json!({
+                    "$integer": base64::encode(timestamp.to_le_bytes()),
+                });
+                return Ok(());
+            }
+            for item in fields.values_mut() {
+                resolve_pending_commit_ts_value(item, timestamp)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate_store_schema(schema: &StoreSchema) -> Result<(), StorageError> {
     if schema.hash.len() != 64 || !schema.hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(StorageError::Unsatisfiable(
@@ -9652,6 +11381,59 @@ fn validate_store_schema(schema: &StoreSchema) -> Result<(), StorageError> {
     Ok(())
 }
 
+type OriginDisposition = (serde_json::Value, Option<(i64, i64, Vec<u8>)>);
+
+fn origin_disposition_decode(record: &OriginRecord) -> Result<OriginDisposition, StorageError> {
+    if record.codec != ORIGIN_DISPOSITION_CODEC
+        || !matches!(
+            record.flags,
+            ORIGIN_FLAG_QUARANTINED | ORIGIN_FLAG_DISCARDED
+        )
+    {
+        return Err(StorageError::IncompatibleStore(
+            "originated disposition has an unsupported codec or flags".to_owned(),
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&record.payload).map_err(|error| json_decode(&error.to_string()))?;
+    let prior_codec = json_i64(&value, "priorCodec")?;
+    let prior_flags = json_i64(&value, "priorFlags")?;
+    if prior_flags != ORIGIN_FLAGS_NONE {
+        return Err(StorageError::IncompatibleStore(
+            "nested originated disposition is unsupported".to_owned(),
+        ));
+    }
+    let prior = if record.flags == ORIGIN_FLAG_QUARANTINED {
+        let payload = decode_base64_field(&value, "priorPayload")?;
+        let stored_hash = decode_base64_field(&value, "priorPayloadHash")?;
+        let actual_hash = origin_hash(
+            &record.identity_key,
+            record.kind,
+            &record.record_key,
+            prior_codec,
+            prior_flags,
+            &payload,
+        );
+        if stored_hash != actual_hash {
+            return Err(StorageError::IncompatibleStore(
+                "quarantined originated record prior-payload checksum mismatch".to_owned(),
+            ));
+        }
+        Some((prior_codec, prior_flags, payload))
+    } else {
+        if value
+            .get("priorPayload")
+            .is_some_and(|payload| !payload.is_null())
+        {
+            return Err(StorageError::IncompatibleStore(
+                "discarded originated record unexpectedly retained its payload".to_owned(),
+            ));
+        }
+        None
+    };
+    Ok((value, prior))
+}
+
 fn origin_payload_references(
     kind: i64,
     codec: i64,
@@ -9662,8 +11444,24 @@ fn origin_payload_references(
         return Ok(Vec::new());
     }
     let (codec, payload) = if flags == ORIGIN_FLAG_QUARANTINED {
-        let disposition: serde_json::Value =
-            serde_json::from_slice(payload).map_err(|error| json_decode(&error.to_string()))?;
+        let record = OriginRecord {
+            identity_key: String::new(),
+            kind,
+            record_key: Vec::new(),
+            codec,
+            flags,
+            payload: payload.to_vec(),
+            payload_hash: Vec::new(),
+        };
+        // Payload reachability lacks the identity/key columns needed to verify the prior semantic
+        // hash. Decode the independent envelope here; full verification occurs during copy/read.
+        if record.codec != ORIGIN_DISPOSITION_CODEC {
+            return Err(StorageError::IncompatibleStore(
+                "originated disposition has an unsupported codec".to_owned(),
+            ));
+        }
+        let disposition: serde_json::Value = serde_json::from_slice(&record.payload)
+            .map_err(|error| json_decode(&error.to_string()))?;
         (
             json_i64(&disposition, "priorCodec")?,
             decode_base64_field(&disposition, "priorPayload")?,
@@ -9675,18 +11473,7 @@ fn origin_payload_references(
             "unknown originated record flags {flags}; payload cleanup was skipped"
         )));
     };
-    if codec != ORIGIN_CODEC_V1 {
-        return Err(StorageError::IncompatibleStore(format!(
-            "unsupported originated codec {codec}; payload cleanup was skipped"
-        )));
-    }
-    let kind = OriginKind::try_from(kind).map_err(|unknown| {
-        StorageError::IncompatibleStore(format!(
-            "unknown originated record kind {unknown}; payload cleanup was skipped"
-        ))
-    })?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&payload).map_err(|error| json_decode(&error.to_string()))?;
+    let (kind, value) = origin_decode(kind, codec, &payload)?;
     let mut references = match kind {
         OriginKind::Blob => vec![decode_base64_field(&value, "bytesHash")?],
         OriginKind::Revision => {
@@ -9695,9 +11482,7 @@ fn origin_payload_references(
                 let hash = hash
                     .as_str()
                     .ok_or_else(|| json_decode("revision log payload hash"))?;
-                hashes.push(
-                    base64::decode(hash).map_err(|error| json_decode(&error.to_string()))?,
-                );
+                hashes.push(base64::decode(hash).map_err(|error| json_decode(&error.to_string()))?);
             }
             hashes
         }
@@ -9710,7 +11495,12 @@ fn origin_payload_references(
         | OriginKind::SettlementReceipt
         | OriginKind::Schedule
         | OriginKind::Upload
-        | OriginKind::IdMapping => Vec::new(),
+        | OriginKind::IdMapping
+        | OriginKind::RemoteProjection
+        | OriginKind::RemoteMembership
+        | OriginKind::RemoteResult
+        | OriginKind::RemoteCursor
+        | OriginKind::CandidatePolicy => Vec::new(),
     };
     if references.iter().any(|hash| hash.len() != 32) {
         return Err(StorageError::IncompatibleStore(
@@ -9746,6 +11536,169 @@ fn origin_hash(
     hash.finalize().to_vec()
 }
 
+/// Canonical identity of every retained-result field a cursor can depend on. Length-prefixing
+/// prevents ambiguity between adjacent textual and binary fields, and hashes the floating clock by
+/// its exact IEEE representation so migration checks preserve the stored value byte-for-byte.
+fn remote_result_content_hash(entry: &ResultEntry) -> Vec<u8> {
+    let mut hash = Sha256::new();
+    for bytes in [
+        entry.key.as_bytes(),
+        entry.function.as_bytes(),
+        entry.args.as_bytes(),
+        entry.schema_hash.as_bytes(),
+        entry.module_hash.as_bytes(),
+        entry.skeleton.as_slice(),
+        entry.paths.as_slice(),
+        entry.skeleton_hash.as_bytes(),
+    ] {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    let clock = entry.clock.to_bits().to_be_bytes();
+    hash.update((clock.len() as u64).to_be_bytes());
+    hash.update(clock);
+    hash.finalize().to_vec()
+}
+
+fn remote_member_projection_hash(projection: &RowHead) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for bytes in [
+        projection.table.as_bytes(),
+        projection.server_document_id.as_bytes(),
+        projection.local_document_id.as_bytes(),
+        projection.current_rev_id.as_bytes(),
+        projection.projection_hash.as_bytes(),
+        projection
+            .current_root_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+        projection
+            .current_node_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+        projection
+            .server_base
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+        projection
+            .server_row
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    ] {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    hash.update(projection.logical_clock.to_bits().to_be_bytes());
+    hash.update(projection.updated_time.to_be_bytes());
+    hash.finalize().into()
+}
+
+/// Decode through the retained reader for the source codec, then write the current codec into the
+/// unpublished candidate. The source ledger is never modified.
+fn origin_record_encode_current(
+    record: &OriginRecord,
+    source_epoch: i64,
+    target_epoch: i64,
+) -> Result<OriginRecord, StorageError> {
+    let expected = origin_hash(
+        &record.identity_key,
+        record.kind,
+        &record.record_key,
+        record.codec,
+        record.flags,
+        &record.payload,
+    );
+    if expected != record.payload_hash {
+        return Err(StorageError::IncompatibleStore(
+            "originated record checksum mismatch; candidate copy stopped".to_owned(),
+        ));
+    }
+    OriginKind::try_from(record.kind).map_err(|unknown| {
+        StorageError::IncompatibleStore(format!("unknown originated record kind {unknown}"))
+    })?;
+    let (codec, payload) = match record.flags {
+        ORIGIN_FLAGS_NONE => {
+            let (kind, value) = origin_decode(record.kind, record.codec, &record.payload)?;
+            let value = origin_adapt(kind, value, source_epoch, target_epoch)?;
+            origin_encode_current(kind, &value)?
+        }
+        ORIGIN_FLAG_QUARANTINED => {
+            let (mut disposition, prior) = origin_disposition_decode(record)?;
+            let (prior_codec, prior_flags, prior_payload) = prior.ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "quarantine disposition has no retained payload; candidate copy stopped"
+                        .to_owned(),
+                )
+            })?;
+            let (kind, value) = origin_decode(record.kind, prior_codec, &prior_payload)?;
+            let value = origin_adapt(kind, value, source_epoch, target_epoch)?;
+            let (prior_codec, prior_payload) = origin_encode_current(kind, &value)?;
+            let prior_hash = origin_hash(
+                &record.identity_key,
+                record.kind,
+                &record.record_key,
+                prior_codec,
+                prior_flags,
+                &prior_payload,
+            );
+            let object = disposition.as_object_mut().ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "originated disposition is not an object; candidate copy stopped".to_owned(),
+                )
+            })?;
+            object.insert("priorCodec".to_owned(), prior_codec.into());
+            object.insert(
+                "priorPayload".to_owned(),
+                base64::encode(&prior_payload).into(),
+            );
+            object.insert(
+                "priorPayloadHash".to_owned(),
+                base64::encode(prior_hash).into(),
+            );
+            let payload = serde_json::to_vec(&disposition)
+                .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+            (ORIGIN_DISPOSITION_CODEC, payload)
+        }
+        ORIGIN_FLAG_DISCARDED => {
+            let (disposition, prior) = origin_disposition_decode(record)?;
+            if prior.is_some() {
+                return Err(StorageError::IncompatibleStore(
+                    "discard disposition retained a payload; candidate copy stopped".to_owned(),
+                ));
+            }
+            let payload = serde_json::to_vec(&disposition)
+                .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+            (ORIGIN_DISPOSITION_CODEC, payload)
+        }
+        flags => {
+            return Err(StorageError::IncompatibleStore(format!(
+                "unknown originated record flags {flags}; candidate copy stopped"
+            )));
+        }
+    };
+    let payload_hash = origin_hash(
+        &record.identity_key,
+        record.kind,
+        &record.record_key,
+        codec,
+        record.flags,
+        &payload,
+    );
+    Ok(OriginRecord {
+        identity_key: record.identity_key.clone(),
+        kind: record.kind,
+        record_key: record.record_key.clone(),
+        codec,
+        flags: record.flags,
+        payload,
+        payload_hash,
+    })
+}
+
 fn origin_key(parts: &[&[u8]]) -> Vec<u8> {
     let capacity = parts
         .iter()
@@ -9772,6 +11725,19 @@ fn json_value<'a>(
     field: &str,
 ) -> Result<&'a serde_json::Value, StorageError> {
     value.get(field).ok_or_else(|| json_decode(field))
+}
+
+fn json_array_values<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a [serde_json::Value], StorageError> {
+    match value.get(field) {
+        None => Ok(&[]),
+        Some(value) => value
+            .as_array()
+            .map(Vec::as_slice)
+            .ok_or_else(|| json_decode(field)),
+    }
 }
 
 fn json_str<'a>(value: &'a serde_json::Value, field: &str) -> Result<&'a str, StorageError> {
@@ -9822,20 +11788,6 @@ fn decode_base64_field(value: &serde_json::Value, field: &str) -> Result<Vec<u8>
     base64::decode(json_str(value, field)?).map_err(|error| json_decode(&error.to_string()))
 }
 
-fn json_optional_origin_cursor(
-    value: &serde_json::Value,
-    field: &str,
-) -> Result<Option<OriginCursor>, StorageError> {
-    match value.get(field) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(cursor) => Ok(Some(OriginCursor {
-            identity_key: json_str(cursor, "identityKey")?.to_owned(),
-            kind: json_i64(cursor, "kind")?,
-            record_key: decode_base64_field(cursor, "recordKey")?,
-        })),
-    }
-}
-
 fn origin_cursor_json(cursor: &OriginCursor) -> serde_json::Value {
     serde_json::json!({
         "identityKey": cursor.identity_key,
@@ -9853,12 +11805,12 @@ use helpers::{
     combine_rollback, commit_seq_key, create_peer_id, doc_write_row, hex, int_at,
     is_built_in_index, is_data_only_id, is_fresh_id, is_local_document_id_for_table,
     is_valid_ident, key_positions, lock, lock_key, materialized_row, max_commit_seq_params,
-    optional_int_at, optional_text_at, order_col_value_at, path_lock, peer_id_from_bytes,
-    physical_index_columns, projection_logical_clock, real_at, record_order, remote_doc_encode,
-    remote_doc_id_encode, require_terminal_mutation_call, rev_lifecycle_at, row_changes,
-    row_to_dirty_head, row_to_file_metadata, row_to_id_mapping, row_to_mutation_record,
-    row_to_pending_upload, row_to_rev_state, row_to_scheduled_job, schedule_lease_params,
-    schema_signature, text_at, text_ref_at, text_value, validate_ident, RecordOrder,
+    optional_text_at, order_col_value_at, path_lock, peer_id_from_bytes, physical_index_columns,
+    projection_logical_clock, real_at, record_order, remote_doc_encode, remote_doc_id_encode,
+    require_terminal_mutation_call, rev_lifecycle_at, row_changes, row_to_dirty_head,
+    row_to_file_metadata, row_to_id_mapping, row_to_mutation_record, row_to_pending_upload,
+    row_to_rev_state, row_to_scheduled_job, schedule_lease_params, text_at, text_ref_at,
+    text_value, validate_ident, RecordOrder,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -9909,30 +11861,4 @@ fn bootstrap_i64_read(driver: &TursoDriver, key: &str) -> Result<Option<i64>, St
             })
         },
     )
-}
-
-fn legacy_origin_seed(
-    identity_key: String,
-    kind: OriginKind,
-    record_key: Vec<u8>,
-    payload: Vec<u8>,
-) -> LegacyOriginSeed {
-    LegacyOriginSeed {
-        identity_key,
-        kind,
-        record_key,
-        payload,
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn legacy_json_seed(
-    identity_key: String,
-    kind: OriginKind,
-    record_key: Vec<u8>,
-    value: serde_json::Value,
-) -> Result<LegacyOriginSeed, StorageError> {
-    let payload = serde_json::to_vec(&value)
-        .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-    Ok(legacy_origin_seed(identity_key, kind, record_key, payload))
 }

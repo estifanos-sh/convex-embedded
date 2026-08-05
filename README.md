@@ -6,7 +6,7 @@ local SQLite runtime owns the device projection and all Loro computation.
 
 ## Requirements
 
-- `convex` 1.42.1 or newer
+- `convex` 1.43.0 or newer
 - Node.js 24 or newer for the Node runtime and package build tools
 - Cross-origin isolation for browser builds that use the threaded WASM runtime
 
@@ -15,6 +15,25 @@ Install the package alongside Convex:
 ```sh
 pnpm add @convex-dev/embedded convex
 ```
+
+### Robelest test releases
+
+Until the package is approved for an official Convex release, this repository publishes complete
+test builds as `@robelest/convex-embedded`. Install one under the eventual official dependency key
+so application imports, generated modules, and bundler configuration exercise the real
+`@convex-dev/embedded/*` paths:
+
+```sh
+pnpm add @convex-dev/embedded@npm:@robelest/convex-embedded@<version> convex
+```
+
+The `package preview` pull-request label publishes an ephemeral package assembled from JavaScript,
+WASM, five Node targets, both Apple XCFramework slices, and all four Android ABIs. The `npm package`
+label runs the same assembly and, after a versioned pull request merges, publishes the Robelest npm
+package with provenance. Manual prereleases use the same path: one source ref is resolved to an exact
+commit, all production adapters and the complete package are qualified at that commit, and only then
+is the release tag created and the npm package published. Neither path has credentials or a package
+identity capable of publishing `@convex-dev/embedded`.
 
 ## 1. Configure Convex
 
@@ -84,6 +103,62 @@ export const create = replicated.mutation({
 });
 ```
 
+### Commit timestamps
+
+Embedded implements Convex 1.43's `ctx.db.vars.commitTs` in ordinary local and replicated
+mutations. Declare persisted and returned timestamps with `v.commitTs()`; Embedded keeps the value
+logical while the mutation runs, then atomically replaces every persisted occurrence and the
+returned value with one device commit timestamp:
+
+```ts
+// convex/schema.ts
+import { v } from "convex/values";
+
+import { defineEmbeddedSchema, replicatedTable } from "@convex-dev/embedded/schema";
+
+export default defineEmbeddedSchema({
+  events: replicatedTable({
+    name: v.string(),
+    committedAt: v.commitTs(),
+  }).index("by_committed_at", ["committedAt"]),
+});
+
+// convex/events.ts
+import { v } from "convex/values";
+
+import { replicated } from "./embedded";
+
+export const create = replicated.mutation({
+  args: { name: v.string() },
+  returns: v.commitTs(),
+  handler: async (ctx, args) => {
+    const committedAt = ctx.db.vars.commitTs;
+    await ctx.db.insert("events", { name: args.name, committedAt });
+
+    // Staged reads use the logical value, including indexed equality and ranges.
+    await ctx.db
+      .query("events")
+      .withIndex("by_committed_at", (q) => q.eq("committedAt", committedAt))
+      .unique();
+    return committedAt;
+  },
+});
+```
+
+The placeholder is valid only inside the mutation transaction. It cannot escape through a
+top-level query or action, scheduled-function arguments, CRDT set members, or durable storage
+without being resolved. A nested query called by the same mutation may receive and return it
+because it shares the transaction. The bigint returned to application code is the resolved device
+timestamp.
+
+For a replicated mutation, the device resolves its optimistic documents, local after-images, and
+result using the device transaction timestamp. During authoritative replay, Embedded binds the
+same logical value to hosted Convex's `ctx.db.vars.commitTs`; the hosted timestamp can therefore
+differ from the device timestamp. Result verification hashes the logical value, not either physical
+timestamp. Nested app-mutation calls from replicated mutations remain unsupported until their
+writes can join the parent's replay capture; factor shared logic into a helper or component call
+instead.
+
 Use `remote` for hosted-only queries and mutations, and the `local` namespace (below) for
 device-only operations. Replicated functions see only replicated fields, remote functions see the
 hosted document, and local functions see replicated fields plus device overlays.
@@ -120,23 +195,17 @@ contain an `e.local` field. Search, vector, and staged indexes are supported on 
 only when they are hosted-only; the embedded store does not implement those index kinds.
 
 Device-only functions live in directories the app names with the bundler `local` option, use the
-`local` namespace, and are referenced by importing the function value directly. The schema file
-registers itself as the type source once:
+`local` namespace, and are referenced by importing the function value directly. The bundler plugin
+registers the schema as the type source: `convex/embedded.generated.ts` carries a type-only
+`Register` augmentation binding the `local` builders to the schema's device data model, so every
+program that includes the lockfile is registered. The augmentation is erased at compile time and
+never deploys.
 
 ```ts
 // convex/schema.ts
-import type {} from "@convex-dev/embedded/local";
-
 const schema = defineEmbeddedSchema({ ... });
 export default schema;
-
-declare module "@convex-dev/embedded/local" {
-  interface Register { schema: typeof schema }
-}
 ```
-
-The type-only import brings the augmented module into programs that compile only `convex/`; it is
-erased at compile time and never deploys.
 
 ```ts
 // local/preferences.ts — an ordinary TypeScript module
@@ -218,13 +287,168 @@ served from the server's retained answer, so re-sorting or re-paging a replicate
 a list the server never returned.
 
 The build plugin writes `convex/embedded.generated.ts`, a small checked-in lockfile holding the
-function manifest and the identity hashes of the schema source and that manifest. The device schema
+function manifest, the identity hashes of the schema source and that manifest, and the type-only
+`Register` augmentation that binds the `local` builders to the schema. The device schema
 is not in it: every adapter analyzes the live schema and inlines the result into the virtual
 registry, so the file stays about a kilobyte. Its multi-dot name is load-bearing — the Convex CLI
 skips those modules, so the lockfile never deploys as a hosted function while `convex/embedded.ts`
 still imports `embeddedManifest` from it and esbuild bundles it into the deployment. Treat it like
 other generated Convex output: do not edit it by hand, and pass the imported schema to every bundler
 adapter so stale placement metadata cannot enter a device build.
+
+## Schema changes and migrations
+
+Embedded has three migration layers. Choose the layer that owns the data being changed:
+
+| Change                                                     | Migration mechanism                                |
+| ---------------------------------------------------------- | -------------------------------------------------- |
+| Embedded package internals                                 | Automatic during `client.open()`                   |
+| Hosted fields in a `replicatedTable` or plain hosted table | Convex migration component or an internal mutation |
+| `localTable` documents or other device-originated records  | Optional device setup action                       |
+
+A hosted migration cannot read a device's local records. Device setup cannot change hosted rows.
+If one release changes both, coordinate the hosted migration and the app's new setup action as two
+parts of the same widen-migrate-narrow rollout.
+
+### Package compatibility
+
+Applications never author migrations for Embedded's private SQLite tables or record formats.
+`client.open()` performs package-owned compatibility work automatically and fails without deleting
+the existing store when that work cannot be proven safe.
+
+Preview 2 establishes the first library-store compatibility baseline. Stores created by earlier
+unreleased previews are left intact but cannot be opened by Preview 2; clear that preview-only app
+storage once, or choose a new storage id. Starting with Preview 2, released compatibility is tested
+against immutable store fixtures.
+
+### Hosted Convex data
+
+Use Convex's usual widen-migrate-narrow sequence for authoritative hosted data:
+
+1. Widen the schema so both old and new documents validate, and deploy code that handles both.
+2. Backfill existing documents.
+3. Verify completion, then narrow the schema and remove the compatibility code.
+
+For a table-sized backfill, use `@convex-dev/migrations`. It batches work, records progress, resumes
+after failures, and can dry-run a batch. Install and register it beside Embedded:
+
+```sh
+pnpm add @convex-dev/migrations
+```
+
+```ts
+// convex/convex.config.ts
+import embedded from "@convex-dev/embedded/convex.config";
+import migrations from "@convex-dev/migrations/convex.config.js";
+import { defineApp } from "convex/server";
+
+const app = defineApp();
+app.use(embedded);
+app.use(migrations);
+export default app;
+```
+
+Define hosted migrations with Embedded's `remote.internalMutation` builder so they operate on the
+hosted document shape:
+
+```ts
+// convex/migrations.ts
+import { Migrations } from "@convex-dev/migrations";
+
+import { components } from "./_generated/api";
+import { remote } from "./embedded";
+import schema from "./schema";
+
+const migrations = new Migrations(components.migrations, {
+  internalMutation: remote.internalMutation,
+  schema,
+});
+
+export const backfillArchived = migrations.define({
+  table: "documents",
+  migrateOne: (_ctx, document) => ({
+    archived: document.archived ?? false,
+  }),
+});
+```
+
+Deploy the widened schema and migration before running it. Dry-run one batch first, then start the
+resumable migration; add `--prod` to both commands for production:
+
+```sh
+pnpm convex run migrations:backfillArchived '{"dryRun":true}'
+pnpm convex run migrations:backfillArchived
+```
+
+An ordinary `remote.internalMutation` is also a migration function. It is appropriate for one
+document or another provably bounded change:
+
+```ts
+// convex/migrations.ts
+import { v } from "convex/values";
+
+import { remote } from "./embedded";
+
+export const migrateOneDocument = remote.internalMutation({
+  args: { id: v.id("documents") },
+  returns: v.null(),
+  handler: async (ctx, { id }) => {
+    const document = await ctx.db.get(id);
+    if (document && document.archived === undefined) {
+      await ctx.db.patch(id, { archived: false });
+    }
+    return null;
+  },
+});
+```
+
+Run it with `pnpm convex run migrations:migrateOneDocument '{"id":"..."}'`. Keep direct
+migration functions idempotent. Do not read an unbounded table with `collect()` in one mutation;
+use the migrations component or implement explicit cursor-based batching instead. Hosted migration
+results reach devices through normal pull replication.
+
+### Device-originated data
+
+Open every embedded client explicitly. An optional setup action runs before the client becomes
+ready and orchestrates ordinary internal local queries and mutations over device-owned data:
+
+```ts
+import { v } from "convex/values";
+import { defineLocal } from "@convex-dev/embedded/local";
+
+import schema from "../convex/schema";
+import { rewritePreferences } from "./preferences";
+
+const local = defineLocal(schema);
+
+export const setup = local.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    // Call bounded, idempotent internal mutations here.
+    await ctx.runMutation(rewritePreferences, {});
+    return null;
+  },
+});
+
+await client.open(setup);
+```
+
+`setup` must be an imported, bundled internal local action with empty arguments and a `null`
+result; callbacks, strings, server references, public actions, queries, and mutations are rejected.
+Each `ctx.runMutation` is a separate durable setup batch, so setup code must be idempotent and
+paginate instead of collecting an unbounded table. Setup runs unauthenticated and has no hosted
+function, scheduling, file-storage, nested-action, or raw-package-record context. It is still normal
+JavaScript, so avoid non-idempotent external side effects: Embedded cannot roll back a `fetch()` if
+the process dies afterward. A throw preserves the previously opened data; reopening with the same
+setup identity resumes and reruns the action.
+
+Pass the setup action in every build that may still need to execute or resume it. After it has
+completed on the supported device population, a later release may return to plain `open()`; the
+store retains the completed setup identity without retaining an executable hook. Pass a different
+setup action when a later app version needs new setup work. That action must handle every source
+shape the application still supports across skipped releases. Plain `open()` remains sufficient
+for automatic package upgrades and compatible schema changes that require no app-authored rewrite.
 
 ## 2. Configure the browser build
 
@@ -412,6 +636,7 @@ import { api } from "../convex/_generated/api";
 const client = new ConvexEmbeddedClient({
   url: import.meta.env.VITE_CONVEX_URL,
 });
+await client.open();
 
 const documents = await client.query(api.documents.list, {});
 const id = await client.mutation(api.documents.create, { body: "Hello" });
@@ -438,6 +663,12 @@ does not need a browser bundler plugin or cross-origin isolation, but it does re
 for the current operating system and architecture. Device-only modules are passed programmatically:
 the constructor's `local` option takes a record of import thunks keyed by module path relative to
 the application's local directory, mirroring how `modules` supplies the Convex function graph.
+
+Those direct loaders support ordinary local queries and mutations. A Node setup action passed to
+`open(setup)` must come from local source transformed by an Embedded bundler adapter so it carries a
+trusted module name and graph hash; an unstamped, hand-assembled loader map fails closed for setup.
+Browser and Expo builds receive the stamp automatically from their required Vite/Unplugin or Metro
+integration.
 
 ### Browser storage
 

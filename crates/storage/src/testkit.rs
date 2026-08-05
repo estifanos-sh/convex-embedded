@@ -41,8 +41,7 @@ pub fn tmp_path(name: &str) -> PathBuf {
 pub fn schema() -> StoreSchema {
     StoreSchema {
         hash: "0".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![
             TableDef {
                 name: "issues".into(),
@@ -75,8 +74,7 @@ pub fn schema() -> StoreSchema {
 pub fn bool_schema() -> StoreSchema {
     StoreSchema {
         hash: "1".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "flags".into(),
             placement: TablePlacement::Replicated,
@@ -99,8 +97,7 @@ pub fn bool_schema() -> StoreSchema {
 pub fn alias_schema() -> StoreSchema {
     StoreSchema {
         hash: "2".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "users".into(),
             placement: TablePlacement::Replicated,
@@ -160,8 +157,7 @@ pub fn sql_table() -> TableDef {
 pub fn vals_schema() -> StoreSchema {
     StoreSchema {
         hash: "3".repeat(64),
-        migrations: vec![],
-        migration_code_hash: String::new(),
+        setup_hash: String::new(),
         tables: vec![TableDef {
             name: "vals".into(),
             placement: TablePlacement::Replicated,
@@ -261,6 +257,8 @@ pub fn doc_writes(rows: Vec<DocWrite>) -> WriteBatch {
         deletes: vec![],
         fresh_ids: vec![],
         data_only_ids: vec![],
+        commit_ts_doc_writes: vec![],
+        commit_ts_local_field_writes: vec![],
         id_mappings: vec![],
         schedules: vec![],
     }

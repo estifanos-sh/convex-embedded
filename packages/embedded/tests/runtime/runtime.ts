@@ -11,7 +11,7 @@ import {
   defineSchema,
   defineTable,
 } from "convex/server";
-import { compareValues, ConvexError, v } from "convex/values";
+import { compareValues, convexToJson, ConvexError, v } from "convex/values";
 import type { Value } from "convex/values";
 import { describe, expect, test } from "vite-plus/test";
 
@@ -38,7 +38,13 @@ import type {
   StoredDoc,
   WriteBatch,
 } from "../../src/storage/types";
-import { decodeError, encode, encodeError } from "../../src/runtime/codec";
+import { decode, decodeError, encode, encodeError } from "../../src/runtime/codec";
+import {
+  commitTsPlaceholder,
+  hasPendingCommitTs,
+  resolveKnownPendingCommitTs,
+  resolvePendingCommitTs,
+} from "../../src/runtime/pending";
 import { defineFunctions } from "../../src/runtime/functions";
 import { seedEntropy, withEntropy } from "../../src/entropy";
 import { createRunner, type Runner } from "../../src/runtime/runner";
@@ -62,6 +68,10 @@ const appSchema = defineSchema({
     category: v.optional(v.union(v.string(), v.null())),
     name: v.string(),
   }).index("by_category", ["category"]),
+  stamps: defineTable({
+    label: v.string(),
+    stamp: v.commitTs(),
+  }).index("by_stamp", ["stamp"]),
 });
 type DataModel = DataModelFromSchemaDefinition<typeof appSchema>;
 
@@ -72,6 +82,37 @@ let flakyFails = false;
 let flakyStarted: (() => void) | undefined;
 
 const messages = {
+  stampCommitTs: mutation({
+    args: {},
+    returns: v.commitTs(),
+    handler: async (ctx) => {
+      const stamp = ctx.db.vars.commitTs;
+      await ctx.db.insert("messages", {
+        body: "timestamped",
+        channel: "timestamp",
+        meta: { stamp },
+      });
+      return stamp;
+    },
+  }),
+  stageAndFindCommitTs: mutation({
+    args: { label: v.string() },
+    returns: v.object({ found: v.string(), stamp: v.commitTs() }),
+    handler: async (ctx, args) => {
+      const stamp = ctx.db.vars.commitTs;
+      await ctx.db.insert("stamps", { label: args.label, stamp });
+      const found = await ctx.db
+        .query("stamps")
+        .withIndex("by_stamp", (q) => q.eq("stamp", stamp))
+        .unique();
+      return { found: found?.label ?? "missing", stamp };
+    },
+  }),
+  echo: query({
+    args: { value: v.any() },
+    returns: v.any(),
+    handler: (_ctx, args) => args.value,
+  }),
   send: mutation({
     args: { channel: v.string(), body: v.string() },
     handler: (ctx, args) => ctx.db.insert("messages", { channel: args.channel, body: args.body }),
@@ -282,6 +323,18 @@ const messages = {
         body: "scheduled",
         channel: args.channel,
       }),
+  }),
+  scheduleCommitTs: mutation({
+    args: {},
+    handler: (ctx) =>
+      (
+        ctx.scheduler as { runAfter(ms: number, ref: string, args: unknown): Promise<string> }
+      ).runAfter(0, "messages:childStamp", { value: ctx.db.vars.commitTs }),
+  }),
+  childStamp: mutation({
+    visibility: "internal",
+    args: { value: v.any() },
+    handler: () => null,
   }),
   cancelScheduled: mutation({
     args: { id: v.string() },
@@ -756,6 +809,7 @@ async function waitFor(check: () => boolean | Promise<boolean>, message: string)
 class FakeStorage implements RuntimeStorage {
   private now = 1;
   private seq = 0;
+  private commitTs = 0n;
   private readonly docs = new Map<string, StoredDoc>();
   private readonly ids = new Map<string, IdMapping>();
   private readonly mutations = new Map<string, MutationRecord & { args: string; name: string }>();
@@ -763,6 +817,11 @@ class FakeStorage implements RuntimeStorage {
   readonly pushEnvelopes: Array<{
     afterImages: unknown[];
     crdt: unknown[];
+    reads?: Array<{
+      kind: string;
+      equality?: Array<{ field: string; value: unknown; commitTs?: true }>;
+      members?: string[];
+    }>;
   }> = [];
 
   constructor(readonly remote?: RemoteSurface) {}
@@ -903,6 +962,51 @@ class FakeStorage implements RuntimeStorage {
   }
 
   commit(batch: WriteBatch, options?: CommitOptions) {
+    const commitTs = options?.commitTs === true ? (this.commitTs += 1n) : undefined;
+    if (commitTs !== undefined && options !== undefined) {
+      for (const write of batch.docWrites) {
+        if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.data)) continue;
+        write.data = resolveKnownPendingCommitTs(write.data, commitTs);
+        const entries = Array.isArray(write.cols) ? write.cols : Object.entries(write.cols);
+        for (const [name, value] of entries) {
+          if (typeof value !== "object" || value?.kind !== "commitTs") continue;
+          if (Array.isArray(write.cols)) {
+            const entry = write.cols.find(([candidate]) => candidate === name);
+            if (entry) entry[1] = commitTs;
+          } else {
+            write.cols[name] = commitTs;
+          }
+        }
+      }
+      for (const write of batch.localFieldWrites ?? []) {
+        if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.value)) continue;
+        write.value = resolveKnownPendingCommitTs(write.value, commitTs);
+      }
+      if (
+        options.source === "local" &&
+        "mutation" in options &&
+        (options.mutation === "existing" || options.mutation === "terminal") &&
+        options.mutationResultCommitTs === true &&
+        options.mutationResult !== undefined
+      ) {
+        options.mutationResult = encode(
+          resolvePendingCommitTs(decode(options.mutationResult), commitTs),
+        );
+      }
+      if (
+        options.source === "local" &&
+        "push" in options &&
+        options.push?.afterImagesCommitTs === true
+      ) {
+        const envelope = JSON.parse(options.push.json) as {
+          afterImages: Array<{ content: string; value?: unknown }>;
+        };
+        for (const image of envelope.afterImages) {
+          if (image.content === "value") image.value = resolveJsonCommitTs(image.value, commitTs);
+        }
+        options.push.json = JSON.stringify(envelope);
+      }
+    }
     if (options?.source === "local" && "push" in options && options.push !== undefined) {
       this.pushEnvelopes.push(
         JSON.parse(options.push.json) as { afterImages: unknown[]; crdt: unknown[] },
@@ -969,11 +1073,151 @@ class FakeStorage implements RuntimeStorage {
       ],
       changes,
       commitSeq: this.seq,
+      ...(commitTs === undefined ? {} : { commitTs }),
     });
   }
 }
 
+function resolveJsonCommitTs(value: unknown, timestamp: bigint): unknown {
+  if (Array.isArray(value)) return value.map((item) => resolveJsonCommitTs(item, timestamp));
+  if (value && typeof value === "object") {
+    const fields = value as Record<string, unknown>;
+    if (Object.keys(fields).length === 1 && fields.$commitTs === null) {
+      return convexToJson(timestamp as Value);
+    }
+    return Object.fromEntries(
+      Object.entries(fields).map(([key, item]) => [key, resolveJsonCommitTs(item, timestamp)]),
+    );
+  }
+  return value;
+}
+
 describe("runtime", () => {
+  test("resolves db.vars.commitTs atomically in the returned value and stored document", async () => {
+    const r = await runner("commit-timestamp");
+    const first = (await r.runMutation("messages:stampCommitTs", {})) as bigint;
+    const second = (await r.runMutation("messages:stampCommitTs", {})) as bigint;
+
+    expect(typeof first).toBe("bigint");
+    expect(typeof second).toBe("bigint");
+    expect(second).toBeGreaterThan(first);
+    const rows = (await r.runQuery("messages:list", { channel: "timestamp" })) as Array<{
+      meta: { stamp: bigint };
+    }>;
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.meta.stamp).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(
+      [first, second].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    );
+  });
+
+  test("replicated pushes retain logical result hashing and resolve only durable after-images", async () => {
+    const store = new FakeStorage();
+    const r = createRunner({ messages }, store, storeSchema);
+    const mutationId = "mutation:commit-timestamp-push";
+    await store.mutation.write({ args: "{}", mutationId, name: "messages:stampCommitTs" });
+
+    const result = await r.runMutation(
+      "messages:stampCommitTs",
+      {},
+      {
+        mutationId,
+        mutationIsFresh: true,
+        pushCall: { fn: "messages:stampCommitTs", rngSeed: mutationId },
+      },
+    );
+
+    expect(result).toBe(1n);
+    expect(store.pushEnvelopes).toMatchObject([
+      {
+        afterImages: [
+          {
+            value: { meta: { stamp: convexToJson(1n) } },
+          },
+        ],
+      },
+    ]);
+  });
+
+  test("staged index equality keeps the logical marker distinct from literal max int64", async () => {
+    const store = new FakeStorage();
+    const r = createRunner({ messages }, store, storeSchema);
+    await r.runMutation("messages:send", { body: "seed", channel: "unrelated" });
+    await store.commit(
+      {
+        docWrites: [
+          {
+            table: "stamps",
+            id: "stamps|ffffffffffffffffffffffffffffffff",
+            data: { label: "literal-max", stamp: (1n << 63n) - 1n },
+            cols: [["stamp", (1n << 63n) - 1n]],
+            creationTime: 1,
+          },
+        ],
+        deletes: [],
+      },
+      { changes: "omit", source: "remote" },
+    );
+
+    const result = (await r.runMutation("messages:stageAndFindCommitTs", {
+      label: "pending",
+    })) as { found: string; stamp: bigint };
+    expect(result).toEqual({ found: "pending", stamp: 1n });
+  });
+
+  test("replicated commit timestamp witnesses exclude the physical MAX_INT64 sentinel row", async () => {
+    const store = new FakeStorage();
+    const r = createRunner({ messages }, store, storeSchema);
+    const literalMaxId = "stamps|ffffffffffffffffffffffffffffffff";
+    await store.commit(
+      {
+        docWrites: [
+          {
+            table: "stamps",
+            id: literalMaxId,
+            data: { label: "literal-max", stamp: (1n << 63n) - 1n },
+            cols: [["stamp", (1n << 63n) - 1n]],
+            creationTime: 1,
+          },
+        ],
+        deletes: [],
+      },
+      { changes: "omit", source: "remote" },
+    );
+    const mutationId = "mutation:commit-timestamp-witness";
+    await store.mutation.write({ args: "{}", mutationId, name: "messages:stageAndFindCommitTs" });
+
+    await r.runMutation(
+      "messages:stageAndFindCommitTs",
+      { label: "pending" },
+      {
+        mutationId,
+        mutationIsFresh: true,
+        pushCall: { fn: "messages:stageAndFindCommitTs", rngSeed: mutationId },
+      },
+    );
+
+    const range = store.pushEnvelopes[0]?.reads?.find((read) => read.kind === "range");
+    expect(range?.equality).toMatchObject([{ field: "stamp", commitTs: true }]);
+    expect(range?.members).not.toContain(literalMaxId);
+  });
+
+  test("top-level queries and scheduled arguments reject the pending timestamp", async () => {
+    const r = createRunner({ messages }, new FakeStorage(), storeSchema);
+    await expect(r.runQuery("messages:echo", { value: commitTsPlaceholder })).rejects.toThrow(
+      "db.vars.commitTs",
+    );
+    const nativeStore = await NativeStore.openWith(
+      nativeModule().Store,
+      tmp("rt_commit_timestamp_schedule_reject.db"),
+    );
+    await nativeStore.setup(storeSchema);
+    const nativeRunner = createRunner({ messages }, nativeStore, storeSchema);
+    await expect(nativeRunner.runMutation("messages:scheduleCommitTs", {})).rejects.toThrow(
+      "db.vars.commitTs",
+    );
+    await nativeStore.close();
+  });
+
   test("separates plain after-images from CRDT effects", async () => {
     const crdtSchema = defineSchema({
       docs: defineTable({

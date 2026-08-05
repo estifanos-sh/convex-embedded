@@ -1,7 +1,7 @@
 use storage::{
     Bound, ColValue, ColumnDef, CommitOptions, CountSpec, CrdtFieldDef, CrdtFieldKind, CrdtOp,
     CrdtOperation, CrdtRestore, DeleteIn, DocWrite, IdMapping, IdMappingContent, IndexDef,
-    LocalFieldDef, LocalFieldDelete, LocalFieldWrite, MigrationDefinition, Order, ReadSpec, RowKey,
+    LocalFieldDef, LocalFieldDelete, LocalFieldWrite, Order, ReadSpec, RowKey,
     ScheduledFunctionKind, ScheduledJob, ScheduledState, StoreSchema, TableDef, TablePlacement,
     UploadLease, UploadLeaseWrite, WriteBatch,
 };
@@ -11,15 +11,7 @@ use crate::{model, BridgeError, BridgeResult};
 pub(crate) fn schema(value: model::Schema) -> BridgeResult<StoreSchema> {
     Ok(StoreSchema {
         hash: value.hash,
-        migrations: value
-            .migrations
-            .into_iter()
-            .map(|migration| MigrationDefinition {
-                id: migration.id,
-                definition_hash: migration.definition_hash,
-            })
-            .collect(),
-        migration_code_hash: value.migration_code_hash,
+        setup_hash: value.setup_hash,
         tables: value
             .tables
             .into_iter()
@@ -156,6 +148,7 @@ fn scalar(value: model::Scalar) -> BridgeResult<ColValue> {
         value.int,
         value.boolean,
         value.undef,
+        value.commit_ts,
     )
 }
 
@@ -165,31 +158,49 @@ fn tagged(
     int: Option<String>,
     boolean: Option<bool>,
     undef: Option<bool>,
+    commit_ts: Option<bool>,
 ) -> BridgeResult<ColValue> {
     let count = usize::from(text.is_some())
         + usize::from(real.is_some())
         + usize::from(int.is_some())
-        + usize::from(boolean.is_some());
+        + usize::from(boolean.is_some())
+        + usize::from(commit_ts.is_some());
     if count > 1 || (count == 1 && undef == Some(true)) {
         return Err(BridgeError::Protocol(
             "multiple scalar value tags set".to_owned(),
         ));
     }
-    match (text, real, int, boolean, undef) {
-        (_, _, _, _, Some(true)) => Ok(ColValue::Undefined),
-        (Some(value), None, None, None, _) => Ok(ColValue::Text(value)),
-        (None, Some(value), None, None, _) => Ok(ColValue::Real(value)),
-        (None, None, Some(value), None, _) => value
+    match (text, real, int, boolean, undef, commit_ts) {
+        (_, _, _, _, Some(true), _) => Ok(ColValue::Undefined),
+        (Some(value), None, None, None, _, None) => Ok(ColValue::Text(value)),
+        (None, Some(value), None, _, _, None) => Ok(ColValue::Real(value)),
+        (None, None, Some(value), None, _, None) => value
             .parse()
             .map(ColValue::Integer)
             .map_err(|error| BridgeError::Protocol(format!("invalid i64 value: {error}"))),
-        (None, None, None, Some(value), _) => Ok(ColValue::Bool(value)),
-        (None, None, None, None, _) => Ok(ColValue::Null),
+        (None, None, None, Some(value), _, None) => Ok(ColValue::Bool(value)),
+        (None, None, None, None, _, Some(true)) => Ok(ColValue::PendingCommitTs),
+        (None, None, None, None, _, None) => Ok(ColValue::Null),
+        (None, None, None, None, _, Some(false)) => Err(BridgeError::Protocol(
+            "commitTs marker must be true".to_owned(),
+        )),
         _ => Err(BridgeError::Protocol("invalid scalar tags".to_owned())),
     }
 }
 
 pub(crate) fn write_batch(value: model::WriteBatch) -> BridgeResult<WriteBatch> {
+    let commit_ts_doc_writes = value
+        .doc_writes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, write)| (write.pending_commit_ts == Some(true)).then_some(index))
+        .collect();
+    let commit_ts_local_field_writes = value
+        .local_field_writes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, write)| (write.pending_commit_ts == Some(true)).then_some(index))
+        .collect();
     Ok(WriteBatch {
         doc_writes: value
             .doc_writes
@@ -249,6 +260,8 @@ pub(crate) fn write_batch(value: model::WriteBatch) -> BridgeResult<WriteBatch> 
             .into_iter()
             .map(scheduled_job)
             .collect::<BridgeResult<_>>()?,
+        commit_ts_doc_writes,
+        commit_ts_local_field_writes,
     })
 }
 
@@ -277,6 +290,7 @@ fn doc_write(value: model::DocWrite) -> BridgeResult<DocWrite> {
                     column.int,
                     column.boolean,
                     column.undef,
+                    column.commit_ts,
                 )?;
                 Ok((column.name, scalar))
             })
@@ -351,7 +365,7 @@ pub(crate) fn commit_options(value: Option<model::CommitOptions>) -> BridgeResul
     let Some(value) = value else {
         return Ok(CommitOptions::default());
     };
-    CommitOptions::decode(
+    let mut options = CommitOptions::decode(
         value.source.as_deref(),
         value.mutation_id,
         value.mutation_name,
@@ -362,7 +376,13 @@ pub(crate) fn commit_options(value: Option<model::CommitOptions>) -> BridgeResul
         value.mutation_is_fresh.unwrap_or(false),
         value.include_changes.unwrap_or(true),
     )
-    .ok_or_else(|| BridgeError::Protocol("invalid exact commit metadata".to_owned()))
+    .ok_or_else(|| BridgeError::Protocol("invalid exact commit metadata".to_owned()))?;
+    options.commit_ts = value.commit_ts.unwrap_or(false);
+    options.mutation_result_commit_ts = value.mutation_result_commit_ts.unwrap_or(false);
+    if let Some(push) = &mut options.push {
+        push.after_images_commit_ts = value.push_after_images_commit_ts.unwrap_or(false);
+    }
+    Ok(options)
 }
 
 pub(crate) fn id_mapping(value: model::IdMapping) -> BridgeResult<IdMapping> {

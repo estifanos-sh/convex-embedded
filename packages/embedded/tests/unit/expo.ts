@@ -9,6 +9,52 @@ import { ExpoStoreBinding } from "../../src/expo/store";
 vi.mock("../../src/expo/native", () => ({ loadNativeModule: vi.fn() }));
 
 describe("Expo native bridge", () => {
+  test("forwards durable setup completion through the versioned native bridge", async () => {
+    const requests: ReturnType<typeof decodeRequest>[] = [];
+    const native: NativeStoreObject = {
+      call: async (bytes) => {
+        requests.push(decodeRequest(bytes));
+        return response("null", []);
+      },
+      clockRead: () => 0,
+      close: async () => undefined,
+      release: () => undefined,
+    };
+    const binding = new ExpoStoreBinding(native);
+
+    await binding.migrationSetupComplete?.(7);
+
+    expect(requests).toEqual([
+      { buffers: [], json: "[7]", operation: "migrationSetupComplete", version: 9 },
+    ]);
+  });
+
+  test("preserves bounded queue-policy completion booleans", async () => {
+    const native: NativeStoreObject = {
+      call: async (bytes) => {
+        const request = decodeRequest(bytes);
+        return response(request.json.includes("false") ? "false" : "true", []);
+      },
+      clockRead: () => 0,
+      close: async () => undefined,
+      release: () => undefined,
+    };
+    const binding = new ExpoStoreBinding(native);
+
+    await expect(
+      binding.migrationQueuePolicyWrite?.(
+        7,
+        JSON.stringify({ collectComplete: false, thresholds: [] }),
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      binding.migrationQueuePolicyWrite?.(
+        7,
+        JSON.stringify({ collectComplete: true, thresholds: [] }),
+      ),
+    ).resolves.toBe(true);
+  });
+
   test("encodes positional arguments, bytes, and exact integers", () => {
     const request = decodeRequest(
       encodeRequest("blobWrite", ["blob", new Uint8Array([1, 2, 3]), 9_007_199_254_740_993n]),
@@ -18,7 +64,7 @@ describe("Expo native bridge", () => {
       buffers: [new Uint8Array([1, 2, 3])],
       json: '["blob",{"$buffer":0},{"$integer":"9007199254740993"}]',
       operation: "blobWrite",
-      version: 2,
+      version: 9,
     });
   });
 
@@ -33,7 +79,7 @@ describe("Expo native bridge", () => {
   });
 
   test("loads once and rejects missing or stale native modules", () => {
-    const native = module(2);
+    const native = module(9);
     const resolve = vi.fn(() => native);
     const load = createNativeModuleLoader(resolve);
 
@@ -41,8 +87,8 @@ describe("Expo native bridge", () => {
     expect(load()).toBe(native);
     expect(resolve).toHaveBeenCalledOnce();
     expect(() => createNativeModuleLoader(() => null)()).toThrow("not linked");
-    expect(() => createNativeModuleLoader(() => module(1))()).toThrow(
-      "does not match JavaScript version 2",
+    expect(() => createNativeModuleLoader(() => module(8))()).toThrow(
+      "does not match JavaScript version 9",
     );
   });
 
@@ -201,7 +247,7 @@ function response(json: string, buffers: Uint8Array[]): Uint8Array {
   string(bytes, "error");
   bytes.push(0xc0);
   string(bytes, "version");
-  bytes.push(2);
+  bytes.push(9);
   return Uint8Array.from(bytes);
 }
 

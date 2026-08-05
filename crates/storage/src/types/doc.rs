@@ -11,6 +11,9 @@ pub enum ColValue {
     Text(String),
     Real(f64),
     Integer(i64),
+    /// A write-only marker. `EmbeddedStore::commit` replaces it before any SQL statement writes
+    /// a document or index key, so it must never reach a durable key encoder.
+    PendingCommitTs,
     Bool(bool),
 }
 
@@ -37,6 +40,7 @@ impl ColValue {
                 out.extend_from_slice(&((*n as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
                 out
             }
+            ColValue::PendingCommitTs => ColValue::Integer(i64::MAX).encode_key(),
             ColValue::Real(f) => {
                 let bits = f.to_bits();
                 let key = if bits & 0x8000_0000_0000_0000 != 0 {
@@ -95,6 +99,7 @@ impl From<ColValue> for turso_core::Value {
             ColValue::Text(s) => turso_core::Value::Text(turso_core::types::Text::new(s)),
             ColValue::Real(n) => turso_core::Value::from_f64(n),
             ColValue::Integer(n) => turso_core::Value::from_i64(n),
+            ColValue::PendingCommitTs => turso_core::Value::from_i64(i64::MAX),
             ColValue::Bool(b) => turso_core::Value::from_i64(i64::from(b)),
         }
     }
@@ -104,6 +109,7 @@ impl From<ColValue> for turso_core::Value {
 /// order-preserving key from [`ColValue::encode_key`] as a `BLOB`, so they carry no affinity —
 /// any value type sorts correctly.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ColumnDef {
     pub name: String,
     pub field: Option<String>,
@@ -111,6 +117,7 @@ pub struct ColumnDef {
 
 /// A secondary index over one or more extracted columns. Mirrors the TS `IndexDef`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IndexDef {
     pub name: String,
     pub fields: Vec<String>,
@@ -119,27 +126,34 @@ pub struct IndexDef {
 
 /// A table: its document store plus extracted columns and indexes. Mirrors the TS `TableDef`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TableDef {
     pub name: String,
     pub placement: TablePlacement,
     pub columns: Vec<ColumnDef>,
+    #[serde(default, alias = "crdt_fields")]
     pub crdt_fields: Vec<CrdtFieldDef>,
+    #[serde(default, alias = "local_fields")]
     pub local_fields: Vec<LocalFieldDef>,
     pub indexes: Vec<IndexDef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum TablePlacement {
+    #[serde(rename = "replicated", alias = "Replicated")]
     Replicated,
+    #[serde(rename = "device", alias = "Device")]
     Device,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LocalFieldDef {
     pub field: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CrdtFieldDef {
     pub field: String,
     pub kind: CrdtFieldKind,
@@ -147,22 +161,24 @@ pub struct CrdtFieldDef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum CrdtFieldKind {
+    #[serde(rename = "count", alias = "Count")]
     Count,
+    #[serde(rename = "set", alias = "Set")]
     Set,
+    #[serde(rename = "text", alias = "Text")]
     Text,
 }
 
 /// The full schema handed to `setup`. Mirrors the TS `StoreSchema`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoreSchema {
     /// Canonical SHA-256 over the complete application schema, including validators.
+    #[serde(default)]
     pub hash: String,
-    /// Ordered, append-only device migration definitions bundled with the application.
+    /// Build-stamped identity of the optional setup action passed to `open()`.
     #[serde(default)]
-    pub migrations: Vec<super::MigrationDefinition>,
-    /// Hash of the current migration handlers. Candidate-only; not released history.
-    #[serde(default)]
-    pub migration_code_hash: String,
+    pub setup_hash: String,
     pub tables: Vec<TableDef>,
 }
 
@@ -218,6 +234,10 @@ pub struct WriteBatch {
     pub data_only_ids: Vec<RowKey>,
     pub id_mappings: Vec<IdMapping>,
     pub schedules: Vec<super::ScheduledJob>,
+    /// Payload ordinals whose encoded document/column values require commit timestamp resolution.
+    pub commit_ts_doc_writes: Vec<usize>,
+    /// Payload ordinals whose encoded local-field values require commit timestamp resolution.
+    pub commit_ts_local_field_writes: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
