@@ -37,7 +37,8 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).not.toContain("pkg-pr-new");
     expect(workflow).toContain("Prerelease and release modes require a robelest-v* tag");
     expect(workflow).toContain("options: [preview, prerelease, release]");
-    expect(workflow).toContain("dist_tag=preview");
+    expect(workflow).toContain("dist_tag=latest");
+    expect(workflow).not.toContain("dist_tag=preview");
     expect(workflow).toContain("CONVEX_EMBEDDED_PUBLISH_VERSION");
     expect(workflow).toContain("@robelest/convex-embedded");
     expect(workflow).toContain("github.repository == 'get-convex/embedded'");

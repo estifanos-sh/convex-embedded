@@ -881,11 +881,10 @@ jobs:
           echo "package=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if [[ "$PUBLISH_MODE" == "prerelease" ]]; then
-            echo "dist_tag=preview" >> "$GITHUB_OUTPUT"
-          else
-            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
-          fi
+          # The Robelest scope is the pre-official test channel. Its newest
+          # qualified package must also be the default installation target,
+          # including prereleases.
+          echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
           echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
 
       # npm Trusted Publishing supports private/internal repositories, but its
