@@ -888,9 +888,15 @@ jobs:
           fi
           echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
 
-      - name: Publish package with provenance
+      # npm Trusted Publishing supports private/internal repositories, but its
+      # public Sigstore provenance attestations do not. Keep the short-lived
+      # OIDC credential while explicitly disabling provenance until this
+      # repository is public.
+      - name: Publish package with trusted publishing
         if: steps.release.outputs.published != 'true'
-        run: npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --provenance --access public --tag "${{ steps.release.outputs.dist_tag }}"
+        env:
+          NPM_CONFIG_PROVENANCE: "false"
+        run: npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public --tag "${{ steps.release.outputs.dist_tag }}"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3

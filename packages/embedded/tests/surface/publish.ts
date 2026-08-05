@@ -27,8 +27,9 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain("Enable pnpm for the Expo compile fixture");
     expect(workflow).toContain("node packages/embedded/scripts/publish.ts pack");
     expect(workflow).toContain(
-      "npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --provenance --access public",
+      "npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public",
     );
+    expect(workflow).toContain('NPM_CONFIG_PROVENANCE: "false"');
     expect(workflow).toContain("Publish package preview prerelease");
     expect(workflow).toContain("gh release create");
     expect(workflow).toContain("artifacts/convex-embedded.tgz");
