@@ -1474,12 +1474,15 @@ describe("v5 server surface", () => {
     expect(serverA).not.toBe(serverB);
   });
 
-  test("gates a push by manifest placement, rejecting a non-replicated target before invoking it", async () => {
+  test("settles a push to a target that became remote without invoking it", async () => {
     const replayWrite = {
       [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
     };
+    const commit = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:commit",
+    };
     const pushComponent = {
-      protocol: { installation: {}, pull: componentPullReference, replayWrite },
+      protocol: { commit, installation: {}, pull: componentPullReference, replayWrite },
     } as unknown as ComponentApi<"embedded">;
     const embedded = defineEmbedded({
       component: pushComponent,
@@ -1493,11 +1496,12 @@ describe("v5 server surface", () => {
     const ctx = {
       auth: { getUserIdentity: async () => null },
       meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
-      runMutation: async (reference: unknown) => {
+      runMutation: async (reference: unknown, args: Record<string, unknown>) => {
         if (reference === replayWrite) {
           replayWrites += 1;
           return null;
         }
+        if (reference === commit) return (args.request as { settlement: unknown }).settlement;
         targetInvocations += 1;
         return {
           kind: "embeddedReplay",
@@ -1506,16 +1510,62 @@ describe("v5 server surface", () => {
       },
     };
 
-    await expect(invokePush(embedded, ctx, mutationPushRequest("admin:wipe", {}))).rejects.toThrow(
-      /cannot invoke remote mutation admin:wipe/,
-    );
-    expect(replayWrites).toBe(0);
+    await expect(
+      invokePush(embedded, ctx, mutationPushRequest("admin:wipe", {})),
+    ).resolves.toMatchObject({
+      error: { code: "EMBEDDED_REJECTED" },
+      outcome: "rejected",
+    });
+    expect(replayWrites).toBe(1);
     expect(targetInvocations).toBe(0);
 
     await expect(
       invokePush(embedded, ctx, mutationPushRequest("replay:insertNull", {})),
     ).resolves.toMatchObject({ outcome: "applied" });
     expect(targetInvocations).toBe(1);
+  });
+
+  test("settles a push whose after-image includes a narrowed field", async () => {
+    const replayWrite = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
+    };
+    const commit = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:commit",
+    };
+    const embedded = defineEmbedded({
+      component: {
+        protocol: { commit, installation: {}, pull: componentPullReference, replayWrite },
+      } as unknown as ComponentApi<"embedded">,
+      schema,
+    });
+    let targetInvocations = 0;
+    const ctx = {
+      auth: { getUserIdentity: async () => null },
+      meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
+      runMutation: async (reference: unknown, args: Record<string, unknown>) => {
+        if (reference === replayWrite) return null;
+        if (reference === commit) return (args.request as { settlement: unknown }).settlement;
+        targetInvocations += 1;
+        throw new Error("after-image validation must precede target invocation");
+      },
+    };
+    const request = {
+      ...mutationPushRequest("documents:write", {}),
+      afterImages: [
+        {
+          content: "value",
+          rowId: "document-1",
+          table: "documents",
+          value: { owner: "owner", secret: "narrowed", title: "title" },
+        },
+      ],
+    };
+
+    await expect(invokePush(embedded, ctx, request)).resolves.toMatchObject({
+      error: { code: "EMBEDDED_REJECTED" },
+      outcome: "rejected",
+    });
+    expect(targetInvocations).toBe(0);
   });
 
   test("settles a push whose deployed target no longer exists", async () => {

@@ -1166,6 +1166,8 @@ export class EmbeddedClient {
         localReady: async (candidateRunner) => {
           await candidateRunner.localReady;
         },
+        progress: () =>
+          this.emitDiagnostic({ at: getTimerTime(), phase: "store-setup", type: "runtime" }),
         remote: options.remote !== undefined,
         runnerSchema: schema,
         setup:

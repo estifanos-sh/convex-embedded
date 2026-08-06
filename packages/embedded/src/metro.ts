@@ -26,6 +26,7 @@ import {
   fromVirtualSourceId,
   renderEmbeddedBundle,
   renderEmbeddedIdentity,
+  renderLocalShim,
   VIRTUAL_IDENTITY_MODULE_ID,
   VIRTUAL_MODULE_ID,
   VIRTUAL_SOURCE_MODULE_PREFIX,
@@ -64,6 +65,10 @@ interface MetroConfigShape {
   };
 }
 
+interface MetroResolution {
+  filePath?: string;
+}
+
 /**
  * Adds embedded Convex module generation and resolution to a Metro config.
  *
@@ -94,10 +99,21 @@ export async function withConvexEmbedded<Config extends object>(
   const cacheDir = path.join(root, "node_modules", ".cache", "convex-embedded");
   const registryPath = path.join(cacheDir, "registry.js");
   const identityPath = path.join(cacheDir, "identity.js");
-  await mkdir(cacheDir, { recursive: true });
+  const localShimPaths = new Map(
+    Object.entries(bundle.localModules).map(([moduleId, module]) => [
+      path.normalize(module.file),
+      path.join(cacheDir, "local", `${Buffer.from(moduleId, "utf8").toString("base64url")}.js`),
+    ]),
+  );
+  await mkdir(path.join(cacheDir, "local"), { recursive: true });
   await Promise.all([
     writeIfChanged(registryPath, renderEmbeddedBundle(bundle)),
     writeIfChanged(identityPath, renderEmbeddedIdentity(bundle)),
+    ...Object.entries(bundle.localModules).map(async ([moduleId, module]) => {
+      const shim = localShimPaths.get(path.normalize(module.file));
+      if (shim === undefined) throw new Error(`Missing local shim path for ${moduleId}.`);
+      await writeIfChanged(shim, renderLocalShim(moduleId, bundle.moduleGraphHash, module.file));
+    }),
   ]);
 
   const sourceFiles = new Set(
@@ -133,9 +149,12 @@ export async function withConvexEmbedded<Config extends object>(
       }
       return resolveMapped(context, sourcePath, platform);
     }
-    return previous
+    const resolved = previous
       ? previous(context, moduleName, platform)
       : context.resolveRequest(context, moduleName, platform);
+    const sourcePath = resolvedMetroSourcePath(resolved);
+    const shim = sourcePath === undefined ? undefined : localShimPaths.get(sourcePath);
+    return shim === undefined ? resolved : resolveMapped(context, shim, platform);
   };
 
   return {
@@ -145,6 +164,12 @@ export async function withConvexEmbedded<Config extends object>(
       resolveRequest,
     },
   } as Config;
+}
+
+function resolvedMetroSourcePath(resolution: unknown): string | undefined {
+  if (typeof resolution !== "object" || resolution === null) return undefined;
+  const filePath = (resolution as MetroResolution).filePath;
+  return typeof filePath === "string" ? path.normalize(filePath) : undefined;
 }
 
 async function writeIfChanged(file: string, contents: string): Promise<void> {

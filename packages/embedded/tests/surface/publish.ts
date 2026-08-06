@@ -69,6 +69,8 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain("Qualify exact source for publication");
     expect(workflow).toContain("needs: [gate, qualification, javascript, node, apple, android]");
     expect(workflow).toContain("Bind release tag to validated source");
+    expect(workflow).toContain("git fetch --no-tags origin main");
+    expect(workflow).toContain('git merge-base --is-ancestor "$SOURCE_SHA" origin/main');
     expect(workflow).toContain("ref: ${{ needs.gate.outputs.sha }}");
     expect(workflow).toContain("EXPECTED_SHA: ${{ needs.gate.outputs.sha }}");
     expect(workflow).toContain("ASSEMBLED_SHA: ${{ needs.assemble.outputs.sha }}");

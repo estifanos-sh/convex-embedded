@@ -73,6 +73,26 @@ ${stamp}(${JSON.stringify(moduleId)}, ${JSON.stringify(graphHash)}, { ${named} }
 `;
 }
 
+/**
+ * Renders the Metro-facing module wrapper for one local entrypoint.
+ *
+ * Metro resolves the module the application imports, rather than offering the Vite/Unplugin
+ * transform hook. The wrapper evaluates the original module first, stamps its exported local
+ * registrations with this build's graph identity, then re-exports them. The virtual registry
+ * deliberately continues to import the source directly: its runtime loader supplies only the
+ * stable dispatch reference and must not make an application setup value look build-stamped.
+ */
+export function renderLocalShim(moduleId: string, graphHash: string, sourcePath: string): string {
+  const source = JSON.stringify(toVirtualSourceId(sourcePath));
+  return `import * as local from ${source};
+import { stampLocal } from "@convex-dev/embedded/internal/local";
+
+stampLocal(${JSON.stringify(moduleId)}, ${JSON.stringify(graphHash)}, local);
+
+export * from ${source};
+`;
+}
+
 export function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): string {
   const schemaHash = bundle.embeddedSchema.runtimeStoreSchema.hash;
   if (schemaHash === undefined) {

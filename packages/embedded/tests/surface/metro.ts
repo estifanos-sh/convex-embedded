@@ -91,12 +91,14 @@ describe("embedded Metro adapter", () => {
       await file(convexDir, "embedded.ts", embeddedEntrypoint());
       const localDir = path.join(root, "local");
       const deviceDir = path.join(root, "device");
+      const drafts = path.join(localDir, "sync/drafts.ts");
       await file(localDir, "sync/drafts.ts", localFunctions(2));
       await file(deviceDir, "prefs.ts", localFunctions());
-      const previous = vi.fn((_context, moduleName: string, _platform: string | null) => ({
-        moduleName,
-        source: "previous",
-      }));
+      const previous = vi.fn((_context, moduleName: string, _platform: string | null) =>
+        moduleName === "./setup"
+          ? { filePath: drafts, moduleName, source: "previous" }
+          : { moduleName, source: "previous" },
+      );
       const config: TestMetroConfig = { projectRoot: root, resolver: { resolveRequest: previous } };
 
       const resolved = await withConvexEmbedded(config, {
@@ -109,9 +111,7 @@ describe("embedded Metro adapter", () => {
       );
 
       expect(registry).toContain(
-        `"local/sync/drafts": () => import("${toVirtualSourceId(
-          path.join(localDir, "sync/drafts.ts"),
-        )}")`,
+        `"local/sync/drafts": () => import("${toVirtualSourceId(drafts)}")`,
       );
       expect(registry).toContain(
         `"local/prefs": () => import("${toVirtualSourceId(path.join(deviceDir, "prefs.ts"))}")`,
@@ -120,13 +120,19 @@ describe("embedded Metro adapter", () => {
 
       const fallback = vi.fn((_context, moduleName: string) => ({ moduleName, source: "default" }));
       const context = { resolveRequest: fallback };
-      for (const source of [
-        path.join(localDir, "sync/drafts.ts"),
-        path.join(deviceDir, "prefs.ts"),
-      ]) {
+      for (const source of [drafts, path.join(deviceDir, "prefs.ts")]) {
         resolved.resolver.resolveRequest(context, toVirtualSourceId(source), "ios");
         expect(previous).toHaveBeenLastCalledWith(context, source, "ios");
       }
+
+      const imported = resolved.resolver.resolveRequest(context, "./setup", "ios") as {
+        moduleName: string;
+      };
+      expect(imported.moduleName).toMatch(/node_modules\/\.cache\/convex-embedded\/local\/.+\.js$/);
+      const shim = await readFile(imported.moduleName, "utf8");
+      expect(shim).toContain(`import * as local from "${toVirtualSourceId(drafts)}"`);
+      expect(shim).toContain('stampLocal("local/sync/drafts",');
+      expect(shim).toContain(`export * from "${toVirtualSourceId(drafts)}"`);
     });
   });
 

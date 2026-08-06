@@ -84,11 +84,22 @@ describe("Robelest package publication", () => {
     ).toThrow(`only ${publishedPackageName} is allowed`);
   });
 
-  test("requires every native target in the packed payload", () => {
+  test("requires every runtime artifact in the packed payload", () => {
     const complete = new Set(requiredPackageFiles().map((path) => `package/${path}`));
     expect(() => verifyPackedFiles(complete)).not.toThrow();
     complete.delete("package/native/android/x86_64/libconvex_embedded_mobile.so");
     expect(() => verifyPackedFiles(complete)).toThrow("x86_64");
+
+    for (const path of [
+      "package/dist/browser-embedded.mjs",
+      "package/dist/thread/browser-worker.mjs",
+    ]) {
+      const withMissingArtifact = new Set(
+        requiredPackageFiles().map((entry) => `package/${entry}`),
+      );
+      withMissingArtifact.delete(path);
+      expect(() => verifyPackedFiles(withMissingArtifact)).toThrow(path.replace("package/", ""));
+    }
   });
 
   test("packs and re-verifies the exact prepared payload", () => {

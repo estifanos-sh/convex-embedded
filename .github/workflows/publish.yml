@@ -113,6 +113,11 @@ jobs:
           echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
           if [[ "$MODE" == "release" || "$MODE" == "prerelease" ]]; then
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/main; then
+              echo "::error::Robelest npm releases must build a commit already reachable from main."
+              exit 1
+            fi
             if git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
               TAG_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
               if [[ "$TAG_SHA" != "$SOURCE_SHA" ]]; then

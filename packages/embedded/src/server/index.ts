@@ -1336,8 +1336,6 @@ function buildPush(
       }
       assertRuntimeVersion(args.runtime);
       if (args.kind === "mutation") {
-        assertReplicatedTarget(manifest, args.functionName, "mutation");
-        assertWireAfterImages(args.afterImages, placements);
         const identity = await identityAttributeOf(ctx);
         const { requestId } = await ctx.meta.getRequestMetadata();
         const fingerprint = await hashValue({
@@ -1390,17 +1388,22 @@ function buildPush(
           );
         }
 
-        const authoredArgs = (await resolveArgRefs(
-          ctx,
-          component,
-          args.clientId,
-          args.args,
-          args.argRefs,
-        )) as Record<string, unknown>;
         const target = makeFunctionReference<"mutation", Record<string, unknown>, unknown>(
           args.functionName,
         );
         try {
+          // Every deterministic per-envelope validation belongs inside the settlement boundary.
+          // Otherwise a renamed function or narrowed after-image escapes as a transport error and
+          // can poison the device's entire push lane instead of durably rejecting this mutation.
+          assertReplicatedTarget(manifest, args.functionName, "mutation");
+          assertWireAfterImages(args.afterImages, placements);
+          const authoredArgs = (await resolveArgRefs(
+            ctx,
+            component,
+            args.clientId,
+            args.args,
+            args.argRefs,
+          )) as Record<string, unknown>;
           const result = await ctx.runMutation(target, authoredArgs);
           if (!isEmbeddedReplayResult(result)) {
             throw new ConvexError({
