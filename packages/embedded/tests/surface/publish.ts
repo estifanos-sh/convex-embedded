@@ -84,7 +84,8 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain("Downloaded package digest $ACTUAL_TARBALL_SHA256");
     expect(workflow).toContain("needs: [gate, qualification, javascript, node, apple, android]");
     expect(workflow).toContain("Bind release tag to validated source");
-    expect(workflow).toContain("git fetch --no-tags origin main");
+    expect(workflow).toContain("Credentials are deliberately removed from this job");
+    expect(workflow).not.toContain("git fetch --no-tags origin main");
     expect(workflow).toContain('git merge-base --is-ancestor "$SOURCE_SHA" origin/main');
     expect(workflow).toContain("ref: ${{ needs.gate.outputs.sha }}");
     expect(workflow).toContain("EXPECTED_SHA: ${{ needs.gate.outputs.sha }}");

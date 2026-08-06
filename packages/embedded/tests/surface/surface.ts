@@ -46,6 +46,8 @@ const ENTRYPOINTS = {
   bundler: {
     class: "version-coupled tooling",
     exports: [
+      "AppArtifactModule",
+      "AppArtifactV1",
       "EMBEDDED_GENERATED_FORMAT_VERSION",
       "EmbeddedBundleInput",
       "EmbeddedBundleResult",
@@ -57,6 +59,8 @@ const ENTRYPOINTS = {
       "EmbeddedGeneratedSchema",
       "FunctionPlacement",
       "GenerateEmbeddedResult",
+      "LocalExportDescriptor",
+      "LocalSetupDescriptor",
       "createEmbeddedBundle",
       "generateEmbedded",
       "readLocalExportNames",
@@ -257,7 +261,7 @@ const ENTRYPOINTS = {
   },
   "internal/local": {
     class: "generated-only",
-    exports: ["defineLocal", "stampLocal"],
+    exports: ["createLocalFacade", "defineLocal", "stampLocal"],
     signatures: [
       "declare function defineLocal<Schema extends EmbeddedSchemaDefinition>(schema: Schema): LocalBuilders<DeviceDataModel<Schema>>;",
       "declare function stampLocal(moduleId: string, exports: Record<string, unknown>): void;",
@@ -419,9 +423,13 @@ describe("package entrypoint contract", () => {
     }
   });
 
-  test("the generated-only local entry exposes only the builder and stamper", async () => {
+  test("the generated-only local entry exposes only generated runtime helpers", async () => {
     const internal = await import("@convex-dev/embedded/internal/local");
-    expect(Object.keys(internal).sort()).toEqual(["defineLocal", "stampLocal"]);
+    expect(Object.keys(internal).sort()).toEqual([
+      "createLocalFacade",
+      "defineLocal",
+      "stampLocal",
+    ]);
   });
 
   test("Node-safe tooling entries are safe to import", async () => {
