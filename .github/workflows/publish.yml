@@ -159,6 +159,9 @@ jobs:
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
+      - name: Build package declarations for source checks
+        run: vp run '@convex-dev/embedded#build:ts'
+
       - name: Check source contracts and reachability
         run: |
           vp check
