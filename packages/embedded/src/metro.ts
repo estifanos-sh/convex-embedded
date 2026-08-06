@@ -112,7 +112,15 @@ export async function withConvexEmbedded<Config extends object>(
     ...Object.entries(bundle.localModules).map(async ([moduleId, module]) => {
       const shim = localShimPaths.get(path.normalize(module.file));
       if (shim === undefined) throw new Error(`Missing local shim path for ${moduleId}.`);
-      await writeIfChanged(shim, renderLocalShim(moduleId, bundle.moduleGraphHash, module.file));
+      await writeIfChanged(
+        shim,
+        renderLocalShim(
+          moduleId,
+          bundle.moduleGraphHash,
+          module.file,
+          bundle.localExports[moduleId],
+        ),
+      );
     }),
   ]);
 

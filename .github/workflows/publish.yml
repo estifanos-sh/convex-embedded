@@ -177,7 +177,10 @@ jobs:
 
       - name: Build production Node and WASM artifacts
         working-directory: packages/embedded
+        env:
+          CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
         run: |
+          node scripts/publish.ts prepare-build
           vp pack
           vp run native
           vp run wasm
@@ -231,7 +234,10 @@ jobs:
             args: ['--frozen-lockfile']
 
       - name: Build and verify JavaScript
+        env:
+          CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
         run: |
+          node packages/embedded/scripts/publish.ts prepare-build
           vp run '@convex-dev/embedded#build:ts'
           vp run '@convex-dev/embedded#test:surface'
 
@@ -428,6 +434,7 @@ jobs:
     timeout-minutes: 30
     outputs:
       sha: ${{ steps.source.outputs.sha }}
+      tarball_sha256: ${{ steps.tarball.outputs.sha256 }}
 
     steps:
       - name: Checkout
@@ -499,6 +506,22 @@ jobs:
           node packages/embedded/scripts/publish.ts prepare
           node packages/embedded/scripts/publish.ts pack artifacts "${{ needs.gate.outputs.mode }}"
 
+      - name: Qualify exact packed artifact
+        # The qualifier installs this archive in a clean temporary consumer. It needs ordinary
+        # npm-registry reads to resolve runtime dependencies, but never receives publish credentials.
+        run: |
+          node packages/embedded/scripts/publish.ts qualify-tarball artifacts/convex-embedded.tgz "${{ needs.gate.outputs.mode }}"
+
+      - name: Bind packed artifact digest
+        id: tarball
+        run: |
+          SHA256=$(sha256sum artifacts/convex-embedded.tgz | awk '{print $1}')
+          if [[ ! "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not calculate a SHA-256 for the assembled package."
+            exit 1
+          fi
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
       - name: Upload assembled package
         uses: actions/upload-artifact@v7
         with:
@@ -518,6 +541,7 @@ jobs:
     outputs:
       sha: ${{ steps.tag.outputs.sha }}
       tag: ${{ steps.tag.outputs.tag }}
+      tarball_sha256: ${{ steps.tag.outputs.tarball_sha256 }}
 
     steps:
       - name: Checkout exact validated source
@@ -530,6 +554,7 @@ jobs:
         id: tag
         env:
           ASSEMBLED_SHA: ${{ needs.assemble.outputs.sha }}
+          ASSEMBLED_TARBALL_SHA256: ${{ needs.assemble.outputs.tarball_sha256 }}
           EXPECTED_SHA: ${{ needs.gate.outputs.sha }}
           RELEASE_TAG: ${{ needs.gate.outputs.tag }}
         run: |
@@ -542,6 +567,10 @@ jobs:
             echo "::error::Package was assembled from $ASSEMBLED_SHA instead of validated source $EXPECTED_SHA."
             exit 1
           fi
+          if [[ ! "$ASSEMBLED_TARBALL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Assembled package does not have a valid SHA-256."
+            exit 1
+          fi
 
           if git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             TAG_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
@@ -549,13 +578,23 @@ jobs:
               echo "::error::Tag $RELEASE_TAG points to $TAG_SHA, not validated source $EXPECTED_SHA."
               exit 1
             fi
+            if [[ "$(git cat-file -t "refs/tags/$RELEASE_TAG")" != "tag" ]]; then
+              echo "::error::Tag $RELEASE_TAG must be annotated with its assembled package digest."
+              exit 1
+            fi
+            if ! git cat-file -p "refs/tags/$RELEASE_TAG" | grep -Fq "Robelest package SHA-256: $ASSEMBLED_TARBALL_SHA256"; then
+              echo "::error::Tag $RELEASE_TAG is not bound to the assembled package digest."
+              exit 1
+            fi
           else
-            git tag "$RELEASE_TAG" "$EXPECTED_SHA"
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "$RELEASE_TAG" "$EXPECTED_SHA" -m "Robelest package SHA-256: $ASSEMBLED_TARBALL_SHA256"
             git push origin "refs/tags/$RELEASE_TAG"
           fi
 
           echo "sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "tarball_sha256=$ASSEMBLED_TARBALL_SHA256" >> "$GITHUB_OUTPUT"
 
   preview:
     name: Publish complete package preview
@@ -698,6 +737,7 @@ jobs:
         id: release
         env:
           EXPECTED_VERSION: ${{ needs.gate.outputs.version }}
+          EXPECTED_TARBALL_SHA256: ${{ needs.release-tag.outputs.tarball_sha256 }}
           PUBLISH_MODE: ${{ needs.gate.outputs.mode }}
           RELEASE_TAG: ${{ needs.release-tag.outputs.tag }}
         run: |
@@ -721,6 +761,15 @@ jobs:
           fi
           if [[ "$VERSION" != "$EXPECTED_VERSION" ]]; then
             echo "::error::Assembled version $VERSION does not match requested version $EXPECTED_VERSION."
+            exit 1
+          fi
+          ACTUAL_TARBALL_SHA256=$(sha256sum artifacts/convex-embedded.tgz | awk '{print $1}')
+          if [[ "$ACTUAL_TARBALL_SHA256" != "$EXPECTED_TARBALL_SHA256" ]]; then
+            echo "::error::Downloaded package digest $ACTUAL_TARBALL_SHA256 does not match release tag digest $EXPECTED_TARBALL_SHA256."
+            exit 1
+          fi
+          if ! git cat-file -p "refs/tags/$RELEASE_TAG" | grep -Fq "Robelest package SHA-256: $EXPECTED_TARBALL_SHA256"; then
+            echo "::error::Release tag $RELEASE_TAG is not bound to the downloaded package digest."
             exit 1
           fi
           node packages/embedded/scripts/publish.ts verify-tarball artifacts/convex-embedded.tgz "$PUBLISH_MODE"

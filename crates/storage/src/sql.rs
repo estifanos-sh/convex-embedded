@@ -59,6 +59,8 @@ pub(crate) const ACTIVE_GENERATION_KEY: &str = "active_generation";
 pub(crate) const BOOTSTRAP_VERSION_KEY: &str = "bootstrap_version";
 pub(crate) const NEXT_GENERATION_KEY: &str = "next_generation";
 pub(crate) const ACTIVE_CONTRACT_KEY: &str = "active_contract";
+/// V2 setup-plan identity is deliberately separate from the durable `StoreContract`.
+pub(crate) const ACTIVE_SETUP_HASH_KEY: &str = "active_setup_hash";
 pub(crate) const CANDIDATE_GENERATION_KEY: &str = "candidate_generation";
 pub(crate) const CANDIDATE_SOURCE_KEY: &str = "candidate_source";
 pub(crate) const CANDIDATE_CONTRACT_KEY: &str = "candidate_contract";
@@ -216,6 +218,7 @@ pub(crate) fn kernel_layout_manifest() -> Vec<String> {
         "bootstrap:v1:active_generation=published-pointer".to_owned(),
         "bootstrap:v1:next_generation=monotonic-allocation".to_owned(),
         "bootstrap:v1:active_contract=published-semantic-contract".to_owned(),
+        "bootstrap:v2:active_setup_hash=published-setup-plan-identity".to_owned(),
         "bootstrap:v1:candidate_generation=unpublished-pointer".to_owned(),
         "bootstrap:v1:candidate_source=active-generation-at-creation".to_owned(),
         "bootstrap:v1:candidate_contract=target-semantic-contract".to_owned(),
@@ -3469,10 +3472,10 @@ fn doc_table(table: &str) -> String {
     format!("doc__{table}")
 }
 
-/// Stamps the current `EMBEDDED_EPOCH` into the database header. The value cannot be a bind
-/// parameter in a PRAGMA, so it is a trusted in-process constant baked into the literal.
-pub(crate) fn write_user_version() -> String {
-    format!("PRAGMA user_version = {EMBEDDED_EPOCH}")
+/// Stamps one validated store epoch into the database header. The value cannot be a bind parameter
+/// in a PRAGMA, so callers pass only an internal contract discriminator.
+pub(crate) fn write_user_version(epoch: i64) -> String {
+    format!("PRAGMA user_version = {epoch}")
 }
 
 pub(crate) fn drop_table(table: &str) -> String {

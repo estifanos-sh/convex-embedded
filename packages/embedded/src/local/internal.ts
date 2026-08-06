@@ -14,6 +14,29 @@ export const EMBEDDED_LOCAL_GRAPH_HASH = "__embeddedLocalGraphHash";
 const EMBEDDED_LOCAL_SCHEMA = "__embeddedLocalSchema";
 const EMBEDDED_LOCAL_SETUP_ONLY = "__embeddedLocalSetupOnly";
 
+/**
+ * Builds the immutable application-facing view of one generated local module.
+ *
+ * The runner may still consume an unwrapped module while opening an old direct runtime, but an
+ * app import always receives a distinct frozen registration. That prevents a second bundle (or a
+ * re-export evaluated later) from changing the setup reference carried by an already-open client.
+ *
+ * @internal
+ */
+export function createLocalFacade<T extends Record<string, unknown>>(
+  moduleId: string,
+  graphHash: string,
+  exports: T,
+): T {
+  const facade: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(exports)) {
+    facade[name] = isLocalFunction(value)
+      ? immutableLocalReference(value, `${moduleId}:${name}`, graphHash)
+      : value;
+  }
+  return Object.freeze(facade) as T;
+}
+
 /** Shared local-registration marker used by generated module transforms and runtimes. */
 export function isLocalFunction(value: unknown): value is Record<string, unknown> {
   return (
@@ -52,7 +75,29 @@ export function stampLocal(
     typeof graphHashOrExports === "string" ? (maybeExports ?? {}) : graphHashOrExports;
   for (const [name, value] of Object.entries(exports)) {
     if (!isLocalFunction(value)) continue;
-    value[EMBEDDED_LOCAL_REFERENCE] = `${moduleId}:${name}`;
+    const reference = `${moduleId}:${name}`;
+    const existing = localReferenceName(value);
+    if (existing !== undefined && Object.isFrozen(value)) {
+      // A generated immutable facade has already carried the only valid identity. The runner's
+      // legacy registration pass is intentionally a no-op in that case. Direct modules can expose
+      // one registration under two aliases; those continue to register under both table keys.
+      if (graphHash !== undefined && existing !== reference) {
+        throw new Error(`Embedded local export ${reference} conflicts with immutable ${existing}.`);
+      }
+      const existingGraph = localGraphHash(value);
+      if (graphHash !== undefined && existingGraph !== graphHash) {
+        throw new Error(
+          `Embedded local export ${reference} belongs to a different application artifact.`,
+        );
+      }
+      continue;
+    }
+    if (Object.isFrozen(value)) {
+      throw new Error(
+        `Embedded local export ${reference} is immutable without a generated application artifact.`,
+      );
+    }
+    value[EMBEDDED_LOCAL_REFERENCE] = reference;
     if (graphHash !== undefined) stampLocalGraph(value, graphHash);
   }
 }
@@ -157,4 +202,38 @@ export function isLocalSetupOnly(value: unknown): boolean {
     value !== null &&
     (value as Record<string, unknown>)[EMBEDDED_LOCAL_SETUP_ONLY] === true
   );
+}
+
+function immutableLocalReference(
+  value: Record<string, unknown>,
+  reference: string,
+  graphHash: string,
+): Record<string, unknown> {
+  const existing = localReferenceName(value);
+  const existingGraph = localGraphHash(value);
+  if (existing !== undefined && (existing !== reference || existingGraph !== graphHash)) {
+    throw new Error(
+      `Embedded local export ${reference} has already been bound to another artifact.`,
+    );
+  }
+  if (existing === reference && existingGraph === graphHash && Object.isFrozen(value)) return value;
+  const facade = Object.create(
+    Object.getPrototypeOf(value),
+    Object.getOwnPropertyDescriptors(value),
+  ) as Record<string, unknown>;
+  Object.defineProperties(facade, {
+    [EMBEDDED_LOCAL_GRAPH_HASH]: {
+      configurable: false,
+      enumerable: false,
+      value: graphHash,
+      writable: false,
+    },
+    [EMBEDDED_LOCAL_REFERENCE]: {
+      configurable: false,
+      enumerable: false,
+      value: reference,
+      writable: false,
+    },
+  });
+  return Object.freeze(facade);
 }

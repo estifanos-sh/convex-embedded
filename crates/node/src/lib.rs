@@ -599,6 +599,41 @@ struct WasmRemoteState {
 }
 
 #[cfg(target_arch = "wasm32")]
+struct WasmRemoteDriverLoan {
+    driver: Option<WasmRemoteDriver>,
+    state: Arc<Mutex<WasmRemoteState>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WasmRemoteDriverLoan {
+    fn new(driver: WasmRemoteDriver, state: Arc<Mutex<WasmRemoteState>>) -> Self {
+        Self {
+            driver: Some(driver),
+            state,
+        }
+    }
+
+    fn driver_mut(&mut self) -> &mut WasmRemoteDriver {
+        self.driver
+            .as_mut()
+            .expect("Wasm remote driver loan is live until drop")
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for WasmRemoteDriverLoan {
+    fn drop(&mut self) {
+        let Some(driver) = self.driver.take() else {
+            return;
+        };
+        let mut state = lock(&self.state);
+        state.driver = Some(driver);
+        state.running = false;
+        wake_next_wasm_remote_waiter(&mut state);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 struct WasmRemoteWaiter {
     kind: WasmRemoteWaiterKind,
     sender: oneshot::Sender<()>,
@@ -3241,7 +3276,7 @@ where
 {
     let queued_at = Instant::now();
     let mut actor_queue_depth = 0;
-    let (mut driver, pending_scope) = loop {
+    let (driver, pending_scope) = loop {
         let (driver, waiter) = {
             let mut state = lock(&remote.state);
             if state.closing {
@@ -3275,43 +3310,43 @@ where
             .await
             .map_err(|_| RemoteError::Command("browser remote wait canceled".to_owned()))?;
     };
-    if let Some(scope) = pending_scope {
-        driver.scope_write(scope)?;
-    }
+    let mut loan = WasmRemoteDriverLoan::new(driver, Arc::clone(&remote.state));
     let actor_queue_ms = u64::try_from(queued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let result = op(&mut driver).await;
-    {
-        let mut state = lock(&remote.state);
-        state.driver = Some(driver);
-        state.running = false;
-        wake_next_wasm_remote_waiter(&mut state);
+    if let Some(scope) = pending_scope {
+        loan.driver_mut().scope_write(scope)?;
     }
+    let result = op(loan.driver_mut()).await;
+    drop(loan);
     result.map(|value| (value, actor_queue_ms, actor_queue_depth))
 }
 
 #[cfg(target_arch = "wasm32")]
 fn wake_next_wasm_remote_waiter(state: &mut WasmRemoteState) {
-    let Some(index) = state
-        .waiters
-        .iter()
-        .position(|waiter| waiter.kind == WasmRemoteWaiterKind::Close)
-        .or_else(|| {
-            state
-                .waiters
-                .iter()
-                .position(|waiter| waiter.kind == WasmRemoteWaiterKind::Foreground)
-        })
-        .or_else(|| {
-            state
-                .waiters
-                .iter()
-                .position(|waiter| waiter.kind == WasmRemoteWaiterKind::Background)
-        })
-    else {
-        return;
-    };
-    let waiter = state.waiters.swap_remove(index);
-    waiter.sender.send(()).ok();
+    loop {
+        let Some(index) = state
+            .waiters
+            .iter()
+            .position(|waiter| waiter.kind == WasmRemoteWaiterKind::Close)
+            .or_else(|| {
+                state
+                    .waiters
+                    .iter()
+                    .position(|waiter| waiter.kind == WasmRemoteWaiterKind::Foreground)
+            })
+            .or_else(|| {
+                state
+                    .waiters
+                    .iter()
+                    .position(|waiter| waiter.kind == WasmRemoteWaiterKind::Background)
+            })
+        else {
+            return;
+        };
+        let waiter = state.waiters.swap_remove(index);
+        if waiter.sender.send(()).is_ok() {
+            return;
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

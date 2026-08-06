@@ -9,6 +9,7 @@
     "dist/*-*.mjs",
     "dist/browser-embedded.d.mts",
     "dist/browser-embedded.mjs",
+    "dist/artifact.json",
     "dist/browser.d.mts",
     "dist/browser.mjs",
     "dist/bundler.d.mts",
@@ -45,6 +46,8 @@
     "native",
     "android",
     "ios",
+    "README.md",
+    "LICENSE",
     "expo-module.config.json",
     "ConvexEmbeddedNative.podspec",
     "src"

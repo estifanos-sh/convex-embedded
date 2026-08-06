@@ -221,11 +221,11 @@ describe("browser deployment coordination", () => {
     await runtime.close();
   });
 
-  test("discovers every deployment that owns the same browser storage", () => {
+  test("discovers every deployment through one physical browser-storage scope", () => {
     const oldIdentity = identity({ moduleGraphHash: "old", packageVersion: "1.0.0" });
     const newIdentity = identity({ moduleGraphHash: "new", packageVersion: "2.0.0" });
 
-    expect(runtimeScope(oldIdentity)).not.toBe(runtimeScope(newIdentity));
+    expect(runtimeScope(oldIdentity)).toBe(runtimeScope(newIdentity));
     expect(controlChannelName(oldIdentity.storageId)).toBe(
       controlChannelName(newIdentity.storageId),
     );
@@ -233,7 +233,8 @@ describe("browser deployment coordination", () => {
 
   test("runtime identity carries the local store format version", () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
-    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(EMBEDDED_EPOCH);
+    expect(EMBEDDED_EPOCH).toBe(48);
+    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(48);
   });
 
   test("a store format version mismatch surfaces as a runtime identity mismatch", () => {
@@ -256,6 +257,16 @@ describe("browser deployment coordination", () => {
         current,
       ),
     ).toThrow(/setup action/);
+  });
+
+  test("rejects an asymmetric setup admission identity", () => {
+    const withSetup = identity({
+      setupGraphHash: "graph-a",
+      setupReference: "local/setup:setup",
+    });
+
+    expect(() => assertSameRuntimeIdentity(withSetup, identity())).toThrow(/setup action/);
+    expect(() => assertSameRuntimeIdentity(identity(), withSetup)).toThrow(/setup action/);
   });
 
   test("rejects a different deployment and notifies clients of the existing owner", () => {

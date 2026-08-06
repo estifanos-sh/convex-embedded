@@ -3,13 +3,16 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const sourcePackageName = "@convex-dev/embedded";
@@ -38,6 +41,7 @@ interface PackageJson {
   homepage?: string;
   license?: string;
   name?: string;
+  peerDependencies?: Record<string, string>;
   publishConfig?: Record<string, unknown>;
   repository?: { type: string; url: string } | string;
   scripts?: Record<string, string>;
@@ -46,6 +50,30 @@ interface PackageJson {
 }
 
 export type PublishMode = "preview" | "prerelease" | "release";
+
+/**
+ * Stamp the version consumed by tsdown before it emits package artifacts.
+ *
+ * This deliberately leaves the source package identity intact: the Robelest rename happens only
+ * in the assembled publication tree. Separate CI jobs start from fresh checkouts, so this must
+ * run in every job that produces distributable JavaScript.
+ */
+export function prepareBuildVersion(directory: string, version?: string): PackageJson {
+  const path = resolve(directory, "package.json");
+  const manifest = readPackageJson(path);
+  if (manifest.name !== sourcePackageName) {
+    throw new Error(
+      `Refusing to build ${String(manifest.name)}; expected source package ${sourcePackageName}.`,
+    );
+  }
+  if (version === undefined) return manifest;
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$/.test(version)) {
+    throw new Error(`Embedded package build version must be semver; received ${version}.`);
+  }
+  manifest.version = version;
+  writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+  return manifest;
+}
 
 /** Keep a frozen fixture directory to its two reviewable, durable release artifacts. */
 export function verifyFixtureFiles(directory: string): void {
@@ -191,11 +219,14 @@ export function preparePackage(directory: string, version?: string): PackageJson
 export function requiredPackageFiles(): string[] {
   return [
     "ConvexEmbeddedNative.podspec",
+    "LICENSE",
+    "README.md",
     "android/build.gradle",
     "android/src/main/java/dev/convex/embedded/mobile/Native.kt",
     "android/src/main/java/expo/modules/convexembedded/ConvexEmbeddedNativeModule.kt",
     "dist/browser-embedded.mjs",
     "dist/browser.mjs",
+    "dist/artifact.json",
     "dist/expo/index.mjs",
     "dist/node.mjs",
     "dist/thread/browser-worker.mjs",
@@ -222,6 +253,7 @@ export function verifyPackageTree(directory: string, mode: PublishMode): void {
       throw new Error(`Robelest package is missing required artifact: ${path}`);
     }
   }
+  verifyArtifactVersion(readArtifact(directory), manifest.version);
 }
 
 export function verifyPackedFiles(files: ReadonlySet<string>, manifest?: PackageJson): void {
@@ -268,8 +300,89 @@ export function verifyTarball(path: string, mode: PublishMode): void {
   ) as PackageJson;
   verifyPackedFiles(files, manifest);
   verifyManifest(manifest, mode);
+  const artifact = JSON.parse(
+    execFileSync("tar", ["-xOzf", path, "package/dist/artifact.json"], { encoding: "utf8" }),
+  ) as unknown;
+  verifyArtifactVersion(artifact, manifest.version);
   if (JSON.stringify(manifest).includes('"catalog:"')) {
     throw new Error("Robelest tarball contains unresolved pnpm catalog dependency ranges.");
+  }
+}
+
+/**
+ * Qualify the exact npm payload after assembly.
+ *
+ * This deliberately installs the tarball in a fresh consumer outside the workspace. It exercises
+ * the package manager's real dependency graph and the public export, so neither relative imports
+ * nor dependencies can be satisfied accidentally by the source checkout. Registry access is the
+ * only external prerequisite; this operation has no deploy or publishing credentials.
+ */
+export function qualifyTarball(path: string, mode: PublishMode): void {
+  const archive = resolve(path);
+  verifyTarball(archive, mode);
+  const manifest = JSON.parse(
+    execFileSync("tar", ["-xOzf", archive, "package/package.json"], { encoding: "utf8" }),
+  ) as PackageJson;
+  const convex = manifest.peerDependencies?.convex;
+  const temporary = mkdtempSync(join(tmpdir(), "convex-embedded-tarball-qualification-"));
+  try {
+    writeFileSync(
+      resolve(temporary, "package.json"),
+      `${JSON.stringify(
+        {
+          name: "convex-embedded-tarball-qualification",
+          private: true,
+          type: "module",
+          dependencies: {
+            [publishedPackageName]: `file:${archive}`,
+            ...(convex === undefined ? {} : { convex }),
+          },
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    execFileSync(
+      "pnpm",
+      ["install", "--ignore-scripts", "--config.audit=false", "--config.fund=false"],
+      {
+        cwd: temporary,
+        stdio: "inherit",
+      },
+    );
+    execFileSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `await import(${JSON.stringify(`${publishedPackageName}/node`)});`,
+      ],
+      {
+        cwd: temporary,
+        stdio: "inherit",
+      },
+    );
+  } finally {
+    rmSync(temporary, { force: true, recursive: true });
+  }
+}
+
+/** The emitted artifact record proves the packed runtime was built at the manifest's version. */
+function readArtifact(directory: string): unknown {
+  return JSON.parse(readFileSync(resolve(directory, "dist/artifact.json"), "utf8")) as unknown;
+}
+
+function verifyArtifactVersion(artifact: unknown, version: string | undefined): void {
+  if (
+    artifact === null ||
+    typeof artifact !== "object" ||
+    Array.isArray(artifact) ||
+    (artifact as Record<string, unknown>).format !== 1 ||
+    (artifact as Record<string, unknown>).packageVersion !== version
+  ) {
+    throw new Error(
+      `Robelest artifact version does not match package manifest version ${String(version)}.`,
+    );
   }
 }
 
@@ -349,11 +462,15 @@ function main(): void {
     verifyPreview2Fixture();
     const version = process.env.CONVEX_EMBEDDED_PUBLISH_VERSION?.trim() || undefined;
     preparePackage(directory, version);
+  } else if (command === "prepare-build") {
+    const version = process.env.CONVEX_EMBEDDED_PUBLISH_VERSION?.trim() || undefined;
+    prepareBuildVersion(directory, version);
   } else if (command === "fixture") {
     verifyPreview2Fixture();
   } else if (command === "verify") verifyPackageTree(directory, mode(3));
   else if (command === "pack") packPackage(directory, resolve(argument(3, "destination")), mode(4));
   else if (command === "verify-tarball") verifyTarball(resolve(argument(3, "tarball")), mode(4));
+  else if (command === "qualify-tarball") qualifyTarball(resolve(argument(3, "tarball")), mode(4));
   else throw new Error(`Unknown publish command: ${command}`);
 }
 

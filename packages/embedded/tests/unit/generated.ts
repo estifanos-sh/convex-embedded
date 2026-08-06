@@ -3,6 +3,7 @@ import { expect, test } from "vite-plus/test";
 
 import { generateEmbedded, renderEmbeddedGenerated } from "../../src/bundler";
 import { toEmbeddedGeneratedSchema } from "../../src/bundler/generated";
+import { createLocalFacade, localGraphHash, localReferenceName } from "../../src/local/internal";
 import { analyzeEmbeddedSchema, defineEmbeddedSchema, replicatedTable } from "../../src/schema";
 import { e } from "../../src/values";
 
@@ -15,11 +16,22 @@ test("generated contract exports schema-bound local builders without carrying th
     }),
   });
   const source = renderEmbeddedGenerated({
+    artifact: {
+      artifactHash: "artifact-hash",
+      executionHash: "graph-hash",
+      expectedBinding: { mobileAbi: 10, storageAbi: 32 },
+      format: 1,
+      modules: [],
+      replicationHash: "manifest-hash",
+      schemaHash: "schema-hash",
+      setups: [],
+    },
     embeddedSchema: toEmbeddedGeneratedSchema(analyzeEmbeddedSchema(schema)),
     generatedPath: "/repo/convex/_generated/embedded.ts",
     localModules: {
       "local/drafts": { file: "/repo/local/drafts.ts" },
     },
+    localExports: { "local/drafts": [] },
     manifest: {
       documents: {
         list: { kind: "query", placement: "replicated", visibility: "public" },
@@ -50,6 +62,28 @@ test("generated contract exports schema-bound local builders without carrying th
   expect(source).not.toContain("localApi");
   expect(source).not.toContain("local/drafts");
   expect(source.length).toBeLessThan(2048);
+});
+
+test("generated local facades freeze an artifact-bound clone without changing the source export", () => {
+  const source = {
+    setup: {
+      __embeddedPlacement: "local",
+      handler: () => undefined,
+      kind: "action",
+      placement: "local",
+      visibility: "internal",
+    },
+  };
+
+  const facade = createLocalFacade("local/setup", "artifact", source);
+
+  expect(facade.setup).not.toBe(source.setup);
+  expect(Object.isFrozen(facade)).toBe(true);
+  expect(Object.isFrozen(facade.setup)).toBe(true);
+  expect(localReferenceName(facade.setup)).toBe("local/setup:setup");
+  expect(localGraphHash(facade.setup)).toBe("artifact");
+  expect(localReferenceName(source.setup)).toBeUndefined();
+  expect(localGraphHash(source.setup)).toBeUndefined();
 });
 
 test("generator atomically creates the contract needed by bundler builds", async () => {

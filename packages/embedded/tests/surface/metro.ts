@@ -130,8 +130,10 @@ describe("embedded Metro adapter", () => {
       };
       expect(imported.moduleName).toMatch(/node_modules\/\.cache\/convex-embedded\/local\/.+\.js$/);
       const shim = await readFile(imported.moduleName, "utf8");
-      expect(shim).toContain(`import * as local from "${toVirtualSourceId(drafts)}"`);
-      expect(shim).toContain('stampLocal("local/sync/drafts",');
+      expect(shim).toContain(`import * as source from "${toVirtualSourceId(drafts)}"`);
+      expect(shim).toContain('createLocalFacade("local/sync/drafts",');
+      expect(shim).toContain('export const setCompact = embeddedLocal["setCompact"]');
+      expect(shim).not.toContain("stampLocal");
       expect(shim).toContain(`export * from "${toVirtualSourceId(drafts)}"`);
     });
   });

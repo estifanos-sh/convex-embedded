@@ -31,6 +31,7 @@ use crate::types::{
     RevKey, RevState, RevWriteResult, RowChange, RowChangeOp, RowHead, RowKey, ScheduledJob,
     ScheduledState, StoreContract, StoreSchema, TableDef, TablePlacement, UploadLease,
     UploadLeaseWrite, WriteBatch, ORIGIN_FLAG_DISCARDED, ORIGIN_FLAG_QUARANTINED,
+    STORE_CONTRACT_V1_EPOCH, STORE_CONTRACT_V2_EPOCH,
 };
 
 static PATH_LOCKS: LazyLock<Mutex<FxHashMap<String, Weak<Mutex<()>>>>> =
@@ -53,12 +54,43 @@ const ORIGIN_FLAGS_NONE: i64 = 0;
 /// Codec for quarantine/discard metadata. It is deliberately not any semantic record codec: a
 /// future semantic codec may be binary and must never be asked to decode this JSON envelope.
 const ORIGIN_DISPOSITION_CODEC: i64 = 1;
-const MIN_SUPPORTED_EPOCH: i64 = 47;
+const MIN_SUPPORTED_EPOCH: i64 = STORE_CONTRACT_V1_EPOCH;
+const CURRENT_STORE_EPOCH: i64 = STORE_CONTRACT_V2_EPOCH;
+const PREVIEW2_KERNEL_LAYOUT_HASH: &str =
+    "5fa387957ed045e0e1c6e6f4357034af63a102c8180d7fd9f0f8437d41fe72fa";
+const PREVIEW2_GENERATION_LAYOUT_HASH: &str =
+    "4f377db32f9cd4433a83778401c1270a7b71d56b970b7b44badfd4f252df1a0b";
+const PREVIEW2_ORIGIN_WRITER_HASH: &str =
+    "4ba46d92f6760cca0422b6381e2a6ee5c813477e3e9852af14e976b0c343c7a1";
+const PREVIEW2_ORIGIN_READER_HASH: &str =
+    "a9eb50f732b915e2ea7605efb6e9d02504e225ef22361db0dd185ce19309592f";
 const REMOTE_SEED_MIN_BATCH: usize = 64;
 const REMOTE_SEED_PARAMETER_BUDGET: usize = 900;
 
 fn remote_cursor_key_encode(subscription: &str) -> String {
     format!("{REMOTE_CURSOR_PREFIX}{subscription}")
+}
+
+fn contract_matches_store_epoch(contract: &StoreContract, stored_epoch: i64) -> bool {
+    // The workspace epoch is updated with the cross-language release. Until then storage keeps
+    // both released readers explicitly; this guard makes a divergent future configuration fail
+    // loudly in debug/test builds instead of silently widening compatibility.
+    debug_assert!((STORE_CONTRACT_V1_EPOCH..=CURRENT_STORE_EPOCH).contains(&sql::EMBEDDED_EPOCH));
+    match contract.format {
+        1 => {
+            stored_epoch == STORE_CONTRACT_V1_EPOCH
+                && contract.package_epoch == STORE_CONTRACT_V1_EPOCH
+                && contract.kernel_layout_hash == PREVIEW2_KERNEL_LAYOUT_HASH
+                && contract.generation_layout_hash == PREVIEW2_GENERATION_LAYOUT_HASH
+                && contract.origin_writer_hash == PREVIEW2_ORIGIN_WRITER_HASH
+                && contract.origin_reader_hash == PREVIEW2_ORIGIN_READER_HASH
+        }
+        2 => {
+            stored_epoch == STORE_CONTRACT_V2_EPOCH
+                && contract.package_epoch == STORE_CONTRACT_V2_EPOCH
+        }
+        _ => false,
+    }
 }
 
 /// How long a claimed scheduled job holds its lease before another worker may reclaim it. A worker
@@ -268,10 +300,9 @@ impl EmbeddedStore {
                     minimum: MIN_SUPPORTED_EPOCH,
                 });
             }
-            if stored_epoch > sql::EMBEDDED_EPOCH {
+            if stored_epoch > CURRENT_STORE_EPOCH {
                 return Err(StorageError::IncompatibleStore(format!(
-                    "store epoch {stored_epoch} is newer than runtime epoch {}; the store was preserved",
-                    sql::EMBEDDED_EPOCH
+                    "store epoch {stored_epoch} is newer than runtime epoch {CURRENT_STORE_EPOCH}; the store was preserved"
                 )));
             }
             stored_epoch
@@ -308,7 +339,7 @@ impl EmbeddedStore {
                         "bootstrap has no active contract; the store was preserved".to_owned(),
                     )
                 })?;
-            if active_contract.package_epoch != stored_epoch
+            if !contract_matches_store_epoch(&active_contract, stored_epoch)
                 || active_contract.bootstrap_version != bootstrap_version
             {
                 return Err(StorageError::IncompatibleStore(format!(
@@ -500,7 +531,7 @@ impl EmbeddedStore {
                 minimum: MIN_SUPPORTED_EPOCH,
             });
         }
-        if stored_version > sql::EMBEDDED_EPOCH {
+        if stored_version > CURRENT_STORE_EPOCH {
             return Err(StorageError::IncompatibleStore(format!(
                 "unsupported store epoch {stored_version}; the existing store was preserved"
             )));
@@ -518,7 +549,7 @@ impl EmbeddedStore {
                     "bootstrap has no active contract; the existing store was preserved".to_owned(),
                 )
             })?;
-        if active.package_epoch != stored_version
+        if !contract_matches_store_epoch(&active, stored_version)
             || active.bootstrap_version != sql::BOOTSTRAP_VERSION
         {
             return Err(StorageError::IncompatibleStore(
@@ -526,14 +557,14 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
-        let mut requested = StoreContract::for_schema(schema);
-        // A plain open may retire the executable setup hook while the store deliberately retains
-        // its completed identity. Treat omission as accepting that identity; a different non-empty
-        // setup hash still requires the candidate protocol.
-        if requested.setup_hash.is_empty() {
-            requested.setup_hash.clone_from(&active.setup_hash);
-        }
-        if !active.has_same_candidate_identity(&requested) {
+        let requested = StoreContract::for_schema(schema);
+        let active_setup =
+            self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
+        let requested_setup = Self::target_setup_hash(&active_setup, schema);
+        if !active.is_v2()
+            || !active.has_same_candidate_identity(&requested)
+            || requested_setup != active_setup
+        {
             return Err(StorageError::IncompatibleStore(
                 "the store contract changed; use the device migration runner instead of direct setup"
                     .to_owned(),
@@ -583,11 +614,15 @@ impl EmbeddedStore {
             self.write_meta_unlocked(SCHEMA_SIGNATURE_KEY, schema_signature)?;
             self.write_meta_unlocked(SCHEMA_MANIFEST_KEY, schema_manifest)?;
             self.write_bootstrap_unlocked(sql::ACTIVE_GENERATION_KEY, b"1")?;
+            self.write_bootstrap_unlocked(
+                sql::ACTIVE_SETUP_HASH_KEY,
+                schema.setup_hash.as_bytes(),
+            )?;
             let contract = serde_json::to_vec(&StoreContract::for_schema(schema))
                 .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
             self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
             self.driver
-                .execute(&sql::write_user_version(), Vec::new())?;
+                .execute(&sql::write_user_version(CURRENT_STORE_EPOCH), Vec::new())?;
             Ok(())
         })();
         match written {
@@ -931,6 +966,10 @@ impl EmbeddedStore {
         now_ms: i64,
     ) -> Result<(), StorageError> {
         let state_hash = self.remote_subscription_state_hash_unlocked(subscription)?;
+        // A result received before its first cursor is only a cache entry. Its paths may describe
+        // null skeleton positions and therefore need not have local projection rows yet. It cannot
+        // authorize a carried projection state until a concrete cursor publishes both together.
+        let result_key = cursor.and(result_key);
         let result_hash = result_key
             .map(|key| {
                 self.result_read_unlocked(key)?
@@ -1205,6 +1244,37 @@ impl EmbeddedStore {
             .transpose()
     }
 
+    /// Reads the setup-plan identity without conflating it with the durable layout contract.
+    /// Preview 2 stored this value inside its V1 contract, so that frozen representation remains a
+    /// read-only fallback while an epoch-48 candidate is prepared.
+    fn setup_hash_read_unlocked(
+        &self,
+        key: &str,
+        legacy: Option<&StoreContract>,
+    ) -> Result<String, StorageError> {
+        if let Some(bytes) = self.bootstrap_read_unlocked(key)? {
+            return String::from_utf8(bytes).map_err(|error| {
+                StorageError::IncompatibleStore(format!(
+                    "bootstrap {key} setup identity is not UTF-8: {error}"
+                ))
+            });
+        }
+        if let Some(contract) = legacy.filter(|contract| contract.is_v1()) {
+            return Ok(contract.setup_hash.clone().unwrap_or_default());
+        }
+        Err(StorageError::IncompatibleStore(format!(
+            "bootstrap {key} setup identity is missing; the store was preserved"
+        )))
+    }
+
+    fn target_setup_hash(active_setup_hash: &str, schema: &StoreSchema) -> String {
+        if schema.setup_hash.is_empty() {
+            active_setup_hash.to_owned()
+        } else {
+            schema.setup_hash.clone()
+        }
+    }
+
     /// Seed the frozen originated ledger from the generation-zero layout that
     /// existed before the ledger was introduced.
     ///
@@ -1218,7 +1288,7 @@ impl EmbeddedStore {
         schema: &StoreSchema,
     ) -> Result<MigrationCandidate, StorageError> {
         validate_store_schema(schema)?;
-        let mut target = StoreContract::for_schema(schema);
+        let target = StoreContract::for_schema(schema);
         let mut target_contract_hash = target
             .hash()
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
@@ -1263,10 +1333,9 @@ impl EmbeddedStore {
                 minimum: MIN_SUPPORTED_EPOCH,
             });
         }
-        if stored_version > sql::EMBEDDED_EPOCH {
+        if stored_version > CURRENT_STORE_EPOCH {
             return Err(StorageError::IncompatibleStore(format!(
-                "store epoch {stored_version} is newer than runtime epoch {}; the store was preserved",
-                sql::EMBEDDED_EPOCH
+                "store epoch {stored_version} is newer than runtime epoch {CURRENT_STORE_EPOCH}; the store was preserved"
             )));
         }
         if !existing_tables.iter().any(|table| table == sql::BOOTSTRAP) {
@@ -1297,33 +1366,36 @@ impl EmbeddedStore {
                     "bootstrap has no active contract; the store was preserved".to_owned(),
                 )
             })?;
-        if active.package_epoch != stored_version
+        if !contract_matches_store_epoch(&active, stored_version)
             || active.bootstrap_version != sql::BOOTSTRAP_VERSION
+            || active.app_schema_hash != source_schema.hash
         {
             return Err(StorageError::IncompatibleStore(
-                "the active contract does not match the SQLite/bootstrap versions; the store was preserved"
+                "the active contract does not match the supported SQLite/bootstrap/schema contract; the store was preserved"
                     .to_owned(),
             ));
         }
-        // Omitting setup retires its executable hook without erasing its durable identity. This
-        // lets applications return to plain `open()` while preventing an older build from
-        // treating the same setup action as new work and rerunning it against a later store.
-        if target.setup_hash.is_empty() && !active.setup_hash.is_empty() {
-            target.setup_hash.clone_from(&active.setup_hash);
-        }
+        let active_setup_hash =
+            self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
+        let target_setup_hash = Self::target_setup_hash(&active_setup_hash, schema);
         target_contract_hash = target
             .hash()
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
         let source_contract_hash = active
             .hash()
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-        if active.kernel_layout_hash != target.kernel_layout_hash {
+        if active.kernel_layout_hash != target.kernel_layout_hash
+            && !(active.is_v1() && target.is_v2())
+        {
             return Err(StorageError::IncompatibleStore(
-                "the epoch-47 kernel layout fingerprint changed; the store was preserved"
+                "the kernel layout fingerprint changed without a supported store-contract upgrade; the store was preserved"
                     .to_owned(),
             ));
         }
-        if active.has_same_candidate_identity(&target) {
+        if active.is_v2()
+            && active.has_same_candidate_identity(&target)
+            && target_setup_hash == active_setup_hash
+        {
             self.validate_physical_schema_unlocked(schema)?;
             self.activate_schema_unlocked(schema)?;
             return Ok(MigrationCandidate {
@@ -1372,7 +1444,7 @@ impl EmbeddedStore {
                     .ok()
                     .flatten()
                     .as_deref()
-                    == Some(schema.setup_hash.as_bytes())
+                    == Some(target_setup_hash.as_bytes())
             })
             .filter(|_| {
                 self.bootstrap_read_unlocked(sql::CANDIDATE_RETIRE_STATE_KEY)
@@ -1477,13 +1549,13 @@ impl EmbeddedStore {
             self.write_bootstrap_unlocked(sql::CANDIDATE_CONTRACT_KEY, &target_json)?;
             self.write_bootstrap_unlocked(
                 sql::CANDIDATE_SETUP_HASH_KEY,
-                schema.setup_hash.as_bytes(),
+                target_setup_hash.as_bytes(),
             )?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_STATE_KEY, b"pending")?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"pending")?;
             self.write_bootstrap_unlocked(
                 sql::CANDIDATE_SETUP_STATE_KEY,
-                if schema.setup_hash.is_empty() {
+                if target_setup_hash.is_empty() {
                     b"skipped"
                 } else {
                     b"pending"
@@ -1531,7 +1603,7 @@ impl EmbeddedStore {
             candidate_generation,
             cleanup_generation: None,
             source_schema,
-            setup_complete: schema.setup_hash.is_empty(),
+            setup_complete: target_setup_hash.is_empty(),
             source_contract_hash,
             target_contract_hash,
             retired_generations,
@@ -2480,16 +2552,27 @@ impl EmbeddedStore {
                         .to_owned(),
                 )
             })?;
-        let mut target = StoreContract::for_schema(schema);
-        // Omitting a previously completed setup action retires its executable hook, not its
-        // durable identity. Carry that identity through any later automatic layout/schema upgrade
-        // so an older build cannot reinterpret the same store as never having run setup.
-        if target.setup_hash.is_empty() {
-            target.setup_hash.clone_from(&candidate_target.setup_hash);
-        }
+        let target = StoreContract::for_schema(schema);
+        let active = self
+            .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "active contract is missing; the active store was preserved".to_owned(),
+                )
+            })?;
+        let active_setup =
+            self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
+        let target_setup = Self::target_setup_hash(&active_setup, schema);
+        let candidate_setup = self.setup_hash_read_unlocked(sql::CANDIDATE_SETUP_HASH_KEY, None)?;
         if candidate_target != target {
             return Err(StorageError::IncompatibleStore(
                 "candidate contract no longer matches the target".to_owned(),
+            ));
+        }
+        if candidate_setup != target_setup {
+            return Err(StorageError::IncompatibleStore(
+                "candidate setup plan no longer matches the target; the active store was preserved"
+                    .to_owned(),
             ));
         }
         if !matches!(
@@ -2590,13 +2673,27 @@ impl EmbeddedStore {
                         .to_owned(),
                 )
             })?;
-        let mut target = StoreContract::for_schema(schema);
-        if target.setup_hash.is_empty() {
-            target.setup_hash.clone_from(&candidate_target.setup_hash);
-        }
+        let target = StoreContract::for_schema(schema);
+        let active = self
+            .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "active contract is missing; the active store was preserved".to_owned(),
+                )
+            })?;
+        let active_setup =
+            self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
+        let target_setup = Self::target_setup_hash(&active_setup, schema);
+        let candidate_setup = self.setup_hash_read_unlocked(sql::CANDIDATE_SETUP_HASH_KEY, None)?;
         if candidate_target != target {
             return Err(StorageError::IncompatibleStore(
                 "candidate contract no longer matches the target".to_owned(),
+            ));
+        }
+        if candidate_setup != target_setup {
+            return Err(StorageError::IncompatibleStore(
+                "candidate setup plan no longer matches the target; the active store was preserved"
+                    .to_owned(),
             ));
         }
         let previous_generation = self.driver.generation();
@@ -2670,11 +2767,12 @@ impl EmbeddedStore {
                 generation.to_string().as_bytes(),
             )?;
             self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
+            self.write_bootstrap_unlocked(sql::ACTIVE_SETUP_HASH_KEY, target_setup.as_bytes())?;
             // The semantic contract and SQLite epoch describe one published store version. Keep
             // them in the same cutover transaction so a process restart can never observe the new
             // generation through the old runtime epoch (or vice versa).
             self.driver
-                .execute(&sql::write_user_version(), Vec::new())?;
+                .execute(&sql::write_user_version(CURRENT_STORE_EPOCH), Vec::new())?;
             let mut retired = self.retired_generations_read_unlocked()?;
             if !retired.contains(&active_generation) {
                 retired.push(active_generation);
@@ -8573,6 +8671,25 @@ impl EmbeddedStore {
             .ok_or_else(|| StorageError::IncompatibleStore("active contract is missing".to_owned()))
     }
 
+    /// Reads the published setup-plan identity without exposing bootstrap internals to bindings.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn active_setup_hash_debug_read(&self) -> Result<String, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let contract = self
+            .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore("active contract is missing".to_owned())
+            })?;
+        self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&contract))
+    }
+
+    /// Test-only view of the `SQLite` header epoch used to prove cutover is one transaction.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn store_epoch_debug_read(&self) -> Result<i64, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.read_user_version()
+    }
+
     /// Corrupts one immutable payload row without changing its content address.
     #[cfg(any(test, feature = "testkit"))]
     pub fn origin_payload_corrupt_debug_write(&self) -> Result<(), StorageError> {
@@ -8698,6 +8815,23 @@ impl EmbeddedStore {
             .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
             .ok_or_else(|| StorageError::Unsatisfiable("active contract is missing".to_owned()))?;
         hash.clone_into(&mut contract.origin_reader_hash);
+        let encoded = serde_json::to_vec(&contract)
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        self.transaction_unlocked(|| {
+            self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &encoded)
+        })
+    }
+
+    /// Replaces the active kernel fingerprint to exercise fail-closed legacy-contract admission.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn contract_kernel_hash_debug_write(&self, hash: &str) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let mut contract = self
+            .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore("active contract is missing".to_owned())
+            })?;
+        hash.clone_into(&mut contract.kernel_layout_hash);
         let encoded = serde_json::to_vec(&contract)
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
         self.transaction_unlocked(|| {

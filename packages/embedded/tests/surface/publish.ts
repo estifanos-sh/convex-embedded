@@ -26,6 +26,11 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain("Download JavaScript bundle for the Node smoke test");
     expect(workflow).toContain("Enable pnpm for the Expo compile fixture");
     expect(workflow).toContain("node packages/embedded/scripts/publish.ts pack");
+    expect(workflow).toContain("node packages/embedded/scripts/publish.ts prepare-build");
+    expect(workflow).toContain("node packages/embedded/scripts/publish.ts qualify-tarball");
+    expect(workflow).toMatch(
+      /name: Prepare and pack the guarded Robelest package[\s\S]*?name: Qualify exact packed artifact[\s\S]*?qualify-tarball artifacts\/convex-embedded\.tgz/,
+    );
     expect(workflow).toContain(
       "npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public",
     );
@@ -67,6 +72,16 @@ describe("Robelest publishing workflow", () => {
       /name: Assemble and verify package[\s\S]*?name: Checkout[\s\S]*?fetch-depth: 0/,
     );
     expect(workflow).toContain("Qualify exact source for publication");
+    expect(workflow).toContain("Bind packed artifact digest");
+    expect(workflow).toContain("tarball_sha256: ${{ steps.tarball.outputs.sha256 }}");
+    expect(workflow).toContain(
+      "ASSEMBLED_TARBALL_SHA256: ${{ needs.assemble.outputs.tarball_sha256 }}",
+    );
+    expect(workflow).toContain("Robelest package SHA-256: $ASSEMBLED_TARBALL_SHA256");
+    expect(workflow).toContain(
+      "EXPECTED_TARBALL_SHA256: ${{ needs.release-tag.outputs.tarball_sha256 }}",
+    );
+    expect(workflow).toContain("Downloaded package digest $ACTUAL_TARBALL_SHA256");
     expect(workflow).toContain("needs: [gate, qualification, javascript, node, apple, android]");
     expect(workflow).toContain("Bind release tag to validated source");
     expect(workflow).toContain("git fetch --no-tags origin main");

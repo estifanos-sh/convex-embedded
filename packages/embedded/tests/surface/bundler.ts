@@ -69,6 +69,82 @@ describe("embedded bundler core", () => {
     expect(toModuleId("/repo/convex", "/repo/convex/admin/users.ts")).toBe("admin/users");
   });
 
+  test("binds the artifact hash to logical module ids as well as bytes", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = canonical("replicated", "query", "list");
+      await file(convexDir, "first.ts", source);
+      const first = await createFixtureBundle(root);
+
+      await rm(path.join(convexDir, "first.ts"));
+      await file(convexDir, "renamed.ts", source);
+      const renamed = await createFixtureBundle(root);
+
+      expect(renamed.moduleGraphHash).not.toBe(first.moduleGraphHash);
+      expect(renamed.artifact.artifactHash).not.toBe(first.artifact.artifactHash);
+      expect(renamed.artifact.modules.map((module) => module.id)).toContain(
+        "app/convex/renamed.ts",
+      );
+    });
+  });
+
+  test("describes setup candidates from local action semantics and their source closures", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "legacy.ts", "export const legacySchema = {};\n");
+      await file(localDir, "helper.ts", 'export const phase = "one";\n');
+      await file(
+        localDir,
+        "lifecycle.ts",
+        `import { local } from "../convex/_generated/embedded";
+import { legacySchema } from "./legacy";
+import { phase } from "./helper";
+const compatibility = local.compatibility(legacySchema);
+export const namedSetup = local.internalMutation({ handler: () => phase });
+export const openDevice = local.internalAction({ handler: () => null });
+export const carryHistory = compatibility.internalAction({ handler: () => null });
+`,
+      );
+      await file(localDir, "entry.ts", 'export { openDevice as open } from "./lifecycle";\n');
+
+      const first = await createFixtureBundle(root, localDir);
+      expect(first.artifact.expectedBinding).toEqual({ mobileAbi: 10, storageAbi: 32 });
+      expect(first.artifact.setups).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "carryHistory",
+            reference: "local/lifecycle:carryHistory",
+            setupOnly: true,
+          }),
+          expect.objectContaining({
+            name: "openDevice",
+            reference: "local/lifecycle:openDevice",
+            setupOnly: false,
+          }),
+          expect.objectContaining({
+            name: "open",
+            reference: "local/entry:open",
+            setupOnly: false,
+          }),
+        ]),
+      );
+      expect(first.artifact.setups.map((setup) => setup.name)).not.toContain("namedSetup");
+      const original = first.artifact.setups.find(
+        (setup) => setup.reference === "local/lifecycle:openDevice",
+      );
+      expect(original?.closureHash).toMatch(/^[a-f0-9]{16}$/);
+
+      await file(localDir, "helper.ts", 'export const phase = "two";\n');
+      const second = await createFixtureBundle(root, localDir);
+      const changed = second.artifact.setups.find(
+        (setup) => setup.reference === "local/lifecycle:openDevice",
+      );
+      expect(changed?.closureHash).not.toBe(original?.closureHash);
+    });
+  });
+
   const moduleSegment = fc.stringMatching(/^[a-z][a-z0-9]{0,7}$/);
   const moduleExtension = fc.constantFrom(
     ".ts",
@@ -716,11 +792,22 @@ export default defineComponent("defaultChild");
 
   test("renders quoted keys for module ids that are not identifiers", () => {
     const source = renderEmbeddedBundle({
+      artifact: {
+        artifactHash: "artifact",
+        executionHash: "graph",
+        expectedBinding: { mobileAbi: 10, storageAbi: 32 },
+        format: 1,
+        modules: [],
+        replicationHash: "manifest",
+        schemaHash: "schema",
+        setups: [],
+      },
       embeddedSchema: toEmbeddedGeneratedSchema(fixtureAnalysis),
       generatedPath: "/repo/convex/_generated/embedded.ts",
       localModules: {
         "local/admin/drafts": { file: "/repo/local/admin/drafts.ts" },
       },
+      localExports: { "local/admin/drafts": [] },
       manifest: {
         "admin/users": {
           list: { kind: "query", placement: "replicated", visibility: "public" },
@@ -872,7 +959,7 @@ describe("embedded local modules", () => {
     });
   });
 
-  test("accepts device-only modules with default, star, and mixed exports", async () => {
+  test("rejects star re-exports that cannot preserve immutable local references", async () => {
     await withFixture(async ({ convexDir, localDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -887,12 +974,9 @@ export { pref as "compact pref" };
 `,
       );
 
-      await expect(createFixtureBundle(root, localDir)).resolves.toMatchObject({
-        localModules: {
-          "local/drafts": { file: path.join(localDir, "drafts.ts") },
-          "local/helpers": { file: path.join(localDir, "helpers.ts") },
-        },
-      });
+      await expect(createFixtureBundle(root, localDir)).rejects.toThrow(
+        "generated local facades require named re-exports",
+      );
     });
   });
 
@@ -1082,8 +1166,8 @@ describe("embedded unplugin adapter", () => {
     });
   });
 
-  test("appends one stamp call to every device-only module it bundles", async () => {
-    await withFixture(async ({ convexDir, localDir }) => {
+  test("does not mutate device-only modules during an app build", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       const source = localFunctions(2);
@@ -1098,18 +1182,25 @@ describe("embedded unplugin adapter", () => {
 
       const transformed = await plugin.transform(source, modulePath);
 
-      expect(transformed?.code).toMatch(
-        new RegExp(
-          String.raw`__embeddedStampLocal\("local/sync/drafts", "[a-f0-9]{16}", \{ readCompact, setCompact \}\);`,
-        ),
+      expect(transformed ?? null).toBe(null);
+      expect((await plugin.transform(source, `${modulePath}?import`)) ?? null).toBe(null);
+      const resolvedFacade = await plugin.resolveId(
+        "./local/sync/drafts",
+        path.join(root, "app.ts"),
       );
-      expect((await plugin.transform(source, `${modulePath}?import`))?.code).toBe(
-        transformed?.code,
-      );
+      const facadeId =
+        typeof resolvedFacade === "string"
+          ? resolvedFacade
+          : (resolvedFacade as { id: string } | null)?.id;
+      expect(facadeId?.startsWith("\0virtual:convex-embedded/facade/")).toBe(true);
+      const facade = await plugin.load(facadeId!);
+      expect(facade).toContain('createLocalFacade("local/sync/drafts",');
+      expect(facade).toContain('export const readCompact = embeddedLocal["readCompact"]');
+      expect(facade).not.toContain("stampLocal");
     });
   });
 
-  test("stamps every exported setup compatibility registration", async () => {
+  test("keeps setup compatibility registrations in the unmodified source module", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -1134,10 +1225,29 @@ export const setup = local.internalAction({});
 
       const transformed = await plugin.transform(source, modulePath);
 
-      expect(transformed?.code).toMatch(
-        /__embeddedStampLocal\("local\/setup", "[a-f0-9]{16}", \{ currentWrite, legacyDelete, legacyRead, setup \}\);/,
-      );
-      expect(transformed?.code).not.toMatch(/\{[^}]*\blegacy\b[^}]*\}/);
+      expect(transformed ?? null).toBe(null);
+    });
+  });
+
+  test("wraps a named setup re-export in the immutable facade", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(localDir, "setup.ts", localFunctions());
+      await file(localDir, "entry.ts", 'export { setCompact as setup } from "./setup";\n');
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const resolved = await plugin.resolveId("./local/entry", path.join(root, "app.ts"));
+      const facadeId =
+        typeof resolved === "string" ? resolved : (resolved as { id: string } | null)?.id;
+      expect(facadeId?.startsWith("\0virtual:convex-embedded/facade/")).toBe(true);
+      const facade = await plugin.load(facadeId!);
+      expect(facade).toContain('export const setup = embeddedLocal["setup"]');
+      expect(facade).not.toContain("stampLocal");
     });
   });
 
@@ -1169,7 +1279,7 @@ export const setup = local.internalAction({});
     });
   });
 
-  test("stamps aliased export names and dodges an identifier the module already uses", async () => {
+  test("keeps aliased exports untouched for the generated facade", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -1186,11 +1296,7 @@ export { setCompact as delete, __embeddedStampLocal as marker };
 
       const transformed = await plugin.transform(source, path.join(localDir, "sync/drafts.ts"));
 
-      expect(transformed?.code).toMatch(
-        new RegExp(
-          String.raw`__embeddedStampLocal\$\("local/sync/drafts", "[a-f0-9]{16}", \{ delete: setCompact, marker: __embeddedStampLocal, readCompact, setCompact \}\);`,
-        ),
-      );
+      expect(transformed ?? null).toBe(null);
     });
   });
 
@@ -1226,7 +1332,7 @@ export { value as "compact pref", value as default };
     });
   });
 
-  test("names exports that follow a regex literal containing quotes", async () => {
+  test("keeps source containing regex literals untouched", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -1247,13 +1353,11 @@ export const toggle = local.mutation({ args: {}, handler: async () => null });
 
       const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
 
-      expect(transformed?.code).toMatch(
-        /__embeddedStampLocal\("local\/pins", "[a-f0-9]{16}", \{ toggle \}\);/,
-      );
+      expect(transformed ?? null).toBe(null);
     });
   });
 
-  test("never names ambient declarations or reserved words in the stamp", async () => {
+  test("keeps ambient declarations out of the emitted source transform", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -1283,13 +1387,11 @@ export const toggle = local.mutation({ args: {}, handler: async () => null });
 
       const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
 
-      expect(transformed?.code).toMatch(
-        /__embeddedStampLocal\("local\/pins", "[a-f0-9]{16}", \{ toggle \}\);/,
-      );
+      expect(transformed ?? null).toBe(null);
     });
   });
 
-  test("names every declarator of an export, including destructuring patterns", async () => {
+  test("does not rewrite destructuring exports", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -1310,9 +1412,7 @@ export const [head, ...tail] = [1, 2, 3];
 
       const transformed = await plugin.transform(source, path.join(localDir, "pins.ts"));
 
-      expect(transformed?.code).toMatch(
-        /__embeddedStampLocal\("local\/pins", "[a-f0-9]{16}", \{ alpha, beta, first, head, second, tail \}\);/,
-      );
+      expect(transformed ?? null).toBe(null);
     });
   });
 
@@ -1461,7 +1561,7 @@ describe("embedded Vite adapter", () => {
     });
   });
 
-  test("stamps device-only modules identically in the app and worker builds", async () => {
+  test("uses the same no-mutation module transform in app and worker builds", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
@@ -1480,11 +1580,9 @@ describe("embedded Vite adapter", () => {
       }>;
       const [workerPlugin] = configPlugin.config().worker.plugins();
 
-      const stamped = await appPlugin.transform(source, modulePath);
-      expect(stamped?.code).toMatch(
-        /__embeddedStampLocal\("local\/sync\/drafts", "[a-f0-9]{16}", \{/,
-      );
-      expect((await workerPlugin.transform(source, modulePath))?.code).toBe(stamped?.code);
+      const transformed = await appPlugin.transform(source, modulePath);
+      expect(transformed ?? null).toBe(null);
+      expect((await workerPlugin.transform(source, modulePath)) ?? null).toBe(null);
       expect(await appPlugin.load(modulePath)).toBe(null);
     });
   });

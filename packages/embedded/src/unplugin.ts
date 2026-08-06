@@ -22,13 +22,16 @@ import path from "node:path";
 
 import { createUnplugin, type UnpluginInstance } from "unplugin";
 
-import { generateEmbedded, readLocalExportNames, type EmbeddedBundleInput } from "./bundler";
+import { generateEmbedded, type EmbeddedBundleInput } from "./bundler";
 import { analyzeEmbeddedSchema, type ConvexEmbeddedSchema } from "./schema";
 import {
   fromVirtualSourceId,
+  fromVirtualFacadeId,
   renderEmbeddedBundle,
   renderEmbeddedIdentity,
-  renderLocalStamp,
+  renderLocalShim,
+  toVirtualFacadeId,
+  VIRTUAL_FACADE_MODULE_PREFIX,
   VIRTUAL_IDENTITY_MODULE_ID,
   VIRTUAL_MODULE_ID,
   VIRTUAL_SOURCE_MODULE_PREFIX,
@@ -73,7 +76,6 @@ const RESOLVED_VIRTUAL_IDENTITY_MODULE_ID = `\0${VIRTUAL_IDENTITY_MODULE_ID}`;
 const DEFAULT_CONVEX_DIR = "convex";
 const DEFAULT_SCHEMA_PATH = "schema.ts";
 const TS_EXTENSIONS = /\.(?:ts|tsx|mts|cts)$/;
-const COMMONJS_EXTENSIONS = /\.c[jt]s$/;
 
 /** Everything the plugin hooks read, resolved once per scan of the Convex and device sources. */
 interface EmbeddedGeneration {
@@ -81,13 +83,13 @@ interface EmbeddedGeneration {
   graphHash: string;
   identity: string;
   localIds: Map<string, string>;
+  localExports: Map<string, string[]>;
   registry: string;
 }
 
 interface EmbeddedProjectRoots {
   convex: string;
   local: string[];
-  localPrefixes: string[];
 }
 
 /**
@@ -132,7 +134,6 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
     roots = {
       convex: path.resolve(state.root, options.convexDir ?? DEFAULT_CONVEX_DIR),
       local,
-      localPrefixes: local.map((dir) => `${dir}${path.sep}`),
     };
     return roots;
   };
@@ -156,6 +157,9 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
             path.normalize(module.file),
             moduleId,
           ]),
+        ),
+        localExports: new Map(
+          Object.entries(bundle.localExports).map(([moduleId, exports]) => [moduleId, exports]),
         ),
         registry: renderEmbeddedBundle(bundle),
       };
@@ -186,6 +190,17 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
         if (sourcePath === undefined) return null;
         return withGeneration((current) => (current.files.has(sourcePath) ? sourcePath : null));
       }
+      if (id.startsWith(VIRTUAL_FACADE_MODULE_PREFIX)) {
+        const sourcePath = fromVirtualFacadeId(id);
+        if (sourcePath === undefined) return null;
+        return withGeneration((current) => (current.localIds.has(sourcePath) ? `\0${id}` : null));
+      }
+      if (importer !== undefined && !importer.startsWith("\0") && isRelativeOrAbsoluteImport(id)) {
+        return withGeneration((current) => {
+          const sourcePath = resolveLocalImport(id, importer, current.localIds);
+          return sourcePath === undefined ? null : `\0${toVirtualFacadeId(sourcePath)}`;
+        });
+      }
       if (
         importer !== RESOLVED_VIRTUAL_MODULE_ID &&
         importer !== RESOLVED_VIRTUAL_IDENTITY_MODULE_ID
@@ -200,7 +215,11 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
 
     load(this: { addWatchFile?: (id: string) => void }, id) {
       if (options.disabled) return null;
-      if (id !== RESOLVED_VIRTUAL_MODULE_ID && id !== RESOLVED_VIRTUAL_IDENTITY_MODULE_ID) {
+      if (
+        id !== RESOLVED_VIRTUAL_MODULE_ID &&
+        id !== RESOLVED_VIRTUAL_IDENTITY_MODULE_ID &&
+        !id.startsWith(`\0${VIRTUAL_FACADE_MODULE_PREFIX}`)
+      ) {
         return null;
       }
       const addWatchFile = this.addWatchFile?.bind(this);
@@ -209,32 +228,27 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
         addWatchFile?.(convex);
         for (const dir of local) addWatchFile?.(dir);
         for (const file of current.files) addWatchFile?.(file);
-        return id === RESOLVED_VIRTUAL_MODULE_ID ? current.registry : current.identity;
-      });
-    },
-
-    transformInclude(id) {
-      if (options.disabled) return false;
-      const { localPrefixes } = projectRoots();
-      if (localPrefixes.length === 0) return false;
-      const file = path.normalize(id.split("?")[0]!);
-      if (COMMONJS_EXTENSIONS.test(file)) return false;
-      return localPrefixes.some((prefix) => file.startsWith(prefix));
-    },
-
-    transform(code, id) {
-      const file = path.normalize(id.split("?")[0]!);
-      return withGeneration((current) => {
-        const moduleId = current.localIds.get(file);
+        if (id === RESOLVED_VIRTUAL_MODULE_ID) return current.registry;
+        if (id === RESOLVED_VIRTUAL_IDENTITY_MODULE_ID) return current.identity;
+        const sourcePath = fromVirtualFacadeId(id.slice(1));
+        if (sourcePath === undefined) return null;
+        const moduleId = current.localIds.get(sourcePath);
         if (moduleId === undefined) return null;
-        const stamp = renderLocalStamp(
+        return renderLocalShim(
           moduleId,
           current.graphHash,
-          code,
-          readLocalExportNames(code),
+          sourcePath,
+          current.localExports.get(moduleId),
         );
-        return stamp === "" ? null : { code: `${code}${stamp}`, map: null };
       });
+    },
+
+    transformInclude(_id) {
+      return false;
+    },
+
+    transform(_code, _id) {
+      return null;
     },
 
     vite: {
@@ -315,4 +329,29 @@ function isPluginSource(file: string, dir: string): boolean {
 function isInside(file: string, dir: string): boolean {
   const relative = path.relative(dir, file);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function isRelativeOrAbsoluteImport(id: string): boolean {
+  return id.startsWith(".") || path.isAbsolute(id);
+}
+
+/** Resolve only paths already discovered as local modules; never probe arbitrary application files. */
+function resolveLocalImport(
+  id: string,
+  importer: string,
+  localIds: Map<string, string>,
+): string | undefined {
+  if (importer.startsWith("\0")) return undefined;
+  const base = path.normalize(
+    path.isAbsolute(id) ? id : path.resolve(path.dirname(importer.split("?")[0]!), id),
+  );
+  for (const sourcePath of localIds.keys()) {
+    if (sourcePath === base) return sourcePath;
+    const extension = path.extname(sourcePath);
+    if (extension !== "" && sourcePath.slice(0, -extension.length) === base) return sourcePath;
+    if (path.dirname(sourcePath) === base && path.basename(sourcePath, extension) === "index") {
+      return sourcePath;
+    }
+  }
+  return undefined;
 }

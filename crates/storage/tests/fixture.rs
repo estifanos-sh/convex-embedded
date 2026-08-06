@@ -319,6 +319,14 @@ fn preview2_fixture_matches_checksum_and_semantic_oracle() {
             .migration_commit(&target, candidate.candidate_generation)
             .unwrap();
     }
+    // Preview 2's V1 contract is readable only long enough to publish a V2 contract through the
+    // candidate pointer transaction. The setup identity moved to its own bootstrap record.
+    let contract = store.active_contract_debug_read().unwrap();
+    assert_eq!(contract.format, 2);
+    assert_eq!(contract.package_epoch, 48);
+    assert!(contract.setup_hash.is_none());
+    assert_eq!(store.active_setup_hash_debug_read().unwrap(), "");
+    assert_eq!(store.store_epoch_debug_read().unwrap(), 48);
     let mut kinds = store
         .origin_page_read(candidate.active_generation, None, 1_000)
         .unwrap()
@@ -354,6 +362,25 @@ fn preview2_fixture_matches_checksum_and_semantic_oracle() {
         manifest["referencedPayloadCount"].as_u64().unwrap() as usize
     );
     assert_eq!(portable_snapshot(&store), manifest["portableOracle"]);
+}
+
+#[test]
+fn preview2_reader_rejects_an_unrecognized_v1_layout_before_candidate_writes() {
+    let opened_path = tmp_path("preview2_fixture_unknown_layout.sqlite3");
+    std::fs::copy(fixture_path(), &opened_path).unwrap();
+    let store =
+        EmbeddedStore::open_with_identity_key(opened_path.to_str().unwrap(), "unauthenticated")
+            .unwrap();
+    store
+        .contract_kernel_hash_debug_write("unrecognized-preview2-kernel")
+        .unwrap();
+
+    let error = store.migration_begin(&fixture_target_schema()).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("supported SQLite/bootstrap/schema contract"));
+    assert_eq!(store.store_epoch_debug_read().unwrap(), 47);
+    assert_eq!(store.active_contract_debug_read().unwrap().format, 1);
 }
 
 /// Capture is deliberately ignored: the checked-in database is a release artifact from this exact

@@ -18,7 +18,12 @@ import {
 
 import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../component/model";
 import { canonicalJson, hashDocument } from "../hash";
-import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../protocol";
+import {
+  EMBEDDED_PROTOCOL_LEGACY_VERSION,
+  EMBEDDED_PROTOCOL_MISMATCH,
+  EMBEDDED_PROTOCOL_VERSION,
+  isEmbeddedProtocolVersion,
+} from "../protocol";
 import { pointerPart } from "../id/path";
 import { projectWireDoc, type EmbeddedSchemaPlacements } from "../schema";
 
@@ -754,10 +759,10 @@ async function plainLiveResult(rows: QueryRow[]) {
 }
 
 function assertRuntimeVersion(runtime: { protocolVersion: number }): void {
-  if (runtime.protocolVersion === EMBEDDED_PROTOCOL_VERSION) return;
+  if (isEmbeddedProtocolVersion(runtime.protocolVersion)) return;
   throw new ConvexError({
     code: EMBEDDED_PROTOCOL_MISMATCH,
-    expected: EMBEDDED_PROTOCOL_VERSION,
+    expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
     received: runtime.protocolVersion,
   });
 }

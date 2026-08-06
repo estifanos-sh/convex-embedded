@@ -300,6 +300,53 @@ fn remote_authoritative_view_survives_candidate_cutover_without_network() {
 }
 
 #[test]
+fn epoch48_contract_separates_setup_plan_and_publishes_it_with_candidate_cutover() {
+    let path = tmp_path("migration_epoch48_setup_plan.db");
+    let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
+    let mut current = schema('0');
+    current.setup_hash = "setup:one".to_owned();
+    // First install seeds an empty base generation, then carries setup through the ordinary
+    // candidate path rather than putting it in the durable StoreContract.
+    let candidate = store.migration_begin(&current).unwrap();
+    if candidate.required {
+        store
+            .migration_bind(&current, candidate.candidate_generation)
+            .unwrap();
+        store
+            .migration_setup_complete(candidate.candidate_generation)
+            .unwrap();
+        store.migration_unbind().unwrap();
+        commit_candidate(&store, &current, candidate.candidate_generation).unwrap();
+    }
+    let contract = store.active_contract_debug_read().unwrap();
+    assert_eq!(store.store_epoch_debug_read().unwrap(), 48);
+    assert_eq!(contract.format, 2);
+    assert_eq!(contract.package_epoch, 48);
+    assert!(contract.setup_hash.is_none());
+    assert_eq!(store.active_setup_hash_debug_read().unwrap(), "setup:one");
+
+    let mut next = current.clone();
+    next.setup_hash = "setup:two".to_owned();
+    assert!(store.setup(&next).is_err());
+    let candidate = store.migration_begin(&next).unwrap();
+    assert!(candidate.required);
+    store
+        .migration_bind(&next, candidate.candidate_generation)
+        .unwrap();
+    store
+        .migration_setup_complete(candidate.candidate_generation)
+        .unwrap();
+    store.migration_unbind().unwrap();
+    commit_candidate(&store, &next, candidate.candidate_generation).unwrap();
+    assert_eq!(store.active_setup_hash_debug_read().unwrap(), "setup:two");
+    assert!(store
+        .active_contract_debug_read()
+        .unwrap()
+        .setup_hash
+        .is_none());
+}
+
+#[test]
 fn deleting_remote_subscription_deletes_its_carried_cursor_membership_and_projection() {
     let path = tmp_path("migration_remote_delete.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
@@ -568,6 +615,54 @@ fn result_only_cursor_cannot_publish_without_every_disclosed_projection() {
     );
     assert_eq!(store.result_read(&result.key).unwrap(), Some(result));
     assert!(read_doc(&store, "issues", local_id).is_some());
+}
+
+#[test]
+fn cursorless_result_paths_are_cache_only_and_do_not_claim_projection_dependencies() {
+    let path = tmp_path("migration_cursorless_result_paths.db");
+    let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
+    let active = schema('0');
+    store.setup(&active).unwrap();
+    let result = ResultEntry {
+        key: "result:cursorless".to_owned(),
+        function: "issues:read".to_owned(),
+        args: "{}".to_owned(),
+        schema_hash: active.hash.clone(),
+        module_hash: "module:cursorless".to_owned(),
+        skeleton: br#"{"value":null}"#.to_vec(),
+        paths: serde_json::to_vec(&serde_json::json!([{
+            "path": "/value",
+            "table": "issues",
+            "rowId": "n575pnjjhzf95ze91djp5v26b188xreb",
+        }]))
+        .unwrap(),
+        skeleton_hash: "skeleton:cursorless".to_owned(),
+        clock: 1.0,
+    };
+    store
+        .remote_page_write(&storage::RemotePageWrite {
+            subscription: "issues:cursorless-result".to_owned(),
+            members: vec![],
+            projections: vec![],
+            crdt: vec![],
+            blobs: vec![],
+            cursor: None,
+            received_time: 10,
+            result: Some(Box::new(result.clone())),
+        })
+        .unwrap();
+
+    let target = schema('1');
+    let candidate = store.migration_begin(&target).unwrap();
+    commit_candidate(&store, &target, candidate.candidate_generation).unwrap();
+    assert_eq!(store.result_read(&result.key).unwrap(), Some(result));
+    assert_eq!(
+        store
+            .remote_cursor_read("issues:cursorless-result")
+            .unwrap(),
+        None,
+        "a cursorless cache entry cannot publish a carried cursor"
+    );
 }
 
 #[test]
@@ -1771,12 +1866,12 @@ fn an_older_runtime_cannot_rebuild_a_newer_semantic_contract_backward() {
         })
         .unwrap();
     store.id_delete("issues", local_id).unwrap();
-    store.contract_epoch_debug_write(48).unwrap();
+    store.contract_epoch_debug_write(47).unwrap();
 
     let error = store.migration_begin(&current).err().unwrap();
     assert!(error
         .to_string()
-        .contains("does not match the SQLite/bootstrap versions"));
+        .contains("supported SQLite/bootstrap/schema contract"));
     assert!(store.id_read("issues", local_id).unwrap().is_none());
 }
 

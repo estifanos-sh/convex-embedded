@@ -80,6 +80,13 @@ const main = defineConfig({
   ],
   hooks: {
     "build:done": () => {
+      // `package.json` is stamped by the release workflow before this build. Carry the exact
+      // value into the tarball so post-assembly qualification can prove the runtime and manifest
+      // were produced for the same release rather than merely packed from the same checkout.
+      writeFileSync(
+        new URL("./dist/artifact.json", import.meta.url),
+        `${JSON.stringify({ format: 1, packageVersion: version })}\n`,
+      );
       const componentConfig = new URL("./dist/component/convex.config.mjs", import.meta.url);
       if (existsSync(componentConfig)) {
         copyFileSync(

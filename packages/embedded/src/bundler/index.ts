@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
 import type { EmbeddedSchemaAnalysis } from "../schema";
 import {
   EMBEDDED_GENERATED_FORMAT_VERSION,
@@ -136,6 +137,17 @@ export interface EmbeddedBundleResult {
   /** Hash of the manifest plus every device source, used by the runtime identity. */
   moduleGraphHash: string;
 
+  /**
+   * Deterministic application artifact consumed by every runtime adapter.
+   *
+   * This is deliberately separate from the generated Convex contract: it describes executable
+   * application code, not the package's durable store contract.
+   */
+  artifact: AppArtifactV1;
+
+  /** Named exports that the generated immutable facade replaces for each local module. */
+  localExports: Record<string, string[]>;
+
   /** Canonical function registrations included in the device artifact. */
   manifest: EmbeddedFunctionManifest;
 }
@@ -154,6 +166,47 @@ export type EmbeddedFunctionManifest = Record<
   string,
   Record<string, EmbeddedFunctionManifestEntry>
 >;
+
+export interface LocalExportDescriptor {
+  name: string;
+  reference: string;
+}
+
+/**
+ * One candidate setup entrypoint discovered from a real local registration.
+ *
+ * `closureHash` is the generated local module-graph identity the runtime stamps onto the exported
+ * registration, while `setupOnly` mirrors the generated compatibility marker. Neither property
+ * is inferred from the export's spelling.
+ */
+export interface LocalSetupDescriptor extends LocalExportDescriptor {
+  closureHash: string;
+  setupOnly: boolean;
+}
+
+export interface AppArtifactModule {
+  contentHash: string;
+  exports: LocalExportDescriptor[];
+  id: string;
+}
+
+/**
+ * The adapter-neutral description of application code that can run on a device.
+ *
+ * Every field is content addressed and canonically ordered. It intentionally has no checkout
+ * path, timestamp, package version, or object identity, so Vite, Metro, the worker, and Expo can
+ * all consume the same contract.
+ */
+export interface AppArtifactV1 {
+  artifactHash: string;
+  executionHash: string;
+  expectedBinding: { mobileAbi: number; storageAbi: number };
+  format: 1;
+  modules: AppArtifactModule[];
+  replicationHash: string;
+  schemaHash: string;
+  setups: LocalSetupDescriptor[];
+}
 
 const DEFAULT_CONVEX_DIR = "convex";
 const DEFAULT_SCHEMA_PATH = "schema.ts";
@@ -363,6 +416,68 @@ async function createEmbeddedBundleInner(
     await assertGeneratedFile(generatedPath, { manifestHash, schemaSourceHash });
   }
   const graph = [...sourceFiles].sort();
+  const localModuleByFile = new Map(
+    Object.entries(localModules).map(([moduleId, module]) => [
+      path.normalize(module.file),
+      moduleId,
+    ]),
+  );
+  const localExports: Record<string, string[]> = Object.fromEntries(
+    Object.entries(localModules)
+      .map(([moduleId, module]) => [
+        moduleId,
+        readLocalExportNames(sources.get(path.normalize(module.file)) ?? "").map(([name]) => name),
+      ])
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+  ) as Record<string, string[]>;
+  const localSetups = readLocalSetupDescriptors(localModules, sources);
+  const artifactModules = graph.map((file) => {
+    const normalized = path.normalize(file);
+    const localModuleId = localModuleByFile.get(normalized);
+    const id =
+      localModuleId === undefined
+        ? `app/${normalizePath(path.relative(root, normalized))}`
+        : localModuleId;
+    const exports = (localModuleId === undefined ? [] : (localExports[localModuleId] ?? [])).map(
+      (name) => ({ name, reference: `${localModuleId}:${name}` }),
+    );
+    return { contentHash: hashBytes(sources.get(normalized)!), exports, id };
+  });
+  const executionHash = hashJson({ manifest, modules: artifactModules });
+  const schemaHash = toEmbeddedGeneratedSchema(input.analysis).runtimeStoreSchema.hash;
+  if (schemaHash === undefined) {
+    throw new Error("Embedded application artifact requires a generated runtime schema hash");
+  }
+  const setups = [...localSetups]
+    .flatMap(([moduleId, exports]) =>
+      [...exports].map(([name, setupOnly]) => ({
+        closureHash: executionHash,
+        name,
+        reference: `${moduleId}:${name}`,
+        setupOnly,
+      })),
+    )
+    .sort((left, right) =>
+      left.reference < right.reference ? -1 : left.reference > right.reference ? 1 : 0,
+    );
+  const artifactWithoutHash = {
+    executionHash,
+    expectedBinding: {
+      // The Expo bridge is versioned independently from the Node/WASM storage ABI. Keep this
+      // paired with `EXPO_NATIVE_API_VERSION` in `src/expo/module.ts`.
+      mobileAbi: 10,
+      storageAbi: EMBEDDED_STORAGE_ABI_VERSION,
+    },
+    format: 1 as const,
+    modules: artifactModules,
+    replicationHash: manifestHash,
+    schemaHash,
+    setups,
+  };
+  const artifact: AppArtifactV1 = {
+    ...artifactWithoutHash,
+    artifactHash: hashJson(artifactWithoutHash),
+  };
 
   return {
     embeddedSchema: toEmbeddedGeneratedSchema(input.analysis),
@@ -370,10 +485,9 @@ async function createEmbeddedBundleInner(
     localModules,
     manifest,
     manifestHash,
-    moduleGraphHash: hashJson({
-      manifest,
-      sources: graph.map((file) => hashBytes(sources.get(file)!)),
-    }),
+    artifact,
+    localExports,
+    moduleGraphHash: executionHash,
     modules,
     schemaPath,
     schemaSourceHash,
@@ -384,7 +498,11 @@ async function createEmbeddedBundleInner(
 const LOCAL_NAMED_EXPORT = /export\s+(?:async\s+)?(?:function\s*\*?|class)\s+([$A-Z_a-z][$\w]*)/g;
 const LOCAL_VARIABLE_EXPORT = /export\s+(?:const|let|var)\s+/g;
 const LOCAL_EXPORT_LIST = /export\s+(type\s+)?\{([^}]*)\}(\s*from\b)?/g;
+const LOCAL_STAR_EXPORT = /\bexport\s*\*(?:\s+as\s+[$A-Z_a-z][$\w]*)?\s+from\b/;
 const LOCAL_EXPORT_ALIAS = /^([$A-Z_a-z][$\w]*)\s+as\s+([$A-Z_a-z][$\w]*)$/;
+const LOCAL_COMPATIBILITY_BINDING =
+  /\b(?:const|let|var)\s+([$A-Z_a-z][$\w]*)(?:\s*:[^=;\n]+)?\s*=\s*local\s*\.\s*compatibility\s*\(/g;
+const LOCAL_NAMED_REEXPORT = /export\s*\{([^}]*)\}\s*from\s*(["'])([^"']+)\2/g;
 const AMBIENT_DECLARATION = /\bdeclare\b/g;
 const IDENTIFIER = /^[$A-Z_a-z][$\w]*$/;
 const RESERVED_BINDINGS = new Set([
@@ -440,6 +558,7 @@ async function readLocalModules(
       sources.set(resolved, await readFile(file, "utf8"));
       placementByFile.set(resolved, "local");
       const moduleId = `local/${toModuleId(localDir, file)}`;
+      assertLocalFacadeExports(moduleId, sources.get(resolved) ?? "");
       const existing = localModules[moduleId];
       if (existing !== undefined) {
         throw new Error(
@@ -450,6 +569,14 @@ async function readLocalModules(
     }
   }
   return localModules;
+}
+
+function assertLocalFacadeExports(moduleId: string, source: string): void {
+  if (LOCAL_STAR_EXPORT.test(maskCommentsAndStrings(source))) {
+    throw new Error(
+      `device-only module ${moduleId} uses export *; generated local facades require named re-exports so setup references remain immutable`,
+    );
+  }
 }
 
 /**
@@ -476,13 +603,15 @@ export function readLocalExportNames(source: string): Array<[string, string]> {
     }
   }
   for (const match of code.matchAll(LOCAL_EXPORT_LIST)) {
-    if (match[1] !== undefined || match[3] !== undefined) continue;
+    if (match[1] !== undefined) continue;
     for (const clause of match[2]!.split(",")) {
       const trimmed = clause.trim();
       if (trimmed === "" || /^type\s/.test(trimmed)) continue;
       const alias = LOCAL_EXPORT_ALIAS.exec(trimmed);
       const exported = alias?.[2] ?? trimmed;
-      const binding = alias?.[1] ?? trimmed;
+      // A named re-export is read from the source module namespace by the generated facade, so
+      // its public name is the only stable binding available at this stage.
+      const binding = match[3] === undefined ? (alias?.[1] ?? trimmed) : exported;
       if (exported === "default" || !IDENTIFIER.test(exported) || !IDENTIFIER.test(binding)) {
         continue;
       }
@@ -491,6 +620,135 @@ export function readLocalExportNames(source: string): Array<[string, string]> {
     }
   }
   return [...names].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+/**
+ * Reads setup candidates from local-builder semantics, not an export-name convention.
+ *
+ * A lifecycle setup must be an internal local action. Compatibility-bound actions retain their
+ * generated setup-only marker; ordinary internal actions remain valid explicit `open(action)`
+ * candidates and are marked `setupOnly: false` for consumers that need to distinguish them.
+ */
+function readLocalSetupDescriptors(
+  localModules: EmbeddedBundleResult["localModules"],
+  sources: ReadonlyMap<string, string>,
+): Map<string, Map<string, boolean>> {
+  const modules = new Map(
+    Object.entries(localModules).map(([moduleId, module]) => [
+      moduleId,
+      { file: path.normalize(module.file), source: sources.get(path.normalize(module.file)) ?? "" },
+    ]),
+  );
+  const moduleByFile = new Map([...modules].map(([moduleId, module]) => [module.file, moduleId]));
+  const cache = new Map<string, Map<string, boolean>>();
+  const reading = new Set<string>();
+  const readModule = (moduleId: string): Map<string, boolean> => {
+    const cached = cache.get(moduleId);
+    if (cached !== undefined) return cached;
+    if (reading.has(moduleId)) {
+      throw new Error(`device-only setup exports contain a cycle at ${moduleId}`);
+    }
+    const module = modules.get(moduleId);
+    if (module === undefined) return new Map();
+    reading.add(moduleId);
+    const exported = new Map<string, boolean>();
+    const setupBindings = readLocalSetupBindings(module.source);
+    for (const [name, binding] of readLocalExportNames(module.source)) {
+      const setupOnly = setupBindings.get(binding);
+      if (setupOnly !== undefined) exported.set(name, setupOnly);
+    }
+    for (const reexport of readLocalNamedReexports(module.source)) {
+      const target = resolveLocalReexport(module.file, reexport.specifier, moduleByFile);
+      if (target === undefined) continue;
+      const targetExports = readModule(target);
+      for (const [sourceName, exportedName] of reexport.names) {
+        const setupOnly = targetExports.get(sourceName);
+        if (setupOnly !== undefined) exported.set(exportedName, setupOnly);
+      }
+    }
+    reading.delete(moduleId);
+    cache.set(moduleId, exported);
+    return exported;
+  };
+  return new Map([...modules.keys()].sort().map((moduleId) => [moduleId, readModule(moduleId)]));
+}
+
+function readLocalSetupBindings(source: string): Map<string, boolean> {
+  const code = maskAmbientDeclarations(maskCommentsAndStrings(source));
+  const compatibilityBindings = new Set<string>();
+  for (const match of code.matchAll(LOCAL_COMPATIBILITY_BINDING)) {
+    compatibilityBindings.add(match[1]!);
+  }
+  const bindings = new Map<string, boolean>();
+  for (const match of code.matchAll(LOCAL_VARIABLE_EXPORT)) {
+    const declarators = code.slice(match.index + match[0].length);
+    const end = indexOfTopLevel(declarators, ";");
+    for (const declarator of splitTopLevel(end === -1 ? declarators : declarators.slice(0, end))) {
+      const equals = indexOfTopLevel(declarator, "=");
+      if (equals === -1) continue;
+      const name = declarator.slice(0, equals).trim();
+      if (!IDENTIFIER.test(name)) continue;
+      const setupOnly = localInternalActionSetupOnly(
+        declarator.slice(equals + 1),
+        compatibilityBindings,
+      );
+      if (setupOnly !== undefined) bindings.set(name, setupOnly);
+    }
+  }
+  return bindings;
+}
+
+function localInternalActionSetupOnly(
+  expression: string,
+  compatibilityBindings: ReadonlySet<string>,
+): boolean | undefined {
+  const marker = ".internalAction";
+  const markerIndex = expression.indexOf(marker);
+  if (markerIndex === -1 || !/\.\s*internalAction\s*\(/.test(expression)) return undefined;
+  const receiver = expression.slice(0, markerIndex).replaceAll(/\s/g, "");
+  if (receiver === "local") return false;
+  if (compatibilityBindings.has(receiver)) return true;
+  return receiver.startsWith("local.compatibility(") ? true : undefined;
+}
+
+function readLocalNamedReexports(
+  source: string,
+): Array<{ names: Array<[source: string, exported: string]>; specifier: string }> {
+  const code = maskCommentsAndStrings(source);
+  const reexports = [];
+  for (const match of source.matchAll(LOCAL_NAMED_REEXPORT)) {
+    if (match.index === undefined || !code.startsWith("export", match.index)) continue;
+    const names: Array<[string, string]> = [];
+    for (const clause of match[1]!.split(",")) {
+      const trimmed = clause.trim();
+      const alias = LOCAL_EXPORT_ALIAS.exec(trimmed);
+      const sourceName = alias?.[1] ?? trimmed;
+      const exportedName = alias?.[2] ?? trimmed;
+      if (!IDENTIFIER.test(sourceName) || !IDENTIFIER.test(exportedName)) continue;
+      names.push([sourceName, exportedName]);
+    }
+    reexports.push({ names, specifier: match[3]! });
+  }
+  return reexports;
+}
+
+function resolveLocalReexport(
+  importer: string,
+  specifier: string,
+  moduleByFile: ReadonlyMap<string, string>,
+): string | undefined {
+  if (!specifier.startsWith(".") && !path.isAbsolute(specifier)) return undefined;
+  const base = path.resolve(path.dirname(importer), specifier);
+  const candidates = [
+    base,
+    ...PROJECT_SOURCE_EXTENSIONS.map((extension) => `${base}${extension}`),
+    ...PROJECT_SOURCE_EXTENSIONS.map((extension) => path.join(base, `index${extension}`)),
+  ];
+  for (const candidate of candidates) {
+    const moduleId = moduleByFile.get(path.normalize(candidate));
+    if (moduleId !== undefined) return moduleId;
+  }
+  return undefined;
 }
 
 /** Bindings introduced by one declarator target: an identifier or a destructuring pattern. */

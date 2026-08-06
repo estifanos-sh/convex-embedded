@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
+/// The immutable Preview 2 durable contract. It remains readable but is never written again.
+pub const STORE_CONTRACT_V1_EPOCH: i64 = 47;
+/// The first contract whose setup identity is stored independently from durable layout identity.
+pub const STORE_CONTRACT_V2_EPOCH: i64 = 48;
+pub const STORE_CONTRACT_V1_FORMAT: i64 = 1;
+pub const STORE_CONTRACT_V2_FORMAT: i64 = 2;
+
 /// Permanent numeric identities for originated semantic records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
@@ -91,30 +98,40 @@ pub struct OriginPage {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreContract {
+    /// Encoding discriminator. Missing means the frozen Preview 2 V1 shape.
+    #[serde(
+        default = "legacy_store_contract_format",
+        skip_serializing_if = "is_legacy_format"
+    )]
+    pub format: i64,
     pub bootstrap_version: i64,
     pub package_epoch: i64,
     pub app_schema_hash: String,
     pub kernel_layout_hash: String,
     pub generation_layout_hash: String,
     pub origin_writer_hash: String,
+    /// V1 retained-reader metadata. V2 deliberately omits it: reader coverage is a runtime
+    /// capability, never a durable migration trigger.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin_reader_hash: String,
-    /// Identity of the candidate setup graph.
-    #[serde(default)]
-    pub setup_hash: String,
+    /// V1 setup identity. V2 deliberately omits it and uses the bootstrap setup-plan record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_hash: Option<String>,
 }
 
 impl StoreContract {
     #[must_use]
     pub fn for_schema(schema: &super::StoreSchema) -> Self {
         Self {
+            format: STORE_CONTRACT_V2_FORMAT,
             bootstrap_version: crate::sql::BOOTSTRAP_VERSION,
-            package_epoch: crate::sql::EMBEDDED_EPOCH,
+            package_epoch: STORE_CONTRACT_V2_EPOCH,
             app_schema_hash: schema.hash.clone(),
             kernel_layout_hash: manifest_hash(&crate::sql::kernel_layout_manifest()),
             generation_layout_hash: manifest_hash(&crate::sql::generation_contract_manifest()),
             origin_writer_hash: manifest_hash(&origin_writer_manifest()),
-            origin_reader_hash: manifest_hash(&origin_reader_manifest()),
-            setup_hash: schema.setup_hash.clone(),
+            origin_reader_hash: String::new(),
+            setup_hash: None,
         }
     }
 
@@ -122,18 +139,37 @@ impl StoreContract {
         serde_json::to_vec(self).map(|bytes| sha256_hex(&bytes))
     }
 
+    #[must_use]
+    pub(crate) fn is_v1(&self) -> bool {
+        self.format == STORE_CONTRACT_V1_FORMAT
+    }
+
+    #[must_use]
+    pub(crate) fn is_v2(&self) -> bool {
+        self.format == STORE_CONTRACT_V2_FORMAT
+    }
+
     /// Reader coverage is a runtime capability, not a reason to rewrite a store. Everything else
     /// is persisted candidate identity.
     #[must_use]
     pub(crate) fn has_same_candidate_identity(&self, other: &Self) -> bool {
         self.bootstrap_version == other.bootstrap_version
+            && self.format == other.format
             && self.package_epoch == other.package_epoch
             && self.app_schema_hash == other.app_schema_hash
             && self.kernel_layout_hash == other.kernel_layout_hash
             && self.generation_layout_hash == other.generation_layout_hash
             && self.origin_writer_hash == other.origin_writer_hash
-            && self.setup_hash == other.setup_hash
     }
+}
+
+fn legacy_store_contract_format() -> i64 {
+    STORE_CONTRACT_V1_FORMAT
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` callback receives `&T`.
+fn is_legacy_format(format: &i64) -> bool {
+    *format == STORE_CONTRACT_V1_FORMAT
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +299,7 @@ fn origin_writer_manifest() -> Vec<(i64, i64, &'static str, &'static str)> {
         .collect()
 }
 
+#[cfg(any(test, feature = "testkit"))]
 fn origin_reader_manifest() -> Vec<(i64, i64, &'static str)> {
     ORIGIN_CODECS
         .iter()

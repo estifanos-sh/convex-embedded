@@ -7,6 +7,8 @@ import { afterEach, describe, expect, test } from "vite-plus/test";
 
 import {
   preparePackage,
+  prepareBuildVersion,
+  qualifyTarball,
   packPackage,
   preview2Tag,
   preview2Version,
@@ -15,6 +17,7 @@ import {
   requiredPackageFiles,
   sourcePackageName,
   verifyManifest,
+  verifyPackageTree,
   verifyFixtureFiles,
   verifyPreview2PendingVersion,
   verifyPackedFiles,
@@ -71,6 +74,23 @@ describe("Robelest package publication", () => {
     expect(manifest.scripts).toEqual({ build: "vp pack" });
   });
 
+  test("stamps the release version before build without changing the source package identity", () => {
+    const directory = mkdtempSync(join(tmpdir(), "convex-embedded-build-version-"));
+    temporary.push(directory);
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({ name: sourcePackageName, version: "0.0.1" }),
+    );
+
+    prepareBuildVersion(directory, "0.0.1-preview-3");
+
+    expect(JSON.parse(readFileSync(join(directory, "package.json"), "utf8"))).toMatchObject({
+      name: sourcePackageName,
+      version: "0.0.1-preview-3",
+    });
+    expect(() => prepareBuildVersion(directory, "not-a-version")).toThrow("must be semver");
+  });
+
   test("cannot verify the official package identity for publication", () => {
     expect(() =>
       verifyManifest(
@@ -91,6 +111,9 @@ describe("Robelest package publication", () => {
     expect(() => verifyPackedFiles(complete)).toThrow("x86_64");
 
     for (const path of [
+      "package/LICENSE",
+      "package/README.md",
+      "package/dist/artifact.json",
       "package/dist/browser-embedded.mjs",
       "package/dist/thread/browser-worker.mjs",
     ]) {
@@ -110,6 +133,7 @@ describe("Robelest package publication", () => {
     writeFileSync(
       join(directory, "package.json"),
       JSON.stringify({
+        exports: { "./node": "./dist/node.mjs" },
         files: [
           "ConvexEmbeddedNative.podspec",
           "android",
@@ -126,11 +150,19 @@ describe("Robelest package publication", () => {
     for (const path of requiredPackageFiles()) {
       const absolute = join(directory, path);
       mkdirSync(join(absolute, ".."), { recursive: true });
-      writeFileSync(absolute, "fixture");
+      writeFileSync(
+        absolute,
+        path === "dist/artifact.json"
+          ? JSON.stringify({ format: 1, packageVersion: "0.0.0" })
+          : path === "dist/node.mjs"
+            ? "export {};\n"
+            : "fixture",
+      );
     }
 
     preparePackage(directory);
     const tarball = packPackage(directory, destination, "preview");
+    expect(() => qualifyTarball(tarball, "preview")).not.toThrow();
 
     expect(readFileSync(tarball).byteLength).toBeGreaterThan(0);
     writeFileSync(
@@ -144,6 +176,33 @@ describe("Robelest package publication", () => {
     const aliased = join(consumer, "node_modules/@convex-dev/embedded/package.json");
     expect(existsSync(aliased)).toBe(true);
     expect(JSON.parse(readFileSync(aliased, "utf8")).name).toBe(publishedPackageName);
+  });
+
+  test("requires release metadata, documentation, and runtime artifacts to agree", () => {
+    const directory = mkdtempSync(join(tmpdir(), "convex-embedded-artifact-version-"));
+    temporary.push(directory);
+    writeFileSync(
+      join(directory, "package.json"),
+      JSON.stringify({
+        name: sourcePackageName,
+        version: "0.0.1-preview-3",
+      }),
+    );
+    for (const path of requiredPackageFiles()) {
+      const absolute = join(directory, path);
+      mkdirSync(join(absolute, ".."), { recursive: true });
+      writeFileSync(
+        absolute,
+        path === "dist/artifact.json"
+          ? JSON.stringify({ format: 1, packageVersion: "wrong" })
+          : "fixture",
+      );
+    }
+    preparePackage(directory, "0.0.1-preview-3");
+
+    expect(() => verifyPackageTree(directory, "prerelease")).toThrow(
+      "artifact version does not match",
+    );
   });
 
   test("rejects placeholder and prerelease versions", () => {

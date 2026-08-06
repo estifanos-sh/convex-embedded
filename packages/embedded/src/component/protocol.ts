@@ -36,8 +36,10 @@ import { write as retentionWrite } from "./crdt/retention";
 import { bytesHash, hashDocument, hashValue } from "../hash";
 import {
   EMBEDDED_CLIENT_RETIRED,
+  EMBEDDED_PROTOCOL_LEGACY_VERSION,
   EMBEDDED_PROTOCOL_MISMATCH,
   EMBEDDED_PROTOCOL_VERSION,
+  isEmbeddedProtocolVersion,
 } from "../protocol";
 
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
@@ -1466,10 +1468,10 @@ function assertRuntime(runtime: {
   moduleGraphHash: string;
   protocolVersion: number;
 }): void {
-  if (runtime.protocolVersion !== EMBEDDED_PROTOCOL_VERSION) {
+  if (!isEmbeddedProtocolVersion(runtime.protocolVersion)) {
     throw new ConvexError({
       code: EMBEDDED_PROTOCOL_MISMATCH,
-      expected: EMBEDDED_PROTOCOL_VERSION,
+      expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
       message: `Embedded protocol ${runtime.protocolVersion} is not supported.`,
       received: runtime.protocolVersion,
     });

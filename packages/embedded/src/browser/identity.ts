@@ -50,6 +50,8 @@ export function createRuntimeIdentity(storageId = browserStorageId()): RuntimeId
     protocolVersion: EMBEDDED_PROTOCOL_VERSION,
     schemaHash: embeddedIdentity.schemaHash,
     storageId,
+    // This is the published storage-contract epoch, including candidate migrations. It remains
+    // part of admission even though physical ownership is keyed only by the OPFS store address.
     storeFormatVersion: EMBEDDED_EPOCH,
     wasmAbiVersion: WASM_API_VERSION,
   };
@@ -58,20 +60,14 @@ export function createRuntimeIdentity(storageId = browserStorageId()): RuntimeId
 /**
  * Stable coordination scope for one origin storage runtime.
  *
- * The scope is intentionally protocol/package/storage/ABI scoped, not schema or module-graph
- * scoped. A schema/module mismatch must hit the same leader and be rejected there; otherwise two
- * different bundles could open separate OPFS database owners.
+ * The scope is only the physical storage address. Compatibility belongs to admission after the
+ * owner has been found; adding a package, protocol, ABI, schema, or graph identity here would let
+ * two incompatible bundles acquire independent owners for the same OPFS database.
  *
  * @internal
  */
 export function runtimeScope(identity: RuntimeIdentity): string {
-  return [
-    "convex-embedded",
-    `p${identity.protocolVersion}`,
-    `pkg${safe(identity.packageVersion)}`,
-    `s${safe(identity.storageId)}`,
-    `wasm${identity.wasmAbiVersion}`,
-  ].join(":");
+  return ["convex-embedded", "storage", safe(identity.storageId)].join(":");
 }
 
 /**
@@ -83,12 +79,24 @@ export function assertSameRuntimeIdentity(
   actual: RuntimeIdentity,
   expected: RuntimeIdentity,
 ): void {
-  const mismatches = (Object.keys(expected) as Array<keyof RuntimeIdentity>).filter(
-    (key) => actual[key] !== expected[key],
-  );
+  // These are the admission contract, not the owner address. Keep this list explicit so a setup
+  // supplied by only one contender is a mismatch in both directions rather than being skipped by
+  // Object.keys(expected).
+  const mismatches = runtimeIdentityFields.filter((key) => actual[key] !== expected[key]);
   if (!mismatches.length) return;
   throw new RuntimeIdentityMismatchError(mismatches);
 }
+
+const runtimeIdentityFields = [
+  "moduleGraphHash",
+  "packageVersion",
+  "protocolVersion",
+  "schemaHash",
+  "setupGraphHash",
+  "setupReference",
+  "storeFormatVersion",
+  "wasmAbiVersion",
+] as const satisfies ReadonlyArray<keyof RuntimeIdentity>;
 
 /** An existing storage owner was opened by a different app deployment. @internal */
 export class RuntimeIdentityMismatchError extends Error {

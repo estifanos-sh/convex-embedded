@@ -5,6 +5,7 @@ import type { EmbeddedBundleResult } from "./index";
 export const VIRTUAL_MODULE_ID = "virtual:convex-embedded";
 export const VIRTUAL_IDENTITY_MODULE_ID = "virtual:convex-embedded/identity";
 export const VIRTUAL_SOURCE_MODULE_PREFIX = `${VIRTUAL_MODULE_ID}/source/`;
+export const VIRTUAL_FACADE_MODULE_PREFIX = `${VIRTUAL_MODULE_ID}/facade/`;
 
 export function toVirtualSourceId(filePath: string): string {
   return `${VIRTUAL_SOURCE_MODULE_PREFIX}${Buffer.from(path.resolve(filePath), "utf8").toString(
@@ -15,6 +16,24 @@ export function toVirtualSourceId(filePath: string): string {
 export function fromVirtualSourceId(id: string): string | undefined {
   if (!id.startsWith(VIRTUAL_SOURCE_MODULE_PREFIX)) return undefined;
   const encoded = id.slice(VIRTUAL_SOURCE_MODULE_PREFIX.length);
+  try {
+    const decoded = Buffer.from(encoded, "base64url").toString("utf8");
+    return path.isAbsolute(decoded) ? path.normalize(decoded) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A generated immutable facade for an application import of a local module. */
+export function toVirtualFacadeId(filePath: string): string {
+  return `${VIRTUAL_FACADE_MODULE_PREFIX}${Buffer.from(path.resolve(filePath), "utf8").toString(
+    "base64url",
+  )}`;
+}
+
+export function fromVirtualFacadeId(id: string): string | undefined {
+  if (!id.startsWith(VIRTUAL_FACADE_MODULE_PREFIX)) return undefined;
+  const encoded = id.slice(VIRTUAL_FACADE_MODULE_PREFIX.length);
   try {
     const decoded = Buffer.from(encoded, "base64url").toString("utf8");
     return path.isAbsolute(decoded) ? path.normalize(decoded) : undefined;
@@ -42,6 +61,7 @@ export function renderEmbeddedBundle(bundle: EmbeddedBundleResult): string {
   return `const embeddedSchemaBase = ${JSON.stringify(bundle.embeddedSchema)};
 export const embeddedSchema = embeddedSchemaBase;
 export const embeddedManifest = ${JSON.stringify(bundle.manifest)};
+export const embeddedArtifact = ${JSON.stringify(bundle.artifact)};
 export const modules = {
 ${moduleEntries}
 };
@@ -52,44 +72,34 @@ ${localEntries}
 }
 
 /**
- * Renders the append-only stamp that names a device module's registrations in every graph that
- * bundles its source. Returns an empty string when the module exports nothing to name.
- */
-export function renderLocalStamp(
-  moduleId: string,
-  graphHash: string,
-  source: string,
-  exports: Array<[string, string]>,
-): string {
-  if (exports.length === 0) return "";
-  let stamp = "__embeddedStampLocal";
-  while (source.includes(stamp)) stamp += "$";
-  const named = exports
-    .map(([exported, binding]) => (exported === binding ? exported : `${exported}: ${binding}`))
-    .join(", ");
-  return `
-import { stampLocal as ${stamp} } from "@convex-dev/embedded/internal/local";
-${stamp}(${JSON.stringify(moduleId)}, ${JSON.stringify(graphHash)}, { ${named} });
-`;
-}
-
-/**
  * Renders the Metro-facing module wrapper for one local entrypoint.
  *
- * Metro resolves the module the application imports, rather than offering the Vite/Unplugin
- * transform hook. The wrapper evaluates the original module first, stamps its exported local
- * registrations with this build's graph identity, then re-exports them. The virtual registry
- * deliberately continues to import the source directly: its runtime loader supplies only the
- * stable dispatch reference and must not make an application setup value look build-stamped.
+ * The facade evaluates the original module but never changes one of its exports. Each local
+ * function exported to application code gets a frozen clone that carries its stable logical
+ * reference and execution hash. The virtual registry deliberately imports the source directly:
+ * its runner maintains the legacy direct-runtime registration path without making an application
+ * setup value depend on evaluation order.
  */
-export function renderLocalShim(moduleId: string, graphHash: string, sourcePath: string): string {
+export function renderLocalShim(
+  moduleId: string,
+  graphHash: string,
+  sourcePath: string,
+  exports: readonly string[] = [],
+): string {
   const source = JSON.stringify(toVirtualSourceId(sourcePath));
-  return `import * as local from ${source};
-import { stampLocal } from "@convex-dev/embedded/internal/local";
+  const named = [...new Set(exports)]
+    .sort()
+    .map((name) => `export const ${name} = embeddedLocal[${JSON.stringify(name)}];`)
+    .join("\n");
+  return `import * as source from ${source};
+import { createLocalFacade } from "@convex-dev/embedded/internal/local";
 
-stampLocal(${JSON.stringify(moduleId)}, ${JSON.stringify(graphHash)}, local);
+const embeddedLocal = createLocalFacade(${JSON.stringify(moduleId)}, ${JSON.stringify(
+    graphHash,
+  )}, source);
 
 export * from ${source};
+${named}
 `;
 }
 
@@ -99,6 +109,7 @@ export function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): string {
     throw new Error("Embedded identity requires a generated runtime storage schema hash");
   }
   return `export const embeddedIdentity = ${JSON.stringify({
+    artifactHash: bundle.artifact.artifactHash,
     moduleGraphHash: bundle.moduleGraphHash,
     schemaHash,
   })};

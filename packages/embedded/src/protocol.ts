@@ -2,6 +2,44 @@
 /** v27 requires structured, sanitized terminal replay failure codes. */
 export const EMBEDDED_PROTOCOL_VERSION = 27;
 
+/** Preview 2's wire revision. A missing identity offer is this legacy wire shape. */
+export const EMBEDDED_PROTOCOL_LEGACY_VERSION = 26;
+
+/**
+ * The deliberately finite set of hosted wires this package deployment understands.
+ *
+ * This is not a numeric range: adding a wire requires an explicit adapter and tests for both
+ * directions. Keep the order newest-first so identity selection prefers the current wire.
+ */
+export const EMBEDDED_PROTOCOL_VERSIONS = [
+  EMBEDDED_PROTOCOL_VERSION,
+  EMBEDDED_PROTOCOL_LEGACY_VERSION,
+] as const;
+
+export type EmbeddedProtocolVersion = (typeof EMBEDDED_PROTOCOL_VERSIONS)[number];
+
+/** Whether a runtime request names one of this deployment's explicit wire adapters. */
+export function isEmbeddedProtocolVersion(value: number): value is EmbeddedProtocolVersion {
+  return value === EMBEDDED_PROTOCOL_VERSION || value === EMBEDDED_PROTOCOL_LEGACY_VERSION;
+}
+
+/**
+ * Select the shared wire for an identity request.
+ *
+ * Preview 2 sent only `{ kind: "identity" }`, so an absent offer is intentionally interpreted as
+ * its fixed v26 contract. New clients send their complete discrete set and receive the newest
+ * common wire. This decision happens before an identity response or any durable component write.
+ */
+export function selectEmbeddedProtocolVersion(
+  offered: readonly number[] | undefined,
+): EmbeddedProtocolVersion | undefined {
+  if (offered === undefined) return EMBEDDED_PROTOCOL_LEGACY_VERSION;
+  for (const version of EMBEDDED_PROTOCOL_VERSIONS) {
+    if (offered.includes(version)) return version;
+  }
+  return undefined;
+}
+
 /** Stable Convex error code for a client/component wire revision mismatch. */
 export const EMBEDDED_PROTOCOL_MISMATCH = "EMBEDDED_PROTOCOL_MISMATCH";
 

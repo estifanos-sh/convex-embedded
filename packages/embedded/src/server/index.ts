@@ -37,7 +37,14 @@ import {
 } from "../crdt/intent";
 import { canonicalJson, hashDocument, hashValue } from "../hash";
 import { validatorIdReferences, validatorIdValues } from "../id/path";
-import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../protocol";
+import {
+  EMBEDDED_PROTOCOL_LEGACY_VERSION,
+  EMBEDDED_PROTOCOL_MISMATCH,
+  EMBEDDED_PROTOCOL_VERSION,
+  isEmbeddedProtocolVersion,
+  selectEmbeddedProtocolVersion,
+  type EmbeddedProtocolVersion,
+} from "../protocol";
 import { withEntropy } from "../entropy";
 import { read as readTime } from "../component/time";
 import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../component/model";
@@ -210,6 +217,18 @@ type Settlement = SettlementInput & {
     | { op: "del"; table: string; rowId: string; plainHash: string }
   >;
 };
+
+type WireSettlementBase = SettlementBase & {
+  crdt: Settlement["crdt"];
+  authoritative: Settlement["authoritative"];
+};
+
+/** A settlement after selecting the caller's response adapter. */
+type WireSettlement =
+  | (WireSettlementBase & { outcome: "applied"; result: unknown })
+  | (WireSettlementBase & { outcome: "conflict"; error: unknown })
+  | (WireSettlementBase & { outcome: "rejected"; error: unknown })
+  | (WireSettlementBase & { outcome: "rebase"; error: unknown });
 
 type CrdtIntentWriter = {
   text: {
@@ -771,6 +790,17 @@ const settlementValidator = v.union(
   }),
 );
 
+// Wire 26 treated a failed settlement's `error` field as opaque. Its Rust decoder checks only the
+// terminal outcome, while v27 requires the closed code above. Keep this adapter-only validator at
+// the public response boundary; component records remain canonicalized before they are returned.
+const legacySettlementValidator = v.union(
+  v.object({ ...settlementFields, outcome: v.literal("conflict"), error: v.any() }),
+  v.object({ ...settlementFields, outcome: v.literal("rejected"), error: v.any() }),
+  v.object({ ...settlementFields, outcome: v.literal("rebase"), error: v.any() }),
+);
+
+const wireSettlementValidator = v.union(settlementValidator, legacySettlementValidator);
+
 type RevisionRunMutation = (
   ref: FunctionReference<
     "mutation",
@@ -1059,7 +1089,12 @@ const runtimeRequestValidator = v.object({
 });
 
 const pullRequestValidator = v.union(
-  v.object({ kind: v.literal("identity") }),
+  v.object({
+    kind: v.literal("identity"),
+    // Omission is the frozen Preview 2 identity request shape and selects wire 26. Current
+    // clients advertise their complete discrete set so this deployment can select wire 27.
+    protocolVersions: v.optional(v.array(v.number())),
+  }),
   v.object({
     kind: v.literal("live"),
     functionName: v.string(),
@@ -1186,11 +1221,20 @@ function buildPull(component: EmbeddedComponent, manifest?: FunctionManifest) {
     ),
     handler: async (ctx, { request: args }) => {
       if (args.kind === "identity") {
+        const protocolVersion = selectEmbeddedProtocolVersion(args.protocolVersions);
+        if (protocolVersion === undefined) {
+          throw new ConvexError({
+            code: EMBEDDED_PROTOCOL_MISMATCH,
+            expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
+            message: "Embedded identity request has no supported protocol version.",
+            received: args.protocolVersions,
+          });
+        }
         const identity = await ctx.auth.getUserIdentity();
         return {
           identity,
           ...(identity ? { identityKey: await hashValue(identity.tokenIdentifier) } : {}),
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+          protocolVersion,
         };
       }
       assertRuntimeVersion(args.runtime);
@@ -1324,8 +1368,8 @@ function buildPush(
 ) {
   return mutationGeneric({
     args: { request: pushRequestValidator },
-    returns: v.union(settlementValidator, v.null()),
-    handler: async (ctx, { request: args }): Promise<Settlement | null> => {
+    returns: v.union(wireSettlementValidator, v.null()),
+    handler: async (ctx, { request: args }): Promise<WireSettlement | null> => {
       if (args.kind === "acknowledge") {
         const identity = await identityAttributeOf(ctx);
         await ctx.runMutation(component.protocol.acknowledge, {
@@ -1334,7 +1378,7 @@ function buildPush(
         });
         return null;
       }
-      assertRuntimeVersion(args.runtime);
+      const wire = assertRuntimeVersion(args.runtime);
       if (args.kind === "mutation") {
         const identity = await identityAttributeOf(ctx);
         const { requestId } = await ctx.meta.getRequestMetadata();
@@ -1383,8 +1427,11 @@ function buildPush(
           expiresAt: readTime() + REPLAY_TTL_MS,
         })) as Settlement | null;
         if (prior) {
-          return normalizeSettlement(
-            await refreshAppliedSettlement(ctx, prior, tableNames, crdtFields, placements),
+          return encodeSettlement(
+            wire,
+            normalizeSettlement(
+              await refreshAppliedSettlement(ctx, prior, tableNames, crdtFields, placements),
+            ),
           );
         }
 
@@ -1411,7 +1458,7 @@ function buildPush(
               message: "Only mutations created by defineEmbedded can be replayed.",
             });
           }
-          return normalizeSettlement(result.settlement);
+          return encodeSettlement(wire, normalizeSettlement(result.settlement));
         } catch (error) {
           // A function removed or narrowed by a later deployment fails before its embedded wrapper
           // can translate the error. Convex has already retried internal mutation failures before
@@ -1448,22 +1495,25 @@ function buildPush(
                   crdtFields,
                 );
           const settlement = failureSettlement(args.mutationId, failure.code);
-          return normalizeSettlement(
-            (await ctx.runMutation(component.protocol.commit, {
-              request: {
-                kind: "failure",
-                clientId: args.clientId,
-                replayId: args.replayId,
-                fingerprint,
-                logicalFingerprint,
-                runtime: args.runtime,
-                ...(identity === null ? {} : { identity }),
-                acknowledgeReplayId: args.acknowledgeReplayId,
-                settlement,
-                changes,
-                revisions,
-              },
-            })) as Settlement,
+          return encodeSettlement(
+            wire,
+            normalizeSettlement(
+              (await ctx.runMutation(component.protocol.commit, {
+                request: {
+                  kind: "failure",
+                  clientId: args.clientId,
+                  replayId: args.replayId,
+                  fingerprint,
+                  logicalFingerprint,
+                  runtime: args.runtime,
+                  ...(identity === null ? {} : { identity }),
+                  acknowledgeReplayId: args.acknowledgeReplayId,
+                  settlement,
+                  changes,
+                  revisions,
+                },
+              })) as Settlement,
+            ),
           );
         }
       }
@@ -1519,6 +1569,19 @@ function normalizeSettlement(settlement: Settlement): Settlement {
       };
     }
   }
+}
+
+/**
+ * Encode a canonical settlement at the only v26/v27 response seam.
+ *
+ * Preview 2's decoder required an `error` field but deliberately treated it as opaque. Sending
+ * `null` preserves its terminal outcome without making the v27 closed failure-code contract part
+ * of the old wire. Wire 27 receives the normalized structured error above.
+ */
+function encodeSettlement(wire: EmbeddedProtocolVersion, settlement: Settlement): WireSettlement {
+  if (wire === EMBEDDED_PROTOCOL_VERSION) return settlement;
+  if (settlement.outcome === "applied") return settlement;
+  return { ...settlement, error: null };
 }
 
 function failureSettlement(mutationId: string, code: ReplayFailureCode): FailureSettlementInput {
@@ -2486,11 +2549,11 @@ async function identityAttributeOf(
   return identity ? await hashValue(identity.tokenIdentifier) : null;
 }
 
-function assertRuntimeVersion(runtime: { protocolVersion: number }): void {
-  if (runtime.protocolVersion === EMBEDDED_PROTOCOL_VERSION) return;
+function assertRuntimeVersion(runtime: { protocolVersion: number }): EmbeddedProtocolVersion {
+  if (isEmbeddedProtocolVersion(runtime.protocolVersion)) return runtime.protocolVersion;
   throw new ConvexError({
     code: EMBEDDED_PROTOCOL_MISMATCH,
-    expected: EMBEDDED_PROTOCOL_VERSION,
+    expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
     message: `Embedded protocol ${runtime.protocolVersion} is not supported.`,
     received: runtime.protocolVersion,
   });

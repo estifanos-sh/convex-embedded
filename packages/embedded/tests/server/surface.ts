@@ -14,7 +14,11 @@ import { hashDocument, hashValue } from "../../src/hash";
 import { pull as componentPull } from "../../src/component/protocol";
 import { retire as componentRetire } from "../../src/component/remote/client";
 import { completeQueryRows } from "../../src/server/query";
-import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import {
+  EMBEDDED_PROTOCOL_LEGACY_VERSION,
+  EMBEDDED_PROTOCOL_MISMATCH,
+  EMBEDDED_PROTOCOL_VERSION,
+} from "../../src/protocol";
 import { seedEntropy } from "../../src/entropy";
 import {
   assertIntentField,
@@ -79,27 +83,89 @@ describe("v5 server surface", () => {
     ).resolves.toEqual({ uploadUrl: "https://upload.example/once" });
   });
 
-  test("reports the deployment protocol during identity negotiation", async () => {
+  test("selects wire 26 for the legacy identity shape and wire 27 for an explicit offer", async () => {
     const embedded = defineEmbedded({ component, schema });
     const handler = (
       embedded.pull as unknown as {
-        _handler: (ctx: unknown, args: { request: { kind: "identity" } }) => Promise<unknown>;
+        _handler: (
+          ctx: unknown,
+          args: { request: { kind: "identity"; protocolVersions?: number[] } },
+        ) => Promise<unknown>;
       }
     )._handler;
+
+    const ctx = {
+      auth: {
+        getUserIdentity: async () => null,
+      },
+    };
+
+    await expect(handler(ctx, { request: { kind: "identity" } })).resolves.toMatchObject({
+      identity: null,
+      protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION,
+    });
+    await expect(
+      handler(ctx, {
+        request: {
+          kind: "identity",
+          protocolVersions: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
+        },
+      }),
+    ).resolves.toMatchObject({
+      identity: null,
+      protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+    });
+  });
+
+  test("rejects an identity offer with no shared wire before reading identity", async () => {
+    const embedded = defineEmbedded({ component, schema });
+    const handler = (
+      embedded.pull as unknown as {
+        _handler: (
+          ctx: unknown,
+          args: { request: { kind: "identity"; protocolVersions: number[] } },
+        ) => Promise<unknown>;
+      }
+    )._handler;
+    let reads = 0;
 
     await expect(
       handler(
         {
           auth: {
-            getUserIdentity: async () => null,
+            getUserIdentity: async () => {
+              reads += 1;
+              return null;
+            },
           },
         },
-        { request: { kind: "identity" } },
+        { request: { kind: "identity", protocolVersions: [25, 28] } },
       ),
-    ).resolves.toMatchObject({
-      identity: null,
-      protocolVersion: EMBEDDED_PROTOCOL_VERSION,
-    });
+    ).rejects.toMatchObject({ data: { code: EMBEDDED_PROTOCOL_MISMATCH } });
+    expect(reads).toBe(0);
+  });
+
+  test("admits Preview 2 runtime requests at the component boundary", async () => {
+    const result = await (
+      componentPull as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+    )._handler(
+      {
+        db: {
+          query: () => ({
+            withIndex: () => ({ unique: async () => null }),
+          }),
+        },
+      },
+      {
+        runtime: {
+          moduleGraphHash: "modules",
+          protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION,
+          schemaHash: "schema",
+        },
+        rows: [],
+      },
+    );
+    expect(result).toMatchObject({ changes: [], crdt: [], members: [] });
   });
 
   test("keeps query transport out of the authored TypeScript surface", () => {
@@ -1665,6 +1731,45 @@ describe("v5 server surface", () => {
     }
   });
 
+  test("encodes a canonical failure as the opaque v26 settlement shape", async () => {
+    const replayWrite = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
+    };
+    const embedded = defineEmbedded({
+      component: {
+        protocol: { installation: {}, pull: componentPullReference, replayWrite },
+      } as unknown as ComponentApi<"embedded">,
+      schema,
+    });
+    const base = {
+      mutationId: "mutation-1",
+      inserts: [],
+      schedules: [],
+      uploads: [],
+      revisions: [],
+      crdt: [],
+      authoritative: [],
+      outcome: "rejected" as const,
+      error: { code: "EMBEDDED_DIVERGENCE", reason: "legacy detail must not cross the bridge" },
+    };
+    const response = await invokePush(
+      embedded,
+      {
+        auth: { getUserIdentity: async () => null },
+        meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
+        runMutation: async (reference: unknown) => {
+          if (reference === replayWrite) return base;
+          throw new Error("unexpected mutation after cached settlement");
+        },
+      },
+      {
+        ...mutationPushRequest("documents:write", {}),
+        runtime: { ...pushRuntime, protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION },
+      },
+    );
+    expect(response).toMatchObject({ mutationId: "mutation-1", outcome: "rejected", error: null });
+  });
+
   test("gates a pull by manifest placement, rejecting a non-replicated target before invoking it", async () => {
     const embedded = defineEmbedded({
       component,
@@ -1764,7 +1869,8 @@ describe("v5 server surface", () => {
     expect(pull.type).toBe("object");
     expect(pull.value.request.optional).toBe(false);
     expect(pullRequest.type).toBe("union");
-    expect(Object.keys(pullRequest.value[0]!.value)).toEqual(["kind"]);
+    expect(Object.keys(pullRequest.value[0]!.value).sort()).toEqual(["kind", "protocolVersions"]);
+    expect(pullRequest.value[0]!.value.protocolVersions?.optional).toBe(true);
     expect(pullRequest.value[1]!.value.runtime?.optional).toBe(false);
     expect(pullRequest.value[1]!.value.functionName?.optional).toBe(false);
     expect(pullRequest.value[1]!.value).not.toHaveProperty("clientId");
