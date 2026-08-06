@@ -21,9 +21,6 @@ on:
         description: Robelest release tag to create after validation; required for npm modes
         required: false
         type: string
-  pull_request_target:
-    types: [closed]
-
 concurrency:
   group: robelest-package-${{ inputs.tag || inputs.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: false
@@ -36,161 +33,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  readiness:
-    name: Release readiness
-    if: >-
-      github.repository == 'get-convex/embedded' &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.draft == false &&
-      contains(github.event.pull_request.labels.*.name, 'npm package')
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24.18.0
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
-
-      - name: Validate version and release channel
-        working-directory: packages/embedded
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          SOURCE_NAME=$(node -p "require('./package.json').name")
-          VERSION=$(node -p "require('./package.json').version")
-          BASE_VERSION=$(
-            git show "$BASE_SHA:packages/embedded/package.json" |
-              node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version"
-          )
-
-          if [[ "$SOURCE_NAME" != "@convex-dev/embedded" ]]; then
-            echo "::error::Source package identity must remain @convex-dev/embedded."
-            exit 1
-          fi
-          if [[ "$VERSION" == "$BASE_VERSION" ]]; then
-            echo "::error::The npm package label requires a version change from $BASE_VERSION."
-            exit 1
-          fi
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ || "$VERSION" == "0.0.0" ]]; then
-            echo "::error::Robelest releases require a nonzero semver version."
-            exit 1
-          fi
-          if ! node -e '
-            const parse = (version) => {
-              const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(version);
-              if (!match) process.exit(2);
-              return { core: match.slice(1, 4).map(Number), pre: match[4]?.split(".") };
-            };
-            const [base, next] = process.argv.slice(1).map(parse);
-            for (let i = 0; i < 3; i += 1) {
-              if (next.core[i] > base.core[i]) process.exit(0);
-              if (next.core[i] < base.core[i]) process.exit(1);
-            }
-            if (base.pre === undefined) process.exit(1);
-            if (next.pre === undefined) process.exit(0);
-            for (let i = 0; i < Math.max(base.pre.length, next.pre.length); i += 1) {
-              if (base.pre[i] === undefined) process.exit(0);
-              if (next.pre[i] === undefined) process.exit(1);
-              if (base.pre[i] === next.pre[i]) continue;
-              const a = /^\d+$/.test(base.pre[i]) ? Number(base.pre[i]) : base.pre[i];
-              const b = /^\d+$/.test(next.pre[i]) ? Number(next.pre[i]) : next.pre[i];
-              if (typeof a === "number" && typeof b !== "number") process.exit(0);
-              if (typeof a !== "number" && typeof b === "number") process.exit(1);
-              process.exit(b > a ? 0 : 1);
-            }
-            process.exit(1);
-          ' "$BASE_VERSION" "$VERSION"; then
-            echo "::error::Version $VERSION must be newer than $BASE_VERSION."
-            exit 1
-          fi
-          if npm view "@robelest/convex-embedded@$VERSION" version --json >/dev/null 2>&1; then
-            echo "::error::@robelest/convex-embedded@$VERSION is already published."
-            exit 1
-          fi
-          if git ls-remote --exit-code --tags origin "refs/tags/robelest-v$VERSION" >/dev/null 2>&1; then
-            echo "::error::Git tag robelest-v$VERSION already exists."
-            exit 1
-          fi
-
-          {
-            echo "## Robelest npm release"
-            echo
-            echo "| Package | Version | Consumer alias |"
-            echo "| --- | --- | --- |"
-            echo "| \`@robelest/convex-embedded\` | \`$VERSION\` | \`@convex-dev/embedded\` |"
-            echo
-            echo "Merging this labeled PR will assemble every native target and publish the test package."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  dispatch-release:
-    name: Start validated Robelest release
-    if: >-
-      github.repository == 'get-convex/embedded' &&
-      github.event_name == 'pull_request_target' &&
-      github.event.pull_request.merged == true &&
-      contains(github.event.pull_request.labels.*.name, 'npm package')
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-      contents: read
-
-    steps:
-      - name: Checkout merged release
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24.18.0
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
-
-      - name: Resolve release metadata
-        id: release
-        working-directory: packages/embedded
-        run: |
-          SOURCE_NAME=$(node -p "require('./package.json').name")
-          VERSION=$(node -p "require('./package.json').version")
-          TAG="robelest-v$VERSION"
-
-          if [[ "$SOURCE_NAME" != "@convex-dev/embedded" ]]; then
-            echo "::error::Source package identity must remain @convex-dev/embedded."
-            exit 1
-          fi
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ || "$VERSION" == "0.0.0" ]]; then
-            echo "::error::Robelest releases require a nonzero semver version."
-            exit 1
-          fi
-          if npm view "@robelest/convex-embedded@$VERSION" version --json >/dev/null 2>&1; then
-            echo "::error::@robelest/convex-embedded@$VERSION is already published."
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if [[ "$VERSION" == *-* ]]; then
-            echo "mode=prerelease" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=release" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Start the exact-SHA validation and build
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MODE: ${{ steps.release.outputs.mode }}
-          TAG: ${{ steps.release.outputs.tag }}
-          SOURCE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-        run: |
-          gh workflow run publish.yml --ref main -f mode="$MODE" -f ref="$SOURCE_SHA" -f tag="$TAG"
-
   gate:
     name: Package build gate
     if: github.repository == 'get-convex/embedded'
@@ -212,7 +54,6 @@ jobs:
           INPUT_REF: ${{ inputs.ref }}
           INPUT_TAG: ${{ inputs.tag }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          NPM_PACKAGE: ${{ contains(github.event.pull_request.labels.*.name, 'npm package') }}
           PACKAGE_PREVIEW: ${{ contains(github.event.pull_request.labels.*.name, 'package preview') }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
           REPOSITORY: ${{ github.repository }}
@@ -247,7 +88,7 @@ jobs:
             else
               echo "ref=$INPUT_REF" >> "$GITHUB_OUTPUT"
             fi
-          elif [[ "$EVENT" == "pull_request" && "$IS_DRAFT" == "false" && ( "$NPM_PACKAGE" == "true" || "$PACKAGE_PREVIEW" == "true" ) ]]; then
+          elif [[ "$EVENT" == "pull_request" && "$IS_DRAFT" == "false" && "$PACKAGE_PREVIEW" == "true" ]]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
             echo "mode=preview" >> "$GITHUB_OUTPUT"
             echo "ref=$PR_SHA" >> "$GITHUB_OUTPUT"
@@ -310,6 +151,12 @@ jobs:
           shared-key: robelest-qualification
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
+
+      - name: Check source contracts and reachability
+        run: |
+          vp check
+          vp run style
+          vp run clippy
 
       - name: Verify Preview2 baseline and release stress
         env:

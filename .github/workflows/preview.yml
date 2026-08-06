@@ -134,7 +134,10 @@ jobs:
           vp run @convex-dev/embedded-demo-expo#export:android
 
       - name: Check
-        run: vp check
+        run: |
+          vp check
+          vp run style
+          vp run clippy
 
       - name: Build the node native addon
         run: vp run @convex-dev/embedded#native

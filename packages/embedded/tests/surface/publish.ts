@@ -54,10 +54,12 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain("cargo test -p storage --features testkit --test migration");
     expect(workflow).toContain("cargo test -p mobile");
     expect(workflow).toContain("vp test run packages/embedded/tests/unit/expo.ts");
-    expect(workflow).toContain('echo "mode=prerelease" >> "$GITHUB_OUTPUT"');
-    expect(workflow).toContain('-f mode="$MODE"');
     expect(workflow).not.toContain('tags: ["robelest-v*"]');
     expect(workflow).not.toContain('[[ "$EVENT" == "push" ]]');
+    expect(workflow).not.toContain("pull_request_target:");
+    expect(workflow).not.toContain("labels.*.name, 'npm package'");
+    expect(workflow).toContain('PACKAGE_PREVIEW" == "true"');
+    expect(workflow).toContain('INPUT_MODE" == "prerelease"');
     expect(workflow).toMatch(
       /name: Checkout exact source[\s\S]*?fetch-depth: 0[\s\S]*?name: Verify Preview2 baseline/,
     );
