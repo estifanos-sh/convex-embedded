@@ -113,7 +113,9 @@ jobs:
           echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
           if [[ "$MODE" == "release" || "$MODE" == "prerelease" ]]; then
-            git fetch --no-tags origin main
+            # `actions/checkout` above used fetch-depth: 0 and already fetched origin/main.
+            # Credentials are deliberately removed from this job, so a second fetch here would
+            # turn an otherwise valid release gate into an interactive-authentication failure.
             if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/main; then
               echo "::error::Robelest npm releases must build a commit already reachable from main."
               exit 1
