@@ -3,7 +3,7 @@ import { defineTable } from "convex/server";
 import { v } from "convex/values";
 import { describe, expect, test } from "vite-plus/test";
 
-import { defineLocal } from "../../src/local";
+import { defineLocal } from "../../src/local/internal";
 import { defineEmbeddedSchema, localTable, replicatedTable } from "../../src/schema";
 import { defineEmbedded } from "../../src/server";
 import { e } from "../../src/values";

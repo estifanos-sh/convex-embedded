@@ -865,6 +865,8 @@ export interface RemoteTick {
   /** Replays the server rejected this tick; skipped so one poison record cannot wedge the pump. */
   pushFailed: number;
   retainedRevisions: RemoteReroot[];
+  /** Ordered terminal mutation settlements produced by durable local transactions this tick. */
+  settlements: RemoteMutationSettlement[];
   sent: number;
   receiptsPushed: number;
   storeJobs: number;
@@ -906,6 +908,29 @@ export interface RemoteReroot {
   id: string;
   revId: string;
 }
+
+/** A terminal hosted replay verdict that committed locally. @internal */
+export type RemoteMutationSettlement =
+  | {
+      mutationId: string;
+      functionName: string;
+      outcome: "applied";
+      retainedRevisions: RemoteReroot[];
+    }
+  | {
+      mutationId: string;
+      functionName: string;
+      outcome: "conflict";
+      code: "EMBEDDED_CONFLICT";
+      retainedRevisions: RemoteReroot[];
+    }
+  | {
+      mutationId: string;
+      functionName: string;
+      outcome: "rejected";
+      code: "EMBEDDED_REJECTED" | "EMBEDDED_DIVERGENCE";
+      retainedRevisions: RemoteReroot[];
+    };
 
 /**
  * Native remote replication configuration. Function paths are intentionally

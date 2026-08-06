@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "setup": "node scripts/setup.ts",
-    "ready": "vp run @convex-dev/embedded#build:ts && vp check && vp run @convex-dev/embedded#style && vp run @convex-dev/embedded#wasm && vp run @convex-dev/embedded#native && vp run @convex-dev/embedded#test:node && vp test && vp run @convex-dev/embedded#test:browser && vp run build:browser:vite",
-    "style": "vp run @convex-dev/embedded#style",
+    "ready": "vp run @convex-dev/embedded#build:ts && vp check && vp run style && vp run clippy && vp run @convex-dev/embedded#wasm && vp run @convex-dev/embedded#native && vp run @convex-dev/embedded#test:node && vp test && vp run @convex-dev/embedded#test:browser && vp run build:browser:vite",
+    "style": "vp run @convex-dev/embedded#style && vp run dead",
+    "dead": "vp exec fallow dead-code --unused-files --fail-on-issues && vp exec fallow dead-code --unused-exports --fail-on-issues",
+    "clippy": "cargo clippy -p storage -p remote -p node --all-targets --all-features -- -D warnings",
     "test:unit": "vp run @convex-dev/embedded#test:unit",
     "test:runtime": "vp run @convex-dev/embedded#test:runtime",
     "test:storage": "vp run @convex-dev/embedded#test:storage",
@@ -58,6 +60,7 @@
     "convex": "catalog:"
   },
   "devDependencies": {
+    "fallow": "catalog:",
     "pkg-pr-new": "catalog:",
     "vite": "catalog:",
     "vite-plus": "catalog:",

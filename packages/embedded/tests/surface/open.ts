@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import { describe, expect, test } from "vite-plus/test";
 
 import type { EmbeddedClient } from "../../src/client";
-import { defineLocal } from "../../src/local";
+import { defineLocal } from "../../src/local/internal";
 import { defineEmbeddedSchema } from "../../src/schema";
 
 const local = defineLocal(defineEmbeddedSchema({}));

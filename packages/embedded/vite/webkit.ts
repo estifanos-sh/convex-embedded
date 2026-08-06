@@ -10,6 +10,7 @@ import {
   convexServerPath,
   convexValuesPath,
   hostedRemoteUrl,
+  localInternalEntryPath,
 } from "../tests/bench/harness/paths.js";
 import { browserCommands } from "../tests/browser/harness/commands.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
@@ -22,14 +23,12 @@ export const webkitProject = {
   optimizeDeps: {
     include: ["convex-helpers/server/pagination", "convex/browser", "convex/server"],
   },
-  plugins: [
-    convexEmbedded({ convexDir: browserConvexDir, registerSchema: false, schema }),
-    browserRuntimeLog(),
-  ],
+  plugins: [convexEmbedded({ convexDir: browserConvexDir, schema }), browserRuntimeLog()],
   resolve: {
     dedupe: ["solid-js"],
     alias: [
       { find: "@convex-dev/embedded/browser", replacement: browserDistPath },
+      { find: "@convex-dev/embedded/internal/local", replacement: localInternalEntryPath },
       { find: "convex/browser", replacement: convexBrowserPath },
       { find: "convex/server", replacement: convexServerPath },
       { find: "convex/values", replacement: convexValuesPath },

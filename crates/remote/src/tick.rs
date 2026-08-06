@@ -20,6 +20,133 @@ impl RemotePending {
     }
 }
 
+/// A terminal replay meaning that is safe to surface outside the remote driver.
+///
+/// `Rebase` is intentionally absent: it leaves the durable envelope pending and is not a
+/// settlement. A rejected verdict carries only the server's closed rejection code, while
+/// conflict derives its one permitted code from the variant itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteMutationOutcome {
+    Applied,
+    Conflict,
+    Rejected(storage::RejectionCode),
+}
+
+impl RemoteMutationOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Conflict => "conflict",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    #[must_use]
+    pub fn code(self) -> Option<&'static str> {
+        match self {
+            Self::Applied => None,
+            Self::Conflict => Some("EMBEDDED_CONFLICT"),
+            Self::Rejected(code) => Some(code.as_str()),
+        }
+    }
+}
+
+/// One terminal mutation settlement produced after its local durable transaction commits.
+///
+/// Its fields remain private so an application-facing transport cannot pair an arbitrary code
+/// with an outcome or report revisions from another settlement. Construct it through the private
+/// producer below, after [`storage::EmbeddedStore::remote_settlement_write`] succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMutationSettlement {
+    mutation_id: String,
+    function: String,
+    outcome: RemoteMutationOutcome,
+    retained_revisions: Vec<storage::RetainedRevision>,
+}
+
+impl RemoteMutationSettlement {
+    #[must_use]
+    pub fn mutation_id(&self) -> &str {
+        &self.mutation_id
+    }
+
+    #[must_use]
+    pub fn function(&self) -> &str {
+        &self.function
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> RemoteMutationOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub fn retained_revisions(&self) -> &[storage::RetainedRevision] {
+        &self.retained_revisions
+    }
+
+    /// Move the closed value across an FFI boundary without making it constructible there.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        String,
+        String,
+        RemoteMutationOutcome,
+        Vec<storage::RetainedRevision>,
+    ) {
+        (
+            self.mutation_id,
+            self.function,
+            self.outcome,
+            self.retained_revisions,
+        )
+    }
+}
+
+/// Captures the validated response plus envelope identity before the store commits. Calling
+/// [`Self::complete`] is deliberately deferred until that commit succeeds.
+#[derive(Debug)]
+pub(crate) struct RemoteMutationSettlementProducer {
+    mutation_id: String,
+    function: String,
+    outcome: RemoteMutationOutcome,
+}
+
+impl RemoteMutationSettlementProducer {
+    pub(crate) fn new(
+        mutation_id: &str,
+        function: &str,
+        verdict: storage::PushVerdict,
+    ) -> Option<Self> {
+        let outcome = match verdict {
+            storage::PushVerdict::Applied => RemoteMutationOutcome::Applied,
+            storage::PushVerdict::Conflict => RemoteMutationOutcome::Conflict,
+            storage::PushVerdict::Rejected(code) => RemoteMutationOutcome::Rejected(code),
+            storage::PushVerdict::Rebase => return None,
+        };
+        Some(Self {
+            mutation_id: mutation_id.to_owned(),
+            function: function.to_owned(),
+            outcome,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn complete(
+        self,
+        retained_revisions: Vec<storage::RetainedRevision>,
+    ) -> RemoteMutationSettlement {
+        RemoteMutationSettlement {
+            mutation_id: self.mutation_id,
+            function: self.function,
+            outcome: self.outcome,
+            retained_revisions,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteTick {
     /// Transport connectivity transition observed by the native actor.
@@ -40,6 +167,8 @@ pub struct RemoteTick {
     pub push_rebases: usize,
     /// Local after-images retained because an authoritative row displaced them.
     pub retained_revisions: Vec<storage::RetainedRevision>,
+    /// Ordered terminal mutation settlements produced by durable local transactions this tick.
+    pub settlements: Vec<RemoteMutationSettlement>,
     pub sent: usize,
     /// Durable push receipts the server accepted and the local store removed this tick.
     pub receipts_pushed: usize,
@@ -75,6 +204,7 @@ impl RemoteTick {
             || self.push_rebases > 0
             || self.pushed > 0
             || !self.retained_revisions.is_empty()
+            || !self.settlements.is_empty()
             || self.receipts_pushed > 0
             || self.pull_changes_applied > 0
             || self.pull_snapshots > 0
@@ -109,6 +239,7 @@ impl RemoteTick {
         self.push_conflicts += other.push_conflicts;
         self.push_rebases += other.push_rebases;
         self.retained_revisions.extend(other.retained_revisions);
+        self.settlements.extend(other.settlements);
         self.sent += other.sent;
         self.receipts_pushed += other.receipts_pushed;
         self.store_jobs += other.store_jobs;
@@ -126,7 +257,9 @@ impl RemoteTick {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemotePending, RemoteTick};
+    use super::{
+        RemoteMutationSettlement, RemoteMutationSettlementProducer, RemotePending, RemoteTick,
+    };
 
     #[test]
     fn pending_is_empty_only_when_every_lane_is_clear() {
@@ -182,5 +315,64 @@ mod tests {
             ..RemoteTick::default()
         }
         .has_observable_progress());
+    }
+
+    #[test]
+    fn settlements_merge_in_completion_order() {
+        let first = RemoteMutationSettlementProducer::new(
+            "first",
+            "documents:write",
+            storage::PushVerdict::Applied,
+        )
+        .expect("applied is terminal")
+        .complete(Vec::new());
+        let second = RemoteMutationSettlementProducer::new(
+            "second",
+            "documents:write",
+            storage::PushVerdict::Conflict,
+        )
+        .expect("conflict is terminal")
+        .complete(Vec::new());
+
+        let mut tick = RemoteTick {
+            settlements: vec![first],
+            ..RemoteTick::default()
+        };
+        tick.merge(RemoteTick {
+            settlements: vec![second],
+            ..RemoteTick::default()
+        });
+
+        assert_eq!(
+            tick.settlements
+                .iter()
+                .map(RemoteMutationSettlement::mutation_id)
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn terminal_settlement_keeps_its_own_retained_revisions() {
+        let revision = storage::RetainedRevision {
+            table: "documents".to_owned(),
+            local_document_id: "documents|local".to_owned(),
+            archived_rev_id: "rev:archived".to_owned(),
+            server_rev_id: Some("rev:server".to_owned()),
+            server_document_id: Some("documents|server".to_owned()),
+            base_root_id: Some("root:base".to_owned()),
+            base_node_id: Some("node:base".to_owned()),
+            attached_node_id: Some("node:local".to_owned()),
+            current_root_id: Some("root:server".to_owned()),
+        };
+        let settlement = RemoteMutationSettlementProducer::new(
+            "mutation",
+            "documents:write",
+            storage::PushVerdict::Conflict,
+        )
+        .expect("conflict is terminal")
+        .complete(vec![revision.clone()]);
+
+        assert_eq!(settlement.retained_revisions(), [revision]);
     }
 }

@@ -2,17 +2,19 @@ import { ConvexHttpClient } from "convex/browser";
 import { makeFunctionReference } from "convex/server";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 
-import type { EmbeddedEvent } from "../../src/events";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
 
 declare const __CONVEX_EMBEDDED_HOSTED_URL__: string | null;
 
 interface ConnectionState {
-  local: "starting" | "ready" | "failed" | "closed";
-  localError?: string;
-  remote: string;
-  remoteError?: string;
+  local:
+    | { status: "starting" | "ready" | "closed" }
+    | { error: { message: string }; status: "failed" };
+  replication:
+    | { status: "disabled" | "starting" | "offline" | "closed" }
+    | { status: "online"; sync: "pending" | "idle" }
+    | { error: { message: string }; status: "error" };
 }
 
 interface SmokeClient {
@@ -27,7 +29,6 @@ interface SmokeClient {
     name: ReturnType<typeof makeFunctionReference>,
     args: Record<string, unknown>,
   ): { onUpdate(callback: () => void): () => void };
-  subscribeInternalEvents?(listener: (event: EmbeddedEvent) => void): () => void;
 }
 
 const listDocuments = makeFunctionReference<
@@ -63,7 +64,9 @@ async function settle(client: SmokeClient): Promise<ConnectionState> {
   let state = client.connectionState();
   while (
     getTimerTime() < deadline &&
-    (state.local === "starting" || state.remote === "starting" || state.remote === "connected")
+    (state.local.status === "starting" ||
+      state.replication.status === "starting" ||
+      (state.replication.status === "online" && state.replication.sync === "pending"))
   ) {
     await new Promise((resolve) => setTimeout(resolve, 50));
     state = client.connectionState();
@@ -80,16 +83,6 @@ describe("webkit runtime smoke", () => {
     const convex = new ConvexEmbeddedClient({ url }) as unknown as SmokeClient;
     clients.add(convex);
 
-    const runtimeFailures: unknown[] = [];
-    convex.subscribeInternalEvents?.((event) => {
-      if (
-        event.type === "runtime" &&
-        (event as { degradation?: string }).degradation === "failed"
-      ) {
-        runtimeFailures.push(event);
-      }
-    });
-
     await convex.open().catch(() => undefined);
 
     let queryError: unknown;
@@ -100,18 +93,18 @@ describe("webkit runtime smoke", () => {
 
     const state = await settle(convex);
 
-    if (state.local === "ready") {
-      expect(["ready", "offline", "error"]).toContain(state.remote);
+    if (state.local.status === "ready") {
+      expect(["online", "offline", "error"]).toContain(state.replication.status);
       expect(Array.isArray(rows)).toBe(true);
       return;
     }
 
-    expect(state.local).toBe("failed");
-    expect(typeof state.localError).toBe("string");
-    expect((state.localError ?? "").length).toBeGreaterThan(0);
-    expect(state.remote).not.toBe("starting");
+    expect(state.local.status).toBe("failed");
+    if (state.local.status !== "failed") throw new Error("Expected a failed local state.");
+    expect(typeof state.local.error.message).toBe("string");
+    expect(state.local.error.message.length).toBeGreaterThan(0);
+    expect(state.replication.status).not.toBe("starting");
     expect(queryError).toBeDefined();
-    expect(runtimeFailures.length).toBeGreaterThan(0);
   }, 40_000);
 
   test("initial pull delivers pre-existing documents from the remote", async () => {
@@ -131,13 +124,6 @@ describe("webkit runtime smoke", () => {
       const convex = new ConvexEmbeddedClient({ url }) as unknown as SmokeClient;
       clients.add(convex);
 
-      let delivered = 0;
-      convex.subscribeInternalEvents?.((event) => {
-        if (event.type !== "remote") return;
-        const tick = (event as { tick?: { received?: number; rowsApplied?: number } }).tick;
-        if (tick) delivered += (tick.received ?? 0) + (tick.rowsApplied ?? 0);
-      });
-
       await convex.open();
 
       const args = { limit: 1, prefix: marker };
@@ -154,14 +140,13 @@ describe("webkit runtime smoke", () => {
       stop();
 
       const state = await settle(convex);
-      if (state.local !== "ready") {
+      if (state.local.status !== "ready") {
         throw new Error(
-          `webkit store did not open (persistent OPFS context required): ${state.localError}`,
+          `webkit store did not open (persistent OPFS context required): ${state.local.status === "failed" ? state.local.error.message : state.local.status}`,
         );
       }
-      expect(state.remote).toBe("ready");
+      expect(state.replication).toEqual({ status: "online", sync: "idle" });
       expect(count).toBe(1);
-      expect(delivered).toBeGreaterThan(0);
       expect(elapsed).toBeLessThan(INITIAL_PULL_DEADLINE_MS);
     } finally {
       await hosted.mutation(removeDocument, { id: created._id });

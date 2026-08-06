@@ -1,9 +1,21 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describe, expect, test } from "vite-plus/test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as {
@@ -11,11 +23,274 @@ const packageJson = JSON.parse(readFileSync(join(packageRoot, "package.json"), "
   files: string[];
   name: string;
 };
+const temporary: string[] = [];
 
-/** The public entry points from package.json#exports that ship a `.d.mts`. */
-const ENTRIES = typedExportEntries();
-const NODE_SAFE_IMPORTS = new Set(["devtools", "devtools/vite", "metro"]);
-const require = createRequire(import.meta.url);
+afterEach(() => {
+  for (const path of temporary.splice(0)) rmSync(path, { force: true, recursive: true });
+});
+
+type EntrypointClass =
+  | "stable app API"
+  | "version-coupled tooling"
+  | "experimental devtools"
+  | "generated-only";
+
+interface EntrypointContract {
+  class: EntrypointClass;
+  exports?: readonly string[];
+  signatures?: readonly string[];
+}
+
+/** Every package export is deliberate: app APIs, build tooling, devtools, or generated code only. */
+const ENTRYPOINTS = {
+  bundler: {
+    class: "version-coupled tooling",
+    exports: [
+      "EMBEDDED_GENERATED_FORMAT_VERSION",
+      "EmbeddedBundleInput",
+      "EmbeddedBundleResult",
+      "EmbeddedFunctionKind",
+      "EmbeddedFunctionManifest",
+      "EmbeddedFunctionManifestEntry",
+      "EmbeddedFunctionVisibility",
+      "EmbeddedGeneratedIdentity",
+      "EmbeddedGeneratedSchema",
+      "FunctionPlacement",
+      "GenerateEmbeddedResult",
+      "createEmbeddedBundle",
+      "generateEmbedded",
+      "readLocalExportNames",
+      "renderEmbeddedGenerated",
+      "toModuleId",
+    ],
+    signatures: [
+      "declare const EMBEDDED_GENERATED_FORMAT_VERSION = 4;",
+      "declare function generateEmbedded(input: EmbeddedBundleInput): Promise<GenerateEmbeddedResult>;",
+      "declare function renderEmbeddedGenerated(bundle: EmbeddedBundleResult): string;",
+    ],
+  },
+  browser: {
+    class: "stable app API",
+    exports: [
+      "AuthTokenFetcher",
+      "ConvexEmbeddedClient",
+      "ConvexEmbeddedClientOptions",
+      "ConvexEmbeddedSchema",
+      "ConvexEmbeddedUploadFetch",
+      "ConvexEmbeddedUploadFetchOptions",
+      "EMBEDDED_ERROR_CODES",
+      "EMBEDDED_SETTLEMENT_CODES",
+      "EMBEDDED_UPLOAD_PATH",
+      "EmbeddedConnectionError",
+      "EmbeddedConnectionErrorCode",
+      "EmbeddedConnectionState",
+      "EmbeddedError",
+      "EmbeddedErrorCode",
+      "EmbeddedLocalConnectionState",
+      "EmbeddedMutationSettlement",
+      "EmbeddedReplicationConnectionState",
+      "EmbeddedRetainedRevision",
+      "EmbeddedSettlementCode",
+      "Watch",
+      "createConvexEmbeddedUploadFetch",
+      "isEmbeddedError",
+    ],
+    signatures: [
+      "declare class ConvexEmbeddedClient extends EmbeddedClient {",
+      "declare function createConvexEmbeddedUploadFetch(client: EmbeddedClient, options?: ConvexEmbeddedUploadFetchOptions): ConvexEmbeddedUploadFetch;",
+    ],
+  },
+  devtools: {
+    class: "experimental devtools",
+    exports: [
+      "EmbeddedDevtoolsSource",
+      "MountEmbeddedDevtoolsOptions",
+      "MountedEmbeddedDevtools",
+      "createEmbeddedDevtoolsSource",
+      "mountEmbeddedDevtools",
+    ],
+    signatures: [
+      "declare function mountEmbeddedDevtools(client: EmbeddedClient, options?: MountEmbeddedDevtoolsOptions): MountedEmbeddedDevtools;",
+    ],
+  },
+  "devtools/vite": {
+    class: "experimental devtools",
+    exports: ["EmbeddedDevtoolsVitePlugin", "EmbeddedDevtoolsVitePlugins", "embeddedDevtools"],
+    signatures: [
+      "declare function embeddedDevtools(config?: TanStackDevtoolsViteConfig): EmbeddedDevtoolsVitePlugins;",
+    ],
+  },
+  node: {
+    class: "stable app API",
+    exports: [
+      "AuthTokenFetcher",
+      "ConvexEmbeddedClient",
+      "ConvexEmbeddedClientOptions",
+      "ConvexEmbeddedSchema",
+      "ConvexEmbeddedUploadFetch",
+      "ConvexEmbeddedUploadFetchOptions",
+      "ConvexLocalModules",
+      "ConvexModules",
+      "EMBEDDED_ERROR_CODES",
+      "EMBEDDED_SETTLEMENT_CODES",
+      "EMBEDDED_UPLOAD_PATH",
+      "EmbeddedConnectionError",
+      "EmbeddedConnectionErrorCode",
+      "EmbeddedConnectionState",
+      "EmbeddedError",
+      "EmbeddedErrorCode",
+      "EmbeddedLocalConnectionState",
+      "EmbeddedMutationSettlement",
+      "EmbeddedReplicationConnectionState",
+      "EmbeddedRetainedRevision",
+      "EmbeddedSettlementCode",
+      "Watch",
+      "createConvexEmbeddedUploadFetch",
+      "isEmbeddedError",
+    ],
+    signatures: ["declare class ConvexEmbeddedClient extends EmbeddedClient {"],
+  },
+  expo: {
+    class: "stable app API",
+    exports: [
+      "AuthTokenFetcher",
+      "ConvexEmbeddedClient",
+      "ConvexEmbeddedClientOptions",
+      "ConvexEmbeddedSchema",
+      "EMBEDDED_ERROR_CODES",
+      "EMBEDDED_SETTLEMENT_CODES",
+      "EmbeddedConnectionError",
+      "EmbeddedConnectionErrorCode",
+      "EmbeddedConnectionState",
+      "EmbeddedError",
+      "EmbeddedErrorCode",
+      "EmbeddedLocalConnectionState",
+      "EmbeddedMutationSettlement",
+      "EmbeddedReplicationConnectionState",
+      "EmbeddedRetainedRevision",
+      "EmbeddedSettlementCode",
+      "Watch",
+      "isEmbeddedError",
+    ],
+    signatures: ["declare class ConvexEmbeddedClient extends EmbeddedClient {"],
+  },
+  metro: {
+    class: "version-coupled tooling",
+    exports: ["ConvexEmbeddedMetroOptions", "withConvexEmbedded"],
+    signatures: [
+      "declare function withConvexEmbedded<Config extends object>(config: Config, options: ConvexEmbeddedMetroOptions): Promise<Config>;",
+    ],
+  },
+  values: {
+    class: "stable app API",
+    exports: ["EmbeddedValue", "e"],
+    signatures: ["declare const e: Readonly<{"],
+  },
+  schema: {
+    class: "stable app API",
+    exports: [
+      "DeviceDataModel",
+      "DeviceModel",
+      "EmbeddedSchemaDefinition",
+      "EmbeddedTableDefinition",
+      "EmbeddedTableValidator",
+      "LocalTableDefinition",
+      "ReplicatedDataModel",
+      "ServerDataModel",
+      "ServerModel",
+      "WireModel",
+      "defineEmbeddedSchema",
+      "localTable",
+      "replicatedTable",
+    ],
+    signatures: [
+      "declare function defineEmbeddedSchema<Tables extends GenericSchema>(tables: Tables, options?: DefineSchemaOptions<true>): EmbeddedSchemaDefinition<Tables>;",
+      "declare function localTable<DocumentSchema extends EmbeddedFields>(documentSchema: DocumentSchema): LocalTableDefinition",
+    ],
+  },
+  "convex.config": {
+    class: "version-coupled tooling",
+    exports: ["default"],
+    signatures: ['declare const _default: import("convex/server").ComponentDefinition<any, {}>;'],
+  },
+  "convex.config.js": {
+    class: "version-coupled tooling",
+    exports: ["default"],
+    signatures: ['declare const _default: import("convex/server").ComponentDefinition<any, {}>;'],
+  },
+  "_generated/component.js": {
+    class: "generated-only",
+    exports: ["ComponentApi"],
+    signatures: ["type ComponentApi<Name extends string | undefined = string | undefined> = {"],
+  },
+  server: {
+    class: "stable app API",
+    exports: ["DefineEmbeddedOptions", "DefinedEmbedded", "defineEmbedded"],
+    signatures: [
+      "declare function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(options: DefineEmbeddedOptions<Schema>): DefinedEmbedded<Schema>;",
+    ],
+  },
+  local: {
+    class: "stable app API",
+    exports: [
+      "LocalAction",
+      "LocalActionBuilder",
+      "LocalActionCtx",
+      "LocalBuilders",
+      "LocalCompatibilityBuilders",
+      "LocalFunction",
+      "LocalFunctionArgs",
+      "LocalFunctionReturns",
+      "LocalMutation",
+      "LocalMutationBuilder",
+      "LocalMutationCtx",
+      "LocalQuery",
+      "LocalQueryBuilder",
+      "LocalQueryCtx",
+    ],
+    signatures: [
+      'readonly placement: "local";',
+      "type LocalBuilders<DataModel extends GenericDataModel> = {",
+      "compatibility<Schema extends EmbeddedSchemaDefinition>(schema: Schema): LocalCompatibilityBuilders<DeviceDataModel<Schema>>;",
+      'internalAction: LocalActionBuilder<DataModel, "internal">;',
+    ],
+  },
+  "internal/local": {
+    class: "generated-only",
+    exports: ["defineLocal", "stampLocal"],
+    signatures: [
+      "declare function defineLocal<Schema extends EmbeddedSchemaDefinition>(schema: Schema): LocalBuilders<DeviceDataModel<Schema>>;",
+      "declare function stampLocal(moduleId: string, exports: Record<string, unknown>): void;",
+      "declare function stampLocal(moduleId: string, graphHash: string, exports: Record<string, unknown>): void;",
+    ],
+  },
+  "internal/text": {
+    class: "stable app API",
+    exports: ["TextFieldOptions", "TextFieldWriter", "createTextField"],
+    signatures: [
+      "declare function createTextField<R>(options: TextFieldOptions<R>): TextFieldWriter;",
+    ],
+  },
+  unplugin: {
+    class: "version-coupled tooling",
+    exports: [
+      "ConvexEmbeddedPluginOptions",
+      "ConvexEmbeddedUnplugin",
+      "convexEmbedded",
+      "convexEmbeddedUnplugin",
+      "default",
+    ],
+    signatures: ["declare const convexEmbeddedUnplugin: ConvexEmbeddedUnplugin;"],
+  },
+  vite: {
+    class: "version-coupled tooling",
+    exports: ["ConvexEmbeddedPluginOptions", "convexEmbedded", "default"],
+    signatures: [
+      "declare function convexEmbedded(options: ConvexEmbeddedPluginOptions): VitePlugin[];",
+    ],
+  },
+  "package.json": { class: "version-coupled tooling" },
+} as const satisfies Record<string, EntrypointContract>;
 
 interface ExportEntry {
   dts: string;
@@ -30,7 +305,6 @@ function typedExportEntries(): ExportEntry[] {
     const types = declarationPath(record);
     if (types === undefined) return [];
     const name = key === "." ? "." : key.replace(/^\.\//, "");
-    if (name.startsWith("internal/")) return [];
     const specifier = key === "." ? packageJson.name : `${packageJson.name}${key.slice(1)}`;
     return [{ dts: types.replace(/^\.\//, ""), name, specifier }];
   });
@@ -51,16 +325,6 @@ function declarationFile(value: string): string | undefined {
   return value.startsWith("./dist/") && /\.d\.[cm]ts$/.test(value) ? value : undefined;
 }
 
-function distDeclarationFiles(dir = join(packageRoot, "dist")): string[] {
-  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-    const fullPath = join(dir, entry.name);
-    if (entry.isDirectory()) return distDeclarationFiles(fullPath);
-    if (!entry.isFile() || !entry.name.endsWith(".d.mts")) return [];
-    return [fullPath];
-  });
-}
-
-/** Extract the publicly exported identifiers from a `.d.mts` declaration file, sorted. */
 function exportedNames(dts: string): string[] {
   const names = new Set<string>();
 
@@ -72,24 +336,103 @@ function exportedNames(dts: string): string[] {
       names.add(aliased ? aliased[1] : part.split(/\s+/)[0]);
     }
   }
-  const decl =
+  const declaration =
     /export\s+(?:declare\s+)?(?:abstract\s+)?(?:class|function|const|let|var|enum|namespace|interface|type)\s+(\w+)/g;
-  for (const m of dts.matchAll(decl)) names.add(m[1]);
+  for (const match of dts.matchAll(declaration)) names.add(match[1]);
 
   return [...names].sort();
 }
 
-describe("public package surface", () => {
+function declarationClosure(entry: ExportEntry): string {
+  const pending = [join(packageRoot, entry.dts)];
+  const visited = new Set<string>();
+  const sources: string[] = [];
+
+  while (pending.length > 0) {
+    const file = pending.pop()!;
+    if (!visited.add(file)) continue;
+    const source = readFileSync(file, "utf8");
+    sources.push(source);
+    for (const match of source.matchAll(/from\s+["']([^"']+)["']/g)) {
+      const specifier = match[1];
+      if (!specifier.startsWith(".")) continue;
+      const declaration = resolve(dirname(file), specifier)
+        .replace(/\.mjs$/, ".d.mts")
+        .replace(/\.cjs$/, ".d.cts")
+        .replace(/\.js$/, ".d.mts");
+      if (existsSync(declaration)) pending.push(declaration);
+    }
+  }
+  return sources.join("\n");
+}
+
+function normalize(source: string): string {
+  return source.replace(/\s+/g, " ").trim();
+}
+
+const ENTRIES = typedExportEntries();
+const require = createRequire(import.meta.url);
+
+describe("package entrypoint contract", () => {
+  test("classifies every exported package path", () => {
+    const actual = Object.keys(packageJson.exports)
+      .map((key) => (key === "." ? "." : key.replace(/^\.\//, "")))
+      .sort();
+    expect(Object.keys(ENTRYPOINTS).sort()).toEqual(actual);
+    expect(Object.values(ENTRYPOINTS).map((entry) => entry.class)).toEqual(
+      expect.arrayContaining([
+        "stable app API",
+        "version-coupled tooling",
+        "experimental devtools",
+        "generated-only",
+      ]),
+    );
+  });
+
   for (const entry of ENTRIES) {
-    test(`${entry.name} entry exports only its intended surface`, () => {
-      const dts = readFileSync(join(packageRoot, entry.dts), "utf8");
-      expect(exportedNames(dts)).toMatchSnapshot();
+    const contract: EntrypointContract = ENTRYPOINTS[entry.name as keyof typeof ENTRYPOINTS];
+    if (contract.exports === undefined) continue;
+
+    test(`${contract.class}: ${entry.name} exports its exact declaration surface`, () => {
+      const declaration = readFileSync(join(packageRoot, entry.dts), "utf8");
+      expect(exportedNames(declaration)).toEqual(contract.exports);
+      const closure = normalize(declarationClosure(entry));
+      for (const signature of contract.signatures ?? []) {
+        expect(closure).toContain(normalize(signature));
+      }
     });
   }
 
-  test("Node-safe package entries are safe to import", async () => {
+  test("the public local entry is types-only", async () => {
+    const local = await import("@convex-dev/embedded/local");
+    expect(Object.keys(local)).toEqual([]);
+    for (const name of [
+      "EMBEDDED_LOCAL_REFERENCE",
+      "Register",
+      "defineLocal",
+      "isLocalFunction",
+      "local",
+      "localReferenceName",
+      "stampLocal",
+    ]) {
+      expect(local).not.toHaveProperty(name);
+    }
+  });
+
+  test("the generated-only local entry exposes only the builder and stamper", async () => {
+    const internal = await import("@convex-dev/embedded/internal/local");
+    expect(Object.keys(internal).sort()).toEqual(["defineLocal", "stampLocal"]);
+  });
+
+  test("Node-safe tooling entries are safe to import", async () => {
     for (const entry of ENTRIES) {
-      if (!NODE_SAFE_IMPORTS.has(entry.name)) continue;
+      if (
+        !["bundler", "devtools", "devtools/vite", "local", "metro", "unplugin", "vite"].includes(
+          entry.name,
+        )
+      ) {
+        continue;
+      }
       await import(entry.specifier);
     }
   });
@@ -130,32 +473,84 @@ describe("public package surface", () => {
     );
   });
 
-  test("no test-only factory leaks into the public surface", () => {
-    const leaked: string[] = [];
-    for (const entry of ENTRIES) {
-      const names = exportedNames(readFileSync(join(packageRoot, entry.dts), "utf8"));
-      for (const name of names) {
-        if (/^defineConformance$|^MemoryTransport$|TestKit/i.test(name)) {
-          leaked.push(`${entry.name}: ${name}`);
-        }
-      }
-    }
-    expect(leaked).toEqual([]);
-  });
+  test("a packed consumer can use local types but cannot import ambient local APIs", () => {
+    const destination = mkdtempSync(join(tmpdir(), "convex-embedded-entrypoint-tarball-"));
+    const consumer = mkdtempSync(join(tmpdir(), "convex-embedded-entrypoint-consumer-"));
+    temporary.push(destination, consumer);
+    execFileSync(
+      "pnpm",
+      ["--config.ignore-scripts=true", "pack", "--pack-destination", destination],
+      {
+        cwd: packageRoot,
+        stdio: "pipe",
+      },
+    );
+    const tarball = readdirSync(destination).find((file) => file.endsWith(".tgz"));
+    if (tarball === undefined) throw new Error("pnpm pack did not create a package tarball");
 
-  test("public declarations do not expose removed DX names", () => {
-    const leaked: string[] = [];
-    for (const path of distDeclarationFiles()) {
-      const declarations = readFileSync(path, "utf8");
-      const code = declarations.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-      const names = exportedNames(declarations).join("\n");
-      const relativePath = path.slice(packageRoot.length + 1);
-      for (const pattern of [/embedded\.generated/i, new RegExp("sync" + "able", "i")]) {
-        if (pattern.test(code) || pattern.test(names) || pattern.test(relativePath)) {
-          leaked.push(`${relativePath}: ${pattern}`);
-        }
-      }
-    }
-    expect(leaked).toEqual([]);
-  });
+    writeFileSync(
+      join(consumer, "package.json"),
+      JSON.stringify({ name: "embedded-entrypoint-consumer", private: true, type: "module" }),
+    );
+    const installed = join(consumer, "node_modules", "@convex-dev", "embedded");
+    mkdirSync(dirname(installed), { recursive: true });
+    execFileSync("tar", ["-xzf", join(destination, tarball), "-C", consumer], { stdio: "pipe" });
+    renameSync(join(consumer, "package"), installed);
+    symlinkSync(
+      resolve(dirname(require.resolve("convex")), "../.."),
+      join(consumer, "node_modules", "convex"),
+      "dir",
+    );
+    writeFileSync(
+      join(consumer, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          noEmit: true,
+          skipLibCheck: true,
+          strict: true,
+          target: "ES2022",
+        },
+      }),
+    );
+    writeFileSync(
+      join(consumer, "index.ts"),
+      `import type { LocalBuilders } from "@convex-dev/embedded/local";
+
+export type LocalContract = LocalBuilders<any>;
+
+// @ts-expect-error Generated modules, not app code, own the builder factory.
+import { defineLocal } from "@convex-dev/embedded/local";
+// @ts-expect-error Generated modules export the schema-bound local value.
+import { local } from "@convex-dev/embedded/local";
+// @ts-expect-error Local stamping stays package-private.
+import { stampLocal } from "@convex-dev/embedded/local";
+// @ts-expect-error Local references stay package-private.
+import { localReferenceName } from "@convex-dev/embedded/local";
+// @ts-expect-error The marker is package-private.
+import { EMBEDDED_LOCAL_REFERENCE } from "@convex-dev/embedded/local";
+// @ts-expect-error Ambient registration was removed.
+import type { Register } from "@convex-dev/embedded/local";
+
+void [defineLocal, local, stampLocal, localReferenceName, EMBEDDED_LOCAL_REFERENCE];
+`,
+    );
+    writeFileSync(
+      join(consumer, "runtime.mjs"),
+      `import * as local from "@convex-dev/embedded/local";
+if (Object.keys(local).length !== 0) throw new Error("public local runtime exports must be empty");
+`,
+    );
+
+    execFileSync(
+      process.execPath,
+      [require.resolve("typescript/bin/tsc"), "--project", "tsconfig.json"],
+      {
+        cwd: consumer,
+        stdio: "pipe",
+      },
+    );
+    execFileSync(process.execPath, ["runtime.mjs"], { cwd: consumer, stdio: "pipe" });
+  }, 30_000);
 });

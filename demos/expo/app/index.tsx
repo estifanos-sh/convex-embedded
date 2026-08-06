@@ -1,5 +1,4 @@
 import { api } from "$convex/_generated/api";
-import type { FunctionReturnType } from "convex/server";
 import * as Haptics from "expo-haptics";
 import { router, useLocalSearchParams } from "expo-router";
 import { Stack } from "expo-router/stack";
@@ -9,6 +8,7 @@ import {
   BackHandler,
   FlatList,
   Keyboard,
+  type ListRenderItemInfo,
   Pressable,
   StyleSheet,
   Text,
@@ -23,6 +23,8 @@ import {
   toggleExpanded as toggleExpandedMutation,
 } from "$local/view";
 import { client } from "@/src/client";
+import { DocumentRow, type DocumentRowProps } from "@/src/list";
+import type { DocumentSummary } from "@/src/row";
 import {
   markFirstRender,
   markListReady,
@@ -34,7 +36,11 @@ import { useEmbeddedQuery } from "@/src/query";
 import { colors, fontSize, radius, spacing } from "@/src/theme";
 import { DocumentScreen, type DocumentScreenHandle } from "./document/[id]";
 
-type DocumentSummary = FunctionReturnType<typeof api.documents.read>[number];
+type DocumentListItem = Pick<DocumentRowProps, "document" | "expanded" | "opening" | "pinned">;
+
+function documentKey({ document }: DocumentListItem): string {
+  return document._id;
+}
 
 export default function DocumentsScreen() {
   const insets = useSafeAreaInsets();
@@ -159,14 +165,33 @@ export default function DocumentsScreen() {
   }, [editorVisible, requestCloseDocument]);
 
   const rows = query.status === "ready" ? query.value : undefined;
-  const documents: DocumentSummary[] = React.useMemo(() => {
+  const documentRows: DocumentListItem[] = React.useMemo(() => {
     const list = rows ?? [];
-    if (pinnedDocumentIds.size === 0) return list;
-    return [
-      ...list.filter((document) => pinnedDocumentIds.has(document._id)),
-      ...list.filter((document) => !pinnedDocumentIds.has(document._id)),
-    ];
-  }, [pinnedDocumentIds, rows]);
+    const ordered =
+      pinnedDocumentIds.size === 0
+        ? list
+        : [
+            ...list.filter((document) => pinnedDocumentIds.has(document._id)),
+            ...list.filter((document) => !pinnedDocumentIds.has(document._id)),
+          ];
+    return ordered.map((document) => ({
+      document,
+      expanded: expandedDocumentIds.has(document._id),
+      opening: openingDocumentId === document._id,
+      pinned: pinnedDocumentIds.has(document._id),
+    }));
+  }, [expandedDocumentIds, openingDocumentId, pinnedDocumentIds, rows]);
+  const renderDocument = React.useCallback(
+    ({ item }: ListRenderItemInfo<DocumentListItem>) => (
+      <DocumentRow
+        {...item}
+        onOpen={openDocument}
+        onToggleExpanded={toggleExpanded}
+        onTogglePin={togglePin}
+      />
+    ),
+    [openDocument, toggleExpanded, togglePin],
+  );
 
   React.useEffect(() => {
     markFirstRender();
@@ -212,11 +237,13 @@ export default function DocumentsScreen() {
           >
             <FlatList
               contentInsetAdjustmentBehavior="never"
-              contentContainerStyle={documents.length === 0 ? styles.emptyContent : styles.content}
-              data={documents}
+              contentContainerStyle={
+                documentRows.length === 0 ? styles.emptyContent : styles.content
+              }
+              data={documentRows}
               keyboardDismissMode="on-drag"
               keyboardShouldPersistTaps="handled"
-              keyExtractor={(document) => document._id}
+              keyExtractor={documentKey}
               ListHeaderComponent={
                 <View style={styles.listHeader}>
                   <TextInput
@@ -264,17 +291,7 @@ export default function DocumentsScreen() {
                   />
                 )
               }
-              renderItem={({ item }) => (
-                <DocumentRow
-                  document={item}
-                  expanded={expandedDocumentIds.has(item._id)}
-                  opening={openingDocumentId === item._id}
-                  pinned={pinnedDocumentIds.has(item._id)}
-                  onOpen={() => openDocument(item._id)}
-                  onToggleExpanded={() => void toggleExpanded(item._id)}
-                  onTogglePin={() => void togglePin(item._id)}
-                />
-              )}
+              renderItem={renderDocument}
               style={styles.list}
             />
             <View
@@ -371,91 +388,6 @@ function useExpandedDocumentIds(): ReadonlySet<string> {
   return expandedIds;
 }
 
-function DocumentRow({
-  document,
-  expanded,
-  opening,
-  pinned,
-  onOpen,
-  onToggleExpanded,
-  onTogglePin,
-}: {
-  document: DocumentSummary;
-  expanded: boolean;
-  opening: boolean;
-  pinned: boolean;
-  onOpen: () => void;
-  onToggleExpanded: () => void;
-  onTogglePin: () => void;
-}) {
-  return (
-    <Pressable
-      accessibilityHint="Opens this document"
-      accessibilityRole="button"
-      onPress={onOpen}
-      onPressIn={() => {
-        if (process.env.EXPO_OS === "ios") void Haptics.selectionAsync();
-      }}
-      style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
-    >
-      <View
-        accessibilityElementsHidden
-        importantForAccessibility="no-hide-descendants"
-        style={styles.documentIcon}
-      >
-        <View style={styles.documentIconFold} />
-        <View style={styles.documentIconLine} />
-        <View style={[styles.documentIconLine, styles.documentIconLineShort]} />
-      </View>
-      <View style={styles.rowCopy}>
-        <Text numberOfLines={1} style={styles.rowTitle}>
-          {document.title || "Untitled"}
-        </Text>
-        <Text style={styles.rowMeta}>{formatDate(document.updatedAt)}</Text>
-        {expanded ? (
-          <Text numberOfLines={1} style={styles.rowMeta}>
-            /{document.slug}
-          </Text>
-        ) : null}
-      </View>
-      <Pressable
-        accessibilityHint="Shows more about this document on this device only"
-        accessibilityLabel={expanded ? "Collapse document details" : "Expand document details"}
-        accessibilityRole="button"
-        accessibilityState={{ expanded }}
-        hitSlop={8}
-        onPress={onToggleExpanded}
-        style={({ pressed }) => [styles.pinButton, pressed && styles.rowPressed]}
-      >
-        <Text style={[styles.pinGlyph, expanded && styles.pinGlyphActive]}>
-          {expanded ? "▾" : "▸"}
-        </Text>
-      </Pressable>
-      <Pressable
-        accessibilityHint="Keeps this document listed on this device only"
-        accessibilityLabel={pinned ? "Unpin document" : "Pin document"}
-        accessibilityRole="button"
-        hitSlop={8}
-        onPress={onTogglePin}
-        style={({ pressed }) => [styles.pinButton, pressed && styles.rowPressed]}
-      >
-        <Text style={[styles.pinGlyph, pinned && styles.pinGlyphActive]}>{pinned ? "★" : "☆"}</Text>
-      </Pressable>
-      {opening ? (
-        <ActivityIndicator color={colors.content.secondary} size="small" />
-      ) : (
-        <Text
-          accessibilityElementsHidden
-          importantForAccessibility="no-hide-descendants"
-          style={styles.chevron}
-        >
-          ›
-        </Text>
-      )}
-    </Pressable>
-  );
-}
-
 function QueryState({
   creating,
   onCreate,
@@ -531,15 +463,6 @@ function ActionButton({
       <Text style={styles.actionButtonLabel}>{label}</Text>
     </Pressable>
   );
-}
-
-function formatDate(value: number): string {
-  return new Intl.DateTimeFormat(undefined, {
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    month: "short",
-  }).format(value);
 }
 
 const styles = StyleSheet.create({
@@ -653,86 +576,6 @@ const styles = StyleSheet.create({
     color: colors.content.error,
     fontSize: fontSize.caption,
     lineHeight: 18,
-  },
-  row: {
-    minHeight: 62,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.md,
-    backgroundColor: colors.background.secondary,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.lg,
-    borderCurve: "continuous",
-  },
-  rowPressed: {
-    backgroundColor: colors.background.tertiary,
-  },
-  documentIcon: {
-    width: 18,
-    height: 22,
-    borderWidth: 1.5,
-    borderColor: colors.content.tertiary,
-    borderRadius: 2,
-    paddingHorizontal: 3,
-    paddingTop: 8,
-    gap: 3,
-  },
-  documentIconFold: {
-    position: "absolute",
-    top: -1,
-    right: -1,
-    width: 7,
-    height: 7,
-    borderLeftWidth: 1.5,
-    borderBottomWidth: 1.5,
-    borderColor: colors.content.tertiary,
-    backgroundColor: colors.background.secondary,
-  },
-  documentIconLine: {
-    width: 9,
-    height: 1.5,
-    backgroundColor: colors.content.tertiary,
-    borderRadius: 1,
-  },
-  documentIconLineShort: {
-    width: 6,
-  },
-  rowCopy: {
-    flex: 1,
-    gap: spacing.xs,
-  },
-  rowTitle: {
-    color: colors.content.primary,
-    fontSize: fontSize.body,
-    fontWeight: "600",
-  },
-  rowMeta: {
-    color: colors.content.tertiary,
-    fontSize: fontSize.caption,
-  },
-  chevron: {
-    color: colors.content.tertiary,
-    fontSize: 24,
-    fontWeight: "300",
-  },
-  pinButton: {
-    width: 32,
-    height: 32,
-    alignItems: "center",
-    justifyContent: "center",
-    borderRadius: radius.sm,
-    borderCurve: "continuous",
-  },
-  pinGlyph: {
-    color: colors.content.tertiary,
-    fontSize: 18,
-    lineHeight: 22,
-  },
-  pinGlyphActive: {
-    color: colors.content.primary,
   },
   pinnedCount: {
     color: colors.content.tertiary,

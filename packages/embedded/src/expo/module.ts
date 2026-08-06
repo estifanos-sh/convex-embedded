@@ -1,4 +1,5 @@
-const EXPO_NATIVE_API_VERSION = 9;
+// Keep this paired with the mobile Rust wire: older native artifacts omit required settlements.
+const EXPO_NATIVE_API_VERSION = 10;
 
 /** Native Expo SharedObject contract. @internal */
 export interface NativeStoreObject {

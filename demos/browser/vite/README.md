@@ -28,7 +28,7 @@ pnpm dev:browser:vite
 - `vite.config.ts` — React, Tailwind, the shared deployment/generated paths, and embedded devtools.
 
 The schema and functions live at the workspace root in `convex/`. The Vite plugin rewrites the
-`convex/embedded.generated.ts` placement lockfile, inlines the device schema into its virtual
+`convex/_generated/embedded.ts` contract, inlines the device schema into its virtual
 registry, bundles device functions into the browser worker, and emits a stable identity hash so
-compatible tabs attach to the same local runtime. The lockfile's multi-dot basename keeps the Convex
-CLI from deploying it as a function module, and `convex dev` never replaces it.
+compatible tabs attach to the same local runtime. The `_generated` directory keeps the contract out
+of deployment discovery, and `convex dev` never replaces it.

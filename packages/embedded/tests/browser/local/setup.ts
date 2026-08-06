@@ -1,9 +1,6 @@
 import { v } from "convex/values";
 
-import { defineLocal } from "@convex-dev/embedded/local";
-import schema from "../convex/schema";
-
-const local = defineLocal(schema);
+import { local } from "../convex/_generated/embedded";
 
 const ensureVersion = local.internalMutation({
   args: {},

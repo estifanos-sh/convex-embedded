@@ -1,19 +1,24 @@
 import type { EmbeddedConnectionState } from "@convex-dev/embedded/expo";
 import { useEffect, useState } from "react";
 
-import { client } from "./client";
+import { client, clientReady } from "./client";
 
 /** Observe local startup and native remote replication without polling the network. */
 export function useEmbeddedConnectionState(): EmbeddedConnectionState {
   const [state, setState] = useState<EmbeddedConnectionState>(() => client.connectionState());
 
   useEffect(() => {
-    const read = (): void => setState(client.connectionState());
-    const unsubscribe = client.subscribeEvents((event) => {
-      if (event.type === "remote" || event.type === "runtime") read();
-    });
-    read();
-    return unsubscribe;
+    let active = true;
+    const unsubscribe = client.subscribeToConnectionState(setState);
+    void clientReady
+      .catch(() => undefined)
+      .then(() => {
+        if (active) setState(client.connectionState());
+      });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   return state;

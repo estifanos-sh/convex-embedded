@@ -6,7 +6,7 @@ import { toEmbeddedGeneratedSchema } from "../../src/bundler/generated";
 import { analyzeEmbeddedSchema, defineEmbeddedSchema, replicatedTable } from "../../src/schema";
 import { e } from "../../src/values";
 
-test("generated contract locks placements without carrying the device schema", () => {
+test("generated contract exports schema-bound local builders without carrying the device schema", () => {
   const schema = defineEmbeddedSchema({
     documents: replicatedTable({
       expanded: e.local(v.boolean()),
@@ -16,7 +16,7 @@ test("generated contract locks placements without carrying the device schema", (
   });
   const source = renderEmbeddedGenerated({
     embeddedSchema: toEmbeddedGeneratedSchema(analyzeEmbeddedSchema(schema)),
-    generatedPath: "/repo/convex/embedded.generated.ts",
+    generatedPath: "/repo/convex/_generated/embedded.ts",
     localModules: {
       "local/drafts": { file: "/repo/local/drafts.ts" },
     },
@@ -28,50 +28,28 @@ test("generated contract locks placements without carrying the device schema", (
     manifestHash: "manifest-hash",
     moduleGraphHash: "graph-hash",
     modules: { documents: "/repo/convex/documents.ts" },
-    registerSchema: true,
     schemaPath: "/repo/convex/schema.ts",
     schemaSourceHash: "schema-source-hash",
     sourceFiles: ["/repo/convex/documents.ts"],
   });
 
-  expect(source).toContain("embeddedGeneratedFormatVersion = 3");
+  expect(source).toContain("embeddedGeneratedFormatVersion = 4");
   expect(source).toContain(
-    'embeddedGeneratedIdentity = {"formatVersion":3,"manifestHash":"manifest-hash","schemaSourceHash":"schema-source-hash"}',
+    'embeddedGeneratedIdentity = {"formatVersion":4,"manifestHash":"manifest-hash","schemaSourceHash":"schema-source-hash"}',
   );
   expect(source).toContain(
     'embeddedManifest = {"documents":{"list":{"kind":"query","placement":"replicated","visibility":"public"}}}',
   );
-  expect(source).toContain('import type {} from "@convex-dev/embedded/local";');
-  expect(source).toContain('import type schema from "./schema.js";');
-  expect(source).toContain('declare module "@convex-dev/embedded/local"');
-  expect(source).toContain("schema: typeof schema;");
+  expect(source).toContain('import { defineLocal } from "@convex-dev/embedded/internal/local";');
+  expect(source).toContain('import schema from "../schema.js";');
+  expect(source).toContain("export const local = defineLocal(schema);");
+  expect(source).not.toContain("Register");
+  expect(source).not.toContain('"@convex-dev/embedded/local"');
   expect(source).not.toContain("embeddedSchema");
   expect(source).not.toContain("runtimeStoreSchema");
   expect(source).not.toContain("localApi");
   expect(source).not.toContain("local/drafts");
   expect(source.length).toBeLessThan(2048);
-});
-
-test("unregistered contract stays a value-only lockfile", () => {
-  const schema = defineEmbeddedSchema({
-    documents: replicatedTable({ title: v.string() }),
-  });
-  const source = renderEmbeddedGenerated({
-    embeddedSchema: toEmbeddedGeneratedSchema(analyzeEmbeddedSchema(schema)),
-    generatedPath: "/repo/convex/embedded.generated.ts",
-    localModules: {},
-    manifest: {},
-    manifestHash: "manifest-hash",
-    moduleGraphHash: "graph-hash",
-    modules: {},
-    registerSchema: false,
-    schemaPath: "/repo/convex/schema.ts",
-    schemaSourceHash: "schema-source-hash",
-    sourceFiles: [],
-  });
-
-  expect(source).not.toContain("import type schema");
-  expect(source).not.toContain("declare module");
 });
 
 test("generator atomically creates the contract needed by bundler builds", async () => {
@@ -94,13 +72,14 @@ test("generator atomically creates the contract needed by bundler builds", async
       root,
     });
 
-    expect(result.path).toBe(path.join(convex, "embedded.generated.ts"));
+    expect(result.path).toBe(path.join(convex, "_generated", "embedded.ts"));
     expect(result.bundle.embeddedSchema.runtimeStoreSchema.tables.length).toBeGreaterThan(0);
     await expect(readFile(result.path, "utf8")).resolves.toContain("embeddedManifest");
     expect(result.source).not.toContain("runtimeStoreSchema");
     expect(result.source).not.toContain("localApi");
     expect(result.source).not.toContain("makeFunctionReference");
     expect(result.source).not.toContain("type LocalReference");
+    expect(result.source).toContain('from "@convex-dev/embedded/internal/local"');
   } finally {
     await rm(root, { force: true, recursive: true });
   }

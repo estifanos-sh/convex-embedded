@@ -88,8 +88,8 @@ describe("candidate startup", () => {
     );
 
     const opened = await openCandidate(store as unknown as StorageBackend, {
-      createRunner: (schema, remote) => {
-        events.push(`runner:${schema.hash}:${String(remote)}`);
+      createRunner: ({ schema, mode, remote }) => {
+        events.push(`runner:${schema.hash}:${mode}:${String(remote)}`);
         return { schema };
       },
       localReady: async () => {
@@ -110,7 +110,7 @@ describe("candidate startup", () => {
       "validate:target:2",
       "unbind",
       "finalize:target:2",
-      "runner:target:true",
+      "runner:target:active:true",
       "ready",
       "retire:0",
       "retire:1",
@@ -130,9 +130,9 @@ describe("candidate startup", () => {
     const store = storeWithCandidate(prepared({ resumed: true, setupComplete: false }), events);
 
     const opened = await openCandidate(store as unknown as StorageBackend, {
-      createRunner: (schema, remote) => {
-        events.push(`runner:${schema.hash}:${String(remote)}`);
-        return { remote };
+      createRunner: ({ schema, mode, remote }) => {
+        events.push(`runner:${schema.hash}:${mode}:${String(remote)}`);
+        return { mode, remote };
       },
       localReady: async () => {
         events.push("ready");
@@ -140,9 +140,9 @@ describe("candidate startup", () => {
       remote: true,
       runnerSchema: target,
       setup: {
-        localSchemas: [],
+        compatibilitySchemas: [],
         run: async (runner) => {
-          events.push(`action:${String(runner.remote)}`);
+          events.push(`action:${runner.mode}:${String(runner.remote)}`);
         },
       },
       targetSchema: target,
@@ -154,9 +154,9 @@ describe("candidate startup", () => {
       "policy:target:2",
       `bind:${workspace.hash}:2`,
       "materialize:2",
-      `runner:${workspace.hash}:false`,
+      `runner:${workspace.hash}:setup:false`,
       "ready",
-      "action:false",
+      "action:setup:false",
       "complete:2",
       "unbind",
       "finalizePrepare:target:2",
@@ -165,7 +165,7 @@ describe("candidate startup", () => {
       "validate:target:2",
       "unbind",
       "finalize:target:2",
-      "runner:target:true",
+      "runner:target:active:true",
       "ready",
       "retire:1",
     ]);
@@ -184,7 +184,7 @@ describe("candidate startup", () => {
         remote: false,
         runnerSchema: target,
         setup: {
-          localSchemas: [],
+          compatibilitySchemas: [],
           run: async () => {
             events.push("action");
             throw new Error("setup failed");
@@ -220,6 +220,33 @@ describe("candidate startup", () => {
     ).rejects.toThrow("requires its matching setup action");
 
     expect(events).toEqual(["prepare:target", "copy:2", "policy:target:2"]);
+  });
+
+  test("constructs only a setup-mode runner before candidate publication", async () => {
+    const events: string[] = [];
+    const store = storeWithCandidate(prepared({ setupComplete: false }), events);
+
+    await openCandidate(store as unknown as StorageBackend, {
+      createRunner: ({ mode, remote }) => {
+        events.push(`runner:${mode}:${String(remote)}`);
+        return { mode };
+      },
+      localReady: async () => undefined,
+      remote: true,
+      runnerSchema: target,
+      setup: {
+        compatibilitySchemas: [],
+        run: async (runner) => {
+          expect(runner.mode).toBe("setup");
+        },
+      },
+      targetSchema: target,
+    });
+
+    expect(events.filter((event) => event.startsWith("runner:"))).toEqual([
+      "runner:setup:false",
+      "runner:active:true",
+    ]);
   });
 
   test("keeps warm open physical setup automatic", async () => {

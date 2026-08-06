@@ -59,13 +59,13 @@ export function assertNoPendingCommitTs(value: unknown, surface: string): void {
  *
  * @internal
  */
-export function resolvePendingCommitTs<T>(value: T, timestamp: bigint): T {
+export function pendingCommitTsRead<T>(value: T, timestamp: bigint): T {
   if (!hasPendingCommitTs(value)) return value;
   return resolve(value, timestamp) as T;
 }
 
 /** Resolve a payload whose typed ABI flag already proves it contains the marker. @internal */
-export function resolveKnownPendingCommitTs<T>(value: T, timestamp: bigint): T {
+export function knownPendingCommitTsRead<T>(value: T, timestamp: bigint): T {
   return resolveKnown(value, timestamp) as T;
 }
 

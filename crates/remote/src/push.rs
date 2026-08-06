@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 use convex::Value;
 use storage::{
     ArgRef, AuthoritativeChange, BaseVersion, CrdtCheckpoint, CrdtEffect, CrdtFieldKind,
-    CrdtReadWitness, InsertRef, Order, PushEnvelope, PushOutcome, PushResponse, RangeVersion,
-    ReadBound, ReadEquality, RevisionCandidate, RevisionCheckpoint, RevisionCheckpointOperation,
-    RevisionContent, RuntimeWireIdentity, ScheduleRef, SettledInsert, SettledSchedule,
-    SettledUpload, UploadRef,
+    CrdtReadWitness, InsertRef, Order, PushEnvelope, PushOutcome, PushResponse, PushVerdict,
+    RangeVersion, ReadBound, ReadEquality, RejectionCode, RevisionCandidate, RevisionCheckpoint,
+    RevisionCheckpointOperation, RevisionContent, RuntimeWireIdentity, ScheduleRef, SettledInsert,
+    SettledSchedule, SettledUpload, UploadRef,
 };
 
 use crate::{codec, ConvexArgs, RemoteError, RemoteResult};
@@ -948,7 +948,12 @@ pub fn decode_push_response(value: &Value) -> RemoteResult<PushResponse> {
     let authoritative = decode_push_array(fields, "authoritative", decode_authoritative_change)?;
     Ok(PushResponse {
         mutation_id: codec::expect_string(field("mutationId")?, "mutationId")?,
-        outcome,
+        verdict: match outcome {
+            PushOutcome::Applied => PushVerdict::Applied,
+            PushOutcome::Conflict | PushOutcome::Rejected | PushOutcome::Rebase => {
+                decode_push_failure(outcome, field("error")?)?
+            }
+        },
         inserts,
         schedules,
         uploads,
@@ -956,6 +961,46 @@ pub fn decode_push_response(value: &Value) -> RemoteResult<PushResponse> {
         crdt,
         authoritative,
     })
+}
+
+/// Decode the closed replay failure shape.
+///
+/// The v27 server boundary removes historic payloads before this point. Reject every field except
+/// `code`, so arbitrary application text cannot enter the native/public transport at all.
+fn decode_push_failure(outcome: PushOutcome, value: &Value) -> RemoteResult<PushVerdict> {
+    let Value::Object(fields) = value else {
+        return Err(RemoteError::Protocol(
+            "embedded:push settlement error must be an object".to_owned(),
+        ));
+    };
+    if fields.keys().any(|key| key != "code") {
+        return Err(RemoteError::Protocol(
+            "embedded:push settlement error contains unknown fields".to_owned(),
+        ));
+    }
+    let code = fields
+        .get("code")
+        .ok_or_else(|| {
+            RemoteError::Protocol("embedded:push settlement error missing code".to_owned())
+        })
+        .and_then(|value| codec::expect_string(value, "error.code"))?;
+    match outcome {
+        PushOutcome::Conflict if code == "EMBEDDED_CONFLICT" => Ok(PushVerdict::Conflict),
+        PushOutcome::Rejected => RejectionCode::parse(&code)
+            .map(PushVerdict::Rejected)
+            .ok_or_else(|| {
+                RemoteError::Protocol(
+                    "embedded:push rejected settlement has invalid error code".to_owned(),
+                )
+            }),
+        PushOutcome::Rebase if code == "EMBEDDED_REBASE" => Ok(PushVerdict::Rebase),
+        PushOutcome::Applied => Err(RemoteError::Protocol(
+            "embedded:push applied settlement cannot carry an error".to_owned(),
+        )),
+        PushOutcome::Conflict | PushOutcome::Rebase => Err(RemoteError::Protocol(
+            "embedded:push settlement error code does not match its outcome".to_owned(),
+        )),
+    }
 }
 
 fn decode_settled_revision(value: &Value) -> RemoteResult<storage::SettledRevision> {
@@ -1258,9 +1303,9 @@ fn json_to_convex(value: serde_json::Value) -> RemoteResult<Value> {
 #[cfg(test)]
 mod tests {
     use convex::Value;
-    use storage::BaseVersion;
+    use storage::{BaseVersion, PushVerdict, RejectionCode};
 
-    use super::{decode_envelope, mutation_args, RemoteError};
+    use super::{decode_envelope, decode_push_response, mutation_args, RemoteError};
 
     fn envelope_with_after_images(after_images: &serde_json::Value) -> String {
         serde_json::json!({
@@ -1367,5 +1412,89 @@ mod tests {
         };
         assert_eq!(equality["commitTs"], Value::Boolean(true));
         assert_eq!(equality["value"], Value::Int64(i64::MAX));
+    }
+
+    fn failure_response(outcome: &str, error: &serde_json::Value) -> Value {
+        Value::try_from(serde_json::json!({
+            "mutationId": "m1",
+            "outcome": outcome,
+            "error": error,
+            "inserts": [],
+            "schedules": [],
+            "uploads": [],
+            "revisions": [],
+            "crdt": [],
+            "authoritative": [],
+        }))
+        .expect("test response is a Convex value")
+    }
+
+    #[test]
+    fn structured_push_failure_codes_decode_to_closed_verdicts() {
+        let cases = [
+            (
+                "conflict",
+                serde_json::json!({ "code": "EMBEDDED_CONFLICT" }),
+                PushVerdict::Conflict,
+            ),
+            (
+                "rejected",
+                serde_json::json!({ "code": "EMBEDDED_REJECTED" }),
+                PushVerdict::Rejected(RejectionCode::Rejected),
+            ),
+            (
+                "rejected",
+                serde_json::json!({ "code": "EMBEDDED_DIVERGENCE" }),
+                PushVerdict::Rejected(RejectionCode::Divergence),
+            ),
+            (
+                "rebase",
+                serde_json::json!({ "code": "EMBEDDED_REBASE" }),
+                PushVerdict::Rebase,
+            ),
+        ];
+
+        for (outcome, error, expected) in cases {
+            let decoded = decode_push_response(&failure_response(outcome, &error))
+                .expect("closed error code should decode");
+            assert_eq!(decoded.verdict, expected);
+        }
+    }
+
+    #[test]
+    fn malformed_or_unknown_push_failure_codes_are_rejected() {
+        let cases = [
+            ("conflict", serde_json::json!("not an object")),
+            ("conflict", serde_json::json!({})),
+            ("conflict", serde_json::json!({ "code": 7 })),
+            (
+                "conflict",
+                serde_json::json!({ "code": "EMBEDDED_REJECTED" }),
+            ),
+            (
+                "rejected",
+                serde_json::json!({ "code": "EMBEDDED_CONFLICT" }),
+            ),
+            ("rebase", serde_json::json!({ "code": "EMBEDDED_CONFLICT" })),
+            ("rejected", serde_json::json!({ "code": "CUT4_SEED" })),
+            (
+                "rejected",
+                serde_json::json!({ "code": "EMBEDDED_REJECTED", "reason": "secret" }),
+            ),
+            (
+                "rejected",
+                serde_json::json!({ "code": "EMBEDDED_REJECTED", "detail": "nope" }),
+            ),
+        ];
+
+        for (outcome, error) in cases {
+            assert!(
+                matches!(
+                    decode_push_response(&failure_response(outcome, &error)),
+                    Err(RemoteError::Protocol(_))
+                ),
+                "{outcome} failure must fail closed"
+            );
+        }
     }
 }

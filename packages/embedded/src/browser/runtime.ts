@@ -11,7 +11,7 @@
 import type { ConvexModules } from "../client";
 import { openCandidate } from "../candidate";
 import type {
-  EmbeddedEventListener,
+  DiagnosticEventListener,
   EmbeddedRemoteEvent,
   EmbeddedRuntimeDegradation,
   EmbeddedRuntimeEvent,
@@ -19,11 +19,9 @@ import type {
 } from "../events";
 import { EMBEDDED_ERROR_CODES, EmbeddedClientRetiredError, errorMessage } from "../error";
 import { randomId } from "../id/random";
-import { localFunctionSchema } from "../local/internal";
 import { createRunner, type Runner } from "../runtime/runner";
 import type { ConvexEmbeddedSchema } from "../schema";
-import { localReferenceName } from "../local";
-import { localGraphHash } from "../local/internal";
+import { localCompatibilitySchema, localGraphHash, localReferenceName } from "../local/internal";
 import {
   consumeRemoteTick,
   mergeRemoteTicks,
@@ -35,6 +33,7 @@ import type {
   RemoteStartOptions,
   RemoteScope,
   RemotePending,
+  RemoteMutationSettlement,
   RemoteTick,
   RemoteTransportHost,
   StoreSchema,
@@ -72,7 +71,12 @@ export interface WorkerState {
   /** Runtime event cleanup callback. */
   eventStop?: () => void;
   /** Runtime event sink used by runner and remote lifecycle events. */
-  emit?: EmbeddedEventListener;
+  emit?: DiagnosticEventListener;
+  /** Exact terminal settlement vectors paired with browser remote diagnostics. */
+  emitRemote?: (
+    event: EmbeddedRemoteEvent,
+    settlements: readonly RemoteMutationSettlement[],
+  ) => void;
   /** OPFS bridge used by the Rust/WASM storage imports. */
   opfs: OpfsDirectory;
   /** Local Convex function runner. */
@@ -260,8 +264,17 @@ export async function initFromMessage(
       options.events === false
         ? undefined
         : (event) => postResponse({ event, op: WorkerEvent.Event }),
+    emitRemote:
+      options.events === false
+        ? undefined
+        : (event, settlements) =>
+            postResponse({
+              event,
+              op: WorkerEvent.Event,
+              ...(settlements.length === 0 ? {} : { settlements: [...settlements] }),
+            }),
     localModules: embedded.localModules,
-    localSchemas: await localModuleSchemas(embedded.localModules),
+    compatibilitySchemas: await localModuleCompatibilitySchemas(embedded.localModules),
     modules: embedded.modules,
     manifest: embedded.embeddedManifest,
     moduleGraphHash: request.identity?.moduleGraphHash,
@@ -476,6 +489,14 @@ function emitWorkerRemoteEvent(
   const sequence = (state.remoteEventSequence ?? 0) + 1;
   state.remoteEventSequence = sequence;
   const now = getTimerTime();
+  const settlements = detail.tick?.settlements ?? [];
+  const tick =
+    detail.tick === undefined
+      ? undefined
+      : (() => {
+          const { settlements: _settlements, ...diagnosticTick } = detail.tick!;
+          return { ...diagnosticTick, retainedRevisions: diagnosticTick.retainedRevisions.length };
+        })();
   const event: EmbeddedRemoteEvent = {
     at: now,
     attempt: detail.attempt ?? 0,
@@ -486,14 +507,16 @@ function emitWorkerRemoteEvent(
     nextRunAt: detail.nextRunIn === undefined ? undefined : now + detail.nextRunIn,
     status,
     sequence,
-    tick: detail.tick
-      ? { ...detail.tick, retainedRevisions: detail.tick.retainedRevisions.length }
-      : undefined,
+    tick,
     type: "remote",
     wasmApiVersion: state.wasmApiVersion,
   };
   state.remoteEvent = event;
-  state.emit?.(event);
+  if (state.emitRemote) {
+    state.emitRemote(event, settlements);
+  } else {
+    state.emit?.(event);
+  }
 }
 
 /** Emits a recovery error through the same generation/sequence fence as transport state. */
@@ -1448,9 +1471,13 @@ export function consumeWorkerRemoteTick(state: WorkerState, tick: RemoteTick): v
  */
 export async function initRuntime(options: {
   debug?: boolean;
-  emit?: EmbeddedEventListener;
+  emit?: DiagnosticEventListener;
+  emitRemote?: (
+    event: EmbeddedRemoteEvent,
+    settlements: readonly RemoteMutationSettlement[],
+  ) => void;
   localModules?: import("../runtime/runner").LocalModuleMap;
-  localSchemas?: readonly ConvexEmbeddedSchema[];
+  compatibilitySchemas?: readonly ConvexEmbeddedSchema[];
   modules: ConvexModules;
   manifest?: import("../runtime/runner").RuntimeFunctionManifest;
   moduleGraphHash?: string;
@@ -1515,8 +1542,8 @@ export async function initRuntime(options: {
       throw new Error("Candidate setup graph identity does not match the worker runtime.");
     }
     const candidate = await openCandidate<Runner>(store, {
-      createRunner: (runnerSchema, remote) =>
-        createRunner(options.modules, store!, runnerSchema, { ...runnerOptions, remote }),
+      createRunner: ({ schema: runnerSchema, mode, remote }) =>
+        createRunner(options.modules, store!, runnerSchema, { ...runnerOptions, mode, remote }),
       localReady: async (candidateRunner) => {
         await candidateRunner.localReady;
       },
@@ -1527,7 +1554,7 @@ export async function initRuntime(options: {
         options.setup === undefined
           ? undefined
           : {
-              localSchemas: options.localSchemas ?? [],
+              compatibilitySchemas: options.compatibilitySchemas ?? [],
               run: async (setupRunner) => {
                 await setupRunner.runAction(
                   options.setup!.reference,
@@ -1543,6 +1570,7 @@ export async function initRuntime(options: {
     runtimeEvent?.({ at: getTimerTime(), phase: "ready", type: "runtime" });
     const state: WorkerState = {
       emit: options.emit,
+      emitRemote: options.emitRemote,
       opfs,
       pthreads: opened.pthreads,
       runner,
@@ -1565,7 +1593,7 @@ export async function initRuntime(options: {
   }
 }
 
-async function localModuleSchemas(
+async function localModuleCompatibilitySchemas(
   modules: import("../runtime/runner").LocalModuleMap | undefined,
 ): Promise<ConvexEmbeddedSchema[]> {
   if (modules === undefined) return [];
@@ -1574,7 +1602,7 @@ async function localModuleSchemas(
     const module = await load();
     if (typeof module !== "object" || module === null) continue;
     for (const value of Object.values(module as Record<string, unknown>)) {
-      const schema = localFunctionSchema(value);
+      const schema = localCompatibilitySchema(value);
       if (schema !== undefined) schemas.add(schema);
     }
   }

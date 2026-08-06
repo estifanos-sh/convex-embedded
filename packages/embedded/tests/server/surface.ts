@@ -1550,7 +1550,6 @@ describe("v5 server surface", () => {
       outcome: "rejected",
       error: {
         code: "EMBEDDED_REJECTED",
-        reason: "Could not find public function documents:renamed",
       },
     });
     expect(committed).toMatchObject({
@@ -1559,6 +1558,61 @@ describe("v5 server surface", () => {
         settlement: { mutationId: "mutation-1", outcome: "rejected" },
       },
     });
+  });
+
+  test("normalizes cached v26 failure payloads before returning a v27 push settlement", async () => {
+    const replayWrite = {
+      [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
+    };
+    const pushComponent = {
+      protocol: { installation: {}, pull: componentPullReference, replayWrite },
+    } as unknown as ComponentApi<"embedded">;
+    const embedded = defineEmbedded({ component: pushComponent, schema });
+    const base = {
+      mutationId: "mutation-1",
+      inserts: [],
+      schedules: [],
+      uploads: [],
+      revisions: [],
+      crdt: [],
+      authoritative: [],
+    };
+    const cases = [
+      {
+        settlement: { ...base, outcome: "conflict", error: { code: "CUT4_SEED", reason: "raw" } },
+        expected: "EMBEDDED_CONFLICT",
+      },
+      {
+        settlement: { ...base, outcome: "rebase", error: { code: "anything", reason: "raw" } },
+        expected: "EMBEDDED_REBASE",
+      },
+      {
+        settlement: {
+          ...base,
+          outcome: "rejected",
+          error: { code: "EMBEDDED_DIVERGENCE", reason: "raw" },
+        },
+        expected: "EMBEDDED_DIVERGENCE",
+      },
+      {
+        settlement: { ...base, outcome: "rejected", error: { code: "CUT4_SEED", reason: "raw" } },
+        expected: "EMBEDDED_REJECTED",
+      },
+    ];
+
+    for (const { settlement, expected } of cases) {
+      const ctx = {
+        auth: { getUserIdentity: async () => null },
+        meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
+        runMutation: async (reference: unknown) => {
+          if (reference === replayWrite) return settlement;
+          throw new Error("unexpected mutation after cached settlement");
+        },
+      };
+      const response = await invokePush(embedded, ctx, mutationPushRequest("documents:write", {}));
+      expect(response).toMatchObject({ outcome: settlement.outcome, error: { code: expected } });
+      expect((response as { error: Record<string, unknown> }).error).toEqual({ code: expected });
+    }
   });
 
   test("gates a pull by manifest placement, rejecting a non-replicated target before invoking it", async () => {

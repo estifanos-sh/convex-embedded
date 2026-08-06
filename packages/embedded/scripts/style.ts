@@ -93,6 +93,7 @@ for (const crateRoot of ["crates/storage/src", "crates/remote/src", "crates/node
 }
 auditRawTimeCalls();
 auditVersionedNames();
+auditDeprecatedTerms();
 
 if (violations.length > 0) {
   console.error("Style audit failed:");
@@ -208,6 +209,55 @@ function auditVersionedNames(): void {
       }
     }
   }
+}
+
+function auditDeprecatedTerms(): void {
+  const roots = [
+    resolve(packageDir, "src"),
+    resolve(packageDir, "tests"),
+    resolve(packageDir, "scripts"),
+    resolve(repoDir, "convex"),
+    resolve(repoDir, "demos/browser/vite/src"),
+    resolve(repoDir, "crates/storage/src"),
+    resolve(repoDir, "crates/remote/src"),
+    resolve(repoDir, "crates/node/src"),
+  ];
+  const terms = [
+    // The physical `__embedded_bootstrap` table and its v1 record names are a frozen on-disk ABI.
+    // Keep that compatibility vocabulary out of this source-symbol deprecation list.
+    deprecated("remote_" + "push_settle", "use remote_settlement_write"),
+    deprecated("remote_" + "pull_page", "use remote_page_write"),
+    deprecated("remote_" + "settlement_ack", "use remote_receipt"),
+    deprecated("remote_" + "read_cursor", "use remote_cursor_read"),
+    deprecated("remote_" + "write_cursor", "use remote_cursor_write"),
+    deprecated("commitOne" + "Upsert", "use commitOneDocWrite"),
+    deprecated("exact" + "ScanBounds", "use hasExactBounds"),
+    deprecated("schedule_" + "due_read", "use schedule_lease_read"),
+    deprecated("cleanup" + "Follower", "use followerDelete"),
+    deprecated("pruneArtifact" + "Copies", "use artifactCopyDelete"),
+    deprecated("replay" + "Sweep", "use replayDelete"),
+    deprecated("EmbeddedData" + "Upsert", "use EmbeddedDataWrite"),
+  ];
+  for (const root of roots) {
+    for (const file of walk(root, isAuditedSource)) {
+      if (statSync(file).isDirectory()) continue;
+      const rel = relative(repoDir, file);
+      if (isGeneratedPath(rel)) continue;
+      const source = readFileSync(file, "utf8");
+      for (const term of terms) {
+        for (const match of source.matchAll(term.pattern)) {
+          violations.push({
+            file: rel,
+            message: `deprecated term "${match[0]}"; ${term.replacement}`,
+          });
+        }
+      }
+    }
+  }
+}
+
+function deprecated(name: string, replacement: string): { pattern: RegExp; replacement: string } {
+  return { pattern: new RegExp(`\\b${name}\\b`, "g"), replacement };
 }
 
 function auditSymbol(file: string, name: string, banned: BannedName[]): void {

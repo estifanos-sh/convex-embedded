@@ -93,7 +93,7 @@ interface EmbeddedProjectRoots {
 /**
  * Vite builds the page and the worker with separate plugin instances created from one options
  * object. Keying the generation by that object gives both instances the same scan and the same
- * lockfile write.
+ * generated-contract write.
  */
 const generations = new WeakMap<
   ConvexEmbeddedPluginOptions,
@@ -142,7 +142,6 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
       convexDir: options.convexDir,
       generatedPath: options.generatedPath,
       local: options.local,
-      registerSchema: options.registerSchema,
       root: state.root,
       schemaPath: options.schemaPath,
     }).then(({ bundle }) => {

@@ -78,25 +78,14 @@ export interface EmbeddedBundleInput {
   local?: string | string[];
 
   /**
-   * Checked-in placement lockfile, relative to `convexDir`.
+   * Checked-in generated Embedded contract, relative to `convexDir`.
    *
-   * Keep the multi-dot basename the default uses: the Convex CLI skips those
-   * modules, so the lockfile never deploys as a hosted function module.
+   * The default lives under Convex's `_generated` directory, so deployment
+   * discovery does not treat it as a hosted function module.
    *
-   * @defaultValue `"embedded.generated.ts"`
+   * @defaultValue `"_generated/embedded.ts"`
    */
   generatedPath?: string;
-
-  /**
-   * Emit the `Register` schema augmentation into the lockfile, binding the
-   * `local` builders to this schema wherever the lockfile is part of the
-   * TypeScript program. Disable for secondary Convex projects (such as test
-   * fixtures) whose program must stay unregistered or already carries another
-   * project's registration.
-   *
-   * @defaultValue `true`
-   */
-  registerSchema?: boolean;
 }
 
 export interface GenerateEmbeddedResult {
@@ -119,11 +108,8 @@ export interface EmbeddedBundleResult {
    */
   schemaPath: string;
 
-  /** Checked-in placement lockfile path. */
+  /** Checked-in generated Embedded contract path. */
   generatedPath: string;
-
-  /** Whether the lockfile carries the `Register` schema augmentation. */
-  registerSchema: boolean;
 
   /**
    * Convex module IDs mapped to absolute source file paths.
@@ -172,7 +158,7 @@ export type EmbeddedFunctionManifest = Record<
 const DEFAULT_CONVEX_DIR = "convex";
 const DEFAULT_SCHEMA_PATH = "schema.ts";
 const EMBEDDED_ENTRYPOINT_PATH = "embedded.ts";
-const DEFAULT_GENERATED_PATH = "embedded.generated.ts";
+const DEFAULT_GENERATED_PATH = "_generated/embedded.ts";
 const LOCAL_ENTRYPOINT = "@convex-dev/embedded/local";
 const SOURCE_EXTENSIONS = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const SYSTEM_MODULE_RE =
@@ -196,7 +182,7 @@ const GENERATED_IDENTITY_PREFIX = "// @convex-dev/embedded-generated ";
  *
  * @param input - Schema analysis plus optional project root, Convex directory, and schema path.
  * @returns Absolute schema path and Convex module IDs mapped to absolute source files.
- * @throws If the schema file cannot be found, the checked-in lockfile is stale,
+ * @throws If the schema file cannot be found, the checked-in generated contract is stale,
  * or two source files produce the same Convex module ID.
  *
  * @example
@@ -212,7 +198,7 @@ export async function createEmbeddedBundle(
   return createEmbeddedBundleInner(input, true);
 }
 
-/** Writes the checked-in placement lockfile and returns the bundle it was rendered from. */
+/** Writes the checked-in generated contract and returns the bundle it was rendered from. */
 export async function generateEmbedded(
   input: EmbeddedBundleInput,
 ): Promise<GenerateEmbeddedResult> {
@@ -389,7 +375,6 @@ async function createEmbeddedBundleInner(
       sources: graph.map((file) => hashBytes(sources.get(file)!)),
     }),
     modules,
-    registerSchema: input.registerSchema ?? true,
     schemaPath,
     schemaSourceHash,
     sourceFiles: graph,
@@ -654,35 +639,41 @@ async function assertGeneratedFile(
     source = await readFile(file, "utf8");
   } catch {
     throw new Error(
-      `Could not find generated Embedded contract at ${file}. Run the Embedded generator before building.`,
+      `Could not find generated Embedded contract at ${file}. Regenerate it with your configured @convex-dev/embedded bundler adapter before building.`,
     );
   }
   const firstLine = source.split(/\r?\n/, 1)[0] ?? "";
   if (!firstLine.startsWith(GENERATED_IDENTITY_PREFIX)) {
-    throw new Error(`Generated Embedded contract at ${file} has no verifiable identity`);
+    throw new Error(
+      `Generated Embedded contract at ${file} has no verifiable identity; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+    );
   }
   let identity: unknown;
   try {
     identity = JSON.parse(firstLine.slice(GENERATED_IDENTITY_PREFIX.length));
   } catch {
-    throw new Error(`Generated Embedded contract at ${file} has an invalid identity`);
+    throw new Error(
+      `Generated Embedded contract at ${file} has an invalid identity; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+    );
   }
   if (!isGeneratedIdentity(identity)) {
-    throw new Error(`Generated Embedded contract at ${file} has an invalid identity`);
+    throw new Error(
+      `Generated Embedded contract at ${file} has an invalid identity; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+    );
   }
   if (identity.formatVersion !== EMBEDDED_GENERATED_FORMAT_VERSION) {
     throw new Error(
-      `Generated Embedded contract format ${identity.formatVersion} is unsupported; regenerate ${file}`,
+      `Generated Embedded contract format ${identity.formatVersion} is unsupported; regenerate it with your configured @convex-dev/embedded bundler adapter: ${file}`,
     );
   }
   if (identity.schemaSourceHash !== expected.schemaSourceHash) {
     throw new Error(
-      `Generated Embedded contract at ${file} is stale for the current schema source`,
+      `Generated Embedded contract at ${file} is stale for the current schema source; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
     );
   }
   if (identity.manifestHash !== expected.manifestHash) {
     throw new Error(
-      `Generated Embedded contract at ${file} is stale for the current function manifest`,
+      `Generated Embedded contract at ${file} is stale for the current function manifest; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
     );
   }
 }
@@ -718,7 +709,7 @@ function readCanonicalRegistrations(
   const code = maskCommentsAndStrings(source);
   if (LOCAL_BUILDER_REFERENCE.test(code)) {
     throw new Error(
-      "embedded.local builders were removed; define device-only functions with the local builders from @convex-dev/embedded/local under one of the plugin's `local` roots",
+      "embedded.local builders were removed; define device-only functions under one of the plugin's configured local roots and import local from the generated Embedded contract",
     );
   }
   const imported = readPlacementImports(source, code);

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 
 import { startRemoteLoop } from "../../src/client";
-import type { EmbeddedEvent } from "../../src/events";
+import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import type { Runner } from "../../src/runtime/runner";
 import type { RemoteSurface, RemoteTick } from "../../src/storage/types";
 
@@ -25,6 +25,7 @@ function emptyTick(): RemoteTick {
     received: 0,
     reconnected: false,
     retainedRevisions: [],
+    settlements: [],
     rowsApplied: 0,
     sent: 0,
     receiptsPushed: 0,

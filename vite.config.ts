@@ -2,22 +2,10 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   fmt: {
-    ignorePatterns: [
-      ".agents/**",
-      ".claude/**",
-      "convex/_generated/**",
-      "convex/embedded.generated.ts",
-      "vendor/**",
-    ],
+    ignorePatterns: [".agents/**", ".claude/**", "convex/_generated/**", "vendor/**"],
   },
   lint: {
-    ignorePatterns: [
-      ".agents/**",
-      ".claude/**",
-      "convex/_generated/**",
-      "convex/embedded.generated.ts",
-      "vendor/**",
-    ],
+    ignorePatterns: [".agents/**", ".claude/**", "convex/_generated/**", "vendor/**"],
     options: { typeAware: true, typeCheck: true },
   },
   staged: {

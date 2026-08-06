@@ -6,8 +6,8 @@ import {
   assertNoPendingCommitTs,
   commitTsPlaceholder,
   hasPendingCommitTs,
-  resolveKnownPendingCommitTs,
-  resolvePendingCommitTs,
+  knownPendingCommitTsRead,
+  pendingCommitTsRead,
 } from "../../src/runtime/pending";
 import { validateValue } from "../../src/runtime/validate";
 
@@ -21,13 +21,13 @@ describe("pending commit timestamps", () => {
     expect(convexToJson(normalized as never)).toEqual({ nested: [{ $commitTs: null }] });
 
     const timestamp = 123n;
-    expect(resolvePendingCommitTs(normalized, timestamp)).toEqual({ nested: [timestamp] });
-    expect(resolvePendingCommitTs((1n << 63n) - 1n, timestamp)).toBe((1n << 63n) - 1n);
+    expect(pendingCommitTsRead(normalized, timestamp)).toEqual({ nested: [timestamp] });
+    expect(pendingCommitTsRead((1n << 63n) - 1n, timestamp)).toBe((1n << 63n) - 1n);
   });
 
   test("trusted flagged payload resolution preserves byte containers", () => {
     const bytes = new Uint8Array([1, 2, 3]);
-    const resolved = resolveKnownPendingCommitTs({ bytes, nested: commitTsPlaceholder }, 123n);
+    const resolved = knownPendingCommitTsRead({ bytes, nested: commitTsPlaceholder }, 123n);
     expect(resolved).toEqual({ bytes, nested: 123n });
     expect(resolved.bytes).toBe(bytes);
   });

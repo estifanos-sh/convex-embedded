@@ -4,11 +4,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { benchDefaults } from "../../../config/bench.ts";
+import { benchEnv, benchValue } from "./benchargs.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
 const args = process.argv.slice(2);
-const env = parseEnv(args);
+const env = benchEnv(args);
 const testConfig = ["--config", "vite/tests.ts"];
 
 if (args.includes("--browser-scale-matrix")) {
@@ -545,83 +546,8 @@ function buildBrowserArtifacts(env: NodeJS.ProcessEnv): void {
   run("node", ["scripts/wasm.ts"], packageDir);
 }
 
-function parseEnv(args: string[]): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  if (args.includes("--smoke")) env.EMBEDDED_BENCH_SMOKE = "1";
-  if (args.includes("--split")) env.EMBEDDED_BENCH_SPLIT = "1";
-  if (args.includes("--full")) env.EMBEDDED_BROWSER_BENCH_PROFILE = "full";
-  const compare = readString(args, "--compare");
-  const rows = readString(args, "--rows");
-  const iterations = readString(args, "--iterations");
-  const layer = readString(args, "--layer");
-  const out = readString(args, "--out");
-  const tabs = readString(args, "--tabs");
-  const warmups = readString(args, "--warmups");
-  const clients = readString(args, "--clients");
-  const revs = readString(args, "--revs");
-  const writes = readString(args, "--writes");
-  const operations = readString(args, "--operations");
-  const seedBatch = readString(args, "--seed-batch");
-  const durationMs = readString(args, "--duration-ms");
-  const timeoutMs = readString(args, "--timeout-ms");
-  const skipRevList = args.includes("--skip-rev-list");
-  if (compare) env.EMBEDDED_BENCH_COMPARE = compare;
-  if (rows) {
-    env.EMBEDDED_BENCH_ROWS = rows;
-    env.EMBEDDED_BROWSER_BENCH_ROWS = rows;
-    env.EMBEDDED_BROWSER_BENCH_SCALE_ROWS = rows;
-  }
-  if (iterations) {
-    env.EMBEDDED_BENCH_ITERATIONS = iterations;
-    env.EMBEDDED_BROWSER_BENCH_ITERATIONS = iterations;
-  }
-  if (layer) env.EMBEDDED_BENCH_LAYER = layer;
-  if (out) {
-    env.EMBEDDED_BENCH_OUT = out;
-    env.EMBEDDED_BROWSER_BENCH_OUT = out;
-    env.EMBEDDED_METAL_BENCH_OUT = out;
-  }
-  if (clients) {
-    env.EMBEDDED_BENCH_CLIENTS = clients;
-    env.EMBEDDED_BROWSER_BENCH_CLIENTS = clients;
-    env.EMBEDDED_METAL_BENCH_CLIENTS = clients;
-  }
-  if (revs) {
-    env.EMBEDDED_METAL_BENCH_REVS = revs;
-  }
-  if (writes) env.EMBEDDED_METAL_BENCH_WRITES = writes;
-  if (operations) env.EMBEDDED_BENCH_OPERATIONS = operations;
-  if (seedBatch) env.EMBEDDED_BENCH_SEED_BATCH = seedBatch;
-  if (durationMs) {
-    env.EMBEDDED_BENCH_DURATION_MS = durationMs;
-    env.EMBEDDED_BROWSER_BENCH_DURATION_MS = durationMs;
-  }
-  if (timeoutMs) {
-    env.EMBEDDED_BENCH_TIMEOUT_MS = timeoutMs;
-    env.EMBEDDED_BROWSER_BENCH_TIMEOUT_MS = timeoutMs;
-    env.EMBEDDED_METAL_BENCH_TIMEOUT_MS = timeoutMs;
-  }
-  if (skipRevList) {
-    env.EMBEDDED_METAL_BENCH_SKIP_REV_LIST = "1";
-  }
-  if (tabs) env.EMBEDDED_BROWSER_BENCH_TABS = tabs;
-  if (warmups) {
-    env.EMBEDDED_BENCH_WARMUPS = warmups;
-    env.EMBEDDED_BROWSER_BENCH_WARMUPS = warmups;
-  }
-  return env;
-}
-
-function readString(args: string[], flag: string): string | undefined {
-  const index = args.indexOf(flag);
-  if (index === -1) return undefined;
-  const value = args[index + 1];
-  if (!value) throw new Error(`${flag} requires a value`);
-  return value;
-}
-
 function usesNativeLayers(args: string[]): boolean {
-  const layer = readString(args, "--layer");
+  const layer = benchValue(args, "--layer");
   if (!layer) return true;
   const layers = layer.split(",").map((part) => part.trim());
   return layers.some((part) => part === "all" || part === "native");

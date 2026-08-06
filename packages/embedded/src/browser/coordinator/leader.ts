@@ -1,5 +1,5 @@
 import { convexToJson, type Value } from "convex/values";
-import type { EmbeddedEvent } from "../../events";
+import type { DiagnosticEvent } from "../../events";
 import { getTimerTime } from "../../time";
 import { rejectMutationsForRebuild, StoreRecovery, type RecoveryHost } from "../recovery";
 import { assertSameRuntimeIdentity, RuntimeIdentityMismatchError } from "../identity";
@@ -14,6 +14,7 @@ import {
 } from "../protocol";
 import { normalizeObject } from "../../runtime/codec";
 import type { RunMutationTiming, StopOnUpdate, WatchUpdateInfo } from "../../runtime/runner";
+import type { RemoteMutationSettlement } from "../../storage/types";
 import { remoteConfigKey } from "../remote";
 import { emitWorkerRemoteError, type WorkerState } from "../runtime";
 import type { BroadcastChannelLike, PeerMessage } from "./protocol";
@@ -256,6 +257,9 @@ export function createLeaderState(options: {
   options.runtime.emit = (event) => {
     postEvent(state, event);
   };
+  options.runtime.emitRemote = (event, settlements) => {
+    postEvent(state, event, settlements);
+  };
   return state;
 }
 
@@ -278,7 +282,7 @@ function abandonedInstanceError(leader: LeaderState): Error {
   );
 }
 
-function degradedEvent(error: string): EmbeddedEvent {
+function degradedEvent(error: string): DiagnosticEvent {
   return { at: getTimerTime(), degradation: "failed", error, type: "runtime" };
 }
 
@@ -882,9 +886,19 @@ function flushClientWatchUpdates(leader: LeaderState, client: ClientState): void
   }
 }
 
-function postEvent(leader: LeaderState, event: EmbeddedEvent): void {
+function postEvent(
+  leader: LeaderState,
+  event: DiagnosticEvent,
+  settlements?: readonly RemoteMutationSettlement[],
+): void {
   const forwarded = event.type === "remote" ? { ...event, incarnation: leader.leaderEpoch } : event;
-  const response: WorkerResponse = { event: forwarded, op: WorkerEvent.Event };
+  const response: WorkerResponse = {
+    event: forwarded,
+    op: WorkerEvent.Event,
+    ...(settlements?.length === 0 || settlements === undefined
+      ? {}
+      : { settlements: [...settlements] }),
+  };
   for (const client of leader.clients.values()) {
     if (canReadEvent(client, forwarded)) client.post(response);
   }
@@ -898,11 +912,11 @@ function postRemoteSnapshot(leader: LeaderState, client: ClientState): void {
   });
 }
 
-function canReadEvent(client: ClientState, event: EmbeddedEvent): boolean {
+function canReadEvent(client: ClientState, event: DiagnosticEvent): boolean {
   return client.remoteConfigured || !isRemoteScopedEvent(event);
 }
 
-function isRemoteScopedEvent(event: EmbeddedEvent): boolean {
+function isRemoteScopedEvent(event: DiagnosticEvent): boolean {
   return (
     event.type === "remote" ||
     event.type === "conflict" ||

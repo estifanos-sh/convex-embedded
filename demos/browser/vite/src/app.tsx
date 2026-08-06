@@ -291,9 +291,7 @@ export function App(): ReactElement {
   }, []);
   const connection = useConnectionState();
   const bootError =
-    connection.local === "failed"
-      ? (connection.localError ?? "The local store failed to start.")
-      : undefined;
+    connection.local.status === "failed" ? connection.local.error.message : undefined;
   const queriedDocuments = documentsQuery.query === "ready" ? documentsQuery.value : [];
   const documentsError =
     documentsQuery.query === "failed"
@@ -335,29 +333,20 @@ export function App(): ReactElement {
 
   useEffect(
     () =>
-      client.onRuntimeEvent((event) => {
-        if (event.degradation === "deployment-mismatch" && event.error) {
-          setAppError(event.error);
-        }
-      }),
-    [],
-  );
-
-  useEffect(
-    () =>
-      client.subscribeInternalEvents((event) => {
-        if (event.type !== "remote" || event.tick === undefined) return;
-        const pending = event.tick.pending?.uploads;
-        if (pending === undefined) return;
+      client.subscribeToConnectionState((connection) => {
         const current = uploadNoticeRef.current;
         if (current === null || current.phase === "failed" || current.phase === "synced") return;
-        if (pending > 0 && current.phase === "local") {
+        if (
+          connection.replication.status === "online" &&
+          connection.replication.sync === "pending" &&
+          current.phase === "local"
+        ) {
           writeUploadNotice({ ...current, phase: "syncing" });
           return;
         }
         if (
-          event.status === "idle" &&
-          pending === 0 &&
+          connection.replication.status === "online" &&
+          connection.replication.sync === "idle" &&
           current.phase !== "saving" &&
           current.token !== undefined &&
           uploadVerifyRef.current !== current.token
@@ -403,7 +392,7 @@ export function App(): ReactElement {
     (selectedDocument || keepsPreviousEditor) && titleBlock ? blockText(titleBlock) : currentTitle;
   const currentRev = useMemo(() => currentRevFromList(revs), [revs]);
   const historyGroups = useMemo(() => groupSavedRevs(revs), [revs]);
-  const historyConnected = connection.remote === "ready" || connection.remote === "connected";
+  const historyConnected = connection.replication.status === "online";
 
   const setBaseline = useCallback(
     (next: Baseline | null, bodyForDiff = JSON.stringify(editor.document)) => {
@@ -1284,39 +1273,7 @@ function useExpandedDocumentIds(): QueryState<Id<"documents">[]> {
 
 function useConnectionState(): EmbeddedConnectionState {
   const [state, setState] = useState<EmbeddedConnectionState>(() => client.connectionState());
-  useEffect(() => {
-    let active = true;
-    let timer: number | undefined = window.setInterval(sync, 500);
-    const unsubscribe = client.subscribeEvents((event) => {
-      if (event.type === "remote" || event.type === "runtime") sync();
-    });
-    const onFocus = (): void => sync();
-    const onPageShow = (): void => sync();
-    const onVisibility = (): void => {
-      if (document.visibilityState === "visible") sync();
-    };
-    window.addEventListener("focus", onFocus);
-    window.addEventListener("pageshow", onPageShow);
-    document.addEventListener("visibilitychange", onVisibility);
-    sync();
-    return () => {
-      active = false;
-      unsubscribe();
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener("pageshow", onPageShow);
-      document.removeEventListener("visibilitychange", onVisibility);
-      if (timer !== undefined) window.clearInterval(timer);
-    };
-    function sync(): void {
-      if (!active) return;
-      const next = client.connectionState();
-      setState(next);
-      if (next.local !== "starting" && timer !== undefined) {
-        window.clearInterval(timer);
-        timer = undefined;
-      }
-    }
-  }, []);
+  useEffect(() => client.subscribeToConnectionState(setState), []);
   return state;
 }
 
@@ -1329,18 +1286,10 @@ function DebugOverlay(props: { connection: EmbeddedConnectionState }): ReactElem
   );
   useEffect(() => {
     if (!debugEnabled) return;
-    const unsubscribeInternal = client.subscribeInternalEvents((event) => {
-      const stamp = new Date().toISOString().slice(11, 23);
-      const summary = JSON.stringify(event).slice(0, 160);
-      setLines((prior) => [...prior.slice(-19), `${stamp} ${summary}`]);
-    });
     const unsubscribeBrowser = subscribeBrowserDebug((event) => {
       setLines((prior) => [...prior.slice(-19), debugLine(event)]);
     });
-    return () => {
-      unsubscribeInternal();
-      unsubscribeBrowser();
-    };
+    return unsubscribeBrowser;
   }, []);
   if (!debugEnabled) return null;
   const { connection } = props;
@@ -1363,7 +1312,7 @@ function DebugOverlay(props: { connection: EmbeddedConnectionState }): ReactElem
       }}
     >
       <div style={{ color: "#fff" }}>
-        {`local=${connection.local} remote=${connection.remote} localError=${connection.localError ?? "-"} remoteError=${connection.remote === "error" ? connection.remoteError : "-"} ua=${navigator.userAgent.slice(0, 80)}`}
+        {`local=${connection.local.status} remote=${connection.replication.status} localError=${connection.local.status === "failed" ? connection.local.error.message : "-"} remoteError=${connection.replication.status === "error" ? connection.replication.error.message : "-"} ua=${navigator.userAgent.slice(0, 80)}`}
       </div>
       {lines.map((line, index) => (
         <div key={index}>{line}</div>
@@ -1383,7 +1332,8 @@ function UploadStatus(props: {
   notice: UploadNotice;
 }): ReactElement {
   const { connection, notice } = props;
-  const offline = connection.remote === "offline" || connection.remote === "closed";
+  const offline =
+    connection.replication.status === "offline" || connection.replication.status === "closed";
   const label =
     notice.phase === "saving"
       ? "Saving locally"
@@ -1415,33 +1365,34 @@ function UploadStatus(props: {
 
 function RemoteStatus(props: { connection: EmbeddedConnectionState }): ReactElement | null {
   const { connection } = props;
-  if (connection.remote === "disabled") return null;
-  const remoteError = connection.remote === "error" ? connection.remoteError : undefined;
+  const replication = connection.replication;
+  if (replication.status === "disabled") return null;
+  const remoteError = replication.status === "error" ? replication.error.message : undefined;
   const label =
-    connection.remote === "ready"
-      ? "Synced"
-      : connection.remote === "connected"
-        ? "Online"
-        : connection.remote === "offline"
-          ? "Offline"
-          : connection.remote === "starting"
-            ? "Connecting"
-            : connection.remote === "closed"
-              ? "Offline"
-              : "Sync error";
+    replication.status === "online"
+      ? replication.sync === "idle"
+        ? "Synced"
+        : "Online"
+      : replication.status === "offline"
+        ? "Offline"
+        : replication.status === "starting"
+          ? "Connecting"
+          : replication.status === "closed"
+            ? "Offline"
+            : "Sync error";
   const icon =
-    connection.remote === "ready" || connection.remote === "connected" ? (
+    replication.status === "online" ? (
       <Cloud size={15} strokeWidth={2} />
-    ) : connection.remote === "starting" ? (
+    ) : replication.status === "starting" ? (
       <Loader2 className="animate-spin" size={15} />
-    ) : connection.remote === "offline" || connection.remote === "closed" ? (
+    ) : replication.status === "offline" || replication.status === "closed" ? (
       <CloudOff size={15} strokeWidth={2} />
     ) : (
       <TriangleAlert size={15} />
     );
   return (
     <span
-      className={`syncStatus syncStatus--${connection.remote}`}
+      className={`syncStatus syncStatus--${replication.status}`}
       title={remoteError ?? label}
       aria-label={remoteError ? `Sync error: ${remoteError}` : label}
       role="status"

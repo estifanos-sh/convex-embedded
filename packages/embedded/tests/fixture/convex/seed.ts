@@ -84,11 +84,17 @@ export const commit = remote.mutation({
         },
       });
     }
+    const code =
+      args.outcome === "conflict"
+        ? "EMBEDDED_CONFLICT"
+        : args.outcome === "rebase"
+          ? "EMBEDDED_REBASE"
+          : "EMBEDDED_REJECTED";
     return await ctx.runMutation(components.embedded.protocol.commit, {
       request: {
         ...identity,
         kind: "failure",
-        settlement: { ...common, outcome: args.outcome, error: { code: "CUT4_SEED" } },
+        settlement: { ...common, outcome: args.outcome, error: { code } },
         changes: [],
         revisions: args.revisions,
       },

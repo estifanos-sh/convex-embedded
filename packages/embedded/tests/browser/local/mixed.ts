@@ -1,9 +1,8 @@
 import { v } from "convex/values";
 
-import { defineLocal } from "../../../src/local";
-import schema from "../convex/schema";
+import { local } from "../convex/_generated/embedded";
 
-const { query } = defineLocal(schema);
+const { query } = local;
 
 export const scope = "device";
 

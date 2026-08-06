@@ -130,20 +130,7 @@ fn portable_snapshot(store: &EmbeddedStore) -> serde_json::Value {
     let mut membership = store.remote_member_read("fixture:subscription").unwrap();
     membership.sort();
     let file = store.file_read("fixture:file").unwrap().unwrap();
-    let crdt = store
-        .crdt_snapshot_read("issues", local_id)
-        .unwrap()
-        .into_iter()
-        .map(|snapshot| {
-            serde_json::json!({
-                "field": snapshot.field,
-                "kind": snapshot.kind.as_wire(),
-                "headSeq": snapshot.head_seq,
-                "projectionHash": snapshot.projection_hash,
-                "hash": snapshot.hash,
-            })
-        })
-        .collect::<Vec<_>>();
+    let crdt = portable_crdt_snapshot(store, local_id);
     serde_json::json!({
         "identityKey": store.identity_read().unwrap().0,
         "deviceDocument": parse_document(store.doc_read("preferences", "preferences:fixture").unwrap()),
@@ -215,17 +202,38 @@ fn portable_snapshot(store: &EmbeddedStore) -> serde_json::Value {
             "table": member.table,
             "serverDocumentId": member.server_document_id,
         })).collect::<Vec<_>>(),
-        "result": {
-            "key": result.key,
-            "function": result.function,
-            "args": result.args,
-            "schemaHash": result.schema_hash,
-            "moduleHash": result.module_hash,
-            "skeleton": String::from_utf8(result.skeleton).unwrap(),
-            "paths": String::from_utf8(result.paths).unwrap(),
-            "skeletonHash": result.skeleton_hash,
-            "clock": result.clock,
-        },
+        "result": portable_result(result),
+    })
+}
+
+fn portable_crdt_snapshot(store: &EmbeddedStore, local_id: &str) -> Vec<serde_json::Value> {
+    store
+        .crdt_snapshot_read("issues", local_id)
+        .unwrap()
+        .into_iter()
+        .map(|snapshot| {
+            serde_json::json!({
+                "field": snapshot.field,
+                "kind": snapshot.kind.as_wire(),
+                "headSeq": snapshot.head_seq,
+                "projectionHash": snapshot.projection_hash,
+                "hash": snapshot.hash,
+            })
+        })
+        .collect()
+}
+
+fn portable_result(result: ResultEntry) -> serde_json::Value {
+    serde_json::json!({
+        "key": result.key,
+        "function": result.function,
+        "args": result.args,
+        "schemaHash": result.schema_hash,
+        "moduleHash": result.module_hash,
+        "skeleton": String::from_utf8(result.skeleton).unwrap(),
+        "paths": String::from_utf8(result.paths).unwrap(),
+        "skeletonHash": result.skeleton_hash,
+        "clock": result.clock,
     })
 }
 

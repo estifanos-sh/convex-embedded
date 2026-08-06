@@ -4,7 +4,7 @@ import { withEmbeddedComponentTables, type EmbeddedSchemaAnalysis } from "../sch
 import type { StoreSchema } from "../storage/types";
 import type { EmbeddedBundleResult } from "./index";
 
-export const EMBEDDED_GENERATED_FORMAT_VERSION = 3;
+export const EMBEDDED_GENERATED_FORMAT_VERSION = 4;
 
 const SCHEMA_SPECIFIER_EXTENSION = /\.([mc]?)(?:tsx?|jsx?)$/;
 
@@ -26,10 +26,9 @@ export function toEmbeddedGeneratedSchema(
 }
 
 /**
- * Renders the checked-in placement lockfile: identity hashes plus the function manifest the
- * deployment enforces. The device schema stays out of it and is inlined by the registry instead.
- * When the bundle registers its schema, the lockfile also carries the `Register` augmentation
- * that binds the `local` builders to the schema's device data model.
+ * Renders the checked-in Embedded contract: identity hashes, the function manifest enforced by
+ * deployment, and the app-bound local function builders. The device storage schema stays out of
+ * the contract and is inlined by the virtual registry instead.
  */
 export function renderEmbeddedGenerated(bundle: EmbeddedBundleResult): string {
   const identity: EmbeddedGeneratedIdentity = {
@@ -45,7 +44,6 @@ export function renderEmbeddedGenerated(bundle: EmbeddedBundleResult): string {
 export const embeddedGeneratedIdentity = ${JSON.stringify(identity)} as const;
 export const embeddedManifest = ${JSON.stringify(bundle.manifest)} as const;
 `;
-  if (!bundle.registerSchema) return `${header}\n${values}`;
   const relative = path
     .relative(path.dirname(bundle.generatedPath), bundle.schemaPath)
     .split(path.sep)
@@ -53,14 +51,10 @@ export const embeddedManifest = ${JSON.stringify(bundle.manifest)} as const;
     .replace(SCHEMA_SPECIFIER_EXTENSION, ".$1js");
   const specifier = relative.startsWith(".") ? relative : `./${relative}`;
   return `${header}
-import type {} from "@convex-dev/embedded/local";
-import type schema from "${specifier}";
+import { defineLocal } from "@convex-dev/embedded/internal/local";
+import schema from "${specifier}";
 
 ${values}
-declare module "@convex-dev/embedded/local" {
-  interface Register {
-    schema: typeof schema;
-  }
-}
+export const local = defineLocal(schema);
 `;
 }

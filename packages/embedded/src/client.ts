@@ -13,7 +13,6 @@
 import { convexToJson, type Value } from "convex/values";
 import { getFunctionName } from "convex/server";
 import type {
-  ArgsAndOptions,
   FunctionArgs,
   FunctionReference,
   FunctionReturnType,
@@ -34,21 +33,25 @@ import {
   type RunMutationTiming,
   type StopOnUpdate,
 } from "./runtime/runner";
+import type {
+  LocalFunctionArgs,
+  LocalFunctionReturns,
+  LocalAction,
+  LocalMutation,
+  LocalQuery,
+} from "./local";
 import {
   isLocalFunction,
+  localGraphHash,
+  localCompatibilitySchema,
   localReferenceName,
-  type LocalFunctionArgs,
-  type LocalFunctionReturns,
-  type LocalAction,
-  type LocalMutation,
-  type LocalQuery,
-} from "./local";
-import { localGraphHash, localFunctionSchema } from "./local/internal";
+} from "./local/internal";
 import { consumeRemoteTick, remotePendingIsEmpty, REMOTE_PULL_DIAGNOSTIC_ERROR } from "./rev";
 import { toRuntimeStoreSchema, type ConvexEmbeddedSchema } from "./schema";
 import { openCandidate } from "./candidate";
 import type {
   RemoteStartOptions,
+  RemoteMutationSettlement,
   RemoteSurface,
   RemoteTick,
   StorageBackend,
@@ -58,6 +61,7 @@ import { getElapsedTime, getTimerTime } from "./time";
 import {
   EmbeddedClientRetiredError,
   EmbeddedClosedError,
+  EmbeddedError,
   EmbeddedNotOpenError,
   EmbeddedOpenMismatchError,
   EmbeddedHostedDependencyError,
@@ -69,75 +73,23 @@ import { randomId } from "./id/random";
 import { REMOTE_CLIENT_RETIRED_PREFIX, RotationBreaker } from "./retirement";
 import { EMBEDDED_PROTOCOL_VERSION, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "./protocol";
 import type {
-  EmbeddedEvent as EmbeddedInternalEvent,
-  EmbeddedEventListener as EmbeddedInternalEventListener,
+  DiagnosticEvent,
   EmbeddedOperationEvent,
   EmbeddedOperationKind,
-  EmbeddedPublicEventListener,
   EmbeddedRemoteEvent,
-  EmbeddedRuntimeEvent,
   EmbeddedSpanEvent,
 } from "./events";
-import { mapPublicEvent } from "./events";
+import {
+  createDevtoolsBridge,
+  type DevtoolsBridge,
+  type DevtoolsClientSnapshot,
+  type DevtoolsOperation,
+  type DevtoolsRunFunctionInput,
+  type DevtoolsUpload,
+} from "./devtools/bridge";
 
 export type { ConvexEmbeddedSchema } from "./schema";
 export type { AuthTokenFetcher } from "convex/browser";
-export type {
-  EmbeddedPublicEvent as EmbeddedEvent,
-  EmbeddedPublicEventListener as EmbeddedEventListener,
-} from "./events";
-export type {
-  EmbeddedDataDelete,
-  EmbeddedDataEvent,
-  EmbeddedDataWrite,
-  EmbeddedMutationTiming,
-  EmbeddedOperationEvent,
-  EmbeddedOperationKind,
-  EmbeddedOperationPhase,
-  EmbeddedRemoteEvent,
-  EmbeddedRemoteStatus,
-  EmbeddedRuntimeDegradation,
-  EmbeddedRuntimeEvent,
-  EmbeddedRuntimePhase,
-  EmbeddedSchedulerEvent,
-  EmbeddedSpanEvent,
-  EmbeddedSpanPhase,
-  EmbeddedStorageEvent,
-} from "./events";
-
-/**
- * Internal options carrying the benchmark diagnostic hook.
- *
- * @typeParam Args - Convex mutation argument object accepted by the mutation.
- *
- * @internal
- */
-interface MutationOptions<_Args extends Record<string, Value>> {
-  /** Internal diagnostic hook used by the benchmark suite. @internal */
-  onTiming?: ((timing: EmbeddedClientMutationTiming) => void) | undefined;
-}
-
-/** Client-side mutation phase timings used by internal benchmarks. @internal */
-export interface EmbeddedClientMutationTiming {
-  authMs: number;
-  idMs: number;
-  normalizeMs: number;
-  operationMs: number;
-  runnerMs: number;
-  stateMs: number;
-  totalMs: number;
-}
-
-/**
- * Reserved options object accepted by {@link EmbeddedClient.mutation}.
- *
- * @typeParam Args - Convex mutation argument object accepted by the mutation.
- *
- * @public
- */
-export interface ConvexEmbeddedMutationOptions<_Args extends Record<string, Value>> {
-  readonly __convexEmbeddedMutationOptionsBrand?: never;
-}
 
 /**
  * A watched query handle.
@@ -228,12 +180,6 @@ export type LocalArgs<Fn> =
     ? [args?: Record<string, never>]
     : [args: LocalFunctionArgs<Fn>];
 
-/** Arguments and mutation options accepted by a device-only mutation. @public */
-export type LocalArgsAndOptions<Fn, Options> =
-  LocalFunctionArgs<Fn> extends Record<string, never>
-    ? [args?: Record<string, never>, options?: Options]
-    : [args: LocalFunctionArgs<Fn>, options?: Options];
-
 /**
  * Mutable authentication state shared by the app client and its remote driver.
  *
@@ -277,8 +223,8 @@ interface EmbeddedClientBaseOptions {
   modules: ConvexModules;
   /** Device-only function modules imported when the runtime starts. */
   localModules?: ConvexLocalModules;
-  /** Schemas carried by imported local registrations, collected by platform adapters. @internal */
-  localSchemas?: readonly ConvexEmbeddedSchema[];
+  /** Historical schemas carried by setup-only local registrations. @internal */
+  compatibilitySchemas?: readonly ConvexEmbeddedSchema[];
   /** Build-stamped setup identities actually present in the loaded local registry. @internal */
   localSetupIdentities?: Readonly<Record<string, string>>;
   /** Storage backend, or a promise for one, owned by the client. */
@@ -324,7 +270,7 @@ export interface EmbeddedRuntimeClientOptions {
   close?: () => Promise<void> | void;
   /**
    * Synchronously available runner whose events are observed before {@link runner} resolves, so
-   * boot-lifecycle runtime events flow to {@link EmbeddedClient.onRuntimeEvent} before ready.
+   * boot-lifecycle runtime events are observed before the client reports readiness.
    */
   eagerRunner?: Runner;
   /** Prebuilt runner used to execute Convex functions. */
@@ -358,62 +304,195 @@ interface ClientState {
   store?: StorageBackend;
 }
 
-/** Local and remote readiness reported by {@link EmbeddedClient.connectionState}. @public */
-type EmbeddedLocalConnectionState = "idle" | "starting" | "ready" | "failed" | "closed";
+/** The lifecycle of the device-local runtime. @public */
+export type EmbeddedLocalConnectionState =
+  | { readonly status: "idle" }
+  | { readonly status: "starting" }
+  | { readonly status: "ready"; readonly persistence: "durable" | "temporary" }
+  | { readonly status: "failed"; readonly error: EmbeddedConnectionError }
+  | { readonly status: "closed" };
 
-export type EmbeddedConnectionState = {
-  local: EmbeddedLocalConnectionState;
-  localError?: string;
-} & (
-  | { remote: "disabled" | "starting" | "connected" | "ready" | "offline" | "closed" }
-  | { remote: "error"; remoteError: string }
-);
+/** The lifecycle of durable replication, distinct from hosted Convex requests. @public */
+export type EmbeddedReplicationConnectionState =
+  | { readonly status: "disabled" }
+  | { readonly status: "starting" }
+  | { readonly status: "offline" }
+  | { readonly status: "online"; readonly sync: "pending" | "idle" }
+  | { readonly status: "error"; readonly error: EmbeddedConnectionError }
+  | { readonly status: "closed" };
 
-/** Embedded client activity captured for devtools. @internal */
-export interface EmbeddedClientDebugOperation {
-  args: unknown;
-  durationMs?: number;
-  error?: string;
-  id: number;
-  kind: EmbeddedOperationKind;
-  name: string;
-  result?: unknown;
-  resultSize?: number;
-  startedAt: number;
-  status: "pending" | "success" | "error";
-  timing?: RunMutationTiming;
+/** Local and replication readiness reported by {@link EmbeddedClient.connectionState}. @public */
+export interface EmbeddedConnectionState {
+  readonly local: EmbeddedLocalConnectionState;
+  readonly replication: EmbeddedReplicationConnectionState;
 }
 
-/** Watched query state captured for devtools. @internal */
-export interface EmbeddedClientDebugQuery {
-  args: unknown;
-  error?: string;
-  hasValue: boolean;
-  key: string;
-  name: string;
-  subscribers: number;
-  value?: unknown;
+/** Stable categories produced while the local runtime or replication driver changes state. @public */
+export type EmbeddedConnectionErrorCode =
+  | "EMBEDDED_CLIENT_RETIRED"
+  | "EMBEDDED_PRE_BASELINE_STORE"
+  | "EMBEDDED_PROTOCOL_MISMATCH"
+  | "EMBEDDED_REPLICATION"
+  | "EMBEDDED_RUNTIME"
+  | "EMBEDDED_STORAGE";
+
+/** A serializable connection failure, present only in a failed/error state branch. @public */
+export interface EmbeddedConnectionError {
+  readonly code: EmbeddedConnectionErrorCode;
+  readonly message: string;
 }
 
-/** Local upload state captured for devtools. @internal */
-export interface EmbeddedClientDebugUpload {
-  contentType?: string;
-  durationMs?: number;
-  error?: string;
-  size: number;
-  startedAt: number;
-  status: "pending" | "success" | "error";
-  storageId?: string;
-  url: string;
+/** A revision retained while applying an authoritative mutation settlement. @public */
+export interface EmbeddedRetainedRevision {
+  readonly id: string;
+  readonly revId: string;
+  readonly table: string;
 }
 
-/** Snapshot consumed by the optional devtools package entrypoint. @internal */
-export interface EmbeddedClientDebugSnapshot {
-  clientId: string;
-  closed: boolean;
-  operations: EmbeddedClientDebugOperation[];
-  queries: EmbeddedClientDebugQuery[];
-  uploads: EmbeddedClientDebugUpload[];
+/**
+ * A terminal durable settlement for one replicated mutation.
+ *
+ * @remarks
+ * This is a live-only channel: subscribing never replays prior settlements.
+ * A rebase is an internal retry step and is intentionally absent from this union.
+ *
+ * @public
+ */
+export type EmbeddedMutationSettlement =
+  | {
+      readonly outcome: "applied";
+      readonly mutationId: string;
+      readonly functionName: string;
+    }
+  | {
+      readonly outcome: "conflict";
+      readonly code: "EMBEDDED_CONFLICT";
+      readonly mutationId: string;
+      readonly functionName: string;
+      readonly retainedRevisions: readonly EmbeddedRetainedRevision[];
+    }
+  | {
+      readonly outcome: "rejected";
+      readonly code: "EMBEDDED_REJECTED" | "EMBEDDED_DIVERGENCE";
+      readonly mutationId: string;
+      readonly functionName: string;
+      readonly retainedRevisions: readonly EmbeddedRetainedRevision[];
+    };
+
+interface StateCell<T> {
+  read(): T;
+  subscribe(callback: (value: T) => void): () => void;
+  write(value: T): void;
+}
+
+/**
+ * A state snapshot and subscription cell with Convex-style change notifications.
+ *
+ * Writes synchronously replace the current snapshot, structural duplicates are ignored, and a
+ * microtask coalesces an arbitrary burst into one notification carrying the latest value.
+ */
+function stateCell<T>(initial: T, equals: (left: T, right: T) => boolean): StateCell<T> {
+  let value = initial;
+  let queued = false;
+  const callbacks = new Set<(value: T) => void>();
+  const pendingCallbacks = new Set<(value: T) => void>();
+  const flush = () => {
+    queued = false;
+    const pending = [...pendingCallbacks];
+    pendingCallbacks.clear();
+    for (const callback of pending) {
+      try {
+        callback(value);
+      } catch (error) {
+        reportListenerError(error);
+      }
+    }
+  };
+  return {
+    read: () => value,
+    subscribe: (callback) => {
+      callbacks.add(callback);
+      let active = true;
+      return () => {
+        if (!active) return;
+        active = false;
+        callbacks.delete(callback);
+        pendingCallbacks.delete(callback);
+      };
+    },
+    write: (next) => {
+      if (equals(value, next)) return;
+      value = next;
+      for (const callback of callbacks) pendingCallbacks.add(callback);
+      if (queued) return;
+      queued = true;
+      queueMicrotask(flush);
+    },
+  };
+}
+
+function connectionState(
+  local: EmbeddedLocalConnectionState,
+  replication: EmbeddedReplicationConnectionState,
+): EmbeddedConnectionState {
+  return Object.freeze({ local: Object.freeze(local), replication: Object.freeze(replication) });
+}
+
+function sameConnectionState(
+  left: EmbeddedConnectionState,
+  right: EmbeddedConnectionState,
+): boolean {
+  return (
+    sameLocalState(left.local, right.local) &&
+    sameReplicationState(left.replication, right.replication)
+  );
+}
+
+function sameLocalState(
+  left: EmbeddedLocalConnectionState,
+  right: EmbeddedLocalConnectionState,
+): boolean {
+  if (left.status !== right.status) return false;
+  switch (left.status) {
+    case "ready":
+      return right.status === "ready" && left.persistence === right.persistence;
+    case "failed":
+      return right.status === "failed" && sameError(left.error, right.error);
+    case "idle":
+    case "starting":
+    case "closed":
+      return true;
+    default:
+      return assertNever(left);
+  }
+}
+
+function sameReplicationState(
+  left: EmbeddedReplicationConnectionState,
+  right: EmbeddedReplicationConnectionState,
+): boolean {
+  if (left.status !== right.status) return false;
+  switch (left.status) {
+    case "online":
+      return right.status === "online" && left.sync === right.sync;
+    case "error":
+      return right.status === "error" && sameError(left.error, right.error);
+    case "disabled":
+    case "starting":
+    case "offline":
+    case "closed":
+      return true;
+    default:
+      return assertNever(left);
+  }
+}
+
+function sameError(left: EmbeddedConnectionError, right: EmbeddedConnectionError): boolean {
+  return left.code === right.code && left.message === right.message;
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected embedded connection state: ${JSON.stringify(value)}`);
 }
 
 /**
@@ -469,20 +548,27 @@ export class EmbeddedClient {
   private acceptedAuthGeneration = -1;
   private identityReady: Promise<void> = Promise.resolve();
   private identityRefresh: { generation: number; promise: Promise<boolean> } | undefined;
-  private localState: EmbeddedConnectionState["local"] = "idle";
-  private remoteState: EmbeddedConnectionState["remote"] = "disabled";
-  private remoteError: string | undefined;
-  private remotePullError: string | undefined;
+  private localConnection: EmbeddedLocalConnectionState = { status: "idle" };
+  private replicationConnection: EmbeddedReplicationConnectionState = { status: "disabled" };
+  private readonly connection = stateCell(
+    connectionState(this.localConnection, this.replicationConnection),
+    sameConnectionState,
+  );
+  private persistence: "durable" | "temporary" = "durable";
+  private replicationPullError: EmbeddedConnectionError | undefined;
   private remoteStart: Promise<void> | undefined;
   private remoteIncarnation: string | undefined;
   private remoteGeneration = -1;
   private remoteSequence = -1;
-  private localError: string | undefined;
   private nextDebugOperationId = 1;
   private nextSpanId = 1;
-  private readonly eventListeners = new Set<EmbeddedInternalEventListener>();
-  private readonly debugOperations: EmbeddedClientDebugOperation[] = [];
-  private readonly debugUploads: EmbeddedClientDebugUpload[] = [];
+  private readonly debugOperations: DevtoolsOperation[] = [];
+  private readonly debugUploads: DevtoolsUpload[] = [];
+  private readonly settlementListeners = new Set<
+    (settlement: EmbeddedMutationSettlement) => void
+  >();
+  private readonly acceptedRemoteSettlementEvents = new WeakSet<EmbeddedRemoteEvent>();
+  private readonly devtools: DevtoolsBridge;
   constructor(
     options: EmbeddedClientOptions | EmbeddedRuntimeClientOptions | DeferredEmbeddedClientOptions,
   ) {
@@ -491,24 +577,35 @@ export class EmbeddedClient {
       "start" in options ? options.hosted : "runner" in options ? options.hosted : options.remote;
     this.hosted = hostedOptions;
     this.start = "start" in options ? (setup) => options.start(setup) : async () => options;
-    this.remoteState = "disabled";
+    this.devtools = createDevtoolsBridge(this, {
+      clearActivity: () => {
+        this.debugOperations.length = 0;
+      },
+      runFunction: (input) => this.runDevtoolsFunction(input),
+      runtime: (request) => this.runDevtoolsRequest(request),
+      snapshot: () => this.devtoolsSnapshot(),
+    });
     // A prebuilt runner is an internal handoff from a worker/lifecycle owner that has already
     // acquired its resources. Keep that test/adapter seam eager; all public platform clients use
     // the deferred `start` form and remain inert until `open()`.
     if ("runner" in options) {
       this.opened = true;
-      this.localState = "starting";
+      this.setLocalConnection({ status: "starting" });
       this.openSetup = undefined;
       this.openIdentity = "none";
-      this.remoteState = options.remoteConfigured === true ? "starting" : "disabled";
+      this.setReplicationConnection(
+        options.remoteConfigured === true ? { status: "starting" } : { status: "disabled" },
+      );
       this.state = this.init(options);
       void this.state.then(
         () => {
-          this.localState = "ready";
+          this.setLocalConnection({ persistence: this.persistence, status: "ready" });
         },
         (error) => {
-          this.localState = "failed";
-          this.localError = errorMessage(error);
+          this.setLocalConnection({
+            error: toConnectionError(error, "EMBEDDED_RUNTIME"),
+            status: "failed",
+          });
         },
       );
       void this.state.catch(() => undefined);
@@ -518,6 +615,11 @@ export class EmbeddedClient {
   /**
    * Opens storage and starts the local runtime. Construction is inert: no worker, native store,
    * scheduler, or remote connection is created before this call.
+   *
+   * @remarks
+   * An open failure is terminal for this client instance. Call {@link close}, construct a new
+   * client, and call `open()` with the same setup identity to resume a durable candidate. This
+   * avoids reusing a partially acquired platform runner after a failed initialization.
    */
   open(): Promise<void>;
   open<Setup extends LocalSetupAction>(setup: ValidLocalSetup<Setup>): Promise<void>;
@@ -541,10 +643,12 @@ export class EmbeddedClient {
       return Promise.reject(error);
     }
     this.opened = true;
-    this.localState = "starting";
+    this.setLocalConnection({ status: "starting" });
     this.openSetup = setup;
     this.openIdentity = identity;
-    this.remoteState = this.hosted === undefined ? "disabled" : "starting";
+    this.setReplicationConnection(
+      this.hosted === undefined ? { status: "disabled" } : { status: "starting" },
+    );
     this.state = Promise.resolve()
       .then(async () => {
         if (this.closed) throw new EmbeddedClosedError();
@@ -553,14 +657,18 @@ export class EmbeddedClient {
       .then((options) => this.init(options, setup));
     void this.state.then(
       () => {
-        this.localState = "ready";
+        this.setLocalConnection({ persistence: this.persistence, status: "ready" });
       },
       (error) => {
-        this.localState = "failed";
-        this.localError = errorMessage(error);
-        if (this.remoteState === "starting") {
-          this.remoteState = "error";
-          this.remoteError = `Embedded runtime failed to start: ${errorMessage(error)}`;
+        this.setLocalConnection({
+          error: toConnectionError(error, "EMBEDDED_RUNTIME"),
+          status: "failed",
+        });
+        if (this.replicationConnection.status === "starting") {
+          this.setReplicationConnection({
+            error: toConnectionError(error, "EMBEDDED_RUNTIME", "Embedded runtime failed to start"),
+            status: "error",
+          });
         }
       },
     );
@@ -593,18 +701,43 @@ export class EmbeddedClient {
     if (this.opened) this.identityReady = this.clearIdentity(generation);
   }
 
-  /** Returns the current local and remote readiness snapshot. */
+  /** Returns the current local and replication readiness snapshot. */
   connectionState(): EmbeddedConnectionState {
-    const localError = this.localState === "failed" ? this.localError : undefined;
-    if (this.remoteState === "error") {
-      return {
-        local: this.localState,
-        localError,
-        remote: "error",
-        remoteError: this.remoteError ?? "Remote replication failed.",
-      };
-    }
-    return { local: this.localState, localError, remote: this.remoteState };
+    return this.connection.read();
+  }
+
+  /**
+   * Calls `callback` after a structural local or replication state change.
+   *
+   * @remarks
+   * This is live-only, follows Convex's connection-state callback shape, and batches changes that
+   * occur in one microtask into a single callback with the latest snapshot.
+   */
+  subscribeToConnectionState(
+    callback: (connectionState: EmbeddedConnectionState) => void,
+  ): () => void {
+    if (this.closed) return () => undefined;
+    return this.connection.subscribe(callback);
+  }
+
+  /**
+   * Observes future terminal settlements after the native store durably writes them.
+   *
+   * @remarks
+   * This channel is live and non-replayable. It never reports internal rebase attempts or raw
+   * server rejection reasons.
+   */
+  subscribeToMutationSettlements(
+    callback: (settlement: EmbeddedMutationSettlement) => void,
+  ): () => void {
+    if (this.closed) return () => undefined;
+    this.settlementListeners.add(callback);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.settlementListeners.delete(callback);
+    };
   }
 
   /**
@@ -659,7 +792,7 @@ export class EmbeddedClient {
    *
    * @typeParam Mutation - Convex mutation function reference type.
    * @param mutation - Convex mutation function reference.
-   * @param argsAndOptions - Mutation arguments followed by optional mutation options.
+   * @param args - Mutation arguments.
    * @returns The mutation return value.
    * @throws An error thrown by the mutation handler, validation, storage commit, or a closed client.
    *
@@ -670,59 +803,34 @@ export class EmbeddedClient {
    */
   mutation<Mutation extends FunctionReference<"mutation">>(
     mutation: Mutation,
-    ...argsAndOptions: ArgsAndOptions<
-      Mutation,
-      ConvexEmbeddedMutationOptions<FunctionArgs<Mutation>>
-    >
+    ...args: OptionalRestArgs<Mutation>
   ): Promise<FunctionReturnType<Mutation>>;
   mutation<Mutation extends LocalMutation<"public", any, any>>(
     mutation: Mutation,
-    ...argsAndOptions: LocalArgsAndOptions<
-      Mutation,
-      ConvexEmbeddedMutationOptions<LocalFunctionArgs<Mutation>>
-    >
+    ...args: LocalArgs<Mutation>
   ): LocalFunctionReturns<Mutation>;
   async mutation(
     mutation: FunctionReference<"mutation"> | LocalMutation<"public", any, any>,
-    ...argsAndOptions: [
-      Record<string, Value>?,
-      ConvexEmbeddedMutationOptions<Record<string, Value>>?,
-    ]
+    ...args: [Record<string, Value>?]
   ): Promise<unknown> {
-    const timingOptions = argsAndOptions[1] as MutationOptions<Record<string, Value>> | undefined;
-    const timingStartedAt = timingOptions?.onTiming ? getTimerTime() : 0;
-    let timingPhaseStartedAt = timingStartedAt;
-    const clientTiming: EmbeddedClientMutationTiming | undefined = timingOptions?.onTiming
-      ? {
-          authMs: 0,
-          idMs: 0,
-          normalizeMs: 0,
-          operationMs: 0,
-          runnerMs: 0,
-          stateMs: 0,
-          totalMs: 0,
-        }
-      : undefined;
     this.ensureOpen();
     const { runner } = await this.state;
-    if (clientTiming) {
-      clientTiming.stateMs = getTimerTime() - timingPhaseStartedAt;
-      timingPhaseStartedAt = getTimerTime();
-    }
     this.ensureOpen();
     const reference = toReference(mutation, runner.localConfigured);
-    const [args] = argsAndOptions;
-    const normalized = toArgs(args);
-    if (clientTiming) {
-      clientTiming.normalizeMs = getTimerTime() - timingPhaseStartedAt;
-      timingPhaseStartedAt = getTimerTime();
-    }
+    const normalized = toArgs(args[0]);
     let runnerTiming: RunMutationTiming | undefined;
     const result = await this.recordOperation(
       "mutation",
       getFunctionName(reference),
       normalized,
-      async () => {
+      async (observed) => {
+        // `recordOperation` took this one observation snapshot. Keep the runner hook tied to the
+        // same decision so an observer cannot see a record without timings (or vice versa).
+        const onTiming = observed
+          ? (value: RunMutationTiming) => {
+              runnerTiming = value;
+            }
+          : undefined;
         const cachedPlacement = this.cachedLocalRoute(reference, "mutation");
         const route = cachedPlacement
           ? ({ execution: "local", placement: cachedPlacement } as const)
@@ -730,59 +838,46 @@ export class EmbeddedClient {
         if (route.execution === "hosted") {
           return this.runHosted("mutation", reference, route.args);
         }
-        if (clientTiming) {
-          clientTiming.operationMs += getTimerTime() - timingPhaseStartedAt;
-          timingPhaseStartedAt = getTimerTime();
-        }
         const auth = await this.currentAuth();
-        if (clientTiming) {
-          clientTiming.authMs += getTimerTime() - timingPhaseStartedAt;
-          timingPhaseStartedAt = getTimerTime();
-        }
         if (route.placement === "local") {
-          const value = await runner.runMutation(reference, normalized, {
-            auth,
-            onTiming: (value) => {
-              runnerTiming = value;
-            },
-          });
-          if (clientTiming) {
-            clientTiming.runnerMs += getTimerTime() - timingPhaseStartedAt;
-            timingPhaseStartedAt = getTimerTime();
-          }
+          const value = await runner.runMutation(
+            reference,
+            normalized,
+            onTiming === undefined ? { auth } : { auth, onTiming },
+          );
           return value;
         }
         const mutationId = this.allocateMutationId();
-        if (clientTiming) {
-          clientTiming.idMs += getTimerTime() - timingPhaseStartedAt;
-          timingPhaseStartedAt = getTimerTime();
-        }
-        const value = await runner.runMutation(reference, normalized, {
-          auth,
-          mutationIsFresh: true,
-          mutationId,
-          pushCall: {
-            fn: getFunctionName(reference),
-            rngSeed: randomId("rng"),
-          },
-          onTiming: (value) => {
-            runnerTiming = value;
-          },
-        });
-        if (clientTiming) {
-          clientTiming.runnerMs += getTimerTime() - timingPhaseStartedAt;
-          timingPhaseStartedAt = getTimerTime();
-        }
+        const value = await runner.runMutation(
+          reference,
+          normalized,
+          onTiming === undefined
+            ? {
+                auth,
+                mutationIsFresh: true,
+                mutationId,
+                pushCall: {
+                  fn: getFunctionName(reference),
+                  rngSeed: randomId("rng"),
+                },
+              }
+            : {
+                auth,
+                mutationIsFresh: true,
+                mutationId,
+                onTiming,
+                pushCall: {
+                  fn: getFunctionName(reference),
+                  rngSeed: randomId("rng"),
+                },
+              },
+        );
         return value;
       },
       (operation) => {
         if (runnerTiming) operation.timing = runnerTiming;
       },
     );
-    if (clientTiming) {
-      clientTiming.totalMs = getTimerTime() - timingStartedAt;
-      timingOptions?.onTiming?.(clientTiming);
-    }
     return result;
   }
 
@@ -825,9 +920,13 @@ export class EmbeddedClient {
     this.ensureOpen();
     const { runner } = await this.state;
     this.ensureOpen();
+    const observed = this.devtools.hasListeners();
+    // Upload diagnostics are optional. In the normal application path, do not allocate an upload
+    // history row or take timing samples merely to discard them.
+    if (!observed) return await runner.handleUpload(url, blob);
     const startedAt = getTimerTime();
     const startedTimerAt = getTimerTime();
-    const upload: EmbeddedClientDebugUpload = {
+    const upload: DevtoolsUpload = {
       contentType: blob.type || undefined,
       size: blob.size,
       startedAt,
@@ -837,8 +936,13 @@ export class EmbeddedClient {
     this.debugUploads.unshift(upload);
     this.trimDebug();
     try {
-      const result = await this.recordOperation("upload", "storage.upload", { url }, () =>
-        runner.handleUpload(url, blob),
+      const result = await this.recordOperation(
+        "upload",
+        "storage.upload",
+        { url },
+        () => runner.handleUpload(url, blob),
+        undefined,
+        observed,
       );
       upload.durationMs = getElapsedTime(startedTimerAt);
       upload.status = "success";
@@ -850,62 +954,6 @@ export class EmbeddedClient {
       upload.status = "error";
       throw error;
     }
-  }
-
-  /**
-   * Subscribes to the public embedded observability event stream.
-   *
-   * @remarks
-   * The listener receives the stable {@link EmbeddedEvent} union: runtime, operation, remote, data,
-   * crdt, upload, schedule, and retention events. Richer internal detail is available to devtools
-   * through the internal channel and is not part of this contract.
-   *
-   * @param listener - Callback invoked for each public observability event emitted by this client.
-   * @returns A function that unsubscribes the listener.
-   * @public
-   */
-  subscribeEvents(listener: EmbeddedPublicEventListener): () => void {
-    return this.subscribeInternalEvents((event) => {
-      const mapped = mapPublicEvent(event);
-      if (mapped) listener(mapped);
-    });
-  }
-
-  /**
-   * Subscribes to the rich internal observability channel used by devtools and boot diagnostics.
-   *
-   * @remarks
-   * Unlike {@link subscribeEvents}, this exposes benchmark timings, spans, and per-tick replication
-   * detail. It is not a stable app contract; app code uses {@link subscribeEvents}.
-   *
-   * @param listener - Callback invoked for each internal event.
-   * @returns A function that unsubscribes the listener.
-   * @internal
-   */
-  subscribeInternalEvents(listener: EmbeddedInternalEventListener): () => void {
-    this.eventListeners.add(listener);
-    return () => {
-      this.eventListeners.delete(listener);
-    };
-  }
-
-  /**
-   * Observes boot-lifecycle transitions and runtime degradation signals.
-   *
-   * @remarks
-   * A convenience view over {@link subscribeEvents} filtered to `runtime` events: store open,
-   * remote attach, and ready phases, plus slow-open and OPFS acquire-contention degradations. An
-   * app can render boot progress or a still-loading notice instead of a dead spinner. The channel
-   * is inert when unused.
-   *
-   * @param listener - Callback invoked for each runtime lifecycle or degradation event.
-   * @returns A function that unsubscribes the listener.
-   * @public
-   */
-  onRuntimeEvent(listener: (event: EmbeddedRuntimeEvent) => void): () => void {
-    return this.subscribeInternalEvents((event) => {
-      if (event.type === "runtime") listener(event);
-    });
   }
 
   /**
@@ -969,10 +1017,10 @@ export class EmbeddedClient {
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.localState = "closed";
-    this.remoteState = this.remoteState === "disabled" ? "disabled" : "closed";
-    this.remoteError = undefined;
-    this.remotePullError = undefined;
+    this.replicationPullError = undefined;
+    this.setLocalConnection({ status: "closed" });
+    this.setReplicationConnection({ status: "closed" });
+    this.settlementListeners.clear();
     for (const state of this.queries.values()) {
       state.stop?.();
       state.stop = undefined;
@@ -989,8 +1037,7 @@ export class EmbeddedClient {
     return this.closePromise;
   }
 
-  /** @internal */
-  protected __devtoolsSnapshot(): EmbeddedClientDebugSnapshot {
+  private devtoolsSnapshot(): DevtoolsClientSnapshot {
     return {
       clientId: this.clientId,
       closed: this.closed,
@@ -1008,28 +1055,17 @@ export class EmbeddedClient {
     };
   }
 
-  /** @internal */
-  protected async __devtoolsRuntime(request: RunnerDevtoolsRequest): Promise<unknown> {
+  private async runDevtoolsRequest(request: RunnerDevtoolsRequest): Promise<unknown> {
     this.ensureOpen();
     const { runner } = await this.state;
     this.ensureOpen();
     return runner.devtools(request);
   }
 
-  /** @internal */
-  protected async __devtoolsRunFunction(input: {
-    args: Record<string, unknown>;
-    kind: "query" | "mutation" | "action";
-    path: string;
-  }): Promise<unknown> {
+  private async runDevtoolsFunction(input: DevtoolsRunFunctionInput): Promise<unknown> {
     if (input.kind === "query") return this.query(input.path as never, input.args as never);
     if (input.kind === "mutation") return this.mutation(input.path as never, input.args as never);
     return this.action(input.path as never, input.args as never);
-  }
-
-  /** @internal */
-  protected __devtoolsClearActivity(): void {
-    this.debugOperations.length = 0;
   }
 
   /** @internal */
@@ -1039,8 +1075,7 @@ export class EmbeddedClient {
     this.ensureOpen();
     if (!remote?.pull) return undefined;
     const tick = await remote.pull(true);
-    consumeRemoteTick(tick, runner, (event) => this.emitEvent(event));
-    this.emitEvent(remoteTickEvent(tick));
+    this.processRemoteTick(tick, runner);
     return tick;
   }
 
@@ -1049,32 +1084,50 @@ export class EmbeddedClient {
     setup?: LocalSetupAction,
   ): Promise<ClientState> {
     if ("runner" in options) {
-      const eagerUnsubscribe = options.eagerRunner?.subscribeEvents?.((event) =>
-        this.emitEvent(event),
-      );
-      const runner = await options.runner;
-      const unsubscribeEvents =
-        eagerUnsubscribe ?? runner.subscribeEvents?.((event) => this.emitEvent(event));
-      if (this.closed) {
+      let unsubscribeEvents: (() => void) | undefined;
+      let unsubscribeSettlements: (() => void) | undefined;
+      let cleaned = false;
+      const cleanup = async (): Promise<void> => {
+        if (cleaned) return;
+        cleaned = true;
         unsubscribeEvents?.();
+        unsubscribeSettlements?.();
         await options.close?.();
-        throw new EmbeddedClosedError();
-      }
-      await this.readCachedIdentity(runner, this.authGeneration);
-      // Worker-backed runtimes execute candidate setup as part of their Init protocol before this
-      // runner resolves. Never execute it again against the now-published generation.
-      if (options.remoteConfigured === true) {
-        void this.refreshRunnerIdentity(runner, this.authGeneration);
-      }
-      return {
-        close: async () => {
-          unsubscribeEvents?.();
-          await options.close?.();
-        },
-        remote: undefined,
-        remoteConfigured: options.remoteConfigured === true,
-        runner,
       };
+      try {
+        unsubscribeEvents = options.eagerRunner?.subscribeEvents?.((event) =>
+          this.emitDiagnostic(event),
+        );
+        unsubscribeSettlements = options.eagerRunner?.subscribeRemoteSettlements?.(
+          (event, settlements) => this.publishBrowserMutationSettlements(event, settlements),
+        );
+        const runner = await options.runner;
+        unsubscribeEvents ??= runner.subscribeEvents?.((event) => this.emitDiagnostic(event));
+        unsubscribeSettlements ??= runner.subscribeRemoteSettlements?.((event, settlements) =>
+          this.publishBrowserMutationSettlements(event, settlements),
+        );
+        if (this.closed) throw new EmbeddedClosedError();
+        await this.readCachedIdentity(runner, this.authGeneration);
+        // Worker-backed runtimes execute candidate setup as part of their Init protocol before this
+        // runner resolves. Never execute it again against the now-published generation.
+        if (options.remoteConfigured === true) {
+          void this.refreshRunnerIdentity(runner, this.authGeneration);
+        }
+        return {
+          close: cleanup,
+          remote: undefined,
+          remoteConfigured: options.remoteConfigured === true,
+          runner,
+        };
+      } catch (error) {
+        try {
+          await cleanup();
+        } catch {
+          // Preserve the initialization error while still making the best effort to release the
+          // runner owner that may have been acquired before it rejected.
+        }
+        throw error;
+      }
     }
 
     const baseSchema = options.storeSchema ?? toRuntimeStoreSchema(options.schema);
@@ -1088,22 +1141,25 @@ export class EmbeddedClient {
     const store = await options.store;
     let runner: Runner;
     try {
-      const localSchemas =
+      const compatibilitySchemas =
         setup === undefined
           ? []
           : [
-              ...(options.localSchemas ?? []),
-              ...[localFunctionSchema(setup)].filter(
-                (value): value is ConvexEmbeddedSchema => value !== undefined,
-              ),
+              ...new Set([
+                ...(options.compatibilitySchemas ?? []),
+                ...[localCompatibilitySchema(setup)].filter(
+                  (value): value is ConvexEmbeddedSchema => value !== undefined,
+                ),
+              ]),
             ];
       const opened = await openCandidate<Runner>(store, {
-        createRunner: (runnerSchema, remote) =>
+        createRunner: ({ schema: runnerSchema, mode, remote }) =>
           createRunner(options.modules, store, runnerSchema, {
-            emit: (event) => this.emitEvent(event),
-            hasEventListeners: () => this.eventListeners.size > 0,
+            emit: (event) => this.emitDiagnostic(event),
+            hasEventListeners: () => this.devtools.hasListeners(),
             localModules: options.localModules,
             manifest: options.manifest,
+            mode,
             moduleGraphHash,
             remote,
           }),
@@ -1116,7 +1172,7 @@ export class EmbeddedClient {
           setup === undefined
             ? undefined
             : {
-                localSchemas,
+                compatibilitySchemas,
                 run: async (setupRunner) => {
                   await setupRunner.runAction(
                     toReference(setup, setupRunner.localConfigured),
@@ -1153,8 +1209,7 @@ export class EmbeddedClient {
               protocolVersion: EMBEDDED_PROTOCOL_VERSION,
             }),
             notify: (tick) => {
-              consumeRemoteTick(tick, runner, (event) => this.emitEvent(event));
-              this.emitEvent(remoteTickEvent(tick));
+              this.processRemoteTick(tick, runner);
             },
           });
           await this.refreshRunnerIdentity(runner, this.authGeneration);
@@ -1169,12 +1224,13 @@ export class EmbeddedClient {
                 throw new Error("Remote replication is waiting for identity negotiation.");
               }
             },
-            (event) => this.emitEvent(event),
+            (event) => this.emitDiagnostic(event),
             async () => {
               await remote.close().catch(() => undefined);
               this.clientId = randomId("client");
               await startRemote();
             },
+            (settlements) => this.publishMutationSettlements(settlements),
           );
         };
         const attemptRemoteStart = async (): Promise<void> => {
@@ -1183,8 +1239,14 @@ export class EmbeddedClient {
             await startRemote();
           } catch (error) {
             if (this.closed) return;
-            this.remoteState = "error";
-            this.remoteError = `Embedded remote replication failed to start: ${errorMessage(error)}`;
+            this.setReplicationConnection({
+              error: toConnectionError(
+                error,
+                "EMBEDDED_REPLICATION",
+                "Embedded remote replication failed to start",
+              ),
+              status: "error",
+            });
             await remote.close().catch(() => undefined);
             if (this.closed || remoteRetryTimer !== undefined) return;
             remoteStartAttempt += 1;
@@ -1195,8 +1257,7 @@ export class EmbeddedClient {
             remoteRetryTimer = setTimeout(() => {
               remoteRetryTimer = undefined;
               if (this.closed) return;
-              this.remoteState = "starting";
-              this.remoteError = undefined;
+              this.setReplicationConnection({ status: "starting" });
               this.remoteStart = attemptRemoteStart();
               void this.remoteStart.catch(() => undefined);
             }, delay);
@@ -1359,9 +1420,7 @@ export class EmbeddedClient {
       try {
         callback();
       } catch (error) {
-        queueMicrotask(() => {
-          throw error;
-        });
+        reportListenerError(error);
       }
     }
   }
@@ -1376,15 +1435,16 @@ export class EmbeddedClient {
     kind: EmbeddedOperationKind,
     name: string,
     args: unknown,
-    run: () => Promise<T>,
-    finish?: (operation: EmbeddedClientDebugOperation) => void,
+    run: (observed: boolean) => Promise<T>,
+    finish?: (operation: DevtoolsOperation) => void,
+    observed = this.devtools.hasListeners(),
   ): Promise<T> {
-    if (this.eventListeners.size === 0) return run();
+    if (!observed) return run(false);
     const startedAt = getTimerTime();
     const id = this.nextDebugOperationId;
     const spanId = `client:${this.nextSpanId}`;
     this.nextSpanId += 1;
-    const operation: EmbeddedClientDebugOperation = {
+    const operation: DevtoolsOperation = {
       args: toDebugValue(args),
       id,
       kind,
@@ -1395,27 +1455,29 @@ export class EmbeddedClient {
     this.nextDebugOperationId += 1;
     this.debugOperations.unshift(operation);
     this.trimDebug();
-    this.emitEvent(operationEvent(operation, "start", startedAt));
-    this.emitEvent(spanEvent(spanId, `client.${kind}`, "start", startedAt));
+    this.emitDiagnostic(operationEvent(operation, "start", startedAt));
+    this.emitDiagnostic(spanEvent(spanId, `client.${kind}`, "start", startedAt));
     const startedTimerAt = getTimerTime();
     try {
-      const result = await run();
+      const result = await run(true);
       finish?.(operation);
       const endedAt = getTimerTime();
       operation.durationMs = getElapsedTime(startedTimerAt);
       operation.result = toDebugValue(result);
       operation.resultSize = debugSize(operation.result);
       operation.status = "success";
-      this.emitEvent(operationEvent(operation, "finish", endedAt));
-      this.emitEvent(spanEvent(spanId, `client.${kind}`, "finish", endedAt, operation.durationMs));
+      this.emitDiagnostic(operationEvent(operation, "finish", endedAt));
+      this.emitDiagnostic(
+        spanEvent(spanId, `client.${kind}`, "finish", endedAt, operation.durationMs),
+      );
       return result;
     } catch (error) {
       const endedAt = getTimerTime();
       operation.durationMs = getElapsedTime(startedTimerAt);
       operation.error = errorMessage(error);
       operation.status = "error";
-      this.emitEvent(operationEvent(operation, "finish", endedAt));
-      this.emitEvent(
+      this.emitDiagnostic(operationEvent(operation, "finish", endedAt));
+      this.emitDiagnostic(
         spanEvent(
           spanId,
           `client.${kind}`,
@@ -1434,7 +1496,49 @@ export class EmbeddedClient {
     this.debugUploads.length = Math.min(this.debugUploads.length, 50);
   }
 
-  private emitEvent(event: EmbeddedInternalEvent): void {
+  private setLocalConnection(next: EmbeddedLocalConnectionState): void {
+    if (this.closed && next.status !== "closed") return;
+    this.localConnection = next;
+    this.connection.write(connectionState(this.localConnection, this.replicationConnection));
+  }
+
+  private setReplicationConnection(next: EmbeddedReplicationConnectionState): void {
+    if (this.closed && next.status !== "closed") return;
+    this.replicationConnection = next;
+    this.connection.write(connectionState(this.localConnection, this.replicationConnection));
+  }
+
+  private processRemoteTick(tick: RemoteTick, runner: Runner): void {
+    consumeRemoteTick(tick, runner, (event) => this.emitDiagnostic(event));
+    this.emitDiagnostic(remoteTickEvent(tick));
+    this.publishMutationSettlements(tick.settlements);
+  }
+
+  private publishMutationSettlements(settlements: readonly RemoteMutationSettlement[]): void {
+    if (this.closed) return;
+    for (const settlement of settlements) {
+      const next = toEmbeddedMutationSettlement(settlement);
+      for (const listener of Array.from(this.settlementListeners)) {
+        try {
+          listener(next);
+        } catch (error) {
+          reportListenerError(error);
+        }
+      }
+    }
+  }
+
+  /** Delivers a browser-worker settlement only when its paired remote event passed the fence. */
+  private publishBrowserMutationSettlements(
+    event: EmbeddedRemoteEvent,
+    settlements: readonly RemoteMutationSettlement[],
+  ): void {
+    if (!this.acceptedRemoteSettlementEvents.delete(event)) return;
+    this.publishMutationSettlements(settlements);
+  }
+
+  private emitDiagnostic(event: DiagnosticEvent): boolean {
+    if (event.type === "runtime") this.updateLocalConnection(event);
     if (event.type === "remote") {
       if (event.incarnation !== undefined && event.incarnation !== this.remoteIncarnation) {
         this.remoteIncarnation = event.incarnation;
@@ -1442,77 +1546,92 @@ export class EmbeddedClient {
         this.remoteSequence = -1;
       }
       if (event.generation !== undefined) {
-        if (event.generation < this.remoteGeneration) return;
+        if (event.generation < this.remoteGeneration) return false;
         if (event.generation > this.remoteGeneration) {
           this.remoteGeneration = event.generation;
           this.remoteSequence = -1;
         }
         if (event.sequence !== undefined) {
-          if (event.sequence <= this.remoteSequence) return;
+          if (event.sequence <= this.remoteSequence) return false;
           this.remoteSequence = event.sequence;
         }
       }
-      if ((event.tick?.pullSnapshots ?? 0) > 0) this.remotePullError = undefined;
+      if ((event.tick?.pullSnapshots ?? 0) > 0) this.replicationPullError = undefined;
       if ((event.tick?.pullDiagnostics ?? 0) > 0) {
-        this.remotePullError = event.error ?? event.tick?.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR;
+        this.replicationPullError = toConnectionError(
+          event.error ?? event.tick?.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR,
+          "EMBEDDED_REPLICATION",
+        );
       }
       if (event.status === "error") {
-        this.remoteState = "error";
-        this.remoteError =
-          event.error?.includes("remote command channel closed") && this.remotePullError
-            ? this.remotePullError
-            : event.error;
-      } else if (this.remotePullError !== undefined && event.status !== "closed") {
-        this.remoteState = "error";
-        this.remoteError = this.remotePullError;
+        this.setReplicationConnection({
+          error:
+            event.error?.includes("remote command channel closed") && this.replicationPullError
+              ? this.replicationPullError
+              : toConnectionError(
+                  event.error ?? "Remote replication failed.",
+                  "EMBEDDED_REPLICATION",
+                ),
+          status: "error",
+        });
+      } else if (this.replicationPullError !== undefined && event.status !== "closed") {
+        this.setReplicationConnection({ error: this.replicationPullError, status: "error" });
       } else if (event.status === "offline") {
-        this.remoteState = "offline";
-        this.remoteError = undefined;
+        this.setReplicationConnection({ status: "offline" });
       } else if (event.status === "closed") {
-        this.remoteState = "closed";
-        this.remoteError = undefined;
+        this.setReplicationConnection({ status: "closed" });
       } else if (event.status === "starting") {
-        this.remoteState = "starting";
-        this.remoteError = undefined;
+        this.setReplicationConnection({ status: "starting" });
       } else if (event.status === "started") {
         if (
-          this.remoteState !== "offline" &&
-          this.remoteState !== "connected" &&
-          this.remoteState !== "ready"
+          this.replicationConnection.status !== "offline" &&
+          this.replicationConnection.status !== "online"
         ) {
-          this.remoteState = "starting";
+          this.setReplicationConnection({ status: "starting" });
         }
-        this.remoteError = undefined;
       } else if (event.status === "connected") {
-        if (remotePendingIsEmpty(event.tick?.pending)) {
-          this.remoteState = "ready";
-        } else if (event.tick?.pending !== undefined || this.remoteState !== "ready") {
-          this.remoteState = "connected";
-        }
-        this.remoteError = undefined;
+        this.setReplicationConnection(this.onlineConnection(event.tick));
       } else if (event.status === "tick") {
-        if (this.remoteState !== "offline") {
-          if (remotePendingIsEmpty(event.tick?.pending)) {
-            this.remoteState = "ready";
-          } else if (event.tick?.pending !== undefined || this.remoteState !== "ready") {
-            this.remoteState = "connected";
-          }
+        if (this.replicationConnection.status !== "offline") {
+          this.setReplicationConnection(this.onlineConnection(event.tick));
         }
-        this.remoteError = undefined;
       } else if (event.status === "idle") {
-        this.remoteState = remotePendingIsEmpty(event.tick?.pending) ? "ready" : "connected";
-        this.remoteError = undefined;
+        this.setReplicationConnection(this.onlineConnection(event.tick));
       }
+      this.acceptedRemoteSettlementEvents.add(event);
     }
-    for (const listener of Array.from(this.eventListeners)) {
-      try {
-        listener(event);
-      } catch (error) {
-        queueMicrotask(() => {
-          throw error;
-        });
+    this.devtools.emit(event);
+    return true;
+  }
+
+  private updateLocalConnection(event: Extract<DiagnosticEvent, { type: "runtime" }>): void {
+    if (event.degradation === "temporary-storage") {
+      this.persistence = "temporary";
+      if (this.localConnection.status === "ready") {
+        this.setLocalConnection({ persistence: "temporary", status: "ready" });
       }
+      return;
     }
+    if (event.degradation === "failed") {
+      this.setLocalConnection({
+        error: toConnectionError(event.error ?? "The embedded runtime failed.", "EMBEDDED_RUNTIME"),
+        status: "failed",
+      });
+      return;
+    }
+    if (event.phase === "ready") {
+      this.setLocalConnection({ persistence: this.persistence, status: "ready" });
+    }
+  }
+
+  private onlineConnection(
+    tick: EmbeddedRemoteEvent["tick"],
+  ): Extract<EmbeddedReplicationConnectionState, { status: "online" }> {
+    if (remotePendingIsEmpty(tick?.pending)) return { status: "online", sync: "idle" };
+    if (tick?.pending !== undefined) return { status: "online", sync: "pending" };
+    return this.replicationConnection.status === "online"
+      ? this.replicationConnection
+      : { status: "online", sync: "pending" };
   }
 
   private ensureOpen(): void {
@@ -1727,8 +1846,9 @@ export function startRemoteLoop(
   remote: RemoteSurface,
   runner: Runner,
   ensureIdentity: () => Promise<void>,
-  emit: (event: EmbeddedInternalEvent) => void,
+  emit: (event: DiagnosticEvent) => void,
   rotateRetiredClient?: () => Promise<void>,
+  publishSettlements?: (settlements: readonly RemoteMutationSettlement[]) => void,
 ): () => void {
   if (!remote.pull) return () => undefined;
   let stopped = false;
@@ -1801,7 +1921,12 @@ export function startRemoteLoop(
         if (tick.pullDiagnostics > 0) {
           pullDiagnostic = tick.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR;
         }
-        if (!stopped) consumeRemoteTick(tick, runner, emit);
+        if (!stopped) {
+          consumeRemoteTick(tick, runner, emit);
+        }
+        const publish = () => {
+          if (!stopped) publishSettlements?.(tick.settlements);
+        };
         // The native actor owns websocket ingress after this bounded wake turn. JavaScript enters
         // it again only for new local durable work or a changed authored-query scope.
         const delay = wakePending ? 0 : undefined;
@@ -1815,6 +1940,7 @@ export function startRemoteLoop(
             tick: toRemoteEventTick(tick),
             type: "remote",
           });
+          publish();
           nextDelay = delay;
           return;
         }
@@ -1826,6 +1952,7 @@ export function startRemoteLoop(
             tick: toRemoteEventTick(tick),
             type: "remote",
           });
+          publish();
           nextDelay = delay;
           return;
         }
@@ -1837,6 +1964,7 @@ export function startRemoteLoop(
             tick: toRemoteEventTick(tick),
             type: "remote",
           });
+          publish();
           nextDelay = delay;
           return;
         }
@@ -1848,6 +1976,7 @@ export function startRemoteLoop(
           tick: toRemoteEventTick(tick),
           type: "remote",
         });
+        publish();
         nextDelay = delay;
       })
       .catch(async (error: unknown) => {
@@ -1909,7 +2038,8 @@ export function startRemoteLoop(
 
 /** Project a native tick into the observability event shape. */
 function toRemoteEventTick(tick: RemoteTick): NonNullable<EmbeddedRemoteEvent["tick"]> {
-  return { ...tick, retainedRevisions: tick.retainedRevisions.length };
+  const { settlements: _settlements, ...diagnostic } = tick;
+  return { ...diagnostic, retainedRevisions: diagnostic.retainedRevisions.length };
 }
 
 /** Report progress completed autonomously by the native remote actor. */
@@ -2066,8 +2196,87 @@ function debugSize(value: unknown): number {
   }
 }
 
+function toEmbeddedMutationSettlement(
+  settlement: RemoteMutationSettlement,
+): EmbeddedMutationSettlement {
+  const retainedRevisions = Object.freeze(
+    settlement.retainedRevisions.map((revision) =>
+      Object.freeze({
+        id: revision.id,
+        revId: revision.revId,
+        table: revision.table,
+      }),
+    ),
+  );
+  switch (settlement.outcome) {
+    case "applied":
+      return Object.freeze({
+        functionName: settlement.functionName,
+        mutationId: settlement.mutationId,
+        outcome: "applied",
+      });
+    case "conflict":
+      return Object.freeze({
+        code: settlement.code,
+        functionName: settlement.functionName,
+        mutationId: settlement.mutationId,
+        outcome: "conflict",
+        retainedRevisions,
+      });
+    case "rejected":
+      return Object.freeze({
+        code: settlement.code,
+        functionName: settlement.functionName,
+        mutationId: settlement.mutationId,
+        outcome: "rejected",
+        retainedRevisions,
+      });
+    default:
+      return assertNever(settlement);
+  }
+}
+
+function toConnectionError(
+  error: unknown,
+  fallback: EmbeddedConnectionErrorCode,
+  prefix?: string,
+): EmbeddedConnectionError {
+  const message = prefix === undefined ? errorMessage(error) : `${prefix}: ${errorMessage(error)}`;
+  const code = connectionErrorCode(error) ?? fallback;
+  return Object.freeze({ code, message });
+}
+
+function connectionErrorCode(error: unknown): EmbeddedConnectionErrorCode | undefined {
+  if (error instanceof EmbeddedError && isConnectionErrorCode(error.code)) return error.code;
+  const marker = /\[convex-embedded:(EMBEDDED_[A-Z_]+)\]/.exec(errorMessage(error))?.[1];
+  return marker !== undefined && isConnectionErrorCode(marker) ? marker : undefined;
+}
+
+function isConnectionErrorCode(value: string): value is EmbeddedConnectionErrorCode {
+  switch (value) {
+    case "EMBEDDED_CLIENT_RETIRED":
+    case "EMBEDDED_PRE_BASELINE_STORE":
+    case "EMBEDDED_PROTOCOL_MISMATCH":
+    case "EMBEDDED_STORAGE":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function reportListenerError(error: unknown): void {
+  const report = (globalThis as { reportError?: (value: unknown) => void }).reportError;
+  if (report) {
+    report(error);
+    return;
+  }
+  queueMicrotask(() => {
+    throw error;
+  });
+}
+
 function operationEvent(
-  operation: EmbeddedClientDebugOperation,
+  operation: DevtoolsOperation,
   phase: EmbeddedOperationEvent["phase"],
   at: number,
 ): EmbeddedOperationEvent {

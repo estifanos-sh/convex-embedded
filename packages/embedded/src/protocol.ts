@@ -1,5 +1,6 @@
 /** Internal wire revision. Increment for every breaking client/component protocol change. */
-export const EMBEDDED_PROTOCOL_VERSION = 26;
+/** v27 requires structured, sanitized terminal replay failure codes. */
+export const EMBEDDED_PROTOCOL_VERSION = 27;
 
 /** Stable Convex error code for a client/component wire revision mismatch. */
 export const EMBEDDED_PROTOCOL_MISMATCH = "EMBEDDED_PROTOCOL_MISMATCH";

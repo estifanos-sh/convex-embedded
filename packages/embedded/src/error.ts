@@ -6,9 +6,10 @@ export function errorMessage(error: unknown): string {
  * Stable public error codes and their meanings.
  *
  * @remarks
- * Every application-visible embedded failure that matches a contract category carries one of these
- * codes on an {@link EmbeddedError}. Storage, schema-mismatch, and CRDT-corruption categories
- * originate in the Rust store and surface through the binding.
+ * Every application-visible embedded failure that is thrown as an {@link EmbeddedError} carries
+ * one of these codes. Terminal replication outcomes use
+ * {@link EMBEDDED_SETTLEMENT_CODES} instead; they are delivered through
+ * `subscribeToMutationSettlements()` rather than thrown.
  *
  * @public
  */
@@ -17,18 +18,10 @@ export const EMBEDDED_ERROR_CODES = {
   EMBEDDED_OPEN_MISMATCH: "open called with a different setup action",
   EMBEDDED_CLOSED: "method called after shutdown began",
   EMBEDDED_OFFLINE: "hosted-only work has no reachable deployment",
-  EMBEDDED_CONFLICT: "a plain point, range, or target witness moved",
-  EMBEDDED_REJECTED: "authoritative app code rejected a locally committed mutation",
-  EMBEDDED_DIVERGENCE:
-    "normalized local and authoritative execution differed; server writes rolled back",
-  EMBEDDED_REBASE_EXHAUSTED:
-    "one retry cycle exhausted its CRDT rebase budget; pending work is retained and backed off",
   EMBEDDED_DEPENDENCY_FAILED: "required insert, upload, or schedule producer cannot apply",
   EMBEDDED_CLIENT_RETIRED:
     "client incarnation was retired; rotate ID, retain pending work, and establish fresh pull state",
-  EMBEDDED_SCHEMA_MISMATCH: "current app validators cannot consume stored or remote data",
   EMBEDDED_PROTOCOL_MISMATCH: "client and deployment protocol versions differ",
-  EMBEDDED_CRDT_CORRUPT: "opaque history fails import, continuity, or projection-hash checks",
   EMBEDDED_STORAGE: "local durable storage could not open or commit",
   EMBEDDED_PRE_BASELINE_STORE:
     "the existing store predates the supported migration baseline and was preserved",
@@ -37,6 +30,26 @@ export const EMBEDDED_ERROR_CODES = {
 
 /** Stable public error code. @public */
 export type EmbeddedErrorCode = keyof typeof EMBEDDED_ERROR_CODES;
+
+/**
+ * Stable terminal replication verdicts produced by the native settlement vector.
+ *
+ * @remarks
+ * These values are intentionally distinct from {@link EmbeddedErrorCode}: a settlement has
+ * already durably completed local processing and is reported as data, never thrown as a client
+ * operation error.
+ *
+ * @public
+ */
+export const EMBEDDED_SETTLEMENT_CODES = {
+  EMBEDDED_CONFLICT: "a plain point, range, or target witness moved",
+  EMBEDDED_REJECTED: "authoritative app code rejected a locally committed mutation",
+  EMBEDDED_DIVERGENCE:
+    "normalized local and authoritative execution differed; server writes rolled back",
+} as const;
+
+/** Stable code carried by a terminal replication settlement. @public */
+export type EmbeddedSettlementCode = keyof typeof EMBEDDED_SETTLEMENT_CODES;
 
 /**
  * A public embedded failure carrying a stable {@link EmbeddedErrorCode}.

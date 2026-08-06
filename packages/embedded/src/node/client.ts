@@ -16,31 +16,21 @@ import {
 } from "../client";
 import type { ConvexEmbeddedSchema } from "../schema";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
-import { localReferenceName } from "../local";
-import { localFunctionSchema, localGraphHash } from "../local/internal";
+import { localCompatibilitySchema, localGraphHash, localReferenceName } from "../local/internal";
 import { loadNativeModule, validateNativeModule, type NativeModule } from "./artifact";
 import { NativeStore } from "./native";
 
 export type {
-  ConvexEmbeddedMutationOptions,
   AuthTokenFetcher,
   ConvexLocalModules,
   ConvexModules,
-  EmbeddedDataDelete,
-  EmbeddedDataEvent,
-  EmbeddedDataWrite,
+  EmbeddedConnectionError,
+  EmbeddedConnectionErrorCode,
   EmbeddedConnectionState,
-  EmbeddedEvent,
-  EmbeddedEventListener,
-  EmbeddedOperationEvent,
-  EmbeddedOperationKind,
-  EmbeddedOperationPhase,
-  EmbeddedRemoteEvent,
-  EmbeddedRemoteStatus,
-  EmbeddedSchedulerEvent,
-  EmbeddedSpanEvent,
-  EmbeddedSpanPhase,
-  EmbeddedStorageEvent,
+  EmbeddedLocalConnectionState,
+  EmbeddedMutationSettlement,
+  EmbeddedReplicationConnectionState,
+  EmbeddedRetainedRevision,
   Watch,
 } from "../client";
 export type { ConvexEmbeddedSchema } from "../schema";
@@ -140,7 +130,7 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
           schema: options.schema,
           modules: options.modules,
           localModules: local?.modules,
-          localSchemas: local?.schemas,
+          compatibilitySchemas: local?.compatibilitySchemas,
           localSetupIdentities: local?.setupIdentities,
           store: openStore(native, options.path),
           authState,
@@ -155,10 +145,10 @@ async function namespaceLocalModules(
   local: NonNullable<ConvexEmbeddedClientOptions["local"]>,
 ): Promise<{
   modules: ConvexLocalModules;
-  schemas: ConvexEmbeddedSchema[];
+  compatibilitySchemas: ConvexEmbeddedSchema[];
   setupIdentities: Record<string, string>;
 }> {
-  const schemas = new Set<ConvexEmbeddedSchema>();
+  const compatibilitySchemas = new Set<ConvexEmbeddedSchema>();
   const setupIdentities: Record<string, string> = {};
   const entries = await Promise.all(
     Object.entries(local).map(async ([modulePath, load]) => {
@@ -168,8 +158,8 @@ async function namespaceLocalModules(
       // registration remains usable as a normal local function but fails closed for `open(setup)`.
       if (typeof loaded === "object" && loaded !== null) {
         for (const value of Object.values(loaded as Record<string, unknown>)) {
-          const schema = localFunctionSchema(value);
-          if (schema !== undefined) schemas.add(schema);
+          const schema = localCompatibilitySchema(value);
+          if (schema !== undefined) compatibilitySchemas.add(schema);
           const reference = localReferenceName(value);
           const graphHash = localGraphHash(value);
           if (reference !== undefined && graphHash !== undefined) {
@@ -180,7 +170,11 @@ async function namespaceLocalModules(
       return [`local/${modulePath}`, async () => loaded] as const;
     }),
   );
-  return { modules: Object.fromEntries(entries), schemas: [...schemas], setupIdentities };
+  return {
+    modules: Object.fromEntries(entries),
+    compatibilitySchemas: [...compatibilitySchemas],
+    setupIdentities,
+  };
 }
 
 function openStore(native: NativeModule, path: string): Promise<NativeStore> {

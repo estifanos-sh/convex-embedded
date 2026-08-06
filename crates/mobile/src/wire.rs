@@ -2,7 +2,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{BridgeError, BridgeResult};
 
-pub(crate) const VERSION: u32 = 9;
+// Remote ticks now carry required terminal settlement records, so older mobile binaries must not
+// silently omit the field when paired with newer JavaScript.
+pub(crate) const VERSION: u32 = 10;
 
 #[derive(Debug)]
 pub(crate) struct Request {

@@ -1,19 +1,19 @@
 /**
- * Typed local observability events emitted by embedded clients.
+ * Internal diagnostics emitted by embedded runtimes and consumed by the private devtools bridge.
  *
  * @packageDocumentation
  */
 
-/** Function or runtime operation reported by the embedded client. @public */
+/** Function or runtime operation reported by the embedded client. @internal */
 export type EmbeddedOperationKind = "query" | "mutation" | "action" | "upload" | "devtools";
 
-/** Lifecycle state for operation events. @public */
+/** Lifecycle state for operation events. @internal */
 export type EmbeddedOperationPhase = "start" | "finish";
 
-/** Logical tracing lifecycle state. @public */
+/** Logical tracing lifecycle state. @internal */
 export type EmbeddedSpanPhase = "start" | "finish";
 
-/** Per-mutation phase timings reported by local runtime diagnostics. @public */
+/** Per-mutation phase timings reported by local runtime diagnostics. @internal */
 export interface EmbeddedMutationTiming {
   argsEncodeMs: number;
   batchMs: number;
@@ -27,7 +27,7 @@ export interface EmbeddedMutationTiming {
   totalMs: number;
 }
 
-/** Browser/native remote replication lifecycle state. @public */
+/** Browser/native remote replication lifecycle state. @internal */
 export type EmbeddedRemoteStatus =
   | "starting"
   | "started"
@@ -41,7 +41,7 @@ export type EmbeddedRemoteStatus =
 /**
  * Boot-lifecycle transition an embedded runtime moves through while opening its local store.
  *
- * @public
+ * @internal
  */
 export type EmbeddedRuntimePhase =
   | "opfs-register"
@@ -57,7 +57,7 @@ export type EmbeddedRuntimePhase =
  * exhausted client rotation, OPFS handle-acquire contention, a store open slow past the notice
  * threshold, a temporary in-memory storage fallback, or a boot failure.
  *
- * @public
+ * @internal
  */
 export type EmbeddedRuntimeDegradation =
   | "deployment-mismatch"
@@ -69,20 +69,20 @@ export type EmbeddedRuntimeDegradation =
   | "corrupt"
   | "failed";
 
-/** Row inserted or replaced by a local storage commit. @public */
+/** Row inserted or replaced by a local storage commit. @internal */
 export interface EmbeddedDataWrite {
   id: string;
   row: Record<string, unknown>;
   table: string;
 }
 
-/** Row deleted by a local storage commit. @public */
+/** Row deleted by a local storage commit. @internal */
 export interface EmbeddedDataDelete {
   id: string;
   table: string;
 }
 
-/** Local function/upload operation event. @public */
+/** Local function/upload operation event. @internal */
 export interface EmbeddedOperationEvent {
   args?: unknown;
   at: number;
@@ -99,7 +99,7 @@ export interface EmbeddedOperationEvent {
   type: "operation";
 }
 
-/** Logical span event for cross-runtime tracing. @public */
+/** Logical span event for cross-runtime tracing. @internal */
 export interface EmbeddedSpanEvent {
   at: number;
   durationMs?: number;
@@ -110,7 +110,7 @@ export interface EmbeddedSpanEvent {
   type: "span";
 }
 
-/** Local document/system-table row changes. @public */
+/** Local document/system-table row changes. @internal */
 export interface EmbeddedDataEvent {
   at: number;
   changedTables: string[];
@@ -122,7 +122,7 @@ export interface EmbeddedDataEvent {
   docWrites: EmbeddedDataWrite[];
 }
 
-/** Local file/upload/id-map changes. @public */
+/** Local file/upload/id-map changes. @internal */
 export interface EmbeddedStorageEvent {
   at: number;
   deletes: EmbeddedDataDelete[];
@@ -130,7 +130,7 @@ export interface EmbeddedStorageEvent {
   docWrites: EmbeddedDataWrite[];
 }
 
-/** Remote replication status and error event. @public */
+/** Remote replication status and error event. @internal */
 export interface EmbeddedRemoteEvent {
   at: number;
   attempt: number;
@@ -191,7 +191,7 @@ export interface EmbeddedRemoteEvent {
  * slow open or OPFS handle-acquire contention that an app can render instead of a dead spinner.
  * These are pure observability: they never change boot behavior.
  *
- * @public
+ * @internal
  */
 export interface EmbeddedRuntimeEvent {
   at: number;
@@ -206,7 +206,7 @@ export interface EmbeddedRuntimeEvent {
   waitedMs?: number;
 }
 
-/** A local after-image retained as a restorable revision. @public */
+/** A local after-image retained as a restorable revision. @internal */
 export interface EmbeddedConflict {
   id: string;
   revId: string;
@@ -215,7 +215,7 @@ export interface EmbeddedConflict {
 
 /**
  * An authoritative result displaced a local after-image, which was retained rather than lost.
- * Apps inspect the revision through their normal authorized Convex history functions. @public
+ * Apps inspect the revision through their normal authorized Convex history functions. @internal
  */
 export interface EmbeddedConflictEvent {
   at: number;
@@ -223,7 +223,7 @@ export interface EmbeddedConflictEvent {
   type: "conflict";
 }
 
-/** Local scheduler row changes. @public */
+/** Local scheduler row changes. @internal */
 export interface EmbeddedSchedulerEvent {
   at: number;
   deletes: EmbeddedDataDelete[];
@@ -232,15 +232,16 @@ export interface EmbeddedSchedulerEvent {
 }
 
 /**
- * Any rich internal observability event.
+ * Any rich observability event produced inside the embedded runtime.
  *
  * @remarks
- * These carry benchmark timings, spans, and per-tick replication detail. They feed devtools and the
- * internal channel; the public {@link EmbeddedPublicEvent} stream is a lean projection of this union.
+ * Diagnostics are intentionally an implementation detail. The app-facing client
+ * exposes connection state and durable mutation settlements instead; the optional
+ * devtools package consumes this union through its private bridge.
  *
  * @internal
  */
-export type EmbeddedEvent =
+export type DiagnosticEvent =
   | EmbeddedConflictEvent
   | EmbeddedDataEvent
   | EmbeddedOperationEvent
@@ -250,181 +251,5 @@ export type EmbeddedEvent =
   | EmbeddedSpanEvent
   | EmbeddedStorageEvent;
 
-/** Listener over the rich internal event channel. @internal */
-export type EmbeddedEventListener = (event: EmbeddedEvent) => void;
-
-/**
- * The public embedded observability event stream: a stable discriminated union with core fields.
- *
- * @remarks
- * This is the exact V5 contract surface produced by {@link import("./client").EmbeddedClient.subscribeEvents}.
- * Richer internal shapes reach devtools through the internal channel; they are not app contracts.
- *
- * @public
- */
-export type EmbeddedPublicEvent =
-  | {
-      type: "runtime";
-      at: number;
-      phase: "starting" | "store-open" | "schema-ready" | "ready" | "degraded" | "closed";
-      error?: string;
-    }
-  | {
-      type: "operation";
-      at: number;
-      operationId: string;
-      functionName: string;
-      kind: "query" | "mutation" | "action";
-      phase:
-        | "local-start"
-        | "local-commit"
-        | "remote-pending"
-        | "rebase"
-        | "applied"
-        | "conflict"
-        | "rejected"
-        | "error";
-      revisionIds?: string[];
-      error?: string;
-    }
-  | {
-      type: "remote";
-      at: number;
-      status: "starting" | "connected" | "ready" | "idle" | "offline" | "error" | "closed";
-      attempt: number;
-      generation?: number;
-      incarnation?: string;
-      nextRunAt?: number;
-      sequence?: number;
-      error?: string;
-    }
-  | {
-      type: "data";
-      at: number;
-      source: "local" | "remote" | "restore" | "migration";
-      tables: string[];
-    }
-  | {
-      type: "crdt";
-      at: number;
-      table: string;
-      rowId: string;
-      field: string;
-      state: "pending" | "rebased" | "checkpoint-requested" | "checkpoint-ready" | "corrupt";
-    }
-  | {
-      type: "upload";
-      at: number;
-      uploadId: string;
-      state: "local" | "uploading" | "hosted" | "failed";
-      error?: string;
-    }
-  | {
-      type: "schedule";
-      at: number;
-      scheduleId: string;
-      state: "pending" | "hosted" | "running" | "complete" | "failed" | "cancelled";
-    }
-  | {
-      type: "retention";
-      at: number;
-      target: "crdt" | "revision" | "file" | "mutation" | "client";
-      processed: number;
-      isDone: boolean;
-    };
-
-/** Listener registered with {@link import("./client").EmbeddedClient.subscribeEvents}. @public */
-export type EmbeddedPublicEventListener = (event: EmbeddedPublicEvent) => void;
-
-function mapRuntimeEvent(event: EmbeddedRuntimeEvent): EmbeddedPublicEvent {
-  if (event.degradation === "corrupt") {
-    return { type: "crdt", at: event.at, table: "", rowId: "", field: "", state: "corrupt" };
-  }
-  const phase: (EmbeddedPublicEvent & { type: "runtime" })["phase"] = event.degradation
-    ? "degraded"
-    : event.phase === "store-open"
-      ? "store-open"
-      : event.phase === "store-setup" ||
-          event.phase === "store-wal-write" ||
-          event.phase === "remote-attach"
-        ? "schema-ready"
-        : event.phase === "ready"
-          ? "ready"
-          : "starting";
-  return { type: "runtime", at: event.at, phase, ...(event.error ? { error: event.error } : {}) };
-}
-
-function mapRemoteEvent(event: EmbeddedRemoteEvent): EmbeddedPublicEvent {
-  const status: (EmbeddedPublicEvent & { type: "remote" })["status"] =
-    event.status === "connected" || event.status === "tick"
-      ? "connected"
-      : event.status === "started"
-        ? "starting"
-        : event.status === "starting"
-          ? "starting"
-          : event.status === "idle"
-            ? "idle"
-            : event.status === "offline"
-              ? "offline"
-              : event.status === "closed"
-                ? "closed"
-                : "error";
-  return {
-    type: "remote",
-    at: event.at,
-    status,
-    attempt: event.attempt,
-    ...(event.incarnation === undefined ? {} : { incarnation: event.incarnation }),
-    ...(event.generation === undefined ? {} : { generation: event.generation }),
-    ...(event.sequence === undefined ? {} : { sequence: event.sequence }),
-    ...(event.nextRunAt === undefined ? {} : { nextRunAt: event.nextRunAt }),
-    ...(event.error ? { error: event.error } : {}),
-  };
-}
-
-function mapOperationEvent(event: EmbeddedOperationEvent): EmbeddedPublicEvent | null {
-  if (event.kind !== "query" && event.kind !== "mutation" && event.kind !== "action") return null;
-  const phase: (EmbeddedPublicEvent & { type: "operation" })["phase"] =
-    event.phase === "start" ? "local-start" : event.status === "error" ? "error" : "local-commit";
-  return {
-    type: "operation",
-    at: event.at,
-    operationId: String(event.id),
-    functionName: event.name,
-    kind: event.kind,
-    phase,
-    ...(event.error ? { error: event.error } : {}),
-  };
-}
-
-/**
- * Projects one rich internal event to its public {@link EmbeddedPublicEvent}, or `null` when the event is
- * internal-only (spans, storage/scheduler row deltas, retained-conflict bookkeeping).
- *
- * @remarks
- * This is the single boundary between the internal channel and the public stream. It never widens the
- * public union: an internal shape with no stable public meaning maps to `null`.
- *
- * @internal
- */
-export function mapPublicEvent(event: EmbeddedEvent): EmbeddedPublicEvent | null {
-  switch (event.type) {
-    case "runtime":
-      return mapRuntimeEvent(event);
-    case "remote":
-      return mapRemoteEvent(event);
-    case "operation":
-      return mapOperationEvent(event);
-    case "data":
-      return {
-        type: "data",
-        at: event.at,
-        // The public V5 union carries no "cache" source; a cache-serve is the app's local optimistic
-        // value, so it projects to "local". The "cache" distinction stays on the internal channel.
-        source: event.source === undefined || event.source === "cache" ? "local" : event.source,
-        tables: event.changedTables,
-      };
-    default:
-      return null;
-  }
-}
+/** Listener over the rich internal diagnostics channel. @internal */
+export type DiagnosticEventListener = (event: DiagnosticEvent) => void;

@@ -1,4 +1,4 @@
-import type { EmbeddedConflictEvent, EmbeddedEvent } from "./events";
+import type { DiagnosticEvent, EmbeddedConflictEvent } from "./events";
 import type { Runner } from "./runtime/runner";
 import type { RemotePending, RemoteReroot, RemoteTick } from "./storage/types";
 import { getTimerTime } from "./time";
@@ -10,7 +10,7 @@ export const REMOTE_PULL_DIAGNOSTIC_ERROR =
 export function consumeRemoteTick(
   tick: RemoteTick,
   runner: Runner,
-  emit: (event: EmbeddedEvent) => void,
+  emit: (event: DiagnosticEvent) => void,
 ): void {
   const changedTables = remoteTickTables(tick);
   if (changedTables.length) runner.invalidate(changedTables, "remote");
@@ -47,6 +47,7 @@ export function remoteTickHasWork(tick: RemoteTick): boolean {
     tick.receiptsPushed > 0 ||
     tick.storeJobs > 0 ||
     tick.pullDiagnostics > 0 ||
+    tick.settlements.length > 0 ||
     tick.changedResults.length > 0 ||
     tick.retainedRevisions.length > 0
   );
@@ -86,6 +87,7 @@ export function mergeRemoteTicks(first: RemoteTick, last: RemoteTick): RemoteTic
     received: first.received + last.received,
     reconnected: first.reconnected || last.reconnected,
     retainedRevisions: [...first.retainedRevisions, ...last.retainedRevisions],
+    settlements: [...first.settlements, ...last.settlements],
     rowsApplied: first.rowsApplied + last.rowsApplied,
     sent: first.sent + last.sent,
     receiptsPushed: first.receiptsPushed + last.receiptsPushed,

@@ -1,5 +1,5 @@
 import { EmbeddedUnsupportedError } from "../error";
-import type { EmbeddedEventListener } from "../events";
+import type { DiagnosticEventListener } from "../events";
 import type { RuntimeStorageWriter, ScheduledJob } from "../storage/types";
 import { getTimerTime } from "../time";
 import { decode, encode, normalizeCopy } from "./codec";
@@ -40,7 +40,7 @@ function scheduleArgs(args: Record<string, unknown>): Record<string, unknown> {
 
 export function createSchedulerService(
   store: RuntimeStorageWriter,
-  emit: EmbeddedEventListener,
+  emit: DiagnosticEventListener,
   calls: RuntimeCalls | undefined,
   remoteActionRuntime: boolean,
   wake: SchedulerPump["wake"] = () => undefined,
@@ -122,7 +122,7 @@ export function createSchedulerService(
 export function createSchedulerPump(
   store: RuntimeStorageWriter,
   calls: RuntimeCalls,
-  emit: EmbeddedEventListener,
+  emit: DiagnosticEventListener,
 ): SchedulerPump {
   const service = fullStore(store);
   if (!service.schedule) return { wake: () => undefined };
@@ -180,7 +180,7 @@ export function createSchedulerPump(
 async function runScheduledDue(
   store: RuntimeStorageWriter,
   calls: RuntimeCalls,
-  emit: EmbeddedEventListener,
+  emit: DiagnosticEventListener,
 ): Promise<void> {
   const service = fullStore(store);
   if (!service.schedule) return;

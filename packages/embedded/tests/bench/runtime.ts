@@ -27,10 +27,16 @@ import {
   temporaryStorePath,
 } from "./harness";
 import {
+  trialAggregate,
+  trialRead,
+  type TrialAggregate,
+  type TrialMeasurement,
+} from "./harness/trials";
+import {
   createConvexEmbeddedClientForTest,
   type ConvexEmbeddedClient,
 } from "../../src/node/client";
-import type { ConvexEmbeddedMutationOptions, EmbeddedClientMutationTiming } from "../../src/client";
+import { readDevtoolsBridge } from "../../src/devtools/bridge";
 import type {
   BindingCommitOptions,
   BindingCountSpec,
@@ -70,40 +76,19 @@ interface BenchOptions {
   rows: number;
   smoke: boolean;
   split: boolean;
+  trials: number;
   warmups: number;
   watcherFanout: number;
 }
 
-interface BenchResult {
+interface BenchResult extends TrialMeasurement {
   baselineHz?: number;
   baselineName?: string;
   baselineRatio?: number;
-  cacheBytes?: number;
-  cacheHits?: number;
-  cacheMisses?: number;
-  headMeanMs?: number;
-  hz: number;
-  heapBytesPerOp?: number;
-  heapDeltaBytes?: number;
   iterations: number;
   layer: BenchLayer;
-  maxMs: number;
-  meanMs: number;
-  medianMs: number;
-  minMs: number;
-  medianHz: number;
   name: string;
-  p90Ms: number;
-  p95Ms: number;
-  p99Ms: number;
-  phaseMeanMs?: Partial<Record<string, number>>;
-  relativeStddev: number;
-  samplesMs: number[];
-  stddevMs: number;
-  tailMeanMs?: number;
-  totalMs: number;
-  trimmedHz: number;
-  trimmedMeanMs: number;
+  trialAggregate?: TrialAggregate;
 }
 
 interface BenchReport {
@@ -117,6 +102,7 @@ interface BenchReport {
   smoke: boolean;
   split: boolean;
   timestamp: string;
+  trials?: number;
   version: 3;
   warmups: number;
 }
@@ -165,12 +151,6 @@ interface MutationTimingRecorder {
   reset(): void;
 }
 
-interface ClientTimingRecorder {
-  readonly callback?: (timing: EmbeddedClientMutationTiming) => void;
-  means(): Partial<Record<string, number>> | undefined;
-  reset(): void;
-}
-
 const mutationTimingPhases = [
   "prepareMs",
   "argsEncodeMs",
@@ -182,16 +162,6 @@ const mutationTimingPhases = [
   "notifyMs",
   "totalMs",
 ] as const satisfies readonly MutationTimingPhase[];
-
-const clientTimingPhases = [
-  "stateMs",
-  "normalizeMs",
-  "operationMs",
-  "authMs",
-  "idMs",
-  "runnerMs",
-  "totalMs",
-] as const satisfies readonly (keyof EmbeddedClientMutationTiming)[];
 
 const clientInsert = makeFunctionReference<
   "mutation",
@@ -206,17 +176,14 @@ const clientPatch = makeFunctionReference<
 const clientSeed = makeFunctionReference<"mutation", { channel: string; rows: number }, string[]>(
   runtimeBenchRevs.seed,
 );
+const clientSeedBatchRows = 8_192;
 
 let benchmarkWarmups = 10;
 
 test("typescript runtime benchmark", async () => {
   const options = parseOptions();
   benchmarkWarmups = options.warmups;
-  const results: BenchResult[] = [];
-
-  for (const layer of options.layers) {
-    results.push(...(await runLayer(layer, options)));
-  }
+  const results = await runTrials(options);
 
   const report: BenchReport = {
     iterations: options.iterations,
@@ -229,7 +196,14 @@ test("typescript runtime benchmark", async () => {
       "write old-baseline ratios compare against the old async-persist path; embedded resolves mutations after durable projection plus dirty-head commit",
       "runtime write scenarios measure commit resolution, not downstream watcher reruns",
       "heap KB is net heap delta over measured iterations; heapBytesPerOp is recorded in JSON",
-      "comparison gates use raw mean throughput; a mean miss with passing trimmed/median throughput is reported as inconclusive rather than a proven regression",
+      ...(options.trials > 1
+        ? [
+            "comparison gates use the median metric from fresh, serial trials; pooled raw metrics remain diagnostic in trialAggregate",
+            "cross-revision qualification must alternate current and baseline trials externally (for example, ABBA)",
+          ]
+        : [
+            "comparison gates use one trial's raw mean throughput; a mean miss with passing trimmed/median throughput is reported as inconclusive rather than a proven regression",
+          ]),
       ...(options.split
         ? [
             "split timings are diagnostic and intentionally opt-in because timing probes add overhead",
@@ -239,6 +213,7 @@ test("typescript runtime benchmark", async () => {
     smoke: options.smoke,
     split: options.split,
     timestamp: new Date().toISOString(),
+    trials: options.trials > 1 ? options.trials : undefined,
     version: 3,
     warmups: options.warmups,
   };
@@ -258,6 +233,7 @@ test("typescript runtime benchmark", async () => {
   for (const result of report.results) {
     expect(Number.isFinite(result.hz)).toBe(true);
     expect(result.iterations).toBe(options.iterations);
+    expect(result.trialAggregate?.count ?? 1).toBe(options.trials);
   }
   const failures = comparisons.filter((comparison) => comparison.status === "fail");
   expect(
@@ -267,6 +243,45 @@ test("typescript runtime benchmark", async () => {
     ),
   ).toEqual([]);
 }, 300_000);
+
+async function runTrials(options: BenchOptions): Promise<BenchResult[]> {
+  const results: BenchResult[] = [];
+  for (const layer of options.layers) {
+    const trials: BenchResult[][] = [];
+    for (let trial = 0; trial < options.trials; trial += 1) {
+      // Each layer owns and closes its harnesses, so every trial gets a fresh store.
+      trials.push(await runLayer(layer, options));
+    }
+    results.push(...trialResults(trials));
+  }
+  return results;
+}
+
+function trialResults(trials: readonly BenchResult[][]): BenchResult[] {
+  const first = trials[0];
+  if (!first) return [];
+  if (trials.length === 1) return first;
+
+  for (const trial of trials.slice(1)) {
+    if (trial.length !== first.length) {
+      throw new Error("Benchmark trial scenarios changed between runs.");
+    }
+  }
+
+  return first.map((result, index) => {
+    const runs = trials.map((trial) => trial[index]!);
+    if (runs.some((run) => run.layer !== result.layer || run.name !== result.name)) {
+      throw new Error("Benchmark trial scenario order changed between runs.");
+    }
+    const aggregate = trialAggregate(runs);
+    return {
+      ...result,
+      ...aggregate.metrics,
+      baselineRatio: result.baselineHz ? aggregate.metrics.hz / result.baselineHz : undefined,
+      trialAggregate: aggregate.aggregate,
+    };
+  });
+}
 
 async function runLayer(layer: BenchLayer, options: BenchOptions): Promise<BenchResult[]> {
   switch (layer) {
@@ -1310,18 +1325,42 @@ async function createClientBenchHarness(
     },
     nativeModule(),
   );
-  const channel = options.channel ?? "general";
-  const ids =
-    (options.seedRows ?? 0) > 0
-      ? await client.mutation(clientSeed, { channel, rows: options.seedRows! })
-      : [];
-  (client as unknown as { __devtoolsClearActivity(): void }).__devtoolsClearActivity();
-  return {
-    channel,
-    client,
-    close: () => client.close(),
-    ids,
-  };
+  try {
+    await client.open();
+    const channel = options.channel ?? "general";
+    const ids = await seedClientRows(client, channel, options.seedRows ?? 0);
+    readDevtoolsBridge(client).clearActivity();
+    return {
+      channel,
+      client,
+      close: () => client.close(),
+      ids,
+    };
+  } catch (error) {
+    try {
+      await client.close();
+    } catch {
+      // Preserve the setup error after a best-effort cleanup of a partially opened client.
+    }
+    throw error;
+  }
+}
+
+async function seedClientRows(
+  client: ConvexEmbeddedClient,
+  channel: string,
+  rows: number,
+): Promise<string[]> {
+  const ids: string[] = [];
+  for (let remaining = rows; remaining > 0; remaining -= clientSeedBatchRows) {
+    ids.push(
+      ...(await client.mutation(clientSeed, {
+        channel,
+        rows: Math.min(remaining, clientSeedBatchRows),
+      })),
+    );
+  }
+  return ids;
 }
 
 async function runClientScenarios(
@@ -1335,46 +1374,36 @@ async function runClientScenarios(
     const insertHarness = await createClientBenchHarness({ seedRows: 0 });
     harnesses.push(insertHarness);
     let sequence = 0;
-    const insertTiming = createClientTimingRecorder(options.split);
     results.push(
       await measure(
         layer,
         "client.mutation.insert",
         options.iterations,
         () =>
-          insertHarness.client.mutation(
-            clientInsert,
-            {
-              body: `client-inserted-${sequence}`,
-              channel: insertHarness.channel,
-              sequence: sequence++,
-            },
-            clientTimingOption(insertTiming),
-          ),
-        { baseline: oldBaselines.mutationInsert, phases: insertTiming },
+          insertHarness.client.mutation(clientInsert, {
+            body: `client-inserted-${sequence}`,
+            channel: insertHarness.channel,
+            sequence: sequence++,
+          }),
+        { baseline: oldBaselines.mutationInsert },
       ),
     );
 
     const patchHarness = await createClientBenchHarness({ seedRows: options.rows });
     harnesses.push(patchHarness);
     let patchIndex = 0;
-    const patchTiming = createClientTimingRecorder(options.split);
     results.push(
       await measure(
         layer,
         "client.mutation.patch",
         options.iterations,
         () =>
-          patchHarness.client.mutation(
-            clientPatch,
-            {
-              body: `client-patched-${patchIndex}`,
-              id: patchHarness.ids[patchIndex++ % patchHarness.ids.length]!,
-              updated: patchIndex,
-            },
-            clientTimingOption(patchTiming),
-          ),
-        { phases: patchTiming },
+          patchHarness.client.mutation(clientPatch, {
+            body: `client-patched-${patchIndex}`,
+            id: patchHarness.ids[patchIndex++ % patchHarness.ids.length]!,
+            updated: patchIndex,
+          }),
+        {},
       ),
     );
 
@@ -2032,6 +2061,7 @@ function parseOptions(): BenchOptions {
     rows: readNumber("EMBEDDED_BENCH_ROWS") ?? (smoke ? runtime.smokeRows : runtime.rows),
     smoke,
     split: process.env.EMBEDDED_BENCH_SPLIT === "1",
+    trials: readNumber("EMBEDDED_BENCH_TRIALS") ?? 1,
     warmups: Math.min(iterations, requestedWarmups),
     watcherFanout: readNonNegativeNumber("EMBEDDED_BENCH_WATCHERS") ?? runtime.watcherFanout,
   };
@@ -2153,47 +2183,23 @@ async function measure(
   const endHeap = process.memoryUsage().heapUsed;
   const endStats = options.readStats?.();
   const cacheDelta = diffStats(startStats, endStats);
-  const split = Math.max(1, Math.ceil(iterations * 0.1));
-  const headMeanMs = mean(samples.slice(0, split));
-  const tailMeanMs = mean(samples.slice(-split));
-  const sortedSamples = [...samples].sort((left, right) => left - right);
-  const totalMs = samples.reduce((sum, sample) => sum + sample, 0);
-  const hz = iterations / (totalMs / 1_000);
-  const trimmedSamples = trimSamples(sortedSamples, 0.1);
-  const trimmedMeanMs = mean(trimmedSamples);
-  const medianMs = percentile(sortedSamples, 0.5);
-  const stddevMs = stddev(samples, totalMs / iterations);
+  const timing = trialRead(samples);
   const heapDeltaBytes = endHeap - startHeap;
   return {
     baselineHz: options.baseline?.hz,
     baselineName: options.baseline?.name,
-    baselineRatio: options.baseline ? hz / options.baseline.hz : undefined,
+    baselineRatio: options.baseline ? timing.hz / options.baseline.hz : undefined,
     cacheBytes: endStats?.bytes,
     cacheHits: cacheDelta?.hits,
     cacheMisses: cacheDelta?.misses,
-    headMeanMs,
-    hz,
     heapBytesPerOp: heapDeltaBytes / iterations,
     heapDeltaBytes,
     iterations,
     layer,
-    maxMs: sortedSamples[sortedSamples.length - 1] ?? 0,
-    meanMs: totalMs / iterations,
-    medianHz: medianMs > 0 ? 1_000 / medianMs : 0,
-    medianMs,
-    minMs: sortedSamples[0] ?? 0,
     name,
-    p90Ms: percentile(sortedSamples, 0.9),
-    p95Ms: percentile(sortedSamples, 0.95),
-    p99Ms: percentile(sortedSamples, 0.99),
     phaseMeanMs: options.phases?.means(),
-    relativeStddev: stddevMs / (totalMs / iterations),
     samplesMs: samples,
-    stddevMs,
-    tailMeanMs,
-    totalMs,
-    trimmedHz: trimmedMeanMs > 0 ? 1_000 / trimmedMeanMs : 0,
-    trimmedMeanMs,
+    ...timing,
   };
 }
 
@@ -2226,45 +2232,8 @@ function createMutationTimingRecorder(enabled: boolean): MutationTimingRecorder 
   };
 }
 
-function createClientTimingRecorder(enabled: boolean): ClientTimingRecorder {
-  if (!enabled) {
-    return {
-      means: () => undefined,
-      reset: () => undefined,
-    };
-  }
-  const totals = new Map<keyof EmbeddedClientMutationTiming, number>();
-  let count = 0;
-  return {
-    callback(timing) {
-      count += 1;
-      for (const key of clientTimingPhases) {
-        totals.set(key, (totals.get(key) ?? 0) + timing[key]);
-      }
-    },
-    means() {
-      if (count === 0) return undefined;
-      const means: Partial<Record<string, number>> = {};
-      for (const key of clientTimingPhases) means[key] = (totals.get(key) ?? 0) / count;
-      return means;
-    },
-    reset() {
-      count = 0;
-      totals.clear();
-    },
-  };
-}
-
 function mutationTimingOption(recorder: MutationTimingRecorder): RunMutationOptions | undefined {
   return recorder.callback ? { onTiming: recorder.callback } : undefined;
-}
-
-function clientTimingOption(
-  recorder: ClientTimingRecorder,
-): ConvexEmbeddedMutationOptions<Record<string, never>> | undefined {
-  return recorder.callback
-    ? ({ onTiming: recorder.callback } as ConvexEmbeddedMutationOptions<Record<string, never>>)
-    : undefined;
 }
 
 function mutationIdTimingOption(
@@ -2298,43 +2267,15 @@ function sumStats(stats: Record<string, number>): number {
   return Object.values(stats).reduce((sum, value) => sum + value, 0);
 }
 
-function mean(values: number[]): number {
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function stddev(values: number[], average: number): number {
-  if (values.length === 0) return 0;
-  const variance =
-    values.reduce((sum, value) => {
-      const delta = value - average;
-      return sum + delta * delta;
-    }, 0) / values.length;
-  return Math.sqrt(variance);
-}
-
-function trimSamples(sortedSamples: number[], fraction: number): number[] {
-  if (sortedSamples.length < 3) return sortedSamples;
-  const trim = Math.min(
-    Math.floor(sortedSamples.length / 2) - 1,
-    Math.floor(sortedSamples.length * fraction),
-  );
-  return sortedSamples.slice(trim, sortedSamples.length - trim);
-}
-
-function percentile(samples: number[], percent: number): number {
-  if (!samples.length) return 0;
-  const index = Math.min(samples.length - 1, Math.ceil(samples.length * percent) - 1);
-  return samples[index] ?? 0;
-}
-
 function printReport(
   report: BenchReport,
   layers: BenchLayer[],
   comparisons: BenchComparison[],
 ): void {
   console.log("Embedded runtime benchmark");
+  const trials = report.trials ? ` trials=${report.trials}` : "";
   console.log(
-    `runtime=typescript node=${report.node} layers=${layers.join(",")} rows=${report.rows} iterations=${report.iterations} warmups=${report.warmups}`,
+    `runtime=typescript node=${report.node} layers=${layers.join(",")} rows=${report.rows} iterations=${report.iterations}${trials} warmups=${report.warmups}`,
   );
   for (const note of report.semanticNotes) console.log(`note=${note}`);
   for (const layer of layers) {
@@ -2349,6 +2290,12 @@ function printReport(
       );
       if (result.phaseMeanMs) {
         console.log(`  split ${result.name}: ${formatPhaseMeans(result.phaseMeanMs)}`);
+      }
+      if (result.trialAggregate) {
+        const { pooled } = result.trialAggregate;
+        console.log(
+          `  trials ${result.trialAggregate.count} ${result.trialAggregate.method}: pooled mean=${format(pooled.meanMs)}ms p95=${format(pooled.p95Ms)}ms`,
+        );
       }
     }
   }

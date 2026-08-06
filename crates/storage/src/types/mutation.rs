@@ -308,6 +308,60 @@ impl PushOutcome {
     }
 }
 
+/// The only public code a terminal rejected replay may carry.
+///
+/// Server-provided reasons are deliberately neither accepted nor retained: they are arbitrary
+/// application text and must not cross the durable remote boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionCode {
+    Rejected,
+    Divergence,
+}
+
+impl RejectionCode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "EMBEDDED_REJECTED",
+            Self::Divergence => "EMBEDDED_DIVERGENCE",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "EMBEDDED_REJECTED" => Some(Self::Rejected),
+            "EMBEDDED_DIVERGENCE" => Some(Self::Divergence),
+            _ => None,
+        }
+    }
+}
+
+/// Validated server verdict for one replay.
+///
+/// This is deliberately more specific than [`PushOutcome`]: a caller cannot pair `applied` with
+/// an error code, cannot use an arbitrary conflict code, and cannot attach a rebase code to a
+/// terminal settlement. It is created only by strict push-response decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushVerdict {
+    Applied,
+    Conflict,
+    Rejected(RejectionCode),
+    Rebase,
+}
+
+impl PushVerdict {
+    #[must_use]
+    pub fn outcome(self) -> PushOutcome {
+        match self {
+            Self::Applied => PushOutcome::Applied,
+            Self::Conflict => PushOutcome::Conflict,
+            Self::Rejected(_) => PushOutcome::Rejected,
+            Self::Rebase => PushOutcome::Rebase,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettledInsert {
     pub ordinal: usize,
@@ -362,13 +416,20 @@ pub enum AuthoritativeChange {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PushResponse {
     pub mutation_id: String,
-    pub outcome: PushOutcome,
+    pub verdict: PushVerdict,
     pub inserts: Vec<SettledInsert>,
     pub schedules: Vec<SettledSchedule>,
     pub uploads: Vec<SettledUpload>,
     pub revisions: Vec<SettledRevision>,
     pub crdt: Vec<SettledCrdt>,
     pub authoritative: Vec<AuthoritativeChange>,
+}
+
+impl PushResponse {
+    #[must_use]
+    pub fn outcome(&self) -> PushOutcome {
+        self.verdict.outcome()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

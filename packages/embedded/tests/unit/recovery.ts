@@ -12,7 +12,7 @@ import {
   type RecoveryTimer,
 } from "../../src/browser/recovery";
 import { deferred } from "../../src/promise";
-import type { EmbeddedEvent } from "../../src/events";
+import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import { LeaderRuntime, type LeaderRecoveryHooks } from "../../src/browser/coordinator/leader";
 import { WorkerCommand, WorkerEvent, type WorkerResponse } from "../../src/browser/protocol";
 import {

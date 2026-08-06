@@ -10,6 +10,8 @@ import {
   isEmbeddedError,
   normalizeStorageError,
   type EmbeddedErrorCode,
+  EMBEDDED_SETTLEMENT_CODES,
+  type EmbeddedSettlementCode,
 } from "../../src/error";
 import { deserializeError, serializeError } from "../../src/browser/protocol";
 
@@ -18,18 +20,18 @@ const CONTRACT_CODES: EmbeddedErrorCode[] = [
   "EMBEDDED_NOT_OPEN",
   "EMBEDDED_OPEN_MISMATCH",
   "EMBEDDED_OFFLINE",
-  "EMBEDDED_CONFLICT",
-  "EMBEDDED_REJECTED",
-  "EMBEDDED_DIVERGENCE",
-  "EMBEDDED_REBASE_EXHAUSTED",
   "EMBEDDED_DEPENDENCY_FAILED",
   "EMBEDDED_CLIENT_RETIRED",
-  "EMBEDDED_SCHEMA_MISMATCH",
   "EMBEDDED_PROTOCOL_MISMATCH",
-  "EMBEDDED_CRDT_CORRUPT",
   "EMBEDDED_STORAGE",
   "EMBEDDED_PRE_BASELINE_STORE",
   "EMBEDDED_UNSUPPORTED",
+];
+
+const SETTLEMENT_CODES: EmbeddedSettlementCode[] = [
+  "EMBEDDED_CONFLICT",
+  "EMBEDDED_REJECTED",
+  "EMBEDDED_DIVERGENCE",
 ];
 
 describe("embedded error registry", () => {
@@ -40,7 +42,7 @@ describe("embedded error registry", () => {
     }
   });
 
-  test("constructs every code, including the Rust-originated storage and schema paths", () => {
+  test("constructs every thrown code, including the Rust-originated storage path", () => {
     for (const code of CONTRACT_CODES) {
       const error = new EmbeddedError(code);
       expect(error).toBeInstanceOf(Error);
@@ -49,8 +51,14 @@ describe("embedded error registry", () => {
       expect(isEmbeddedError(error, code)).toBe(true);
     }
     expect(new EmbeddedError("EMBEDDED_STORAGE").code).toBe("EMBEDDED_STORAGE");
-    expect(new EmbeddedError("EMBEDDED_SCHEMA_MISMATCH").code).toBe("EMBEDDED_SCHEMA_MISMATCH");
-    expect(new EmbeddedError("EMBEDDED_CRDT_CORRUPT").code).toBe("EMBEDDED_CRDT_CORRUPT");
+  });
+
+  test("keeps terminal settlement codes out of thrown errors", () => {
+    expect(Object.keys(EMBEDDED_SETTLEMENT_CODES).sort()).toEqual([...SETTLEMENT_CODES].sort());
+    for (const code of SETTLEMENT_CODES) {
+      expect(EMBEDDED_SETTLEMENT_CODES[code].length).toBeGreaterThan(0);
+      expect(code in EMBEDDED_ERROR_CODES).toBe(false);
+    }
   });
 
   test("public subclasses carry their contract code and stable name", () => {
@@ -71,8 +79,8 @@ describe("embedded error registry", () => {
   });
 
   test("omits values and narrows by code", () => {
-    const error = new EmbeddedError("EMBEDDED_CONFLICT");
-    expect(isEmbeddedError(error, "EMBEDDED_REJECTED")).toBe(false);
+    const error = new EmbeddedError("EMBEDDED_STORAGE");
+    expect(isEmbeddedError(error, "EMBEDDED_OFFLINE")).toBe(false);
     expect(isEmbeddedError(new Error("plain"))).toBe(false);
   });
 

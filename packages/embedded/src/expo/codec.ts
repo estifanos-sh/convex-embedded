@@ -1,4 +1,6 @@
-const VERSION = 9;
+// Keep this paired with the mobile Rust wire: required terminal settlements are not compatible
+// with an artifact that serializes the older tick shape.
+const VERSION = 10;
 const BUFFER = "$buffer";
 const FLOAT = "$float";
 const INTEGER = "$integer";

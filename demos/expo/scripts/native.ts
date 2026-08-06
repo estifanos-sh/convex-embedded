@@ -166,6 +166,7 @@ function verifySha256(file: string, expected: string): void {
 }
 
 function prepareAndroid(channel: string, env: NodeJS.ProcessEnv): void {
+  prepareJava(env);
   const installedCargoNdk = read("cargo", ["ndk", "--version"], env);
   if (!installedCargoNdk.includes(CARGO_NDK_VERSION)) {
     run(
@@ -183,7 +184,11 @@ function prepareAndroid(channel: string, env: NodeJS.ProcessEnv): void {
     );
   }
 
-  const sdkRoot = env.ANDROID_HOME ?? env.ANDROID_SDK_ROOT;
+  const sdkRoot = androidSdkRoot(env);
+  if (sdkRoot) {
+    env.ANDROID_HOME = sdkRoot;
+    env.ANDROID_SDK_ROOT = sdkRoot;
+  }
   const configuredNdk = env.ANDROID_NDK_HOME ?? env.ANDROID_NDK_ROOT;
   const pinnedNdk = sdkRoot ? path.join(sdkRoot, "ndk", ANDROID_NDK_VERSION) : undefined;
   const ndkPath = [configuredNdk, pinnedNdk].find(isPinnedNdk);
@@ -216,6 +221,33 @@ function prepareAndroid(channel: string, env: NodeJS.ProcessEnv): void {
   }
   env.ANDROID_NDK_HOME = pinnedNdk;
   env.ANDROID_NDK_ROOT = pinnedNdk;
+}
+
+function prepareJava(env: NodeJS.ProcessEnv): void {
+  if (env.JAVA_HOME) return;
+  const home = [
+    "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
+    "/usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
+  ].find(existsSync);
+  if (!home) return;
+  env.JAVA_HOME = home;
+  env.PATH = [path.join(home, "bin"), env.PATH].filter(Boolean).join(path.delimiter);
+}
+
+function androidSdkRoot(env: NodeJS.ProcessEnv): string | undefined {
+  const configured = env.ANDROID_HOME ?? env.ANDROID_SDK_ROOT;
+  const candidates = [
+    ...(configured ? [configured] : []),
+    path.join(os.homedir(), "Library/Android/sdk"),
+    path.join(os.homedir(), "Android/Sdk"),
+    "/opt/homebrew/share/android-commandlinetools",
+    "/usr/local/share/android-commandlinetools",
+  ];
+  return (
+    candidates.find((sdk) => isPinnedNdk(path.join(sdk, "ndk", ANDROID_NDK_VERSION))) ??
+    candidates.find((sdk) => existsSync(path.join(sdk, "cmdline-tools"))) ??
+    candidates.find(existsSync)
+  );
 }
 
 function isPinnedNdk(candidate: string | undefined): candidate is string {

@@ -8,8 +8,8 @@ export type MutableDeploymentEnvironment = Record<string, string | undefined>;
 
 const deploymentNames = ["VITE_CONVEX_URL", "CONVEX_URL"] as const;
 
-/** Checked-in placement lockfile, named so the Convex CLI never deploys it. */
-export const embeddedGeneratedPath = "embedded.generated.ts";
+/** Checked-in Embedded contract under Convex's generated directory. */
+export const embeddedGeneratedPath = "_generated/embedded.ts";
 
 /** Device-only function root, relative to the repository root, shared by both demo graphs. */
 export const embeddedLocalPath = "local";

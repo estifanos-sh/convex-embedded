@@ -3,7 +3,8 @@ import { ConvexError } from "convex/values";
 import { decodeError, encodeError } from "../runtime/codec";
 import { EmbeddedError, isEmbeddedError, type EmbeddedErrorCode } from "../error";
 import type { RunnerDevtoolsRequest, RunMutationTiming } from "../runtime/runner";
-import type { EmbeddedEvent } from "../events";
+import type { DiagnosticEvent } from "../events";
+import type { RemoteMutationSettlement } from "../storage/types";
 
 /**
  * Minimal worker shape used by the browser embedded runtime.
@@ -244,8 +245,10 @@ export type WorkerResponse =
       phase: string;
     }
   | {
-      event: EmbeddedEvent;
+      event: DiagnosticEvent;
       op: typeof WorkerEvent.Event;
+      /** Exact durable settlements paired with this diagnostic event; internal worker transport. */
+      settlements?: RemoteMutationSettlement[];
     }
   | {
       authRequestId: number;

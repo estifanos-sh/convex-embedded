@@ -9,13 +9,18 @@ import type {
   StopOnUpdate,
 } from "../runtime/runner";
 import { functionName } from "../runtime/service";
-import type { EmbeddedEvent, EmbeddedEventListener, EmbeddedRuntimeEvent } from "../events";
+import type {
+  DiagnosticEvent,
+  DiagnosticEventListener,
+  EmbeddedRemoteEvent,
+  EmbeddedRuntimeEvent,
+} from "../events";
 import type { ConvexEmbeddedRemoteOptions } from "../client";
 import type { FunctionReference } from "../runtime/functions";
 import { getTimerTime } from "../time";
 import { randomId } from "../id/random";
 import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
-import type { RemoteIdentity } from "../storage/types";
+import type { RemoteIdentity, RemoteMutationSettlement } from "../storage/types";
 import {
   deserializeError,
   serializeError,
@@ -135,7 +140,10 @@ export class WorkerRunner implements Runner {
   private readonly initTimeoutMs: number;
   private readonly onDispose: (() => void) | undefined;
   private readonly requestTimeoutMs: number;
-  private readonly eventListeners = new Set<EmbeddedEventListener>();
+  private readonly eventListeners = new Set<DiagnosticEventListener>();
+  private readonly settlementListeners = new Set<
+    (event: EmbeddedRemoteEvent, settlements: readonly RemoteMutationSettlement[]) => void
+  >();
   private readonly remoteAuth:
     | ((args: { forceRefreshToken: boolean }) => Promise<string | null> | string | null)
     | undefined;
@@ -391,10 +399,23 @@ export class WorkerRunner implements Runner {
     );
   }
 
-  subscribeEvents(listener: EmbeddedEventListener): StopOnUpdate {
+  subscribeEvents(listener: DiagnosticEventListener): StopOnUpdate {
     this.eventListeners.add(listener);
     return () => {
       this.eventListeners.delete(listener);
+    };
+  }
+
+  /** Internal transport for exact durable settlement vectors from the worker. */
+  subscribeRemoteSettlements(
+    listener: (
+      event: EmbeddedRemoteEvent,
+      settlements: readonly RemoteMutationSettlement[],
+    ) => void,
+  ): StopOnUpdate {
+    this.settlementListeners.add(listener);
+    return () => {
+      this.settlementListeners.delete(listener);
     };
   }
 
@@ -722,6 +743,16 @@ export class WorkerRunner implements Runner {
         });
       }
     }
+    if (!message.settlements?.length || message.event.type !== "remote") return;
+    for (const listener of Array.from(this.settlementListeners)) {
+      try {
+        listener(message.event, message.settlements);
+      } catch (error) {
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
   }
 
   handleAuthTokenRequest(message: Partial<WorkerResponse>): void {
@@ -797,7 +828,7 @@ export class WorkerRunner implements Runner {
   }
 }
 
-function isInitProgress(event: EmbeddedEvent): boolean {
+function isInitProgress(event: DiagnosticEvent): boolean {
   if (event.type !== "runtime") return false;
   if (event.phase !== undefined && INIT_PROGRESS_PHASES.has(event.phase)) return true;
   return event.degradation !== undefined && INIT_PROGRESS_DEGRADATIONS.has(event.degradation);

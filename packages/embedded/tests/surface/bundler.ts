@@ -218,11 +218,11 @@ export const replicated = null;
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
       await createFixtureBundle(root);
-      const generatedPath = path.join(convexDir, "embedded.generated.ts");
+      const generatedPath = path.join(convexDir, "_generated", "embedded.ts");
       const generated = await readFile(generatedPath, "utf8");
       await writeFile(
         generatedPath,
-        generated.replace('"formatVersion":3', '"formatVersion":999'),
+        generated.replace('"formatVersion":4', '"formatVersion":999'),
         "utf8",
       );
 
@@ -717,7 +717,7 @@ export default defineComponent("defaultChild");
   test("renders quoted keys for module ids that are not identifiers", () => {
     const source = renderEmbeddedBundle({
       embeddedSchema: toEmbeddedGeneratedSchema(fixtureAnalysis),
-      generatedPath: "/repo/convex/embedded.generated.ts",
+      generatedPath: "/repo/convex/_generated/embedded.ts",
       localModules: {
         "local/admin/drafts": { file: "/repo/local/admin/drafts.ts" },
       },
@@ -727,7 +727,6 @@ export default defineComponent("defaultChild");
         },
       },
       modules: { "admin/users": "/repo/convex/admin/users.ts" },
-      registerSchema: true,
       sourceFiles: ["/repo/convex/admin/users.ts"],
       schemaPath: "/repo/convex/schema.ts",
       schemaSourceHash: "schema",
@@ -746,7 +745,7 @@ describe("embedded local modules", () => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
-      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(localDir, "sync/drafts.ts", localFunctions(2));
       await file(localDir, "shapes.ts", localExportShapes());
       await file(localDir, "_helpers.ts", "export const limit = 10;\n");
       await file(localDir, "ignored.d.ts", "export {};\n");
@@ -770,7 +769,7 @@ describe("embedded local modules", () => {
       const deviceDir = path.join(root, "device");
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(localDir, "sync/drafts.ts", localFunctions(2));
       await file(deviceDir, "prefs.ts", localFunctions());
 
       const bundle = await createFixtureBundle(root, [localDir, deviceDir]);
@@ -821,7 +820,7 @@ describe("embedded local modules", () => {
       const deviceDir = path.join(root, "device");
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(localDir, "sync/drafts.ts", localFunctions(2));
       await file(deviceDir, "prefs.ts", localFunctions());
       const plugin = convexEmbeddedUnplugin.rollup({
         convexDir,
@@ -848,7 +847,7 @@ describe("embedded local modules", () => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
-      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(localDir, "sync/drafts.ts", localFunctions(2));
 
       const source = renderEmbeddedBundle(await createFixtureBundle(root, localDir));
 
@@ -1009,7 +1008,7 @@ describe("embedded unplugin adapter", () => {
       expect(source).toContain("export const embeddedSchema = ");
       expect(source).toContain("runtimeStoreSchema");
       expect(source).not.toMatch(/^import\s/m);
-      const lockfile = await readFile(path.join(convexDir, "embedded.generated.ts"), "utf8");
+      const lockfile = await readFile(path.join(convexDir, "_generated", "embedded.ts"), "utf8");
       expect(lockfile).toContain("embeddedManifest");
       expect(lockfile).not.toContain("runtimeStoreSchema");
       expect(lockfile).not.toContain("embeddedSchema");
@@ -1087,7 +1086,7 @@ describe("embedded unplugin adapter", () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      const source = localFunctions();
+      const source = localFunctions(2);
       await file(localDir, "sync/drafts.ts", source);
       const modulePath = path.join(localDir, "sync/drafts.ts");
 
@@ -1110,11 +1109,43 @@ describe("embedded unplugin adapter", () => {
     });
   });
 
+  test("stamps every exported setup compatibility registration", async () => {
+    await withFixture(async ({ convexDir, localDir }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      const source = `import { local } from "../convex/_generated/embedded";
+import { legacySchema } from "./legacySchema";
+
+const legacy = local.compatibility(legacySchema);
+export const legacyRead = legacy.internalQuery({});
+export const legacyDelete = legacy.internalMutation({});
+export const currentWrite = local.internalMutation({});
+export const setup = local.internalAction({});
+`;
+      const modulePath = path.join(localDir, "setup.ts");
+      await file(localDir, "legacySchema.ts", "export const legacySchema = {};\n");
+      await file(localDir, "setup.ts", source);
+
+      const plugin = convexEmbeddedUnplugin.rollup({
+        convexDir,
+        local: localDir,
+        schema: fixtureSchema,
+      }) as unknown as BundlerPlugin;
+
+      const transformed = await plugin.transform(source, modulePath);
+
+      expect(transformed?.code).toMatch(
+        /__embeddedStampLocal\("local\/setup", "[a-f0-9]{16}", \{ currentWrite, legacyDelete, legacyRead, setup \}\);/,
+      );
+      expect(transformed?.code).not.toMatch(/\{[^}]*\blegacy\b[^}]*\}/);
+    });
+  });
+
   test("never replaces a device-only module with a stub", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(localDir, "sync/drafts.ts", localFunctions(2));
       const modulePath = path.join(localDir, "sync/drafts.ts");
 
       const plugin = convexEmbeddedUnplugin.rollup({
@@ -1142,7 +1173,7 @@ describe("embedded unplugin adapter", () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      const source = `${localFunctions()}const __embeddedStampLocal = 1;
+      const source = `${localFunctions(2)}const __embeddedStampLocal = 1;
 export { setCompact as delete, __embeddedStampLocal as marker };
 `;
       await file(localDir, "sync/drafts.ts", source);
@@ -1199,7 +1230,7 @@ export { value as "compact pref", value as default };
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      const source = `import { local } from "@convex-dev/embedded/local";
+      const source = `import { local } from "../convex/_generated/embedded";
 
 const quoted = /["']/g;
 void quoted;
@@ -1226,7 +1257,7 @@ export const toggle = local.mutation({ args: {}, handler: async () => null });
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      const source = `import { local } from "@convex-dev/embedded/local";
+      const source = `import { local } from "../convex/_generated/embedded";
 
 declare global {
   export const leakedGlobal: number;
@@ -1318,7 +1349,7 @@ export const [head, ...tail] = [1, 2, 3];
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      const source = localFunctions();
+      const source = localFunctions(2);
       await file(localDir, "sync/drafts.ts", source);
       const modulePath = path.join(localDir, "sync/drafts.ts");
 
@@ -1398,12 +1429,12 @@ export const [head, ...tail] = [1, 2, 3];
       await file(convexDir, "messages.ts", canonical("replicated", "query", "list"));
 
       const bundle = await createFixtureBundle(root);
-      const lockfile = path.join(convexDir, "embedded.generated.ts");
+      const lockfile = path.join(convexDir, "_generated", "embedded.ts");
 
       expect(bundle.generatedPath).toBe(lockfile);
       expect(Object.values(bundle.modules)).not.toContain(lockfile);
       expect(bundle.sourceFiles).not.toContain(lockfile);
-      expect(bundle.manifest["embedded.generated"]).toBeUndefined();
+      expect(bundle.manifest.embedded).toBeUndefined();
       await expect(readFile(lockfile, "utf8")).resolves.toContain("embeddedManifest");
     });
   });
@@ -1434,7 +1465,7 @@ describe("embedded Vite adapter", () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      const source = localFunctions();
+      const source = localFunctions(2);
       await file(localDir, "sync/drafts.ts", source);
       const modulePath = path.join(localDir, "sync/drafts.ts");
 
@@ -1568,8 +1599,8 @@ async function createFixtureBundle(root: string, local?: string | string[]) {
   return createEmbeddedBundle({ analysis: fixtureAnalysis, local, root });
 }
 
-function localFunctions(): string {
-  return `import { local } from "@convex-dev/embedded/local";
+function localFunctions(depth = 1): string {
+  return `import { local } from "${"../".repeat(depth)}convex/_generated/embedded";
 
 export const setCompact = local.mutation({ args: {}, handler: async () => null });
 export const readCompact = local.query({ args: {}, handler: async () => null });

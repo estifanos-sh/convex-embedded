@@ -31,11 +31,18 @@ export const metalReconnectVolumeBenchOutPath = fileURLToPath(
 );
 export const browserDistPath = fileURLToPath(new URL("./dist/browser.mjs", packageRootUrl));
 export const devtoolsDistPath = fileURLToPath(new URL("./dist/devtools/index.mjs", packageRootUrl));
+/** Internal browser-harness seam; intentionally not a package export. */
+export const devtoolsTestingDistPath = fileURLToPath(
+  new URL("./dist/devtools/testing.mjs", packageRootUrl),
+);
 export const metalConvexDir = fileURLToPath(new URL("./tests/metal/convex", packageRootUrl));
 export const metalFixtureDir = fileURLToPath(new URL("./tests/fixture", packageRootUrl));
 export const browserConvexDir = fileURLToPath(new URL("./tests/browser/convex", packageRootUrl));
 export const browserLocalDir = fileURLToPath(new URL("./tests/browser/local", packageRootUrl));
 export const localEntryPath = fileURLToPath(new URL("./src/local.ts", packageRootUrl));
+export const localInternalEntryPath = fileURLToPath(
+  new URL("./src/internal/local.ts", packageRootUrl),
+);
 export const convexPath = fileURLToPath(import.meta.resolve("convex"));
 export const convexBrowserPath = fileURLToPath(import.meta.resolve("convex/browser"));
 export const convexBrowserWebPath = convexBrowserPath.replace(/index-node\.js$/, "index.js");

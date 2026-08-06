@@ -7,29 +7,19 @@ import { embeddedManifest, embeddedSchema, localModules, modules } from "virtual
 import { embeddedIdentity } from "virtual:convex-embedded/identity";
 
 import { createEmbeddedAuthState, EmbeddedClient, validateLoadedSetupIdentity } from "../client";
-import { localReferenceName } from "../local";
-import { localFunctionSchema, localGraphHash } from "../local/internal";
+import { localCompatibilitySchema, localGraphHash, localReferenceName } from "../local/internal";
 import type { ConvexEmbeddedSchema } from "../schema";
 import { openExpoStore } from "./store";
 
 export type {
   AuthTokenFetcher,
-  ConvexEmbeddedMutationOptions,
+  EmbeddedConnectionError,
+  EmbeddedConnectionErrorCode,
   EmbeddedConnectionState,
-  EmbeddedDataDelete,
-  EmbeddedDataEvent,
-  EmbeddedDataWrite,
-  EmbeddedEvent,
-  EmbeddedEventListener,
-  EmbeddedOperationEvent,
-  EmbeddedOperationKind,
-  EmbeddedOperationPhase,
-  EmbeddedRemoteEvent,
-  EmbeddedRemoteStatus,
-  EmbeddedSchedulerEvent,
-  EmbeddedSpanEvent,
-  EmbeddedSpanPhase,
-  EmbeddedStorageEvent,
+  EmbeddedLocalConnectionState,
+  EmbeddedMutationSettlement,
+  EmbeddedReplicationConnectionState,
+  EmbeddedRetainedRevision,
   Watch,
 } from "../client";
 export type { ConvexEmbeddedSchema } from "../schema";
@@ -96,7 +86,7 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
         validateLoadedSetupIdentity(setup, local.setupIdentities, embeddedIdentity.moduleGraphHash);
         return {
           localModules,
-          localSchemas: local.schemas,
+          compatibilitySchemas: local.compatibilitySchemas,
           localSetupIdentities: local.setupIdentities,
           manifest: embeddedManifest,
           moduleGraphHash: embeddedIdentity.moduleGraphHash,
@@ -118,17 +108,17 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
 }
 
 async function localModuleMetadata(moduleLoaders: Record<string, () => Promise<unknown>>): Promise<{
-  schemas: ConvexEmbeddedSchema[];
+  compatibilitySchemas: ConvexEmbeddedSchema[];
   setupIdentities: Record<string, string>;
 }> {
-  const schemas = new Set<ConvexEmbeddedSchema>();
+  const compatibilitySchemas = new Set<ConvexEmbeddedSchema>();
   const setupIdentities: Record<string, string> = {};
   for (const load of Object.values(moduleLoaders)) {
     const module = await load();
     if (typeof module !== "object" || module === null) continue;
     for (const value of Object.values(module as Record<string, unknown>)) {
-      const schema = localFunctionSchema(value);
-      if (schema !== undefined) schemas.add(schema);
+      const schema = localCompatibilitySchema(value);
+      if (schema !== undefined) compatibilitySchemas.add(schema);
       const reference = localReferenceName(value);
       const graphHash = localGraphHash(value);
       if (reference !== undefined && graphHash !== undefined) {
@@ -136,5 +126,5 @@ async function localModuleMetadata(moduleLoaders: Record<string, () => Promise<u
       }
     }
   }
-  return { schemas: [...schemas], setupIdentities };
+  return { compatibilitySchemas: [...compatibilitySchemas], setupIdentities };
 }

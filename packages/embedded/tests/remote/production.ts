@@ -8,6 +8,7 @@ import { describe, expect, test } from "vite-plus/test";
 import { api } from "../../../../convex/_generated/api";
 import schema from "../../../../convex/schema";
 import { ConvexEmbeddedClient } from "../../src/node/client";
+import { readDevtoolsBridge } from "../../src/devtools/bridge";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
@@ -482,7 +483,7 @@ describe("v5 production pull contract", () => {
       offline = undefined;
 
       live = new ConvexEmbeddedClient({ modules: { documents }, path, schema, url: remoteUrl });
-      stopEvents = live.subscribeInternalEvents((event) => {
+      stopEvents = readDevtoolsBridge(live).subscribe((event) => {
         if (event.type === "remote") remoteEvents.push(event);
       });
       expect(await live.query(api.documents.read, { prefix })).toHaveLength(3);

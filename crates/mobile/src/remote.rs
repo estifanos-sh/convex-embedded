@@ -338,11 +338,8 @@ fn tick_value(tick: RemoteTick) -> serde_json::Value {
         "pushFailed": tick.push_failed,
         "pushConflicts": tick.push_conflicts,
         "pushRebases": tick.push_rebases,
-        "retainedRevisions": tick.retained_revisions.into_iter().map(|revision| serde_json::json!({
-            "table": revision.table,
-            "id": revision.local_document_id,
-            "revId": revision.server_rev_id.unwrap_or(revision.archived_rev_id),
-        })).collect::<Vec<_>>(),
+        "retainedRevisions": tick.retained_revisions.into_iter().map(reroot_value).collect::<Vec<_>>(),
+        "settlements": tick.settlements.into_iter().map(settlement_value).collect::<Vec<_>>(),
         "sent": tick.sent,
         "receiptsPushed": tick.receipts_pushed,
         "storeJobs": tick.store_jobs,
@@ -370,6 +367,43 @@ fn tick_value(tick: RemoteTick) -> serde_json::Value {
         object.remove("pending");
     }
     value
+}
+
+fn reroot_value(revision: storage::RetainedRevision) -> serde_json::Value {
+    serde_json::json!({
+        "table": revision.table,
+        "id": revision.local_document_id,
+        "revId": revision.server_rev_id.unwrap_or(revision.archived_rev_id),
+    })
+}
+
+fn settlement_value(settlement: remote::RemoteMutationSettlement) -> serde_json::Value {
+    let (mutation_id, function_name, outcome, retained_revisions) = settlement.into_parts();
+    let mut fields = serde_json::Map::from_iter([
+        (
+            "mutationId".to_owned(),
+            serde_json::Value::String(mutation_id),
+        ),
+        (
+            "functionName".to_owned(),
+            serde_json::Value::String(function_name),
+        ),
+        (
+            "outcome".to_owned(),
+            serde_json::Value::String(outcome.as_str().to_owned()),
+        ),
+        (
+            "retainedRevisions".to_owned(),
+            serde_json::Value::Array(retained_revisions.into_iter().map(reroot_value).collect()),
+        ),
+    ]);
+    if let Some(code) = outcome.code() {
+        fields.insert(
+            "code".to_owned(),
+            serde_json::Value::String(code.to_owned()),
+        );
+    }
+    serde_json::Value::Object(fields)
 }
 
 fn doc_push_value(pushed: RemoteDocPush) -> serde_json::Value {
@@ -753,6 +787,7 @@ mod tests {
 
         assert!(tick.get("pending").is_none());
         assert!(tick.get("connected").is_none());
+        assert_eq!(tick["settlements"], serde_json::json!([]));
     }
 
     #[test]

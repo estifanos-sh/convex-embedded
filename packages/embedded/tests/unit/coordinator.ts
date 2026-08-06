@@ -10,7 +10,7 @@ import { WASM_API_VERSION } from "../../src/browser/artifact";
 import { EMBEDDED_EPOCH } from "../../src/abi";
 import { getTimerTime } from "../../src/time";
 import { EmbeddedClient } from "../../src/client";
-import type { EmbeddedEvent } from "../../src/events";
+import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import type { Runner } from "../../src/runtime/runner";
 import {
@@ -420,6 +420,84 @@ describe("browser deployment coordination", () => {
         }),
       }),
     );
+    const snapshot = messages[1] as Extract<PeerMessage, { op: typeof PeerOp.Response }>;
+    expect("settlements" in snapshot.response).toBe(false);
+  });
+
+  test("forwards a live remote settlement vector without replaying it in snapshots", () => {
+    const firstResponses: WorkerResponse[] = [];
+    const laterResponses: WorkerResponse[] = [];
+    const runtime = remoteRuntime();
+    const event = {
+      at: 1,
+      attempt: 1,
+      generation: 2,
+      sequence: 3,
+      status: "idle",
+      tick: {
+        changedTables: [],
+        pullAttempted: 0,
+        pushAccepted: 1,
+        pushAttempted: 1,
+        pushConflicts: 0,
+        pushFailed: 0,
+        pushRebases: 0,
+        pushed: 1,
+        received: 0,
+        reconnected: false,
+        retainedRevisions: 0,
+        rowsApplied: 0,
+        sent: 1,
+        receiptsPushed: 1,
+        storeJobs: 0,
+      },
+      type: "remote",
+    } satisfies Extract<EmbeddedEvent, { type: "remote" }>;
+    runtime.remoteEvent = event;
+    const leader = new LeaderRuntime({
+      epoch: "leader-incarnation",
+      identity: identity(),
+      runtime,
+      scope: "scope",
+      storagePath: "documents.db",
+    });
+    const client = (id: string, responses: WorkerResponse[]) => ({
+      activeMutations: 0,
+      id,
+      post: (response: WorkerResponse) => responses.push(response),
+      remoteConfigured: true,
+      watches: new Map(),
+      workerId: id,
+    });
+
+    leader.addLocalClient(client("first", firstResponses));
+    expect(firstResponses).toHaveLength(1);
+    expect("settlements" in firstResponses[0]!).toBe(false);
+
+    runtime.emitRemote?.(event, [
+      {
+        functionName: "documents:write",
+        mutationId: "settled-once",
+        outcome: "applied",
+        retainedRevisions: [],
+      },
+    ]);
+    expect(firstResponses.at(-1)).toMatchObject({
+      event: { generation: 2, sequence: 3, type: "remote" },
+      op: WorkerEvent.Event,
+      settlements: [
+        {
+          functionName: "documents:write",
+          mutationId: "settled-once",
+          outcome: "applied",
+          retainedRevisions: [],
+        },
+      ],
+    });
+
+    leader.addLocalClient(client("later", laterResponses));
+    expect(laterResponses).toHaveLength(1);
+    expect("settlements" in laterResponses[0]!).toBe(false);
   });
 
   test("promotes one follower and replays an unresolved request after leader death", async () => {
@@ -566,9 +644,9 @@ describe("browser deployment coordination", () => {
     try {
       await Promise.resolve();
       emit?.(oldEvent);
-      expect(client.connectionState().remote).toBe("connected");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "pending" });
       emit?.(nextEvent);
-      expect(client.connectionState().remote).toBe("offline");
+      expect(client.connectionState().replication).toEqual({ status: "offline" });
     } finally {
       await client.close();
       await second.close();

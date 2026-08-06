@@ -1,6 +1,6 @@
 import type { UserIdentity } from "convex/server";
 
-import type { EmbeddedEventListener } from "../events";
+import type { DiagnosticEventListener, EmbeddedRemoteEvent } from "../events";
 import type { FunctionReference } from "../runtime/functions";
 import type {
   Runner,
@@ -10,7 +10,7 @@ import type {
   RunOptions,
   StopOnUpdate,
 } from "../runtime/runner";
-import type { RemoteIdentity } from "../storage/types";
+import type { RemoteIdentity, RemoteMutationSettlement } from "../storage/types";
 import type { WorkerRunner } from "./proxy";
 
 /** One disposable worker generation behind a stable browser client. @internal */
@@ -42,9 +42,13 @@ export class BrowserLifecycleRunner implements Runner {
   private active: BrowserRunnerHandle | undefined;
   private closed = false;
   private eventStop: StopOnUpdate | undefined;
+  private settlementStop: StopOnUpdate | undefined;
   private generation = 0;
   private initial: Promise<WorkerRunner>;
-  private readonly listeners = new Set<EmbeddedEventListener>();
+  private readonly listeners = new Set<DiagnosticEventListener>();
+  private readonly settlementListeners = new Set<
+    (event: EmbeddedRemoteEvent, settlements: readonly RemoteMutationSettlement[]) => void
+  >();
   private networkOnline: boolean | undefined;
   private temporaryStorage = false;
   private suspended = false;
@@ -141,10 +145,22 @@ export class BrowserLifecycleRunner implements Runner {
     return await (await this.current()).devtools(request);
   }
 
-  subscribeEvents(listener: EmbeddedEventListener): StopOnUpdate {
+  subscribeEvents(listener: DiagnosticEventListener): StopOnUpdate {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  subscribeRemoteSettlements(
+    listener: (
+      event: EmbeddedRemoteEvent,
+      settlements: readonly RemoteMutationSettlement[],
+    ) => void,
+  ): StopOnUpdate {
+    this.settlementListeners.add(listener);
+    return () => {
+      this.settlementListeners.delete(listener);
     };
   }
 
@@ -192,6 +208,8 @@ export class BrowserLifecycleRunner implements Runner {
     this.generation += 1;
     this.eventStop?.();
     this.eventStop = undefined;
+    this.settlementStop?.();
+    this.settlementStop = undefined;
     for (const watch of this.watches) {
       watch.stop?.();
       watch.stop = undefined;
@@ -235,6 +253,8 @@ export class BrowserLifecycleRunner implements Runner {
       this.active = undefined;
       this.eventStop?.();
       this.eventStop = undefined;
+      this.settlementStop?.();
+      this.settlementStop = undefined;
       void active.closeNow();
       for (const watch of this.watches) watch.stop = undefined;
     }
@@ -247,6 +267,8 @@ export class BrowserLifecycleRunner implements Runner {
     this.generation += 1;
     this.eventStop?.();
     this.eventStop = undefined;
+    this.settlementStop?.();
+    this.settlementStop = undefined;
     for (const watch of this.watches) {
       watch.stopped = true;
       watch.stop?.();
@@ -281,6 +303,7 @@ export class BrowserLifecycleRunner implements Runner {
 
   private bindEvents(active: BrowserRunnerHandle): void {
     this.eventStop?.();
+    this.settlementStop?.();
     const generation = this.generation;
     this.eventStop = active.eagerRunner.subscribeEvents((event) => {
       if (this.suspended || this.closed || generation !== this.generation) return;
@@ -290,6 +313,18 @@ export class BrowserLifecycleRunner implements Runner {
       for (const listener of Array.from(this.listeners)) {
         try {
           listener(event);
+        } catch (error) {
+          queueMicrotask(() => {
+            throw error;
+          });
+        }
+      }
+    });
+    this.settlementStop = active.eagerRunner.subscribeRemoteSettlements?.((event, settlements) => {
+      if (this.suspended || this.closed || generation !== this.generation) return;
+      for (const listener of Array.from(this.settlementListeners)) {
+        try {
+          listener(event, settlements);
         } catch (error) {
           queueMicrotask(() => {
             throw error;

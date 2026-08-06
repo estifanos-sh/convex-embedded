@@ -23,8 +23,13 @@
  * @packageDocumentation
  */
 export { ConvexEmbeddedClient } from "./client";
-export { EMBEDDED_ERROR_CODES, EmbeddedError, isEmbeddedError } from "../error";
-export type { EmbeddedErrorCode } from "../error";
+export {
+  EMBEDDED_ERROR_CODES,
+  EMBEDDED_SETTLEMENT_CODES,
+  EmbeddedError,
+  isEmbeddedError,
+} from "../error";
+export type { EmbeddedErrorCode, EmbeddedSettlementCode } from "../error";
 export {
   EMBEDDED_UPLOAD_PATH,
   createConvexEmbeddedUploadFetch,
@@ -34,24 +39,15 @@ export {
 export type {
   AuthTokenFetcher,
   ConvexEmbeddedClientOptions,
-  ConvexEmbeddedMutationOptions,
   ConvexEmbeddedSchema,
   ConvexLocalModules,
   ConvexModules,
-  EmbeddedDataDelete,
-  EmbeddedDataEvent,
-  EmbeddedDataWrite,
+  EmbeddedConnectionError,
+  EmbeddedConnectionErrorCode,
   EmbeddedConnectionState,
-  EmbeddedEvent,
-  EmbeddedEventListener,
-  EmbeddedOperationEvent,
-  EmbeddedOperationKind,
-  EmbeddedOperationPhase,
-  EmbeddedRemoteEvent,
-  EmbeddedRemoteStatus,
-  EmbeddedSchedulerEvent,
-  EmbeddedSpanEvent,
-  EmbeddedSpanPhase,
-  EmbeddedStorageEvent,
+  EmbeddedLocalConnectionState,
+  EmbeddedMutationSettlement,
+  EmbeddedReplicationConnectionState,
+  EmbeddedRetainedRevision,
   Watch,
 } from "./client";

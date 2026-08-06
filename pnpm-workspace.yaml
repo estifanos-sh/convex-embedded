@@ -2,8 +2,8 @@ packages:
   - apps/*
   - packages/*
   - tools/*
-  - demos/*
-  - demos/*/*
+  - demos/expo
+  - demos/browser/*
 
 catalogMode: prefer
 
@@ -42,6 +42,7 @@ catalog:
   pkg-pr-new: 0.0.75
   react-test-renderer: 19.1.0
   "@types/react-test-renderer": 19.1.0
+  fallow: 3.14.0
 overrides:
   vite: "catalog:"
   vitest: "catalog:"

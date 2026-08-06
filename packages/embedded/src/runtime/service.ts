@@ -1,6 +1,6 @@
 import { getFunctionName } from "convex/server";
 import type { RuntimeStorageWriter, ScheduledFunctionKind, StorageBackend } from "../storage/types";
-import { localReferenceName } from "../local";
+import { localReferenceName } from "../local/internal";
 import type { FunctionReference } from "./functions";
 
 export interface RuntimeCalls {

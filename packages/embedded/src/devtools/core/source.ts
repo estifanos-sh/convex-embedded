@@ -1,12 +1,12 @@
 import type { EmbeddedClient } from "../../client";
-import type { EmbeddedEvent } from "../../events";
+import type { DiagnosticEvent } from "../../events";
+import { readDevtoolsBridge, type DevtoolsBridge } from "../bridge";
 import type {
   RunnerDevtoolsRequest,
   RunnerDevtoolsRows,
   RunnerDevtoolsSnapshot,
 } from "../../runtime/runner";
 import type {
-  EmbeddedDevtoolsClient,
   EmbeddedDevtoolsRuntime,
   EmbeddedDevtoolsRunFunctionInput,
   EmbeddedDevtoolsSnapshot,
@@ -23,14 +23,11 @@ import { emptySnapshot, mergeSnapshots } from "./types";
  * @public
  */
 export function createEmbeddedDevtoolsSource(client: EmbeddedClient): EmbeddedDevtoolsSource {
-  return new ClientDevtoolsSource(client as unknown as EmbeddedDevtoolsClient);
+  return new ClientDevtoolsSource(readDevtoolsBridge(client));
 }
 
 class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
-  private readonly listeners = new Map<
-    EmbeddedDevtoolsView,
-    Set<(event?: EmbeddedEvent) => void>
-  >();
+  private readonly listeners = new Map<EmbeddedDevtoolsView, Set<() => void>>();
   private runtime: RunnerDevtoolsSnapshot | undefined;
   private runtimeError: string | null = null;
   private runtimeStatus: EmbeddedDevtoolsRuntime["status"] = "loading";
@@ -41,14 +38,11 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private eventTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingClientRebuild = false;
-  private readonly pendingViewEvents = new Map<EmbeddedDevtoolsView, EmbeddedEvent[]>();
+  private readonly pendingViews = new Set<EmbeddedDevtoolsView>();
   private readonly unsubscribe: () => void;
 
-  constructor(private readonly client: EmbeddedDevtoolsClient) {
-    this.unsubscribe =
-      client.subscribeInternalEvents?.((event) => {
-        this.queueEvent(event);
-      }) ?? (() => undefined);
+  constructor(private readonly bridge: DevtoolsBridge) {
+    this.unsubscribe = bridge.subscribe((event) => this.queueDiagnostic(event));
     this.rebuild();
     void this.readRuntime();
   }
@@ -58,16 +52,19 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
     return this.snapshot;
   }
 
-  subscribe(view: EmbeddedDevtoolsView, callback: (event?: EmbeddedEvent) => void): () => void {
-    let set = this.listeners.get(view);
-    if (!set) {
-      set = new Set();
-      this.listeners.set(view, set);
+  subscribe(view: EmbeddedDevtoolsView, callback: () => void): () => void {
+    let callbacks = this.listeners.get(view);
+    if (!callbacks) {
+      callbacks = new Set();
+      this.listeners.set(view, callbacks);
     }
-    set.add(callback);
+    callbacks.add(callback);
     void this.readRuntime();
+    let active = true;
     return () => {
-      set?.delete(callback);
+      if (!active) return;
+      active = false;
+      callbacks?.delete(callback);
     };
   }
 
@@ -88,11 +85,8 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
   }
 
   async runFunction(input: EmbeddedDevtoolsRunFunctionInput): Promise<unknown> {
-    if (!this.client.__devtoolsRunFunction) {
-      throw new Error("This embedded client does not expose devtools function controls.");
-    }
     const fn = await this.readFunction(input.path);
-    return this.client.__devtoolsRunFunction({ ...input, kind: fn.kind });
+    return this.bridge.runFunction({ ...input, kind: fn.kind });
   }
 
   async patchDocument(table: string, id: string, fields: Record<string, unknown>): Promise<void> {
@@ -114,7 +108,7 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
   }
 
   clearActivity(): void {
-    this.client.__devtoolsClearActivity?.();
+    this.bridge.clearActivity();
     this.rebuild();
     this.emit("activity");
   }
@@ -125,16 +119,13 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
     this.refreshTimer = undefined;
     if (this.eventTimer) clearTimeout(this.eventTimer);
     this.eventTimer = undefined;
-    this.pendingViewEvents.clear();
+    this.pendingViews.clear();
     this.unsubscribe();
     this.listeners.clear();
   }
 
   private async runtimeRequest(request: RunnerDevtoolsRequest): Promise<unknown> {
-    if (!this.client.__devtoolsRuntime) {
-      throw new Error("This embedded client does not expose runtime devtools controls.");
-    }
-    return this.client.__devtoolsRuntime(request);
+    return this.bridge.runtime(request);
   }
 
   private async readFunction(path: string) {
@@ -187,85 +178,82 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
     }, 100);
   }
 
-  private scheduleEventFlush(): void {
+  private scheduleInvalidation(): void {
     if (this.disposed || this.eventTimer) return;
     this.eventTimer = setTimeout(() => {
       this.eventTimer = undefined;
-      this.flushEvents();
+      this.flushInvalidations();
     }, 0);
   }
 
-  private queueView(view: EmbeddedDevtoolsView, event: EmbeddedEvent): void {
+  private queueView(view: EmbeddedDevtoolsView): void {
     if (!this.hasViewListeners(view)) return;
     this.pendingClientRebuild = true;
-    let events = this.pendingViewEvents.get(view);
-    if (!events) {
-      events = [];
-      this.pendingViewEvents.set(view, events);
-    }
-    events.push(event);
-    this.scheduleEventFlush();
+    this.pendingViews.add(view);
+    this.scheduleInvalidation();
   }
 
-  private flushEvents(): void {
+  private flushInvalidations(): void {
     if (this.disposed) return;
     if (this.pendingClientRebuild) {
       this.pendingClientRebuild = false;
       this.rebuild();
     }
-    const events = [...this.pendingViewEvents];
-    this.pendingViewEvents.clear();
-    for (const [view, viewEvents] of events) {
-      for (const event of viewEvents) this.emit(view, event);
-    }
+    const views = [...this.pendingViews];
+    this.pendingViews.clear();
+    for (const view of views) this.emit(view);
   }
 
   private rebuild(): void {
-    const client = this.client.__devtoolsSnapshot?.();
-    if (!client || !this.runtime) {
-      this.snapshot = emptySnapshot();
-      if (client) {
-        this.snapshot = {
-          ...this.snapshot,
-          activity: {
-            operations: client.operations,
-            queries: client.queries,
-            uploads: client.uploads,
-          },
-          runtime: {
-            ...this.snapshot.runtime,
-            clientId: client.clientId,
-            closed: client.closed,
-            error: this.runtimeError,
-            status: this.runtimeStatus,
-          },
-        };
-      }
+    const client = this.bridge.snapshot();
+    if (!this.runtime) {
+      this.snapshot = {
+        ...emptySnapshot(),
+        activity: {
+          operations: client.operations,
+          queries: client.queries,
+          uploads: client.uploads,
+        },
+        runtime: {
+          ...emptySnapshot().runtime,
+          clientId: client.clientId,
+          closed: client.closed,
+          error: this.runtimeError,
+          status: this.runtimeStatus,
+        },
+      };
       return;
     }
     this.snapshot = mergeSnapshots(client, this.runtime, this.runtimeStatus, this.runtimeError);
   }
 
-  private emit(view: EmbeddedDevtoolsView, event?: EmbeddedEvent): void {
-    for (const listener of this.listeners.get(view) ?? []) listener(event);
+  private emit(view: EmbeddedDevtoolsView): void {
+    for (const callback of Array.from(this.listeners.get(view) ?? [])) {
+      try {
+        callback();
+      } catch (error) {
+        reportListenerError(error);
+      }
+    }
   }
 
-  private emitAll(event?: EmbeddedEvent): void {
-    for (const view of this.listeners.keys()) this.emit(view, event);
+  private emitAll(): void {
+    for (const view of this.listeners.keys()) this.emit(view);
   }
 
-  private queueEvent(event: EmbeddedEvent): void {
-    if (event.type === "operation" || event.type === "span") this.queueView("activity", event);
+  private queueDiagnostic(event: DiagnosticEvent): void {
+    if (event.type === "operation" || event.type === "span") this.queueView("activity");
+    if (event.type === "operation" && event.kind === "upload") this.queueView("storage");
     if (event.type === "data") {
-      this.queueView("data", event);
+      this.queueView("data");
       if (this.hasViewListeners("data")) this.scheduleRuntimeRefresh();
     }
     if (event.type === "storage") {
-      this.queueView("storage", event);
+      this.queueView("storage");
       if (this.hasViewListeners("storage")) this.scheduleRuntimeRefresh();
     }
     if (event.type === "scheduler") {
-      this.queueView("scheduler", event);
+      this.queueView("scheduler");
       if (this.hasViewListeners("scheduler")) this.scheduleRuntimeRefresh();
     }
   }
@@ -277,4 +265,15 @@ class ClientDevtoolsSource implements EmbeddedDevtoolsSource {
 
 function formatRuntimeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function reportListenerError(error: unknown): void {
+  const report = (globalThis as { reportError?: (value: unknown) => void }).reportError;
+  if (report) {
+    report(error);
+    return;
+  }
+  queueMicrotask(() => {
+    throw error;
+  });
 }

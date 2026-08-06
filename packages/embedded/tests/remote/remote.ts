@@ -10,6 +10,7 @@ import * as documents from "../../../../convex/documents";
 import schema from "../../../../convex/schema";
 import { hashDocument, hashValue } from "../../src/hash";
 import { ConvexEmbeddedClient } from "../../src/node/client";
+import { readDevtoolsBridge } from "../../src/devtools/bridge";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
 import { fixtureRemoteUrl } from "../testkit/remote";
@@ -665,7 +666,7 @@ describe("v5 real Convex vertical slice", () => {
       url: remoteUrl,
     });
     const events: unknown[] = [];
-    const stopEvents = client.subscribeInternalEvents((event) => {
+    const stopEvents = readDevtoolsBridge(client).subscribe((event) => {
       if (event.type !== "remote" && event.type !== "runtime") return;
       events.push(event);
       if (events.length > 40) events.shift();
@@ -794,7 +795,7 @@ describe("v5 real Convex vertical slice", () => {
     );
     const events: unknown[][] = clients.map(() => []);
     const stopEvents = clients.map((client, index) =>
-      client.subscribeInternalEvents((event) => {
+      readDevtoolsBridge(client).subscribe((event) => {
         if (event.type !== "remote" && event.type !== "runtime") return;
         events[index]!.push(event);
         if (events[index]!.length > 20) events[index]!.shift();
@@ -897,7 +898,7 @@ describe("v5 real Convex vertical slice", () => {
     let received = 0;
     const remoteErrors: string[] = [];
     const remoteTicks: unknown[] = [];
-    const stopEvents = client.subscribeInternalEvents((event) => {
+    const stopEvents = readDevtoolsBridge(client).subscribe((event) => {
       if (event.type !== "remote") return;
       acceptedPushes += event.tick?.pushAccepted ?? 0;
       received += event.tick?.received ?? 0;
@@ -1019,7 +1020,7 @@ describe("v5 real Convex vertical slice", () => {
         received?: number;
       };
     }> = [];
-    const stopEvents = first.subscribeInternalEvents((event) => {
+    const stopEvents = readDevtoolsBridge(first).subscribe((event) => {
       if (event.type !== "remote") return;
       remoteEvents.push({
         ...(event.error === undefined ? {} : { error: event.error }),
@@ -1418,7 +1419,7 @@ describe("v5 real Convex vertical slice", () => {
     let failedPushes = 0;
     let conflictPushes = 0;
     const remoteErrors: string[] = [];
-    const stopEvents = client.subscribeInternalEvents((event) => {
+    const stopEvents = readDevtoolsBridge(client).subscribe((event) => {
       if (event.type !== "remote") return;
       acceptedPushes += event.tick?.pushAccepted ?? 0;
       failedPushes += event.tick?.pushFailed ?? 0;
@@ -1476,7 +1477,7 @@ describe("v5 real Convex vertical slice", () => {
     let attemptedPushes = 0;
     let failedPushes = 0;
     const remoteErrors: string[] = [];
-    const stopEvents = client.subscribeInternalEvents((event) => {
+    const stopEvents = readDevtoolsBridge(client).subscribe((event) => {
       if (event.type !== "remote") return;
       acceptedPushes += event.tick?.pushAccepted ?? 0;
       attemptedPushes += event.tick?.pushAttempted ?? 0;
@@ -1538,7 +1539,7 @@ describe("v5 real Convex vertical slice", () => {
       url: remoteUrl,
     });
     const events: unknown[] = [];
-    const stopEvents = embedded.subscribeInternalEvents((event) => {
+    const stopEvents = readDevtoolsBridge(embedded).subscribe((event) => {
       if (event.type === "remote") events.push(event);
     });
     const stop = embedded

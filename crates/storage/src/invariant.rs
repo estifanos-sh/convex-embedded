@@ -3,7 +3,7 @@
 //! `store::debug_assert_rev_invariants`, gated on `#[cfg(debug_assertions)]`, so a release build
 //! compiles the check out. Allow the resulting dead code in that configuration rather than
 //! fragmenting the module with per-item cfgs.
-#![cfg_attr(not(any(test, feature = "testkit")), allow(dead_code))]
+#![cfg_attr(not(any(test, debug_assertions)), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet};
 

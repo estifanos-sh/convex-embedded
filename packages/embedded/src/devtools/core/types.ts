@@ -1,13 +1,11 @@
 import type {
-  EmbeddedClientDebugOperation,
-  EmbeddedClientDebugQuery,
-  EmbeddedClientDebugSnapshot,
-  EmbeddedClientDebugUpload,
-} from "../../client";
-import type { EmbeddedEvent, EmbeddedEventListener } from "../../events";
+  DevtoolsClientSnapshot,
+  DevtoolsOperation,
+  DevtoolsQuery,
+  DevtoolsUpload,
+} from "../bridge";
 import type {
   RunnerDevtoolsFunction,
-  RunnerDevtoolsRequest,
   RunnerDevtoolsRows,
   RunnerDevtoolsSchemaTable,
   RunnerDevtoolsSnapshot,
@@ -20,13 +18,13 @@ import type { ScheduledJob } from "../../storage/types";
 export type EmbeddedDevtoolsView = "activity" | "data" | "functions" | "scheduler" | "storage";
 
 /** Client activity entry rendered by the Activity tab. @public */
-export type EmbeddedDevtoolsOperation = EmbeddedClientDebugOperation;
+export type EmbeddedDevtoolsOperation = DevtoolsOperation;
 
 /** Watched query entry rendered by the Activity/Data tabs. @public */
-export type EmbeddedDevtoolsQuery = EmbeddedClientDebugQuery;
+export type EmbeddedDevtoolsQuery = DevtoolsQuery;
 
 /** Upload activity entry rendered by the Storage tab. @public */
-export type EmbeddedDevtoolsUpload = EmbeddedClientDebugUpload;
+export type EmbeddedDevtoolsUpload = DevtoolsUpload;
 
 /** Table summary rendered by the Data tab sidebar. @public */
 export type EmbeddedDevtoolsTable = RunnerDevtoolsTable;
@@ -99,20 +97,8 @@ export interface EmbeddedDevtoolsSource {
   ): Promise<EmbeddedDevtoolsRows>;
   patchDocument(table: string, id: string, fields: Record<string, unknown>): Promise<void>;
   runFunction(input: EmbeddedDevtoolsRunFunctionInput): Promise<unknown>;
-  subscribe(view: EmbeddedDevtoolsView, callback: (event?: EmbeddedEvent) => void): () => void;
-}
-
-/** Client hooks consumed by the source implementation. @internal */
-export interface EmbeddedDevtoolsClient {
-  __devtoolsClearActivity?(): void;
-  __devtoolsRunFunction?(
-    input: EmbeddedDevtoolsRunFunctionInput & {
-      kind: EmbeddedDevtoolsFunction["kind"];
-    },
-  ): Promise<unknown>;
-  __devtoolsRuntime?(request: RunnerDevtoolsRequest): Promise<unknown>;
-  __devtoolsSnapshot?(): EmbeddedClientDebugSnapshot;
-  subscribeInternalEvents?(listener: EmbeddedEventListener): () => void;
+  /** Invalidates this view; snapshots are read separately with {@link getSnapshot}. */
+  subscribe(view: EmbeddedDevtoolsView, callback: () => void): () => void;
 }
 
 /** Empty snapshot used before the runtime has answered. @internal */
@@ -122,7 +108,7 @@ export function emptySnapshot(): EmbeddedDevtoolsSnapshot {
 
 /** Merge client-side activity with runtime-backed storage state. @internal */
 export function mergeSnapshots(
-  client: EmbeddedClientDebugSnapshot,
+  client: DevtoolsClientSnapshot,
   runtime: RunnerDevtoolsSnapshot,
   status: EmbeddedDevtoolsRuntime["status"] = "ready",
   error: string | null = null,
@@ -149,7 +135,7 @@ export function mergeSnapshots(
   };
 }
 
-function emptyClientSnapshot(): EmbeddedClientDebugSnapshot {
+function emptyClientSnapshot(): DevtoolsClientSnapshot {
   return {
     clientId: "unknown",
     closed: false,

@@ -119,7 +119,7 @@ codec = excluded.codec, flags = excluded.flags, payload = excluded.payload, \
 payload_hash = excluded.payload_hash";
 
 /// Batch originated records so large pull pages do not pay one interpreter/driver crossing per
-/// membership edge. Callers keep chunks bounded to stay below SQLite's parameter limit.
+/// membership edge. Callers keep chunks bounded to stay below `SQLite`'s parameter limit.
 pub(crate) fn write_origins(count: usize) -> String {
     let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", count)
         .collect::<Vec<_>>()
@@ -2355,7 +2355,7 @@ pub(crate) fn read_membership() -> &'static str {
 }
 
 /// Read one table's arbitrary result-disclosed rows through its server-id index. Grouping by table
-/// avoids the poor VALUES/LEFT JOIN plan used by some SQLite runtimes for large projection sets.
+/// avoids the poor VALUES/LEFT JOIN plan used by some `SQLite` runtimes for large projection sets.
 pub(crate) fn read_result_projections(count: usize) -> String {
     let values = std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()

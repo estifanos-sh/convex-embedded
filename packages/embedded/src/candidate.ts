@@ -1,4 +1,5 @@
 import type { StoreSetupCandidate } from "./migrations";
+import type { RunnerMode } from "./runtime/mode";
 import type { ConvexEmbeddedSchema } from "./schema";
 import type { StorageBackend, StoreSchema } from "./storage/types";
 import { setupWorkspaceSchema } from "./storage/workspace";
@@ -26,15 +27,23 @@ export interface CandidateStep {
 }
 
 export interface CandidateSetup<R> {
-  readonly localSchemas: readonly ConvexEmbeddedSchema[];
+  /** Historical schemas named by setup-only local helpers. */
+  readonly compatibilitySchemas: readonly ConvexEmbeddedSchema[];
   run(runner: R): Promise<void>;
+}
+
+/** Complete, named runner construction contract for one candidate phase. */
+export interface CandidateRunnerSpec {
+  readonly mode: RunnerMode;
+  readonly remote: boolean;
+  readonly schema: StoreSchema;
 }
 
 export interface CandidateDependencies<R> {
   /** Private release-test seam invoked only after a phase has durably advanced. */
   checkpoint?: (phase: CandidatePhase) => Promise<void>;
   /** Construct a runner against the generation currently selected by storage. */
-  createRunner(schema: StoreSchema, remote: boolean): R;
+  createRunner(spec: CandidateRunnerSpec): R;
   /** Wait until local function modules are usable before setup or publication completes. */
   localReady(runner: R): Promise<unknown>;
   /** Runtime schema used after the exact target contract is published. */
@@ -87,7 +96,11 @@ export async function openCandidate<R>(
   }
   if (candidate === undefined) {
     await store.setup(dependencies.targetSchema);
-    const runner = dependencies.createRunner(dependencies.runnerSchema, dependencies.remote);
+    const runner = dependencies.createRunner({
+      mode: "active",
+      remote: dependencies.remote,
+      schema: dependencies.runnerSchema,
+    });
     await dependencies.localReady(runner);
     return { report: { required: false, resumed: false, retiredGenerations: [] }, runner };
   }
@@ -132,7 +145,7 @@ export async function openCandidate<R>(
         const workspace = setupWorkspaceSchema(
           prepared.sourceSchema,
           dependencies.targetSchema,
-          dependencies.setup.localSchemas,
+          dependencies.setup.compatibilitySchemas,
         );
         await candidate.bind(workspace, prepared.generation);
         bound = true;
@@ -142,7 +155,11 @@ export async function openCandidate<R>(
           dependencies.progress,
           dependencies.checkpoint,
         );
-        const setupRunner = dependencies.createRunner(workspace, false);
+        const setupRunner = dependencies.createRunner({
+          mode: "setup",
+          remote: false,
+          schema: workspace,
+        });
         await dependencies.localReady(setupRunner);
         await dependencies.setup.run(setupRunner);
         await candidate.complete(prepared.generation);
@@ -176,7 +193,11 @@ export async function openCandidate<R>(
     if (bound) await candidate.unbind().catch(() => undefined);
   }
 
-  const runner = dependencies.createRunner(dependencies.runnerSchema, dependencies.remote);
+  const runner = dependencies.createRunner({
+    mode: "active",
+    remote: dependencies.remote,
+    schema: dependencies.runnerSchema,
+  });
   await dependencies.localReady(runner);
   for (const generation of retired) {
     await advance(

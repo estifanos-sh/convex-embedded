@@ -13,10 +13,10 @@ import type { StoreSchema, TableDef } from "./types";
 export function setupWorkspaceSchema(
   source: StoreSchema,
   target: StoreSchema,
-  localSchemas: readonly ConvexEmbeddedSchema[],
+  compatibilitySchemas: readonly ConvexEmbeddedSchema[],
 ): StoreSchema {
   const tables = new Map<string, TableDef>();
-  const localStoreSchemas = localSchemas.map(toRuntimeStoreSchema);
+  const localStoreSchemas = compatibilitySchemas.map(toRuntimeStoreSchema);
   validateCompatibilityIndexes(target, localStoreSchemas);
   // Compatibility schemas contribute historical shapes, but the release target is applied last
   // and therefore owns every public table/index/field name used at cutover.

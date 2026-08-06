@@ -7,7 +7,6 @@ import type {
   EmbeddedDevtoolsSource,
   EmbeddedDevtoolsTable,
 } from "../../core/types";
-import type { EmbeddedEvent } from "../../../events";
 import { copyButton, rowId, valuePreview } from "../components";
 import { button, el, empty, setStatus } from "../dom";
 import { json, parseObject, stringify } from "../json";
@@ -484,8 +483,7 @@ export function mountDataTab(host: HTMLElement, source: EmbeddedDevtoolsSource):
     }
   };
 
-  const stop = source.subscribe("data", (event) => {
-    if (applyDataEvent(event)) return;
+  const stop = source.subscribe("data", () => {
     renderList();
     renderMain();
     renderDetail();
@@ -544,47 +542,6 @@ export function mountDataTab(host: HTMLElement, source: EmbeddedDevtoolsSource):
     await source.refresh();
     renderList();
     if (table) await loadRows(true, state.selectedRowId ?? undefined);
-  }
-
-  function applyDataEvent(event: EmbeddedEvent | undefined): boolean {
-    if (event?.type !== "data" || !state.table || !event.changedTables.includes(state.table)) {
-      return false;
-    }
-    if (state.editing) {
-      state.pendingRefresh = true;
-      renderList();
-      return true;
-    }
-    let changed = false;
-    for (const deleted of event.deletes) {
-      if (deleted.table !== state.table) continue;
-      const next = state.rows.filter((row) => rowId(row) !== deleted.id);
-      changed ||= next.length !== state.rows.length;
-      state.rows = next;
-      if (state.selectedRowId === deleted.id) state.selectedRowId = null;
-    }
-    for (const docWrite of event.docWrites) {
-      if (docWrite.table !== state.table) continue;
-      const index = state.rows.findIndex((row) => rowId(row) === docWrite.id);
-      const row = docWrite.row;
-      if (index >= 0) {
-        state.rows = state.rows.map((current, currentIndex) =>
-          currentIndex === index ? row : current,
-        );
-      } else if (state.done || state.rows.length < PAGE_SIZE) {
-        state.rows = state.rows.concat(row);
-      } else {
-        continue;
-      }
-      changed = true;
-    }
-    if (!changed) return false;
-    state.loadedTable = state.table;
-    state.rows = state.rows.sort(compareRows);
-    renderList();
-    renderMain();
-    renderDetail();
-    return true;
   }
 }
 

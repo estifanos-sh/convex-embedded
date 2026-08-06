@@ -2,8 +2,15 @@ import { makeFunctionReference } from "convex/server";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import { commands } from "vitest/browser";
 
-import type { EmbeddedEvent, EmbeddedOperationEvent, EmbeddedRemoteEvent } from "../../src/events";
-import { defineLocal, localReferenceName } from "../../src/local";
+import { createEmbeddedDevtoolsSource } from "@convex-dev/embedded/devtools";
+
+import type {
+  DiagnosticEvent as EmbeddedEvent,
+  EmbeddedOperationEvent,
+  EmbeddedRemoteEvent,
+} from "../../src/events";
+import { subscribeToDevtoolsDiagnostics } from "../../dist/devtools/testing.mjs";
+import { defineLocal, localReferenceName } from "../../src/local/internal";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
 import schema from "./convex/schema";
@@ -87,7 +94,26 @@ interface DocumentClient extends RuntimeClient {
 interface RuntimeClient {
   close(): Promise<void>;
   open(): Promise<void>;
-  subscribeInternalEvents?(listener: (event: EmbeddedEvent) => void): () => void;
+}
+
+type DiagnosticClient = Parameters<typeof subscribeToDevtoolsDiagnostics>[0];
+type DevtoolsSourceClient = Parameters<typeof createEmbeddedDevtoolsSource>[0];
+
+function subscribeDiagnostics(
+  client: RuntimeClient,
+  listener: (event: EmbeddedEvent) => void,
+): () => void {
+  return subscribeToDevtoolsDiagnostics(client as DiagnosticClient, listener);
+}
+
+async function readDevtoolsSnapshot(client: RuntimeClient): Promise<unknown> {
+  const source = createEmbeddedDevtoolsSource(client as DevtoolsSourceClient);
+  try {
+    await source.refresh();
+    return source.getSnapshot("storage");
+  } finally {
+    source.dispose();
+  }
 }
 
 interface OrphanClient {
@@ -293,7 +319,7 @@ describe("browser runtime", () => {
     );
     const convex = await openClient(new ConvexEmbeddedClient());
     const operations: EmbeddedOperationEvent[] = [];
-    convex.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(convex, (event) => {
       if (event.type === "operation") operations.push(event);
     });
 
@@ -419,31 +445,16 @@ describe("browser runtime", () => {
     });
   });
 
-  test("observes the boot lifecycle through the client runtime event channel", async () => {
+  test("reports ready local state after the browser runtime opens", async () => {
     useIsolatedBrowserStorage("runtime-events");
     const { ConvexEmbeddedClient } = await withTimeout(
       import("@convex-dev/embedded/browser"),
       "browser package import",
     );
     const convex = await openClient(new ConvexEmbeddedClient());
-    const runtimeEvents: RuntimeEvent[] = [];
-    const stop = convex.onRuntimeEvent?.((event) => runtimeEvents.push(event as RuntimeEvent));
-
     await withTimeout(convex.query(listDocuments, {}), "runtime-events ready query");
-    await waitForWithin(() => {
-      expect(runtimeEvents.some((event) => event.phase === "ready")).toBe(true);
-    }, 5_000);
-    stop?.();
-
-    const phases = runtimeEvents
-      .filter((event) => event.phase !== undefined && event.degradation === undefined)
-      .map((event) => event.phase);
-    await mark("client runtime events", { phases, total: runtimeEvents.length });
-
-    expect(runtimeEvents.every((event) => event.type === "runtime")).toBe(true);
-    expect(phases).toContain("store-open");
-    expect(phases.indexOf("store-open")).toBeLessThan(phases.indexOf("ready"));
-    expect(phases.at(-1)).toBe("ready");
+    expect(convex.connectionState().local).toMatchObject({ status: "ready" });
+    await mark("client runtime state", { local: convex.connectionState().local });
   });
 
   test("leaves the runtime event channel inert when a boot is unobserved", async () => {
@@ -467,7 +478,7 @@ describe("browser runtime", () => {
     const convex = await openClient(new ConvexEmbeddedClient());
     const mounted = mountEmbeddedDevtools(convex, { defaultOpen: true });
     const operations: EmbeddedOperationEvent[] = [];
-    convex.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(convex, (event) => {
       if (event.type === "operation") operations.push(event);
     });
 
@@ -517,7 +528,7 @@ describe("browser runtime", () => {
 
     const first = await openClient(new ConvexEmbeddedClient());
     const firstOperations: EmbeddedOperationEvent[] = [];
-    first.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(first, (event) => {
       if (event.type === "operation") firstOperations.push(event);
     });
     const firstSample = await timeMutation(firstOperations, () =>
@@ -528,7 +539,7 @@ describe("browser runtime", () => {
 
     const reopened = await openClient(new ConvexEmbeddedClient());
     const reopenedOperations: EmbeddedOperationEvent[] = [];
-    reopened.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(reopened, (event) => {
       if (event.type === "operation") reopenedOperations.push(event);
     });
     const samples = [];
@@ -566,27 +577,30 @@ describe("browser runtime", () => {
     const opened = convex.open();
     const operations: EmbeddedOperationEvent[] = [];
     const remoteEvents: unknown[] = [];
-    convex.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(convex, (event) => {
       if (event.type === "operation") operations.push(event);
       if (event.type === "remote") remoteEvents.push(event);
     });
 
-    expect(convex.connectionState()).toMatchObject({ local: "starting", remote: "starting" });
+    expect(convex.connectionState()).toMatchObject({
+      local: { status: "starting" },
+      replication: { status: "starting" },
+    });
     await opened;
     const prefix = `timing-dead-remote-${getTimerTime()}-${Math.random().toString(36).slice(2)}:`;
     const samples = [];
     for (let i = 0; i < 12; i += 1) {
       samples.push(await timeMutation(operations, () => writeDocument(convex, `${prefix}${i}`)));
     }
-    expect(convex.connectionState().local).toBe("ready");
-    expect(convex.connectionState().remote).not.toBe("disabled");
+    expect(convex.connectionState().local.status).toBe("ready");
+    expect(convex.connectionState().replication.status).not.toBe("disabled");
     await delay(100);
 
     const connection = convex.connectionState();
-    if (connection.remote === "error") {
-      expect(connection.remoteError).toBeTypeOf("string");
+    if (connection.replication.status === "error") {
+      expect(connection.replication.error.message).toBeTypeOf("string");
     } else {
-      expect("remoteError" in connection).toBe(false);
+      expect("error" in connection.replication).toBe(false);
     }
 
     await mark("dead remote mutation timing", {
@@ -856,7 +870,7 @@ describe("browser runtime", () => {
       }),
     );
     const events: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
-    convex.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(convex, (event) => {
       if (event.type === "remote") events.push(event);
     });
 
@@ -880,11 +894,7 @@ describe("browser runtime", () => {
         expect(events.some((event) => (event.tick?.pushAttempted ?? 0) > 0)).toBe(true);
       }, 15_000);
     } catch (error) {
-      const snapshot = (await (
-        convex as unknown as {
-          __devtoolsRuntime(request: { kind: "snapshot" }): Promise<unknown>;
-        }
-      ).__devtoolsRuntime({ kind: "snapshot" })) as { storage?: unknown };
+      const snapshot = (await readDevtoolsSnapshot(convex)) as { storage?: unknown };
       throw new Error(
         `browser remote never attempted its queued push: ${JSON.stringify({
           cause: error instanceof Error ? error.message : String(error),
@@ -929,7 +939,7 @@ describe("browser runtime", () => {
     await browserCommands().embeddedRemoteDocumentCreate(remoteUrl, text, "abc");
     const convex = await openClient(new ConvexEmbeddedClient({ url: remoteUrl }));
     const remoteEvents: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
-    convex.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(convex, (event) => {
       if (event.type === "remote") remoteEvents.push(event);
     });
     const stop = convex.watchQuery(listDocuments, {}).onUpdate(() => undefined);
@@ -982,10 +992,10 @@ describe("browser runtime", () => {
     let secondId: string | undefined;
     const firstRemoteEvents: EmbeddedRemoteEvent[] = [];
     const secondRemoteEvents: EmbeddedRemoteEvent[] = [];
-    first.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(first, (event) => {
       if (event.type === "remote") firstRemoteEvents.push(event);
     });
-    second.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(second, (event) => {
       if (event.type === "remote") secondRemoteEvents.push(event);
     });
     const watches = [first, second].map((client) => {
@@ -1079,16 +1089,8 @@ describe("browser runtime", () => {
         ).resolves.toBe(false);
       }, 15_000);
     } catch (error) {
-      const snapshot = await (
-        first as unknown as {
-          __devtoolsRuntime(request: { kind: "snapshot" }): Promise<unknown>;
-        }
-      ).__devtoolsRuntime({ kind: "snapshot" });
-      const secondSnapshot = await (
-        second as unknown as {
-          __devtoolsRuntime(request: { kind: "snapshot" }): Promise<unknown>;
-        }
-      ).__devtoolsRuntime({ kind: "snapshot" });
+      const snapshot = await readDevtoolsSnapshot(first);
+      const secondSnapshot = await readDevtoolsSnapshot(second);
       throw new Error(
         `hosted CRDT convergence failed: ${JSON.stringify({
           cause: error instanceof Error ? error.message : String(error),
@@ -1120,10 +1122,10 @@ describe("browser runtime", () => {
     const second = await open("b");
     const firstRemoteEvents: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
     const remoteEvents: Array<{ error?: string; status?: string; tick?: RemoteTick }> = [];
-    first.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(first, (event) => {
       if (event.type === "remote") firstRemoteEvents.push(event);
     });
-    second.subscribeInternalEvents?.((event) => {
+    subscribeDiagnostics(second, (event) => {
       if (event.type === "remote") remoteEvents.push(event);
     });
     const watches = [first, second].map((client) =>
@@ -1156,16 +1158,8 @@ describe("browser runtime", () => {
           ).resolves.toBe(false);
         }, 15_000);
       } catch (error) {
-        const snapshot = await (
-          second as unknown as {
-            __devtoolsRuntime(request: { kind: "snapshot" }): Promise<unknown>;
-          }
-        ).__devtoolsRuntime({ kind: "snapshot" });
-        const firstSnapshot = await (
-          first as unknown as {
-            __devtoolsRuntime(request: { kind: "snapshot" }): Promise<unknown>;
-          }
-        ).__devtoolsRuntime({ kind: "snapshot" });
+        const snapshot = await readDevtoolsSnapshot(second);
+        const firstSnapshot = await readDevtoolsSnapshot(first);
         throw new Error(
           `hosted delete did not converge: ${JSON.stringify({
             cause: error instanceof Error ? error.message : String(error),

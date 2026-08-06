@@ -325,7 +325,6 @@ export async function runBrowserRemoteBenchmark(
       const embeddedQueryDeliveryMs = embeddedDeliveryAt - embeddedStartedAt;
       embeddedBody = nextEmbeddedBody;
       return {
-        admission: mutation.admission,
         admissionMs: mutation.admissionMs,
         cacheServes: (await embeddedCacheServeState(embeddedObserver)) - embeddedCacheServesBefore,
         listTransitions:

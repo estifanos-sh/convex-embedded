@@ -1,4 +1,5 @@
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 import { readFlag, readValue, repoRoot } from "./read.ts";
@@ -16,8 +17,48 @@ export function skipWasmOpt(): boolean {
 /** The pinned Android NDK root, required by the mobile artifact toolchain. */
 export function androidNdk(): string {
   const path = readValue("ANDROID_NDK_HOME") ?? readValue("ANDROID_NDK_ROOT");
-  if (!path) throw new Error("ANDROID_NDK_HOME must point to the pinned Android NDK.");
-  return path;
+  if (path) return path;
+  const pinned = androidSdkCandidates()
+    .map((sdk) => resolve(sdk, "ndk", androidNdkVersion))
+    .find((candidate) => existsSync(resolve(candidate, "source.properties")));
+  if (pinned) return pinned;
+  throw new Error(
+    `Android NDK ${androidNdkVersion} was not found. Set ANDROID_NDK_HOME, or install the ` +
+      "pinned NDK under ANDROID_HOME/ANDROID_SDK_ROOT.",
+  );
+}
+
+/** Resolve an explicit SDK first, then standard Android Studio and Homebrew installations. */
+export function androidSdk(): string | undefined {
+  const candidates = androidSdkCandidates();
+  return (
+    candidates.find((sdk) =>
+      existsSync(resolve(sdk, "ndk", androidNdkVersion, "source.properties")),
+    ) ??
+    candidates.find((sdk) => existsSync(resolve(sdk, "cmdline-tools"))) ??
+    candidates.find(existsSync)
+  );
+}
+
+function androidSdkCandidates(): string[] {
+  const configured = readValue("ANDROID_HOME") ?? readValue("ANDROID_SDK_ROOT");
+  return [
+    ...(configured ? [configured] : []),
+    resolve(homedir(), "Library/Android/sdk"),
+    resolve(homedir(), "Android/Sdk"),
+    "/opt/homebrew/share/android-commandlinetools",
+    "/usr/local/share/android-commandlinetools",
+  ];
+}
+
+/** Resolve JDK 17 from the environment or Homebrew without requiring a privileged macOS install. */
+export function javaHome(): string | undefined {
+  const configured = readValue("JAVA_HOME");
+  if (configured) return configured;
+  return [
+    "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
+    "/usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
+  ].find(existsSync);
 }
 
 /** The Android NDK revision pinned across the mobile artifact build and the EAS pre-install hook. */

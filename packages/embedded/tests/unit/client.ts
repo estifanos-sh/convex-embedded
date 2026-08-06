@@ -13,11 +13,13 @@ import {
 import { BrowserLifecycleRunner, installPageLifecycle } from "../../src/browser/lifecycle";
 import type { WorkerRunner } from "../../src/browser/proxy";
 import { WorkerEvent, type EmbeddedWorker, type RuntimeIdentity } from "../../src/browser/protocol";
-import type { EmbeddedEvent } from "../../src/events";
+import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
+import { readDevtoolsBridge } from "../../src/devtools/bridge";
 import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import type { Runner } from "../../src/runtime/runner";
+import type { RemoteMutationSettlement, RemoteTick } from "../../src/storage/types";
 import { setEmbeddedIdentity } from "../../src/browser/identity";
-import { defineLocal, stampLocal } from "../../src/local";
+import { defineLocal, stampLocal } from "../../src/local/internal";
 import { defineEmbeddedSchema } from "../../src/schema";
 import { v } from "convex/values";
 
@@ -522,6 +524,42 @@ describe("browser network lifecycle", () => {
 });
 
 describe("connection invariants", () => {
+  test("releases eager runner ownership when initialization rejects", async () => {
+    let eventStops = 0;
+    let settlementStops = 0;
+    let closes = 0;
+    const eagerRunner = {
+      subscribeEvents: () => () => {
+        eventStops += 1;
+      },
+      subscribeRemoteSettlements: () => () => {
+        settlementStops += 1;
+      },
+    } as unknown as Runner;
+    const client = new EmbeddedClient({
+      close: async () => {
+        closes += 1;
+      },
+      eagerRunner,
+      remoteConfigured: true,
+      runner: Promise.reject(new Error("runner initialization failed")),
+    });
+    try {
+      await expect(client.open()).rejects.toThrow("runner initialization failed");
+      expect(eventStops).toBe(1);
+      expect(settlementStops).toBe(1);
+      expect(closes).toBe(1);
+      expect(client.connectionState().local.status).toBe("failed");
+
+      await client.close();
+      expect(eventStops).toBe(1);
+      expect(settlementStops).toBe(1);
+      expect(closes).toBe(1);
+    } finally {
+      await client.close();
+    }
+  });
+
   test("local mutations do not allocate replication metadata", async () => {
     let runOptions: Parameters<Runner["runMutation"]>[2];
     const runner = {
@@ -541,6 +579,51 @@ describe("connection invariants", () => {
       await expect(client.mutation(mutation, {})).resolves.toBe("saved");
       expect(runOptions).not.toHaveProperty("mutationId");
       expect(runOptions).not.toHaveProperty("pushCall");
+      expect(runOptions).not.toHaveProperty("onTiming");
+
+      const stopDevtools = readDevtoolsBridge(client).subscribe(() => undefined);
+      await expect(client.mutation(mutation, {})).resolves.toBe("saved");
+      expect(runOptions).toHaveProperty("onTiming", expect.any(Function));
+      stopDevtools();
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("does not retain upload diagnostics unless the private devtools bridge observes", async () => {
+    let uploads = 0;
+    const runner = {
+      handleUpload: async () => {
+        uploads += 1;
+        return { storageId: `upload-${uploads}` };
+      },
+      identity: { read: async () => undefined, write: async () => undefined },
+      subscribeEvents: () => () => undefined,
+    } as unknown as Runner;
+    class TestClient extends EmbeddedClient {
+      upload(url: string, blob: Blob): Promise<{ storageId: string }> {
+        return this.handleUploadUrl(url, blob);
+      }
+    }
+    const client = new TestClient({ eagerRunner: runner, runner });
+    const blob = new Blob(["upload"], { type: "text/plain" });
+    try {
+      await expect(client.upload("/upload/one", blob)).resolves.toEqual({ storageId: "upload-1" });
+      const bridge = readDevtoolsBridge(client);
+      expect(bridge.snapshot().uploads).toEqual([]);
+
+      const stop = bridge.subscribe(() => undefined);
+      await expect(client.upload("/upload/two", blob)).resolves.toEqual({ storageId: "upload-2" });
+      expect(bridge.snapshot().uploads).toMatchObject([
+        {
+          contentType: "text/plain",
+          size: 6,
+          status: "success",
+          storageId: "upload-2",
+          url: "/upload/two",
+        },
+      ]);
+      stop();
     } finally {
       await client.close();
     }
@@ -566,16 +649,19 @@ describe("connection invariants", () => {
     });
     try {
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(client.connectionState()).toMatchObject({ local: "ready", remote: "starting" });
+      expect(client.connectionState()).toMatchObject({
+        local: { status: "ready" },
+        replication: { status: "starting" },
+      });
 
       emit?.({ at: 1, attempt: 0, status: "started", type: "remote" });
-      expect(client.connectionState().remote).toBe("starting");
+      expect(client.connectionState().replication.status).toBe("starting");
 
       emit?.({ at: 2, attempt: 1, status: "connected", type: "remote" });
-      expect(client.connectionState().remote).toBe("connected");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "pending" });
 
       emit?.({ at: 3, attempt: 2, status: "tick", type: "remote" });
-      expect(client.connectionState().remote).toBe("connected");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "pending" });
 
       emit?.({
         at: 4,
@@ -608,11 +694,11 @@ describe("connection invariants", () => {
         },
         type: "remote",
       });
-      expect(client.connectionState().remote).toBe("ready");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "idle" });
 
       emit?.({ at: 5, attempt: 4, status: "connected", type: "remote" });
       emit?.({ at: 6, attempt: 5, status: "tick", type: "remote" });
-      expect(client.connectionState().remote).toBe("ready");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "idle" });
     } finally {
       await client.close();
     }
@@ -636,7 +722,7 @@ describe("connection invariants", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       emit?.({ at: 1, attempt: 1, status: "offline", type: "remote" });
       emit?.({ at: 2, attempt: 2, status: "tick", type: "remote" });
-      expect(client.connectionState().remote).toBe("offline");
+      expect(client.connectionState().replication).toEqual({ status: "offline" });
     } finally {
       await client.close();
     }
@@ -696,9 +782,11 @@ describe("connection invariants", () => {
         type: "remote",
       });
       expect(client.connectionState()).toEqual({
-        local: "ready",
-        remote: "error",
-        remoteError: "snapshot could not be applied",
+        local: { persistence: "durable", status: "ready" },
+        replication: {
+          error: { code: "EMBEDDED_REPLICATION", message: "snapshot could not be applied" },
+          status: "error",
+        },
       });
       emit?.({
         at: 3,
@@ -715,9 +803,11 @@ describe("connection invariants", () => {
         type: "remote",
       });
       expect(client.connectionState()).toEqual({
-        local: "ready",
-        remote: "error",
-        remoteError: "snapshot could not be applied",
+        local: { persistence: "durable", status: "ready" },
+        replication: {
+          error: { code: "EMBEDDED_REPLICATION", message: "snapshot could not be applied" },
+          status: "error",
+        },
       });
 
       emit?.({
@@ -727,7 +817,7 @@ describe("connection invariants", () => {
         tick: { ...tick, connected: true, pullSnapshots: 1 },
         type: "remote",
       });
-      expect(client.connectionState().remote).toBe("ready");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "idle" });
     } finally {
       await client.close();
     }
@@ -755,7 +845,10 @@ describe("connection invariants", () => {
         type: "remote",
       });
 
-      expect(client.connectionState()).toEqual({ local: "ready", remote: "starting" });
+      expect(client.connectionState()).toEqual({
+        local: { persistence: "durable", status: "ready" },
+        replication: { status: "starting" },
+      });
     } finally {
       await client.close();
     }
@@ -784,10 +877,10 @@ describe("connection invariants", () => {
       });
       emit?.({ at: 2, attempt: 1, generation: 1, sequence: 99, status: "offline", type: "remote" });
       emit?.({ at: 3, attempt: 1, generation: 2, sequence: 1, status: "offline", type: "remote" });
-      expect(client.connectionState().remote).toBe("connected");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "pending" });
 
       emit?.({ at: 4, attempt: 1, generation: 2, sequence: 2, status: "started", type: "remote" });
-      expect(client.connectionState().remote).toBe("connected");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "pending" });
     } finally {
       await client.close();
     }
@@ -839,9 +932,380 @@ describe("connection invariants", () => {
         },
         type: "remote",
       });
-      expect(client.connectionState().remote).toBe("connected");
+      expect(client.connectionState().replication).toEqual({ status: "online", sync: "pending" });
     } finally {
       await client.close();
     }
   });
+
+  test("publishes only changed nested connection snapshots and closes terminally", async () => {
+    let emit: ((event: EmbeddedEvent) => void) | undefined;
+    const runner = {
+      identity: { read: async () => undefined, write: async () => undefined },
+      remote: { identity: { read: async () => undefined } },
+      subscribeEvents: (listener: (event: EmbeddedEvent) => void) => {
+        emit = listener;
+        return () => undefined;
+      },
+    } as unknown as Runner;
+    const client = new EmbeddedClient({ eagerRunner: runner, remoteConfigured: true, runner });
+    const states: unknown[] = [];
+    const reported: unknown[] = [];
+    const reportError = globalThis.reportError;
+    Object.defineProperty(globalThis, "reportError", {
+      configurable: true,
+      value: (error: unknown) => reported.push(error),
+      writable: true,
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      emit?.({ at: 0, attempt: 0, status: "connected", type: "remote" });
+      const lateStates: unknown[] = [];
+      const stopLate = client.subscribeToConnectionState((state) => lateStates.push(state));
+      await Promise.resolve();
+      expect(lateStates).toEqual([]);
+      stopLate();
+
+      const stopThrowing = client.subscribeToConnectionState(() => {
+        throw new Error("listener failure");
+      });
+      const stop = client.subscribeToConnectionState((state) => states.push(state));
+
+      // No initial replay. Two semantic transitions in one turn coalesce to the latest snapshot.
+      emit?.({ at: 1, attempt: 1, status: "connected", type: "remote" });
+      emit?.({
+        at: 2,
+        attempt: 2,
+        status: "idle",
+        tick: remoteTickEventTick({
+          pending: {
+            checkpoints: 0,
+            inflight: 0,
+            mutations: 0,
+            scope: 0,
+            settlements: 0,
+            uploads: 0,
+          },
+        }),
+        type: "remote",
+      });
+      expect(states).toEqual([]);
+      await Promise.resolve();
+      expect(states).toEqual([
+        {
+          local: { persistence: "durable", status: "ready" },
+          replication: { status: "online", sync: "idle" },
+        },
+      ]);
+      expect(reported).toHaveLength(1);
+
+      // A structural duplicate does not notify, and unsubscription is idempotent.
+      emit?.({
+        at: 3,
+        attempt: 3,
+        status: "idle",
+        tick: remoteTickEventTick({
+          pending: {
+            checkpoints: 0,
+            inflight: 0,
+            mutations: 0,
+            scope: 0,
+            settlements: 0,
+            uploads: 0,
+          },
+        }),
+        type: "remote",
+      });
+      await Promise.resolve();
+      expect(states).toHaveLength(1);
+      stop();
+      stop();
+      stopThrowing();
+      await client.close();
+      await Promise.resolve();
+      expect(client.connectionState()).toEqual({
+        local: { status: "closed" },
+        replication: { status: "closed" },
+      });
+
+      let postCloseCalls = 0;
+      const stopPostClose = client.subscribeToConnectionState(() => {
+        postCloseCalls += 1;
+      });
+      emit?.({ at: 4, attempt: 4, status: "connected", type: "remote" });
+      await Promise.resolve();
+      expect(postCloseCalls).toBe(0);
+      stopPostClose();
+      stopPostClose();
+      expect(client.connectionState()).toEqual({
+        local: { status: "closed" },
+        replication: { status: "closed" },
+      });
+    } finally {
+      if (reportError === undefined) {
+        Reflect.deleteProperty(globalThis, "reportError");
+      } else {
+        Object.defineProperty(globalThis, "reportError", {
+          configurable: true,
+          value: reportError,
+          writable: true,
+        });
+      }
+      await client.close();
+    }
+  });
+
+  test("delivers terminal settlements only from the durable settlement vector", async () => {
+    const runner = {
+      identity: { read: async () => undefined, write: async () => undefined },
+      invalidate: () => undefined,
+      rerunResults: () => undefined,
+      subscribeEvents: () => () => undefined,
+    } as unknown as Runner;
+    const client = new EmbeddedClient({ eagerRunner: runner, runner });
+    const settlements: unknown[] = [];
+    const late: unknown[] = [];
+    const diagnostics: EmbeddedEvent[] = [];
+    const stop = client.subscribeToMutationSettlements((settlement) =>
+      settlements.push(settlement),
+    );
+    const stopDiagnostics = readDevtoolsBridge(client).subscribe((event) =>
+      diagnostics.push(event),
+    );
+    try {
+      await Promise.resolve();
+      const process = (
+        client as unknown as {
+          processRemoteTick(tick: RemoteTick, runner: Runner): void;
+        }
+      ).processRemoteTick.bind(client);
+
+      // Aggregate remote counters and rebases never manufacture a terminal settlement.
+      process({ ...emptyRemoteTick(), pushAccepted: 1, pushFailed: 1, pushRebases: 3 }, runner);
+      expect(settlements).toEqual([]);
+
+      process(
+        {
+          ...emptyRemoteTick(),
+          settlements: [
+            {
+              functionName: "todos:create",
+              mutationId: "m1",
+              outcome: "applied",
+              retainedRevisions: [],
+            },
+            {
+              code: "EMBEDDED_CONFLICT",
+              functionName: "todos:edit",
+              mutationId: "m2",
+              outcome: "conflict",
+              retainedRevisions: [{ id: "doc", revId: "r1", table: "todos" }],
+            },
+            {
+              code: "EMBEDDED_REJECTED",
+              functionName: "todos:remove",
+              mutationId: "m3",
+              outcome: "rejected",
+              retainedRevisions: [{ id: "doc", revId: "r2", table: "todos" }],
+            },
+          ] satisfies RemoteMutationSettlement[],
+        },
+        runner,
+      );
+      expect(settlements).toEqual([
+        { functionName: "todos:create", mutationId: "m1", outcome: "applied" },
+        {
+          code: "EMBEDDED_CONFLICT",
+          functionName: "todos:edit",
+          mutationId: "m2",
+          outcome: "conflict",
+          retainedRevisions: [{ id: "doc", revId: "r1", table: "todos" }],
+        },
+        {
+          code: "EMBEDDED_REJECTED",
+          functionName: "todos:remove",
+          mutationId: "m3",
+          outcome: "rejected",
+          retainedRevisions: [{ id: "doc", revId: "r2", table: "todos" }],
+        },
+      ]);
+      expect("retainedRevisions" in (settlements[0] as object)).toBe(false);
+      expect((settlements[1] as { code?: string }).code).toBe("EMBEDDED_CONFLICT");
+      expect("reason" in (settlements[2] as object)).toBe(false);
+      for (const event of diagnostics.filter(
+        (event): event is Extract<EmbeddedEvent, { type: "remote" }> => event.type === "remote",
+      )) {
+        expect("settlements" in event).toBe(false);
+        expect(event.tick === undefined || !("settlements" in event.tick)).toBe(true);
+      }
+
+      // Subscriptions are live-only and unsubscribe idempotently.
+      const stopLate = client.subscribeToMutationSettlements((settlement) => late.push(settlement));
+      expect(late).toEqual([]);
+      stop();
+      stop();
+      process(
+        {
+          ...emptyRemoteTick(),
+          settlements: [
+            {
+              functionName: "todos:next",
+              mutationId: "m4",
+              outcome: "applied",
+              retainedRevisions: [],
+            },
+          ],
+        },
+        runner,
+      );
+      expect(settlements).toHaveLength(3);
+      expect(late).toEqual([{ functionName: "todos:next", mutationId: "m4", outcome: "applied" }]);
+      stopLate();
+    } finally {
+      stopDiagnostics();
+      await client.close();
+    }
+  });
+
+  test("forwards a browser settlement vector only after its accepted remote event", async () => {
+    let emitEvent: ((event: EmbeddedEvent) => void) | undefined;
+    let emitSettlements:
+      | ((
+          event: Extract<EmbeddedEvent, { type: "remote" }>,
+          settlements: readonly RemoteMutationSettlement[],
+        ) => void)
+      | undefined;
+    const runner = {
+      identity: { read: async () => undefined, write: async () => undefined },
+      subscribeEvents: (listener: (event: EmbeddedEvent) => void) => {
+        emitEvent = listener;
+        return () => {
+          emitEvent = undefined;
+        };
+      },
+      subscribeRemoteSettlements: (
+        listener: (
+          event: Extract<EmbeddedEvent, { type: "remote" }>,
+          settlements: readonly RemoteMutationSettlement[],
+        ) => void,
+      ) => {
+        emitSettlements = listener;
+        return () => {
+          emitSettlements = undefined;
+        };
+      },
+    } as unknown as Runner;
+    const client = new EmbeddedClient({ eagerRunner: runner, remoteConfigured: true, runner });
+    const settlements: unknown[] = [];
+    const statesAtSettlement: unknown[] = [];
+    const stop = client.subscribeToMutationSettlements((settlement) =>
+      settlements.push(settlement),
+    );
+    const stopState = client.subscribeToMutationSettlements(() => {
+      statesAtSettlement.push(client.connectionState());
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const accepted = {
+        at: 1,
+        attempt: 1,
+        generation: 2,
+        sequence: 2,
+        status: "idle",
+        tick: remoteTickEventTick({
+          pending: {
+            checkpoints: 0,
+            inflight: 0,
+            mutations: 0,
+            scope: 0,
+            settlements: 0,
+            uploads: 0,
+          },
+        }),
+        type: "remote",
+      } satisfies Extract<EmbeddedEvent, { type: "remote" }>;
+      const vector = [
+        {
+          functionName: "todos:worker",
+          mutationId: "browser-m1",
+          outcome: "applied",
+          retainedRevisions: [],
+        },
+      ] satisfies RemoteMutationSettlement[];
+
+      // The proxy first passes the normal diagnostic event; the paired vector follows only after
+      // that event crossed the generation/sequence fence.
+      emitEvent?.(accepted);
+      emitSettlements?.(accepted, vector);
+      expect(settlements).toEqual([
+        { functionName: "todos:worker", mutationId: "browser-m1", outcome: "applied" },
+      ]);
+      expect(statesAtSettlement).toEqual([
+        {
+          local: { persistence: "durable", status: "ready" },
+          replication: { status: "online", sync: "idle" },
+        },
+      ]);
+
+      // A duplicate and an older generation may carry a vector on the wire, but neither can
+      // replay a previously delivered terminal settlement.
+      emitEvent?.(accepted);
+      emitSettlements?.(accepted, vector);
+      const stale = { ...accepted, generation: 1, sequence: 99 };
+      emitEvent?.(stale);
+      emitSettlements?.(stale, vector);
+      expect(settlements).toHaveLength(1);
+    } finally {
+      stop();
+      stopState();
+      await client.close();
+    }
+  });
 });
+
+function emptyRemoteTick(): RemoteTick {
+  return {
+    changedResults: [],
+    changedTables: [],
+    pullAttempted: 0,
+    pullChangesApplied: 0,
+    pullDiagnostics: 0,
+    pullSnapshots: 0,
+    pushAccepted: 0,
+    pushAttempted: 0,
+    pushConflicts: 0,
+    pushFailed: 0,
+    pushRebases: 0,
+    pushed: 0,
+    receiptsPushed: 0,
+    received: 0,
+    reconnected: false,
+    retainedRevisions: [],
+    rowsApplied: 0,
+    sent: 0,
+    settlements: [],
+    storeJobs: 0,
+  };
+}
+
+function remoteTickEventTick(
+  overrides: Partial<NonNullable<Extract<EmbeddedEvent, { type: "remote" }>["tick"]>>,
+): NonNullable<Extract<EmbeddedEvent, { type: "remote" }>["tick"]> {
+  return {
+    changedTables: [],
+    pullAttempted: 0,
+    pushAccepted: 0,
+    pushAttempted: 0,
+    pushConflicts: 0,
+    pushFailed: 0,
+    pushRebases: 0,
+    received: 0,
+    reconnected: false,
+    retainedRevisions: 0,
+    rowsApplied: 0,
+    sent: 0,
+    receiptsPushed: 0,
+    storeJobs: 0,
+    ...overrides,
+  } as NonNullable<Extract<EmbeddedEvent, { type: "remote" }>["tick"]>;
+}

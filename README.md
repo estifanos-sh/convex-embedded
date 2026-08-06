@@ -28,12 +28,15 @@ pnpm add @convex-dev/embedded@npm:@robelest/convex-embedded@<version> convex
 ```
 
 The `package preview` pull-request label publishes an ephemeral package assembled from JavaScript,
-WASM, five Node targets, both Apple XCFramework slices, and all four Android ABIs. The `npm package`
-label runs the same assembly and, after a versioned pull request merges, publishes the Robelest npm
-package with provenance. Manual prereleases use the same path: one source ref is resolved to an exact
-commit, all production adapters and the complete package are qualified at that commit, and only then
-is the release tag created and the npm package published. Neither path has credentials or a package
-identity capable of publishing `@convex-dev/embedded`.
+WASM, five Node targets, both Apple XCFramework slices, and all four Android ABIs. It is a GitHub
+release asset, not an npm publication.
+
+Every npm publication is an explicit `publish.yml` workflow dispatch. Select `prerelease` or
+`release`, provide the exact source commit, and provide a matching `robelest-v<version>` tag; for
+example, `robelest-v0.0.1-preview-3`. The workflow qualifies and assembles that one commit before it
+creates the tag and publishes the rewritten `@robelest/convex-embedded` tarball. The source manifest
+remains `@convex-dev/embedded@0.0.1`; only the assembled Robelest copy receives the release version.
+Neither path has credentials or a package identity capable of publishing `@convex-dev/embedded`.
 
 ## 1. Configure Convex
 
@@ -56,7 +59,7 @@ Create one Embedded server definition and export its protocol functions:
 import { defineEmbedded } from "@convex-dev/embedded/server";
 
 import { components } from "./_generated/api";
-import { embeddedManifest } from "./embedded.generated";
+import { embeddedManifest } from "./_generated/embedded";
 import schema from "./schema";
 
 export const embedded = defineEmbedded({
@@ -195,11 +198,9 @@ contain an `e.local` field. Search, vector, and staged indexes are supported on 
 only when they are hosted-only; the embedded store does not implement those index kinds.
 
 Device-only functions live in directories the app names with the bundler `local` option, use the
-`local` namespace, and are referenced by importing the function value directly. The bundler plugin
-registers the schema as the type source: `convex/embedded.generated.ts` carries a type-only
-`Register` augmentation binding the `local` builders to the schema's device data model, so every
-program that includes the lockfile is registered. The augmentation is erased at compile time and
-never deploys.
+app-bound `local` namespace from `convex/_generated/embedded`, and are referenced by importing the
+function value directly. The bundler plugin writes that generated contract from the schema, so the
+builders always use the application's device data model without a global module augmentation.
 
 ```ts
 // convex/schema.ts
@@ -209,7 +210,7 @@ export default schema;
 
 ```ts
 // local/preferences.ts — an ordinary TypeScript module
-import { local } from "@convex-dev/embedded/local";
+import { local } from "../convex/_generated/embedded";
 import { v } from "convex/values";
 
 export const setCompact = local.mutation({
@@ -286,15 +287,13 @@ some replicated subscription already delivered, publishes no subscription of its
 served from the server's retained answer, so re-sorting or re-paging a replicated list in one shows
 a list the server never returned.
 
-The build plugin writes `convex/embedded.generated.ts`, a small checked-in lockfile holding the
-function manifest, the identity hashes of the schema source and that manifest, and the type-only
-`Register` augmentation that binds the `local` builders to the schema. The device schema
-is not in it: every adapter analyzes the live schema and inlines the result into the virtual
-registry, so the file stays about a kilobyte. Its multi-dot name is load-bearing — the Convex CLI
-skips those modules, so the lockfile never deploys as a hosted function while `convex/embedded.ts`
-still imports `embeddedManifest` from it and esbuild bundles it into the deployment. Treat it like
-other generated Convex output: do not edit it by hand, and pass the imported schema to every bundler
-adapter so stale placement metadata cannot enter a device build.
+The build plugin writes `convex/_generated/embedded.ts`, a small checked-in contract holding the
+function manifest, identity hashes for the schema source and manifest, and the schema-bound `local`
+builders. Every adapter still analyzes the live schema and inlines the device storage schema into
+the virtual registry, so the contract stays small. Its `_generated` directory keeps it out of
+deployment discovery while `convex/embedded.ts` imports `embeddedManifest` for deployment. Treat it
+like other generated Convex output: do not edit it by hand, and run the configured bundler adapter
+after schema or function changes so stale placement metadata cannot enter a device build.
 
 ## Schema changes and migrations
 
@@ -414,12 +413,9 @@ ready and orchestrates ordinary internal local queries and mutations over device
 
 ```ts
 import { v } from "convex/values";
-import { defineLocal } from "@convex-dev/embedded/local";
 
-import schema from "../convex/schema";
+import { local } from "../convex/_generated/embedded";
 import { rewritePreferences } from "./preferences";
-
-const local = defineLocal(schema);
 
 export const setup = local.internalAction({
   args: {},
@@ -434,14 +430,76 @@ export const setup = local.internalAction({
 await client.open(setup);
 ```
 
+When setup must read a device table that the current schema removed, bind that helper to an
+explicit historical schema. The main generated `local` value remains bound to the current schema;
+`local.compatibility(legacySchema)` returns only internal, setup-only builders:
+
+```ts
+// local/setup.ts
+import { type GenericId, v } from "convex/values";
+
+import { local } from "../convex/_generated/embedded";
+import { legacySchema } from "./legacySchema";
+
+const legacy = local.compatibility(legacySchema);
+
+export const preferencesLegacyRead = legacy.internalQuery({
+  args: {},
+  handler: async (ctx) => await ctx.db.query("legacy_preferences").first(),
+});
+
+export const preferencesCurrentWrite = local.internalMutation({
+  args: { compact: v.boolean() },
+  handler: async (ctx, { compact }) => {
+    if ((await ctx.db.query("preferences").first()) === null) {
+      await ctx.db.insert("preferences", { compact });
+    }
+  },
+});
+
+export const preferencesLegacyDelete = legacy.internalMutation({
+  args: { id: v.id("legacy_preferences") },
+  handler: async (ctx, { id }) => {
+    await ctx.db.delete("legacy_preferences", id);
+  },
+});
+
+export const setup = local.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    const preference = (await ctx.runQuery(preferencesLegacyRead, {})) as {
+      _id: GenericId<"legacy_preferences">;
+      compact: boolean;
+    } | null;
+    if (preference !== null) {
+      await ctx.runMutation(preferencesCurrentWrite, { compact: preference.compact });
+      await ctx.runMutation(preferencesLegacyDelete, { id: preference._id });
+    }
+    return null;
+  },
+});
+```
+
+`legacySchema` is an ordinary `defineEmbeddedSchema` value that describes the historical table.
+Embedded includes it only in the unpublished setup workspace. Functions returned by
+`local.compatibility(...)` are private setup helpers: they can run through the setup action, but
+the active runner excludes and rejects them after cutover. They therefore cannot become a hidden
+long-lived API for removed tables. Every local registration dispatched with `ctx.runQuery` or
+`ctx.runMutation` must be a named export so the configured bundler can stamp and register it. A
+dropped table's originated rows must be explicitly deleted by
+an idempotent setup mutation after their replacement is written; otherwise final target validation
+fails and preserves the old active generation.
+
 `setup` must be an imported, bundled internal local action with empty arguments and a `null`
 result; callbacks, strings, server references, public actions, queries, and mutations are rejected.
 Each `ctx.runMutation` is a separate durable setup batch, so setup code must be idempotent and
 paginate instead of collecting an unbounded table. Setup runs unauthenticated and has no hosted
 function, scheduling, file-storage, nested-action, or raw-package-record context. It is still normal
 JavaScript, so avoid non-idempotent external side effects: Embedded cannot roll back a `fetch()` if
-the process dies afterward. A throw preserves the previously opened data; reopening with the same
-setup identity resumes and reruns the action.
+the process dies afterward. A throw preserves the previously opened data and terminally fails that
+client instance. Close it, construct a new client, and open with the same setup identity to resume
+and rerun the action.
 
 Pass the setup action in every build that may still need to execute or resume it. After it has
 completed on the supported device population, a later release may return to plain `open()`; the
@@ -493,16 +551,16 @@ The plugin options are relative to the Vite project root:
 ```ts
 convexEmbedded({
   convexDir: "convex",
-  generatedPath: "embedded.generated.ts",
+  generatedPath: "_generated/embedded.ts",
   local: "local",
   schema,
   schemaPath: "schema.ts",
 });
 ```
 
-`convexDir`, `generatedPath`, and `schemaPath` above are the defaults. Keep a multi-dot basename for
-`generatedPath` so the Convex CLI never deploys the lockfile as a function module. `schema` is
-required so every build rewrites and verifies the placement lockfile. `local` names the device-only directories — one path
+`convexDir`, `generatedPath`, and `schemaPath` above are the defaults. `generatedPath` lives under
+Convex's generated directory, so the CLI does not deploy it as a function module. `schema` is
+required so every build rewrites and verifies the generated contract. `local` names the device-only directories — one path
 or a list — and is omitted when the application has none. Files in `convex/` with a top-level `"use node"`
 directive are hosted-only and are intentionally excluded from the local registry.
 
@@ -591,7 +649,7 @@ module.exports = withConvexEmbedded(getDefaultConfig(__dirname), {
 });
 ```
 
-Metro analyzes `schema` and rewrites `convex/embedded.generated.ts` before materializing its
+Metro analyzes `schema` and rewrites `convex/_generated/embedded.ts` before materializing its
 registry, exactly as the Vite and Unplugin adapters do.
 
 Metro builds its registry when the configuration loads. Restart Metro after changing the schema or
@@ -648,8 +706,20 @@ const unsubscribe = watch.onUpdate(() => {
 
 console.log(client.connectionState());
 
+const stopConnectionState = client.subscribeToConnectionState((state) => {
+  console.log(state.local, state.replication);
+});
+
+const stopSettlements = client.subscribeToMutationSettlements((settlement) => {
+  if (settlement.outcome === "conflict") {
+    console.log("Mutation retained conflict revisions", settlement.retainedRevisions);
+  }
+});
+
 // During application teardown:
 unsubscribe();
+stopConnectionState();
+stopSettlements();
 await client.close();
 ```
 
@@ -657,6 +727,20 @@ The client also exposes `action`, `setAuth`, and `clearAuth`. Queries and mutati
 Convex function references; the bundler adapter decides which functions are safe to execute locally.
 Revisions are intentionally not a privileged client API. Clients call app-authored functions that
 authorize revision access.
+
+`connectionState()` is a frozen snapshot with independent `local` and `replication` branches.
+`local` moves through `idle`, `starting`, `ready`, `failed`, and `closed`; a ready branch also says
+whether persistence is `durable` or `temporary`. `replication` distinguishes disabled, starting,
+offline, online, error, and closed state, and an online branch says whether durable work is still
+pending. `subscribeToConnectionState()` is live-only and coalesces a burst of transitions into the
+latest snapshot.
+
+`subscribeToMutationSettlements()` is also live-only: it never replays an outcome that happened
+before subscription. A settlement is emitted only after the native store commits that terminal
+outcome. `applied` means the authoritative replay committed; `conflict` carries the closed
+`EMBEDDED_CONFLICT` code and exact retained revisions; `rejected` carries a closed
+`EMBEDDED_REJECTED` or `EMBEDDED_DIVERGENCE` code and any retained revisions. Internal rebase
+attempts and raw server rejection reasons are never exposed.
 
 Node applications import `ConvexEmbeddedClient` from `@convex-dev/embedded/node`. The Node entry
 does not need a browser bundler plugin or cross-origin isolation, but it does require a native binary
@@ -676,11 +760,11 @@ The browser client opens durable SQLite storage in OPFS when the browser allows 
 real open operation instead of inferring support from the user agent or the presence of
 `navigator.storage.getDirectory`.
 
-If the browser denies OPFS, the client opens the same SQLite schema with Turso's in-memory backend
-and emits a `runtime` event with `degradation: "temporary-storage"`. This occurs in current Safari
-and Firefox private browsing. Chromium supplies an in-memory filesystem for incognito profiles, so
-the OPFS path can still open there; Chromium deletes that profile storage when the incognito session
-ends.
+If the browser denies OPFS, the client opens the same SQLite schema with Turso's in-memory backend.
+The ready local connection state then reports `persistence: "temporary"`. This occurs in current
+Safari and Firefox private browsing. Chromium supplies an in-memory filesystem for incognito
+profiles, so the OPFS path can still open there; Chromium deletes that profile storage when the
+incognito session ends.
 
 Temporary storage lasts only as long as its worker context. A reload, tab discard, browser exit, or
 private-session close may erase local documents and unsent mutations. A configured remote can pull

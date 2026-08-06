@@ -13,6 +13,7 @@ import {
   convexValuesPath,
   hostedRemoteUrl,
   localEntryPath,
+  localInternalEntryPath,
 } from "../tests/bench/harness/paths.js";
 import { browserCommands } from "../tests/browser/harness/commands.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
@@ -50,7 +51,6 @@ export const browserProject = {
     convexEmbedded({
       convexDir: browserConvexDir,
       local: browserLocalDir,
-      registerSchema: false,
       schema,
     }),
     browserRuntimeLog(),
@@ -70,6 +70,7 @@ export const browserProject = {
     dedupe: ["solid-js"],
     alias: [
       { find: "@convex-dev/embedded/browser", replacement: browserDistPath },
+      { find: "@convex-dev/embedded/internal/local", replacement: localInternalEntryPath },
       { find: "@convex-dev/embedded/local", replacement: localEntryPath },
       { find: "convex/browser", replacement: convexBrowserPath },
       { find: "convex/server", replacement: convexServerPath },

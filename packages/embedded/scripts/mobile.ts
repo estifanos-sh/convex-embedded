@@ -112,23 +112,28 @@ interface AppleSlice {
 }
 
 function buildAndroid(): void {
-  verifyAndroidToolchain();
+  const ndk = androidNdk();
+  verifyAndroidToolchain(ndk);
   const abis = mobileSlices(androidAbis);
   const output = resolve(targetDir, "mobile-android");
   rmSync(output, { recursive: true, force: true });
-  exec("cargo", [
-    "ndk",
-    "--platform",
-    "24",
-    ...abis.flatMap((abi) => ["--target", abi]),
-    "--output-dir",
-    output,
-    "build",
-    "--package",
-    "mobile",
-    "--release",
-    "--locked",
-  ]);
+  exec(
+    "cargo",
+    [
+      "ndk",
+      "--platform",
+      "24",
+      ...abis.flatMap((abi) => ["--target", abi]),
+      "--output-dir",
+      output,
+      "build",
+      "--package",
+      "mobile",
+      "--release",
+      "--locked",
+    ],
+    { ANDROID_NDK_HOME: ndk, ANDROID_NDK_ROOT: ndk },
+  );
   for (const abi of abis) {
     const source = resolve(output, abi, "libconvex_embedded_mobile.so");
     const destination = resolve(nativeDir, "android", abi, "libconvex_embedded_mobile.so");
@@ -346,22 +351,25 @@ function verifyHeader(): void {
   }
 }
 
-function verifyAndroidToolchain(): void {
+function verifyAndroidToolchain(ndk = androidNdk()): void {
   const version = execText("cargo", ["ndk", "--version"]);
   if (!version.includes(cargoNdkVersion)) {
     throw new Error(`cargo-ndk ${cargoNdkVersion} is required; received ${version.trim()}`);
   }
-  const properties = readFileSync(resolve(androidNdk(), "source.properties"), "utf8");
+  const properties = readFileSync(resolve(ndk, "source.properties"), "utf8");
   if (!properties.includes(`Pkg.Revision = ${androidNdkVersion}`)) {
     throw new Error(`Android NDK ${androidNdkVersion} is required.`);
   }
 }
 
 function androidTool(name: "llvm-nm" | "llvm-readelf"): string {
-  if (!process.env.ANDROID_NDK_HOME && !process.env.ANDROID_NDK_ROOT) {
+  let ndk: string;
+  try {
+    ndk = androidNdk();
+  } catch {
     return name === "llvm-readelf" ? "readelf" : "nm";
   }
-  const roots = resolve(androidNdk(), "toolchains", "llvm", "prebuilt");
+  const roots = resolve(ndk, "toolchains", "llvm", "prebuilt");
   const hosts = readdirSync(roots).filter((entry) => !entry.startsWith("."));
   if (hosts.length !== 1) throw new Error(`Could not resolve ${name} from the Android NDK.`);
   const tool = resolve(roots, hosts[0], "bin", name);

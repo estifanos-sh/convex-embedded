@@ -23,16 +23,19 @@ export function documentStatus(
   if (state === "recovered") return status("Recovered", "warning", true);
   if (state === "saving") return status("Saving", "progress", true);
 
-  if (connection.remote === "ready") return status("Synced", "success", false);
-  if (connection.remote === "connected") return status("Syncing", "progress", true);
-  if (connection.remote === "starting") return status("Connecting", "progress", true);
-  if (connection.remote === "offline" || connection.remote === "closed") {
+  const replication = connection.replication;
+  if (replication.status === "online" && replication.sync === "idle") {
+    return status("Synced", "success", false);
+  }
+  if (replication.status === "online") return status("Syncing", "progress", true);
+  if (replication.status === "starting") return status("Connecting", "progress", true);
+  if (replication.status === "offline" || replication.status === "closed") {
     return status("Saved offline", "warning", true);
   }
-  if (connection.remote === "error") {
+  if (replication.status === "error") {
     return {
       ...status("Sync error", "error", true),
-      accessibilityLabel: `Sync error: ${connection.remoteError}`,
+      accessibilityLabel: `Sync error: ${replication.error.message}`,
     };
   }
   return status("Saved", "success", false);

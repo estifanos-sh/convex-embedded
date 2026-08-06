@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vite-plus/test";
 
-import type { EmbeddedEvent } from "../../src/events";
+import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import { WorkerRunner } from "../../src/browser/proxy";
 import { WorkerEvent, type EmbeddedWorker } from "../../src/browser/protocol";
 
@@ -38,6 +38,66 @@ function fakeWorker(): FakeWorker {
 }
 
 describe("worker runner death surfacing", () => {
+  test("forwards an exact terminal settlement vector only through the private worker transport", () => {
+    const worker = fakeWorker();
+    const runner = new WorkerRunner(worker);
+    const diagnostics: EmbeddedEvent[] = [];
+    const settlements: unknown[] = [];
+    runner.subscribeEvents((event) => diagnostics.push(event));
+    runner.subscribeRemoteSettlements((event, next) => {
+      expect(event).toBe(diagnostics[0]);
+      settlements.push(...next);
+    });
+
+    worker.emit("message", {
+      data: {
+        event: {
+          at: 1,
+          attempt: 1,
+          status: "idle",
+          tick: {
+            changedTables: [],
+            pullAttempted: 0,
+            pushAccepted: 0,
+            pushAttempted: 0,
+            pushConflicts: 0,
+            pushFailed: 0,
+            pushRebases: 0,
+            pushed: 0,
+            received: 0,
+            reconnected: false,
+            retainedRevisions: 0,
+            rowsApplied: 0,
+            sent: 0,
+            receiptsPushed: 0,
+            storeJobs: 0,
+          },
+          type: "remote",
+        },
+        op: WorkerEvent.Event,
+        settlements: [
+          {
+            functionName: "todos:create",
+            mutationId: "worker-settlement",
+            outcome: "applied",
+            retainedRevisions: [],
+          },
+        ],
+      },
+    });
+
+    expect(diagnostics).toHaveLength(1);
+    expect("settlements" in diagnostics[0]!).toBe(false);
+    expect(settlements).toEqual([
+      {
+        functionName: "todos:create",
+        mutationId: "worker-settlement",
+        outcome: "applied",
+        retainedRevisions: [],
+      },
+    ]);
+  });
+
   test("releases external ownership whenever the runner is disposed", () => {
     const worker = fakeWorker();
     let releases = 0;

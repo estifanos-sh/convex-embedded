@@ -3,7 +3,7 @@ import { normalizeStorageError } from "../error";
 import {
   assertNoPendingCommitTs,
   hasPendingCommitTs,
-  resolveKnownPendingCommitTs,
+  knownPendingCommitTsRead,
 } from "../runtime/pending";
 import {
   applyQueuedMutationPolicyStep,
@@ -1678,7 +1678,7 @@ function toBindingColValues(cols: ColValues, pending?: () => void): BindingColVa
 function resolveBatchCommitTs(batch: WriteBatch, timestamp: bigint): void {
   for (const write of batch.docWrites) {
     if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.data)) continue;
-    write.data = resolveKnownPendingCommitTs(write.data, timestamp);
+    write.data = knownPendingCommitTsRead(write.data, timestamp);
     if (Array.isArray(write.cols)) {
       for (const entry of write.cols) {
         if (isPendingCommitTsColumn(entry[1])) entry[1] = timestamp;
@@ -1692,7 +1692,7 @@ function resolveBatchCommitTs(batch: WriteBatch, timestamp: bigint): void {
   }
   for (const write of batch.localFieldWrites ?? []) {
     if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.value)) continue;
-    write.value = resolveKnownPendingCommitTs(write.value, timestamp);
+    write.value = knownPendingCommitTsRead(write.value, timestamp);
     delete write.pendingCommitTs;
   }
   delete batch.pendingCommitTs;

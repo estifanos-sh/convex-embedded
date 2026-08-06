@@ -6,7 +6,8 @@ import { type DataModelFromSchemaDefinition, makeFunctionReference } from "conve
 import { v } from "convex/values";
 import { describe, expect, test } from "vite-plus/test";
 
-import { EmbeddedClient, type EmbeddedClientDebugSnapshot } from "../../src/client";
+import { EmbeddedClient } from "../../src/client";
+import { readDevtoolsBridge } from "../../src/devtools/bridge";
 import { createConvexEmbeddedClientForTest } from "../../src/node/client";
 import { NativeStore } from "../../src/node/native";
 import type { Runner } from "../../src/runtime/runner";
@@ -17,7 +18,7 @@ import {
 import { defineFunctions } from "../../src/runtime/functions";
 import type { StoreBinding } from "../../src/storage/binding";
 import type { RemoteSurface, RemoteTick } from "../../src/storage/types";
-import { defineLocal, stampLocal } from "../../src/local";
+import { defineLocal, stampLocal } from "../../src/local/internal";
 import {
   defineEmbeddedSchema,
   localTable,
@@ -25,6 +26,7 @@ import {
   toRuntimeStoreSchema,
 } from "../../src/schema";
 import { hashValue } from "../../src/hash";
+import { getTimerTime } from "../../src/time";
 import { nativeModule } from "../testkit/native";
 
 const schema = defineEmbeddedSchema({
@@ -169,6 +171,67 @@ const narrowedSetup = narrowedDevice.internalAction({
 const narrowedSetupModule = { narrowedSetup };
 stampLocal("local/narrowed", "setup-graph-narrowed", narrowedSetupModule);
 
+const legacyPreferencesSchema = defineEmbeddedSchema({
+  legacy_preferences: localTable({ compact: v.boolean() }),
+});
+const legacyPreferences = defineLocal(legacyPreferencesSchema);
+const writeLegacyPreference = legacyPreferences.mutation({
+  args: { compact: v.boolean() },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.insert("legacy_preferences", { compact: args.compact });
+    return null;
+  },
+});
+const legacyPreferencesModule = { writeLegacyPreference };
+stampLocal("local/legacy", "legacy-preferences-v1", legacyPreferencesModule);
+
+const historicalPreferences = device.compatibility(legacyPreferencesSchema);
+export const readLegacyPreferences = historicalPreferences.internalQuery({
+  args: {},
+  handler: async (ctx) => await ctx.db.query("legacy_preferences").first(),
+});
+export const deleteLegacyPreference = historicalPreferences.internalMutation({
+  args: { id: v.id("legacy_preferences") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.delete("legacy_preferences", args.id);
+    return null;
+  },
+});
+export const writeCurrentPreference = device.internalMutation({
+  args: { compact: v.boolean() },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    if ((await ctx.db.query("preferences").first()) === null) {
+      await ctx.db.insert("preferences", { compact: args.compact });
+    }
+    return null;
+  },
+});
+export const migrateDroppedPreferences = device.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    const preference = (await ctx.runQuery(readLegacyPreferences, {})) as {
+      _id: string;
+      compact: boolean;
+    } | null;
+    if (preference !== null) {
+      await ctx.runMutation(writeCurrentPreference, { compact: preference.compact });
+      await ctx.runMutation(deleteLegacyPreference, { id: preference._id });
+    }
+    return null;
+  },
+});
+const droppedPreferencesModule = {
+  deleteLegacyPreference,
+  migrateDroppedPreferences,
+  readLegacyPreferences,
+  writeCurrentPreference,
+};
+stampLocal("local/upgrade", "dropped-preferences-v2", droppedPreferencesModule);
+
 describe("v5 embedded client", () => {
   test("does not acquire the runtime and rejects operations before explicit open", async () => {
     const path = join(tmpdir(), `convex-embedded-v5-not-open-${crypto.randomUUID()}.sqlite3`);
@@ -177,7 +240,10 @@ describe("v5 embedded client", () => {
       nativeModule(),
     );
     try {
-      expect(client.connectionState()).toMatchObject({ local: "idle", remote: "disabled" });
+      expect(client.connectionState()).toMatchObject({
+        local: { status: "idle" },
+        replication: { status: "disabled" },
+      });
       await expect(client.query(list, { channel: "general" })).rejects.toMatchObject({
         code: "EMBEDDED_NOT_OPEN",
       });
@@ -318,6 +384,81 @@ describe("v5 embedded client", () => {
       }
     } finally {
       await first.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("moves a removed local table through a setup-only compatibility helper", async () => {
+    const path = join(tmpdir(), `convex-embedded-v5-dropped-table-${crypto.randomUUID()}.sqlite3`);
+    const native = nativeModule();
+    const original = createConvexEmbeddedClientForTest(
+      {
+        schema: legacyPreferencesSchema,
+        modules: {},
+        local: { legacy: async () => legacyPreferencesModule },
+        path,
+      },
+      native,
+    );
+    try {
+      await original.open();
+      await original.mutation(writeLegacyPreference, { compact: true });
+      await original.close();
+
+      const upgraded = createConvexEmbeddedClientForTest(
+        {
+          schema,
+          modules: { messages: modules },
+          local: {
+            prefs: async () => prefs,
+            upgrade: async () => droppedPreferencesModule,
+          },
+          path,
+        },
+        native,
+      );
+      try {
+        await upgraded.open(migrateDroppedPreferences);
+        await expect(upgraded.query(prefs.readCompact, {})).resolves.toEqual([true]);
+        await expect(
+          // @ts-expect-error Historical helpers are never part of the active client surface.
+          upgraded.query(readLegacyPreferences, {}),
+        ).rejects.toThrow("local/upgrade:readLegacyPreferences is setup-only");
+      } finally {
+        await upgraded.close();
+      }
+    } finally {
+      await original.close();
+      rmSync(path, { force: true });
+    }
+  });
+
+  test("plain open ignores setup-only compatibility helpers", async () => {
+    const path = join(
+      tmpdir(),
+      `convex-embedded-v5-plain-compatibility-${crypto.randomUUID()}.sqlite3`,
+    );
+    const client = createConvexEmbeddedClientForTest(
+      {
+        schema,
+        modules: { messages: modules },
+        local: {
+          prefs: async () => prefs,
+          upgrade: async () => droppedPreferencesModule,
+        },
+        path,
+      },
+      nativeModule(),
+    );
+    try {
+      await expect(client.open()).resolves.toBeUndefined();
+      await expect(client.query(prefs.readCompact, {})).resolves.toEqual([]);
+      await expect(
+        // @ts-expect-error Historical helpers are never part of the active client surface.
+        client.query(readLegacyPreferences, {}),
+      ).rejects.toThrow("local/upgrade:readLegacyPreferences is setup-only");
+    } finally {
+      await client.close();
       rmSync(path, { force: true });
     }
   });
@@ -468,7 +609,7 @@ describe("v5 embedded client", () => {
     }
   });
 
-  test("keeps the published generation unchanged when setup throws after a durable batch", async () => {
+  test("keeps the published generation unchanged and makes a failed setup open terminal", async () => {
     const path = join(tmpdir(), `convex-embedded-v5-setup-failure-${crypto.randomUUID()}.sqlite3`);
     const native = nativeModule();
     const baselineOptions = {
@@ -489,6 +630,9 @@ describe("v5 embedded client", () => {
           local: { failing: async () => failingSetupModule },
         },
         native,
+      );
+      await expect(failing.open(writeThenFail)).rejects.toThrow(
+        "setup failed after a durable batch",
       );
       await expect(failing.open(writeThenFail)).rejects.toThrow(
         "setup failed after a durable batch",
@@ -668,7 +812,10 @@ describe("v5 embedded client local-first remote start", () => {
     try {
       await expect(client.query(list, { channel: "general" })).resolves.toEqual([]);
       expect(control.startCalls()).toBe(1);
-      expect(client.connectionState()).toMatchObject({ local: "ready", remote: "starting" });
+      expect(client.connectionState()).toMatchObject({
+        local: { status: "ready" },
+        replication: { status: "starting" },
+      });
     } finally {
       control.resolveStart();
       await client.close();
@@ -682,15 +829,17 @@ describe("v5 embedded client local-first remote start", () => {
     try {
       await expect(client.query(list, { channel: "general" })).resolves.toEqual([]);
       control.rejectStart(new Error("handshake refused"));
-      const deadline = Date.now() + 2_000;
-      while (client.connectionState().remote !== "error" && Date.now() < deadline) {
+      const deadline = getTimerTime() + 2_000;
+      while (client.connectionState().replication.status !== "error" && getTimerTime() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
       const state = client.connectionState();
-      expect(state.remote).toBe("error");
-      if (state.remote === "error") expect(state.remoteError).toContain("handshake refused");
+      expect(state.replication.status).toBe("error");
+      if (state.replication.status === "error") {
+        expect(state.replication.error.message).toContain("handshake refused");
+      }
       await expect(client.query(list, { channel: "general" })).resolves.toEqual([]);
-      expect(client.connectionState().local).toBe("ready");
+      expect(client.connectionState().local.status).toBe("ready");
     } finally {
       await client.close();
       rmSync(path, { force: true });
@@ -706,7 +855,7 @@ describe("v5 embedded client local-first remote start", () => {
       const closing = client.close();
       control.resolveStart();
       await closing;
-      expect(client.connectionState().local).toBe("closed");
+      expect(client.connectionState().local.status).toBe("closed");
       expect(control.startCalls()).toBe(1);
     } finally {
       rmSync(path, { force: true });
@@ -726,7 +875,7 @@ describe("v5 embedded client local-first remote start", () => {
       ]);
       expect(outcome).toBe("closed");
       await closing;
-      expect(client.connectionState().local).toBe("closed");
+      expect(client.connectionState().local.status).toBe("closed");
     } finally {
       rmSync(path, { force: true });
     }
@@ -738,7 +887,7 @@ describe("v5 embedded client local-first remote start", () => {
     try {
       await expect(client.query(list, { channel: "general" })).resolves.toEqual([]);
       control.rejectStart(new Error("handshake refused"));
-      await waitUntil(() => client.connectionState().remote === "error");
+      await waitUntil(() => client.connectionState().replication.status === "error");
       await expect(client.close()).resolves.toBeUndefined();
     } finally {
       rmSync(path, { force: true });
@@ -753,11 +902,11 @@ describe("v5 embedded client local-first remote start", () => {
       const { client, path } = await createRemoteClient("recover", control.remote);
       try {
         await expect(client.query(list, { channel: "general" })).resolves.toEqual([]);
-        await waitUntil(() => client.connectionState().remote === "error");
+        await waitUntil(() => client.connectionState().replication.status === "error");
         expect(control.startCalls()).toBe(1);
         await waitUntil(() => control.startCalls() >= 2, 12_000);
         await waitUntil(() => control.pullCalls() >= 1, 12_000);
-        await waitUntil(() => client.connectionState().remote !== "error", 12_000);
+        await waitUntil(() => client.connectionState().replication.status !== "error", 12_000);
       } finally {
         await client.close();
         rmSync(path, { force: true });
@@ -783,9 +932,7 @@ function prebuiltRunner(localConfigured: boolean): Runner {
 }
 
 function devtoolsQueries(client: EmbeddedClient): Array<{ key: string; name: string }> {
-  const snapshot = (
-    client as unknown as { __devtoolsSnapshot(): EmbeddedClientDebugSnapshot }
-  ).__devtoolsSnapshot();
+  const snapshot = readDevtoolsBridge(client).snapshot();
   return snapshot.queries.map((query) => ({ key: query.key, name: query.name }));
 }
 
@@ -904,9 +1051,9 @@ function recoverableRemote(firstError: unknown): {
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = getTimerTime() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error("waitUntil condition was not met in time");
+    if (getTimerTime() >= deadline) throw new Error("waitUntil condition was not met in time");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
@@ -929,6 +1076,7 @@ function emptyTick(): RemoteTick {
     received: 0,
     reconnected: false,
     retainedRevisions: [],
+    settlements: [],
     rowsApplied: 0,
     sent: 0,
     storeJobs: 0,

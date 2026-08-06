@@ -135,6 +135,39 @@ fn complete_queue_policy(store: &EmbeddedStore, generation: i64, policy: &str) {
     }
 }
 
+fn retry_wounded_disposition_write(store: &EmbeddedStore, generation: i64) {
+    let device = store
+        .origin_page_read(generation, None, 1_000)
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|record| record.kind == OriginKind::DeviceDocument as i64)
+        .unwrap();
+    fail_next_commit();
+    assert!(store
+        .migration_record_disposition_write(
+            generation,
+            &device.identity_key,
+            device.kind,
+            &device.record_key,
+            "wound-matrix",
+            "test quarantine",
+            false,
+        )
+        .is_err());
+    store
+        .migration_record_disposition_write(
+            generation,
+            &device.identity_key,
+            device.kind,
+            &device.record_key,
+            "wound-matrix",
+            "test quarantine",
+            false,
+        )
+        .unwrap();
+}
+
 fn commit_candidate(
     store: &EmbeddedStore,
     schema: &StoreSchema,
@@ -146,6 +179,37 @@ fn commit_candidate(
         r#"{"collectComplete":true,"thresholds":[]}"#,
     );
     store.migration_commit(schema, generation)
+}
+
+fn write_remote_view(store: &EmbeddedStore, local_id: &str, server_id: &str, result: &ResultEntry) {
+    store
+        .remote_page_write(&storage::RemotePageWrite {
+            subscription: "issues:list:{}".to_owned(),
+            members: vec![storage::RemoteMember {
+                table: "issues".to_owned(),
+                server_document_id: server_id.to_owned(),
+            }],
+            projections: vec![storage::AuthoritativeRow {
+                table: "issues".to_owned(),
+                local_document_id: Some(local_id.to_owned()),
+                server_document_id: server_id.to_owned(),
+                plain_hash: "plain:remote".to_owned(),
+                projection_hash: "projection:remote".to_owned(),
+                current_root_id: Some("root:remote".to_owned()),
+                current_node_id: Some("node:remote".to_owned()),
+                row: Some(format!(
+                    r#"{{"_id":"{server_id}","_creationTime":1,"value":"offline"}}"#
+                )),
+                logical_clock: Some(7.0),
+                received_time: 100,
+            }],
+            crdt: vec![],
+            blobs: vec![],
+            cursor: Some("cursor:remote".to_owned()),
+            received_time: 100,
+            result: Some(Box::new(result.clone())),
+        })
+        .unwrap();
 }
 
 #[test]
@@ -175,34 +239,7 @@ fn remote_authoritative_view_survives_candidate_cutover_without_network() {
         skeleton_hash: "skeleton:issues:list".to_owned(),
         clock: 7.0,
     };
-    store
-        .remote_page_write(&storage::RemotePageWrite {
-            subscription: "issues:list:{}".to_owned(),
-            members: vec![storage::RemoteMember {
-                table: "issues".to_owned(),
-                server_document_id: server_id.to_owned(),
-            }],
-            projections: vec![storage::AuthoritativeRow {
-                table: "issues".to_owned(),
-                local_document_id: Some(local_id.to_owned()),
-                server_document_id: server_id.to_owned(),
-                plain_hash: "plain:remote".to_owned(),
-                projection_hash: "projection:remote".to_owned(),
-                current_root_id: Some("root:remote".to_owned()),
-                current_node_id: Some("node:remote".to_owned()),
-                row: Some(format!(
-                    r#"{{"_id":"{server_id}","_creationTime":1,"value":"offline"}}"#
-                )),
-                logical_clock: Some(7.0),
-                received_time: 100,
-            }],
-            crdt: vec![],
-            blobs: vec![],
-            cursor: Some("cursor:remote".to_owned()),
-            received_time: 100,
-            result: Some(Box::new(result.clone())),
-        })
-        .unwrap();
+    write_remote_view(&store, local_id, server_id, &result);
 
     let source = store.origin_page_read(1, None, 1_000).unwrap();
     for kind in 14..=17 {
@@ -1262,36 +1299,7 @@ fn every_candidate_transaction_is_retryable_across_deterministic_commit_wounds()
         r#"{"collectComplete":true,"thresholds":[],"cursor":null}"#,
     );
 
-    let device = store
-        .origin_page_read(generation, None, 1_000)
-        .unwrap()
-        .records
-        .into_iter()
-        .find(|record| record.kind == OriginKind::DeviceDocument as i64)
-        .unwrap();
-    fail_next_commit();
-    assert!(store
-        .migration_record_disposition_write(
-            generation,
-            &device.identity_key,
-            device.kind,
-            &device.record_key,
-            "wound-matrix",
-            "test quarantine",
-            false,
-        )
-        .is_err());
-    store
-        .migration_record_disposition_write(
-            generation,
-            &device.identity_key,
-            device.kind,
-            &device.record_key,
-            "wound-matrix",
-            "test quarantine",
-            false,
-        )
-        .unwrap();
+    retry_wounded_disposition_write(&store, generation);
 
     store.migration_bind_prepare(&target, generation).unwrap();
     while !store.migration_materialize_step(generation).unwrap().done {}

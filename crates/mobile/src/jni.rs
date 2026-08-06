@@ -1,3 +1,8 @@
+#![allow(
+    unreachable_pub,
+    reason = "Android resolves these exported JNI entry points by their stable symbol names"
+)]
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use jni::{

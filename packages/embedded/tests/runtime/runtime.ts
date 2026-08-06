@@ -17,7 +17,7 @@ import { describe, expect, test } from "vite-plus/test";
 
 import type {
   EmbeddedDataEvent,
-  EmbeddedEvent,
+  DiagnosticEvent as EmbeddedEvent,
   EmbeddedSchedulerEvent,
   EmbeddedStorageEvent,
   EmbeddedDataWrite,
@@ -42,8 +42,8 @@ import { decode, decodeError, encode, encodeError } from "../../src/runtime/code
 import {
   commitTsPlaceholder,
   hasPendingCommitTs,
-  resolveKnownPendingCommitTs,
-  resolvePendingCommitTs,
+  knownPendingCommitTsRead,
+  pendingCommitTsRead,
 } from "../../src/runtime/pending";
 import { defineFunctions } from "../../src/runtime/functions";
 import { seedEntropy, withEntropy } from "../../src/entropy";
@@ -966,7 +966,7 @@ class FakeStorage implements RuntimeStorage {
     if (commitTs !== undefined && options !== undefined) {
       for (const write of batch.docWrites) {
         if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.data)) continue;
-        write.data = resolveKnownPendingCommitTs(write.data, commitTs);
+        write.data = knownPendingCommitTsRead(write.data, commitTs);
         const entries = Array.isArray(write.cols) ? write.cols : Object.entries(write.cols);
         for (const [name, value] of entries) {
           if (typeof value !== "object" || value?.kind !== "commitTs") continue;
@@ -980,7 +980,7 @@ class FakeStorage implements RuntimeStorage {
       }
       for (const write of batch.localFieldWrites ?? []) {
         if (write.pendingCommitTs !== true && !hasPendingCommitTs(write.value)) continue;
-        write.value = resolveKnownPendingCommitTs(write.value, commitTs);
+        write.value = knownPendingCommitTsRead(write.value, commitTs);
       }
       if (
         options.source === "local" &&
@@ -990,7 +990,7 @@ class FakeStorage implements RuntimeStorage {
         options.mutationResult !== undefined
       ) {
         options.mutationResult = encode(
-          resolvePendingCommitTs(decode(options.mutationResult), commitTs),
+          pendingCommitTsRead(decode(options.mutationResult), commitTs),
         );
       }
       if (

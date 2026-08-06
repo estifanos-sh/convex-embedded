@@ -16,6 +16,7 @@ export function fixtureRemoteUrl(): string {
 export { fixtureAdminKey };
 
 /** Refuses to run remote mutations against an application deployment lacking the fixture API. */
+// fallow-ignore-next-line unused-export -- Vite loads this default export through globalSetup.
 export default async function setup(): Promise<void> {
   const url = fixtureRemoteUrl();
   const contract = makeFunctionReference<

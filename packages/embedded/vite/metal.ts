@@ -12,6 +12,7 @@ import {
   convexValuesPath,
   hostedDeployment,
   hostedRemoteUrl,
+  localInternalEntryPath,
   metalConvexDir,
 } from "../tests/bench/harness/paths.js";
 import { browserRuntimeLog } from "../tests/browser/harness/log.js";
@@ -52,13 +53,11 @@ export const metalProject = {
     ),
     __CONVEX_EMBEDDED_METAL_BENCH_TIMEOUT_MS__: JSON.stringify(Math.min(300_000, bench.timeoutMs)),
   },
-  plugins: [
-    convexEmbedded({ convexDir: metalConvexDir, registerSchema: false, schema }),
-    browserRuntimeLog(),
-  ],
+  plugins: [convexEmbedded({ convexDir: metalConvexDir, schema }), browserRuntimeLog()],
   resolve: {
     alias: [
       { find: "@convex-dev/embedded/browser", replacement: browserDistPath },
+      { find: "@convex-dev/embedded/internal/local", replacement: localInternalEntryPath },
       { find: "convex/browser", replacement: convexBrowserPath },
       { find: "convex/server", replacement: convexServerPath },
       { find: "convex/values", replacement: convexValuesPath },

@@ -1,4 +1,4 @@
-import type { EmbeddedEventListener } from "../../events";
+import type { DiagnosticEventListener } from "../../events";
 import type { FileMetadata, FileStore, RuntimeStorageWriter } from "../../storage/types";
 import { getTimerTime } from "../../time";
 import { createUploadUrl, readUploadToken } from "../../upload";
@@ -35,14 +35,14 @@ export function createStorageService(
   uploadUrls: Map<string, UploadUrl>,
   objectUrls: Map<string, string>,
   mode: "reader",
-  emit: EmbeddedEventListener,
+  emit: DiagnosticEventListener,
 ): StorageReaderService;
 export function createStorageService(
   store: RuntimeStorageWriter,
   uploadUrls: Map<string, UploadUrl>,
   objectUrls: Map<string, string>,
   mode: "writer",
-  emit: EmbeddedEventListener,
+  emit: DiagnosticEventListener,
   generatedUploadUrls?: string[],
 ): StorageWriterService;
 export function createStorageService(
@@ -50,14 +50,14 @@ export function createStorageService(
   uploadUrls: Map<string, UploadUrl>,
   objectUrls: Map<string, string>,
   mode: "action",
-  emit: EmbeddedEventListener,
+  emit: DiagnosticEventListener,
 ): StorageActionService;
 export function createStorageService(
   store: RuntimeStorageWriter,
   uploadUrls: Map<string, UploadUrl>,
   objectUrls: Map<string, string>,
   mode: "reader" | "writer" | "action",
-  emit: EmbeddedEventListener,
+  emit: DiagnosticEventListener,
   generatedUploadUrls?: string[],
 ): StorageReaderService | StorageWriterService | StorageActionService {
   const service = fullStore(store);

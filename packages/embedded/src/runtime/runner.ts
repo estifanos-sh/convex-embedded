@@ -13,6 +13,7 @@ import type {
   DirtyHeadDebug,
   OneDocWriteCommit,
   RemoteIdentity,
+  RemoteMutationSettlement,
   RemoteScope,
   RemoteSubscription,
   RuntimeStorageWriter,
@@ -22,8 +23,9 @@ import type {
   WriteBatch,
 } from "../storage/types";
 import type {
-  EmbeddedEvent,
-  EmbeddedEventListener,
+  DiagnosticEvent,
+  DiagnosticEventListener,
+  EmbeddedRemoteEvent,
   EmbeddedMutationTiming,
   EmbeddedSpanEvent,
 } from "../events";
@@ -38,7 +40,7 @@ import {
   type ValidatorIdValue,
 } from "../id/path";
 import { EmbeddedUnsupportedError } from "../error";
-import { EMBEDDED_LOCAL_REFERENCE } from "../local";
+import { isLocalFunction, isLocalSetupOnly, stampLocal } from "../local/internal";
 import { normalizeMutationResult } from "../result";
 import { embeddedComponentModules } from "../component/local";
 import { embeddedComponentStoreSchema } from "../schema";
@@ -53,7 +55,7 @@ import {
   equals,
   normalizeCopy,
 } from "./codec";
-import { assertNoPendingCommitTs, hasPendingCommitTs, resolvePendingCommitTs } from "./pending";
+import { assertNoPendingCommitTs, hasPendingCommitTs, pendingCommitTsRead } from "./pending";
 import { pageCursorBoundary } from "./query";
 import {
   createReadAuthority,
@@ -81,6 +83,7 @@ import {
   type ComponentInstancePath,
 } from "./components";
 import type { FunctionPlacement, FunctionReference, RegisteredFunction } from "./functions";
+import type { RunnerMode } from "./mode";
 import type { BaseVersion, ReadBound, ReadTracker } from "./query";
 import { validateFields, validateJson, validateValue } from "./validate";
 import { emitCommit, emitDeletes } from "./emit";
@@ -222,10 +225,12 @@ export interface RunOptions {
 /** Options for the local Convex runner. @internal */
 export interface RunnerOptions {
   deferNotify?(this: void, run: () => void): void;
-  emit?: EmbeddedEventListener;
+  emit?: DiagnosticEventListener;
   hasEventListeners?(): boolean;
   /** Device-only modules imported eagerly during runner construction. */
   localModules?: LocalModuleMap;
+  /** Candidate setup admits historical helpers; the published runner excludes them. */
+  mode?: RunnerMode;
   moduleGraphHash?: string;
   /** Trusted build-time placement metadata, including hosted-only functions. */
   manifest?: RuntimeFunctionManifest;
@@ -395,7 +400,14 @@ export interface Runner {
       subscribe(listener: () => void): StopOnUpdate;
     };
   };
-  subscribeEvents?(listener: EmbeddedEventListener): StopOnUpdate;
+  subscribeEvents?(listener: DiagnosticEventListener): StopOnUpdate;
+  /** Browser-worker-only terminal settlement transport; never exposed by the public client. */
+  subscribeRemoteSettlements?(
+    listener: (
+      event: EmbeddedRemoteEvent,
+      settlements: readonly RemoteMutationSettlement[],
+    ) => void,
+  ): StopOnUpdate;
   onUpdate(
     ref: FunctionReference,
     args: Record<string, unknown>,
@@ -668,15 +680,21 @@ export function createRunner(
   const moduleCache = new Map<string, Promise<ModuleExports>>();
   const functionCache = new Map<string, Promise<RunnableFunction>>();
   const localFunctions = new Map<string, RunnableFunction>();
+  const setupOnlyLocalFunctions = new Set<string>();
   const localConfigured = Object.keys(options.localModules ?? {}).length > 0;
   const localReady = options.localModules
-    ? ingestLocalModules(options.localModules, localFunctions)
+    ? ingestLocalModules(
+        options.localModules,
+        localFunctions,
+        setupOnlyLocalFunctions,
+        options.mode ?? "active",
+      )
     : undefined;
   if (localReady) void localReady.catch(() => undefined);
   const watchers = new Map<string, Watcher>();
   const uploadUrls = new Map<string, UploadUrl>();
   const objectUrls = new Map<string, string>();
-  const eventListeners = new Set<EmbeddedEventListener>();
+  const eventListeners = new Set<DiagnosticEventListener>();
   const remoteWakeListeners = new Set<() => void>();
   let nextSpanId = 1;
   let mutationQueue: Promise<void> | null = null;
@@ -698,7 +716,7 @@ export function createRunner(
     options.hasEventListeners?.() === true ||
     (options.hasEventListeners === undefined && options.emit !== undefined);
 
-  const emit = (event: EmbeddedEvent): void => {
+  const emit = (event: DiagnosticEvent): void => {
     if (!hasEventListeners()) return;
     options.emit?.(event);
     for (const listener of Array.from(eventListeners)) {
@@ -757,6 +775,9 @@ export function createRunner(
     if (localReady) await localReady;
     const local = localFunctions.get(name);
     if (!local) {
+      if (setupOnlyLocalFunctions.has(name)) {
+        throw new Error(`${name} is setup-only and cannot run after candidate setup.`);
+      }
       throw new Error(
         localConfigured
           ? `${name} is not registered under the configured local directories.`
@@ -1492,9 +1513,7 @@ export function createRunner(
         );
       }
       const resolvedResult =
-        commit.commitTs === undefined
-          ? validated
-          : resolvePendingCommitTs(validated, commit.commitTs);
+        commit.commitTs === undefined ? validated : pendingCommitTsRead(validated, commit.commitTs);
       if (commit.commitTs !== undefined && batchInfo !== undefined) {
         resolveBatchCommitTs(batchInfo.batch, commit.commitTs);
       }
@@ -2942,27 +2961,25 @@ function kindMismatch(
 async function ingestLocalModules(
   localModules: LocalModuleMap,
   table: Map<string, RunnableFunction>,
+  setupOnly: Set<string>,
+  mode: RunnerMode,
 ): Promise<void> {
   await Promise.all(
     Object.entries(localModules).map(async ([moduleId, load]) => {
       const exports = (await load()) as Record<string, unknown>;
+      stampLocal(moduleId, exports);
       for (const [exportName, value] of Object.entries(exports)) {
-        if (!isLocalRegistration(value)) continue;
+        if (!isLocalFunction(value)) continue;
+        const name = `${moduleId}:${exportName}`;
+        if (isLocalSetupOnly(value)) {
+          setupOnly.add(name);
+          if (mode === "active") continue;
+        }
         const registration = toRunnable(value);
         if (!registration) continue;
-        const name = `${moduleId}:${exportName}`;
-        (value as Record<string, unknown>)[EMBEDDED_LOCAL_REFERENCE] = name;
         table.set(name, registration);
       }
     }),
-  );
-}
-
-function isLocalRegistration(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { __embeddedPlacement?: unknown }).__embeddedPlacement === "local"
   );
 }
 
@@ -3381,10 +3398,10 @@ function validateReturn(fn: RunnableFunction, value: unknown, allowPending = fal
  * substituted the typed values before persistence; this keeps caches and emitted rows aligned. */
 function resolveBatchCommitTs(batch: WriteBatch, timestamp: bigint): void {
   for (const write of batch.docWrites) {
-    write.data = resolvePendingCommitTs(write.data, timestamp);
+    write.data = pendingCommitTsRead(write.data, timestamp);
   }
   for (const write of batch.localFieldWrites ?? []) {
-    write.value = resolvePendingCommitTs(write.value, timestamp);
+    write.value = pendingCommitTsRead(write.value, timestamp);
   }
 }
 

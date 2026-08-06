@@ -38,7 +38,7 @@ export interface ConvexEmbeddedMetroOptions extends Omit<EmbeddedBundleInput, "a
   disabled?: boolean;
   /** Project root. Defaults to Metro's `projectRoot`, then `process.cwd()`. */
   root?: string;
-  /** Live schema the registry inlines and the placement lockfile is written from. */
+  /** Live schema the registry inlines and the generated contract is written from. */
   schema: ConvexEmbeddedSchema;
 }
 
@@ -88,7 +88,6 @@ export async function withConvexEmbedded<Config extends object>(
     convexDir: options.convexDir,
     generatedPath: options.generatedPath,
     local: options.local,
-    registerSchema: options.registerSchema,
     root,
     schemaPath: options.schemaPath,
   });

@@ -15,8 +15,7 @@ import {
   type ConvexModules,
   type EmbeddedAuthState,
 } from "../client";
-import { localReferenceName } from "../local";
-import { localGraphHash } from "../local/internal";
+import { localGraphHash, localReferenceName } from "../local/internal";
 import type { ConvexEmbeddedSchema } from "../schema";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 import { loadWasmModule, type WasmModule, type WasmSource } from "./artifact";
@@ -39,26 +38,14 @@ declare const Worker:
   | (new (url: URL, options: { name?: string; type: "module" }) => EmbeddedWorkerSource);
 
 export type {
-  ConvexEmbeddedMutationOptions,
   AuthTokenFetcher,
-  EmbeddedDataDelete,
-  EmbeddedDataEvent,
-  EmbeddedDataWrite,
+  EmbeddedConnectionError,
+  EmbeddedConnectionErrorCode,
   EmbeddedConnectionState,
-  EmbeddedEvent,
-  EmbeddedEventListener,
-  EmbeddedOperationEvent,
-  EmbeddedOperationKind,
-  EmbeddedOperationPhase,
-  EmbeddedRuntimeDegradation,
-  EmbeddedRuntimeEvent,
-  EmbeddedRuntimePhase,
-  EmbeddedRemoteEvent,
-  EmbeddedRemoteStatus,
-  EmbeddedSchedulerEvent,
-  EmbeddedSpanEvent,
-  EmbeddedSpanPhase,
-  EmbeddedStorageEvent,
+  EmbeddedLocalConnectionState,
+  EmbeddedMutationSettlement,
+  EmbeddedReplicationConnectionState,
+  EmbeddedRetainedRevision,
   Watch,
 } from "../client";
 export type { ConvexEmbeddedSchema } from "../schema";

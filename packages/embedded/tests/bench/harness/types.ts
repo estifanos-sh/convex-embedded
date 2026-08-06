@@ -60,7 +60,6 @@ export interface BrowserRemoteTickEvidence {
 }
 
 export interface BrowserRemoteEmbeddedSample {
-  admission: BrowserRemoteAdmissionTiming;
   admissionMs: number;
   cacheServes: number;
   listTransitions: number;
@@ -96,16 +95,6 @@ export interface BrowserRemoteBenchSample {
   embedded: BrowserRemoteEmbeddedSample;
   index: number;
   order: "direct-first" | "embedded-first";
-}
-
-export interface BrowserRemoteAdmissionTiming {
-  authMs: number;
-  idMs: number;
-  normalizeMs: number;
-  operationMs: number;
-  runnerMs: number;
-  stateMs: number;
-  totalMs: number;
 }
 
 export interface BrowserRemoteRuntimeTiming {
@@ -229,7 +218,6 @@ export interface BrowserRemotePageState {
     updatedAt: number,
   ): Promise<{
     acceptedBefore: number;
-    admission: BrowserRemoteAdmissionTiming;
     admissionMs: number;
     runtime: BrowserRemoteRuntimeTiming;
   }>;
@@ -240,7 +228,6 @@ export interface BrowserRemotePageState {
     body: { delete: number; index: number; insert: string },
   ): Promise<{
     acceptedBefore: number;
-    admission: BrowserRemoteAdmissionTiming;
     admissionMs: number;
     runtime: BrowserRemoteRuntimeTiming;
     startedAt: number;

@@ -33,8 +33,19 @@ vp run @convex-dev/embedded-demo-expo#android
 
 The demo `ios` and `android` scripts first build the package's TypeScript exports, then install the
 pinned Rust targets and native tooling, rebuild the matching native artifact, and invoke
-`expo run`. Android additionally requires `ANDROID_HOME` or `ANDROID_SDK_ROOT`; the script installs
-and selects NDK `28.1.13356709`.
+`expo run`. The Android setup discovers `ANDROID_HOME`/`ANDROID_SDK_ROOT`, the default Android Studio
+SDK, or Homebrew's command-line tools and installs NDK `28.1.13356709`. On macOS, a minimal local
+toolchain can be installed without a privileged JDK package:
+
+```sh
+brew install openjdk@17
+brew install --cask android-commandlinetools
+JAVA_HOME="$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home" sdkmanager --licenses
+```
+
+Review and accept Google's SDK license interactively; the build never accepts it on your behalf.
+The preparation hook then installs the pinned `cargo-ndk`, Rust targets, and NDK revision. Explicit
+environment variables still take precedence for custom SDK installations.
 
 After the native app exists, Metro can be started separately with:
 
@@ -43,8 +54,8 @@ vp run @convex-dev/embedded-demo-expo#start
 ```
 
 Restart Metro whenever the Convex schema or a device function changes. The Metro adapter regenerates
-the embedded module registry and the shared `convex/embedded.generated.ts` placement lockfile during
-configuration. Vite writes that same lockfile, which Convex codegen never replaces.
+the embedded module registry and the shared `convex/_generated/embedded.ts` contract during
+configuration. Vite writes that same contract, which Convex codegen never replaces.
 
 EAS development and store builds use `eas.json`. Run EAS from this directory so it picks up the demo
 configuration. A checkout is intentionally not linked to any maintainer's Expo account, so sign in

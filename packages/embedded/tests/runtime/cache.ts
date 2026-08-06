@@ -4,7 +4,7 @@ import type { Value } from "convex/values";
 import { compareValues } from "convex/values";
 import { describe, expect, test } from "vite-plus/test";
 
-import type { EmbeddedEvent } from "../../src/events";
+import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import { isEmbeddedError } from "../../src/error";
 import type {
   CountSpec,
@@ -325,6 +325,7 @@ function resultTick(changedResults: string[]): RemoteTick {
     received: 0,
     reconnected: false,
     retainedRevisions: [],
+    settlements: [],
     rowsApplied: 0,
     sent: 0,
     receiptsPushed: 0,

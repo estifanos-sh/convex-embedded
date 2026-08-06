@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vite-plus/test";
 
-import type { EmbeddedEvent } from "../../src/events";
+import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import {
   assembleTransitionChunk,
   createRemoteTransport,
@@ -39,6 +39,7 @@ const tick = (overrides: Partial<RemoteTick>): RemoteTick => ({
   received: 0,
   reconnected: false,
   retainedRevisions: [],
+  settlements: [],
   rowsApplied: 0,
   sent: 0,
   receiptsPushed: 0,

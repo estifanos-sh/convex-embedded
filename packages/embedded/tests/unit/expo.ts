@@ -25,7 +25,7 @@ describe("Expo native bridge", () => {
     await binding.migrationSetupComplete?.(7);
 
     expect(requests).toEqual([
-      { buffers: [], json: "[7]", operation: "migrationSetupComplete", version: 9 },
+      { buffers: [], json: "[7]", operation: "migrationSetupComplete", version: 10 },
     ]);
   });
 
@@ -64,7 +64,7 @@ describe("Expo native bridge", () => {
       buffers: [new Uint8Array([1, 2, 3])],
       json: '["blob",{"$buffer":0},{"$integer":"9007199254740993"}]',
       operation: "blobWrite",
-      version: 9,
+      version: 10,
     });
   });
 
@@ -79,7 +79,7 @@ describe("Expo native bridge", () => {
   });
 
   test("loads once and rejects missing or stale native modules", () => {
-    const native = module(9);
+    const native = module(10);
     const resolve = vi.fn(() => native);
     const load = createNativeModuleLoader(resolve);
 
@@ -87,8 +87,8 @@ describe("Expo native bridge", () => {
     expect(load()).toBe(native);
     expect(resolve).toHaveBeenCalledOnce();
     expect(() => createNativeModuleLoader(() => null)()).toThrow("not linked");
-    expect(() => createNativeModuleLoader(() => module(8))()).toThrow(
-      "does not match JavaScript version 9",
+    expect(() => createNativeModuleLoader(() => module(9))()).toThrow(
+      "does not match JavaScript version 10",
     );
   });
 
@@ -247,7 +247,7 @@ function response(json: string, buffers: Uint8Array[]): Uint8Array {
   string(bytes, "error");
   bytes.push(0xc0);
   string(bytes, "version");
-  bytes.push(9);
+  bytes.push(10);
   return Uint8Array.from(bytes);
 }
 

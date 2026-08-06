@@ -1,12 +1,11 @@
 import { getTimerTime } from "../../../src/time.js";
 
-import { devtoolsDistPath } from "../../bench/harness/paths.js";
+import { devtoolsDistPath, devtoolsTestingDistPath } from "../../bench/harness/paths.js";
 import type {
   BrowserDirectPageState,
   BrowserLatencyBenchResult,
   BrowserLatencyBenchSample,
   BrowserLatencyBenchScenario,
-  BrowserRemoteAdmissionTiming,
   BrowserRemoteRuntimeTiming,
   BrowserRemoteTickEvidence,
   BrowserScaleBenchSample,
@@ -140,36 +139,32 @@ export async function installMetalDevicePage(
 ): Promise<void> {
   await page.goto(`${url}?metal=${encodeURIComponent(`${options.device}-${getTimerTime()}`)}`);
   await page.evaluate(
-    async ({ browserUrl, device, initialWatch, queryLimit, remoteUrl, runId, storageId }) => {
+    async ({
+      browserUrl,
+      devtoolsUrl,
+      devtoolsTestUrl,
+      device,
+      initialWatch,
+      queryLimit,
+      remoteUrl,
+      runId,
+      storageId,
+    }) => {
       localStorage.setItem("convex-embedded.storageId", storageId);
-      const { ConvexEmbeddedClient } = await import(browserUrl);
+      const [{ ConvexEmbeddedClient }, devtoolsModule, devtoolsTestModule] = await Promise.all([
+        import(browserUrl),
+        import(devtoolsUrl),
+        import(devtoolsTestUrl),
+      ]);
       type BrowserClient = {
         close(): Promise<void>;
-        connectionState(): { local: string; remote: string };
+        connectionState(): {
+          local: { error?: { message: string }; status: string };
+          replication: { error?: { message: string }; status: string; sync?: string };
+        };
         open(): Promise<void>;
         mutation(name: string, args: Record<string, unknown>): Promise<unknown>;
         query(name: string, args: Record<string, unknown>): Promise<unknown>;
-        __devtoolsRuntime?(
-          request:
-            | {
-                cursor?: string | null;
-                kind: "listRows";
-                limit?: number;
-                table: string;
-              }
-            | { kind: "snapshot" },
-        ): Promise<{
-          cursor?: string | null;
-          isDone?: boolean;
-          rows?: MetalDocument[];
-          storage?: {
-            dirtyHeads?: Array<Record<string, unknown>>;
-            idMappings: Array<Record<string, unknown>>;
-            projections: Array<Record<string, unknown>>;
-          };
-        }>;
-        subscribeInternalEvents?(listener: (event: unknown) => void): () => void;
-        subscribeEvents(listener: (event: unknown) => void): () => void;
         watchQuery(
           name: string,
           args: Record<string, unknown>,
@@ -178,7 +173,41 @@ export async function installMetalDevicePage(
           onUpdate(callback: () => void, onError?: (error: unknown) => void): () => void;
         };
       };
+      type TestDevtoolsSource = {
+        dispose(): void;
+        refresh(): Promise<void>;
+        getSnapshot(view: "storage"): {
+          storage: {
+            dirtyHeads?: Array<Record<string, unknown>>;
+            idMappings: Array<Record<string, unknown>>;
+            projections: Array<Record<string, unknown>>;
+          };
+        };
+        listTableRows(
+          table: string,
+          options?: { cursor?: string | null; limit?: number },
+        ): Promise<{
+          cursor?: string | null;
+          isDone?: boolean;
+          rows?: MetalDocument[];
+        }>;
+      };
+      const createDevtoolsSource = (
+        devtoolsModule as {
+          createEmbeddedDevtoolsSource(this: void, client: BrowserClient): TestDevtoolsSource;
+        }
+      ).createEmbeddedDevtoolsSource;
+      const subscribeToDevtoolsDiagnostics = (
+        devtoolsTestModule as {
+          subscribeToDevtoolsDiagnostics(
+            this: void,
+            client: BrowserClient,
+            listener: (event: unknown) => void,
+          ): () => void;
+        }
+      ).subscribeToDevtoolsDiagnostics;
       let client: BrowserClient | undefined;
+      let devtools: TestDevtoolsSource | undefined;
       let stopEvents: (() => void) | undefined;
       let stopWatch: (() => void) | undefined;
       let watchTarget: MetalWatchTarget =
@@ -368,6 +397,10 @@ export async function installMetalDevicePage(
         if (!client) throw new Error(`Metal device ${device} is not open.`);
         return client;
       };
+      const currentDevtools = () => {
+        if (!devtools) throw new Error(`Metal device ${device} has no devtools test bridge.`);
+        return devtools;
+      };
       const revisionEntry = async (
         id: string,
         revision: Record<string, unknown> | null,
@@ -408,10 +441,8 @@ export async function installMetalDevicePage(
         return result.filter((row) => row.title.startsWith(`${runId}:`));
       };
       const allDevtoolsRows = async () => {
-        const result = await currentClient().__devtoolsRuntime?.({
-          kind: "listRows",
+        const result = await currentDevtools().listTableRows("documents", {
           limit: 200,
-          table: "documents",
         });
         return result?.rows ?? [];
       };
@@ -419,12 +450,10 @@ export async function installMetalDevicePage(
         const rows: MetalDocument[] = [];
         let cursor: string | null = null;
         do {
-          const result = (await currentClient().__devtoolsRuntime?.({
+          const result = await currentDevtools().listTableRows("documents", {
             cursor,
-            kind: "listRows",
             limit: 1024,
-            table: "documents",
-          })) as { cursor?: string | null; rows?: MetalDocument[] } | undefined;
+          });
           rows.push(
             ...((result?.rows ?? []).filter((row: MetalDocument) =>
               row.title.startsWith(`${runId}:`),
@@ -435,18 +464,21 @@ export async function installMetalDevicePage(
         return rows;
       };
       const dirtyHeads = async () => {
-        const result = await currentClient().__devtoolsRuntime?.({ kind: "snapshot" });
-        return result?.storage?.dirtyHeads ?? [];
+        const source = currentDevtools();
+        await source.refresh();
+        return source.getSnapshot("storage").storage.dirtyHeads ?? [];
       };
       const projections = async () => {
-        const result = await currentClient().__devtoolsRuntime?.({ kind: "snapshot" });
-        return result?.storage?.projections ?? [];
+        const source = currentDevtools();
+        await source.refresh();
+        return source.getSnapshot("storage").storage.projections ?? [];
       };
       const idMappings = async () => {
-        const result = await currentClient().__devtoolsRuntime?.({ kind: "snapshot" });
+        const source = currentDevtools();
+        await source.refresh();
         const currentRows = await rows();
         const currentIds = new Set(currentRows.map((row) => row._id));
-        return (result?.storage?.idMappings ?? []).filter((row) => {
+        return source.getSnapshot("storage").storage.idMappings.filter((row) => {
           return (
             row.table === "documents" &&
             typeof row.localId === "string" &&
@@ -459,6 +491,8 @@ export async function installMetalDevicePage(
         stopWatch = undefined;
         stopEvents?.();
         stopEvents = undefined;
+        devtools?.dispose();
+        devtools = undefined;
         const closing = client;
         client = undefined;
         await closing?.close();
@@ -473,9 +507,8 @@ export async function installMetalDevicePage(
           remoteEnabled ? { url: remoteUrl } : {},
         ) as BrowserClient;
         client = created;
-        const subscribe =
-          created.subscribeInternalEvents?.bind(created) ?? created.subscribeEvents.bind(created);
-        stopEvents = subscribe((event) => {
+        devtools = createDevtoolsSource(created);
+        stopEvents = subscribeToDevtoolsDiagnostics(created, (event) => {
           const summary = summarizeEvent(event);
           pushEvent(summary);
         });
@@ -493,9 +526,32 @@ export async function installMetalDevicePage(
         await openTimed(remoteEnabled);
       };
       const state: MetalDeviceState & {
-        connectionState(): { local: string; remote: string };
+        connectionState(): {
+          local: string;
+          localError?: string;
+          remote: string;
+          remoteError?: string;
+        };
       } = {
-        connectionState: () => currentClient().connectionState(),
+        connectionState: () => {
+          const connection = currentClient().connectionState();
+          const remote =
+            connection.replication.status === "online"
+              ? connection.replication.sync === "idle"
+                ? "ready"
+                : "connected"
+              : connection.replication.status;
+          return {
+            local: connection.local.status,
+            ...(connection.local.error === undefined
+              ? {}
+              : { localError: connection.local.error.message }),
+            remote,
+            ...(connection.replication.error === undefined
+              ? {}
+              : { remoteError: connection.replication.error.message }),
+          };
+        },
         writeBody: async (id, body) => {
           await currentClient().mutation("documents:write", { id, splices: [body] });
         },
@@ -597,7 +653,12 @@ export async function installMetalDevicePage(
       ).__embeddedMetalState = state;
       await state.open(true);
     },
-    { ...options, browserUrl },
+    {
+      ...options,
+      browserUrl,
+      devtoolsUrl: `/@fs${devtoolsDistPath}?metal=${getTimerTime()}`,
+      devtoolsTestUrl: `/@fs${devtoolsTestingDistPath}?metal=${getTimerTime()}`,
+    },
   );
 }
 
@@ -758,10 +819,22 @@ export async function installBrowserRemoteBenchPage(
 ): Promise<void> {
   await page.goto(`${pageUrl}?remote=${encodeURIComponent(storageId)}`);
   await page.evaluate(
-    async ({ browserUrl, prefix, remoteUrl, storageId }) => {
+    async ({ browserUrl, devtoolsTestUrl, prefix, remoteUrl, storageId }) => {
       localStorage.setItem("convex-embedded.storageId", storageId);
-      const { ConvexEmbeddedClient } = await import(browserUrl);
+      const [{ ConvexEmbeddedClient }, devtoolsTestModule] = await Promise.all([
+        import(browserUrl),
+        import(devtoolsTestUrl),
+      ]);
       const client = new ConvexEmbeddedClient({ url: remoteUrl });
+      const subscribeToDevtoolsDiagnostics = (
+        devtoolsTestModule as {
+          subscribeToDevtoolsDiagnostics(
+            this: void,
+            client: unknown,
+            listener: (event: unknown) => void,
+          ): () => void;
+        }
+      ).subscribeToDevtoolsDiagnostics;
       await client.open();
       type Summary = { _id: string; title: string; updatedAt: number };
       type Document = { _id: string; body: string; title: string };
@@ -820,7 +893,7 @@ export async function installBrowserRemoteBenchPage(
         documentStops.set(id, documentWatch.onUpdate(refreshDocument));
         refreshDocument();
       };
-      client.subscribeInternalEvents?.((event: unknown) => {
+      const stopEvents = subscribeToDevtoolsDiagnostics(client, (event) => {
         const operation = event as {
           kind?: string;
           phase?: string;
@@ -942,6 +1015,7 @@ export async function installBrowserRemoteBenchPage(
           ),
         close: async () => {
           stop();
+          stopEvents();
           for (const stopDocument of documentStops.values()) stopDocument();
           documentStops.clear();
           await client.close();
@@ -975,24 +1049,13 @@ export async function installBrowserRemoteBenchPage(
         update: async (id: string, title: string, updatedAt: number) => {
           const acceptedBefore = accepted;
           const startedAt = absoluteNow();
-          let admission: BrowserRemoteAdmissionTiming | undefined;
           runtimeAdmission = undefined;
-          await client.mutation(
-            "documents:write",
-            { id, title, updatedAt },
-            {
-              onTiming: (timing: BrowserRemoteAdmissionTiming) => {
-                admission = timing;
-              },
-            },
-          );
-          if (!admission) throw new Error("Embedded mutation did not report admission timing.");
+          await client.mutation("documents:write", { id, title, updatedAt });
           if (!runtimeAdmission) {
             throw new Error("Embedded mutation did not report runtime admission timing.");
           }
           return {
             acceptedBefore,
-            admission,
             admissionMs: absoluteNow() - startedAt,
             runtime: runtimeAdmission,
           };
@@ -1011,24 +1074,13 @@ export async function installBrowserRemoteBenchPage(
         write: async (id: string, body: { delete: number; index: number; insert: string }) => {
           const acceptedBefore = accepted;
           const startedAt = absoluteNow();
-          let admission: BrowserRemoteAdmissionTiming | undefined;
           runtimeAdmission = undefined;
-          await client.mutation(
-            "documents:write",
-            { splices: [body], id },
-            {
-              onTiming: (timing: BrowserRemoteAdmissionTiming) => {
-                admission = timing;
-              },
-            },
-          );
-          if (!admission) throw new Error("Embedded mutation did not report admission timing.");
+          await client.mutation("documents:write", { splices: [body], id });
           if (!runtimeAdmission) {
             throw new Error("Embedded mutation did not report runtime admission timing.");
           }
           return {
             acceptedBefore,
-            admission,
             admissionMs: absoluteNow() - startedAt,
             runtime: runtimeAdmission,
             startedAt,
@@ -1039,7 +1091,13 @@ export async function installBrowserRemoteBenchPage(
         globalThis as typeof globalThis & { __embeddedBrowserRemote?: unknown }
       ).__embeddedBrowserRemote = state;
     },
-    { browserUrl, prefix, remoteUrl, storageId },
+    {
+      browserUrl,
+      devtoolsTestUrl: `/@fs${devtoolsTestingDistPath}?remote=${getTimerTime()}`,
+      prefix,
+      remoteUrl,
+      storageId,
+    },
   );
 }
 
@@ -1195,13 +1253,13 @@ export async function installBrowserBenchPage(
     `${url}?bench=${encodeURIComponent(`${role}-${getTimerTime()}-${Math.random()}`)}`,
   );
   await page.evaluate(
-    async ({ browserUrl, devtoolsUrl, queryLimit, role, scenario, storageId }) => {
+    async ({ browserUrl, devtoolsTestUrl, devtoolsUrl, queryLimit, role, scenario, storageId }) => {
       localStorage.setItem("convex-embedded.storageId", storageId);
-      const [{ ConvexEmbeddedClient }, devtoolsModule] = await Promise.all([
+      const devtoolsEnabled = scenario.devtoolsOpen && role === "primary";
+      const [{ ConvexEmbeddedClient }, devtoolsModule, devtoolsTestModule] = await Promise.all([
         import(browserUrl),
-        scenario.devtoolsOpen && role === "primary"
-          ? import(devtoolsUrl)
-          : Promise.resolve(undefined),
+        devtoolsEnabled ? import(devtoolsUrl) : Promise.resolve(undefined),
+        devtoolsEnabled ? import(devtoolsTestUrl) : Promise.resolve(undefined),
       ]);
       const client = new ConvexEmbeddedClient();
       const operations: Array<{
@@ -1216,40 +1274,60 @@ export async function installBrowserBenchPage(
           totalMs: number;
         };
       }> = [];
-      client.subscribeEvents?.((event: unknown) => {
-        const operation = event as {
-          durationMs?: number;
-          kind?: string;
-          name?: string;
-          phase?: string;
-          status?: string;
-          timing?: { commitMs: number; notifyMs: number; totalMs: number };
-          type?: string;
-        };
-        if (operation.type === "operation") {
-          operations.push({
-            durationMs: operation.durationMs,
-            kind: operation.kind ?? "",
-            name: operation.name ?? "",
-            phase: operation.phase ?? "",
-            status: operation.status ?? "",
-            timing: operation.timing,
-          });
-        }
-      });
-      await client.open();
       const formatError = (error: unknown) =>
         error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       let devtoolsMountError: string | undefined;
       let mounted: { unmount?: () => void } | undefined;
-      try {
-        if (devtoolsModule && "createEmbeddedDevtoolsSource" in devtoolsModule) {
-          const source = devtoolsModule.createEmbeddedDevtoolsSource(client);
-          mounted = { unmount: () => source.dispose() };
+      if (devtoolsEnabled) {
+        try {
+          if (!devtoolsModule || !devtoolsTestModule)
+            throw new Error("The devtools diagnostic scenario did not load its source.");
+          const source = (
+            devtoolsModule as {
+              createEmbeddedDevtoolsSource(this: void, client: unknown): { dispose(): void };
+            }
+          ).createEmbeddedDevtoolsSource(client);
+          const subscribeToDevtoolsDiagnostics = (
+            devtoolsTestModule as {
+              subscribeToDevtoolsDiagnostics(
+                this: void,
+                client: unknown,
+                listener: (event: unknown) => void,
+              ): () => void;
+            }
+          ).subscribeToDevtoolsDiagnostics;
+          const stopEvents = subscribeToDevtoolsDiagnostics(client, (event) => {
+            const operation = event as {
+              durationMs?: number;
+              kind?: string;
+              name?: string;
+              phase?: string;
+              status?: string;
+              timing?: { commitMs: number; notifyMs: number; totalMs: number };
+              type?: string;
+            };
+            if (operation.type === "operation") {
+              operations.push({
+                durationMs: operation.durationMs,
+                kind: operation.kind ?? "",
+                name: operation.name ?? "",
+                phase: operation.phase ?? "",
+                status: operation.status ?? "",
+                timing: operation.timing,
+              });
+            }
+          });
+          mounted = {
+            unmount: () => {
+              stopEvents();
+              source.dispose();
+            },
+          };
+        } catch (error) {
+          devtoolsMountError = formatError(error);
         }
-      } catch (error) {
-        devtoolsMountError = formatError(error);
       }
+      await client.open();
       const watchers: Array<() => void> = [];
       const prefix = `${storageId}:`;
       const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1325,6 +1403,17 @@ export async function installBrowserBenchPage(
         const event = operations
           .slice(before)
           .find((entry) => entry.kind === "mutation" && entry.phase === "finish");
+        if (!devtoolsEnabled) {
+          return {
+            commitMs: 0,
+            envelopeMs: measuredMs,
+            measuredMs,
+            notifyMs: 0,
+            operation,
+            outsideRuntimeMs: measuredMs,
+            totalRuntimeMs: 0,
+          };
+        }
         if (!event || event.status !== "success" || !event.timing) {
           throw new Error(`missing mutation timing event for ${operation}`);
         }
@@ -1379,7 +1468,10 @@ export async function installBrowserBenchPage(
         if (activeScenario.rowCount > rows.length) {
           suspicious.push(`observedRows=${rows.length} below rowCount=${activeScenario.rowCount}`);
         }
-        if (summaries.outsideRuntimeMs.p90 > Math.max(4, summaries.totalRuntimeMs.p90 * 2)) {
+        if (
+          devtoolsEnabled &&
+          summaries.outsideRuntimeMs.p90 > Math.max(4, summaries.totalRuntimeMs.p90 * 2)
+        ) {
           suspicious.push(
             `outsideRuntime p90 ${summaries.outsideRuntimeMs.p90.toFixed(2)}ms dominates runtime p90 ${summaries.totalRuntimeMs.p90.toFixed(2)}ms`,
           );
@@ -1394,7 +1486,7 @@ export async function installBrowserBenchPage(
             `envelope p90 ${summaries.envelopeMs.p90.toFixed(2)}ms exceeds one frame`,
           );
         }
-        if (activeScenario.devtoolsOpen && devtoolsMountError) {
+        if (devtoolsEnabled && devtoolsMountError) {
           suspicious.push(`devtools mount failed in isolated page: ${devtoolsMountError}`);
         }
         return {
@@ -1424,6 +1516,7 @@ export async function installBrowserBenchPage(
     {
       browserUrl,
       devtoolsUrl: `/@fs${devtoolsDistPath}?bench=${getTimerTime()}`,
+      devtoolsTestUrl: `/@fs${devtoolsTestingDistPath}?bench=${getTimerTime()}`,
       queryLimit,
       role,
       scenario,

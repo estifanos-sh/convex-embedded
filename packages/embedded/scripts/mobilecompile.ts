@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { androidAbis, mobileSlices } from "../../../config/build.ts";
+import { androidAbis, androidSdk, javaHome, mobileSlices } from "../../../config/build.ts";
 
 const platform = process.argv[2];
 if (platform !== "ios" && platform !== "android") {
@@ -94,6 +94,13 @@ try {
     }
   } else {
     const android = resolve(work, "android");
+    const jdk = javaHome();
+    const sdk = androidSdk();
+    const environment = {
+      ...process.env,
+      ...(jdk ? { JAVA_HOME: jdk } : {}),
+      ...(sdk ? { ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk } : {}),
+    };
     run(
       resolve(android, "gradlew"),
       [
@@ -102,6 +109,7 @@ try {
         "--no-daemon",
       ],
       android,
+      environment,
     );
   }
 } finally {

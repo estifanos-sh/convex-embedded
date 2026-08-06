@@ -1,4 +1,4 @@
-import { local } from "@convex-dev/embedded/local";
+import { local } from "../convex/_generated/embedded.js";
 import { v } from "convex/values";
 
 export const toggle = local.mutation({

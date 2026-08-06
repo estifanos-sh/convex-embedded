@@ -68,7 +68,7 @@ export function renderLocalStamp(
     .map(([exported, binding]) => (exported === binding ? exported : `${exported}: ${binding}`))
     .join(", ");
   return `
-import { stampLocal as ${stamp} } from "@convex-dev/embedded/local";
+import { stampLocal as ${stamp} } from "@convex-dev/embedded/internal/local";
 ${stamp}(${JSON.stringify(moduleId)}, ${JSON.stringify(graphHash)}, { ${named} });
 `;
 }

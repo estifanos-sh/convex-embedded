@@ -60,7 +60,7 @@ use storage::{
     TableDef, TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch,
 };
 
-const API_VERSION: u32 = 31;
+const API_VERSION: u32 = 32;
 
 #[napi(js_name = "apiVersion")]
 #[must_use]
@@ -508,6 +508,15 @@ pub struct JsReroot {
 }
 
 #[napi(object)]
+pub struct JsRemoteMutationSettlement {
+    pub mutation_id: String,
+    pub function_name: String,
+    pub outcome: String,
+    pub code: Option<String>,
+    pub retained_revisions: Vec<JsReroot>,
+}
+
+#[napi(object)]
 pub struct JsRemotePending {
     pub checkpoints: u32,
     pub inflight: u32,
@@ -532,6 +541,7 @@ pub struct JsRemoteTick {
     pub push_conflicts: u32,
     pub push_rebases: u32,
     pub retained_revisions: Vec<JsReroot>,
+    pub settlements: Vec<JsRemoteMutationSettlement>,
     pub sent: u32,
     pub receipts_pushed: u32,
     pub store_jobs: u32,
@@ -3421,19 +3431,11 @@ fn js_remote_tick(tick: remote::RemoteTick) -> JsRemoteTick {
         push_failed: saturating_u32(tick.push_failed),
         push_conflicts: saturating_u32(tick.push_conflicts),
         push_rebases: saturating_u32(tick.push_rebases),
-        retained_revisions: tick
-            .retained_revisions
+        retained_revisions: tick.retained_revisions.into_iter().map(js_reroot).collect(),
+        settlements: tick
+            .settlements
             .into_iter()
-            .map(|reroot| JsReroot {
-                table: reroot.table,
-                id: reroot.local_document_id,
-                rev_id: reroot.server_rev_id.unwrap_or(reroot.archived_rev_id),
-                server_doc_id: reroot.server_document_id,
-                base_root_id: reroot.base_root_id,
-                base_node_id: reroot.base_node_id,
-                attached_node_id: reroot.attached_node_id,
-                current_root_id: reroot.current_root_id,
-            })
+            .map(js_remote_mutation_settlement)
             .collect(),
         sent: saturating_u32(tick.sent),
         receipts_pushed: saturating_u32(tick.receipts_pushed),
@@ -3451,6 +3453,32 @@ fn js_remote_tick(tick: remote::RemoteTick) -> JsRemoteTick {
             settlements: saturating_u32(pending.settlements),
             uploads: saturating_u32(pending.uploads),
         }),
+    }
+}
+
+fn js_reroot(reroot: storage::RetainedRevision) -> JsReroot {
+    JsReroot {
+        table: reroot.table,
+        id: reroot.local_document_id,
+        rev_id: reroot.server_rev_id.unwrap_or(reroot.archived_rev_id),
+        server_doc_id: reroot.server_document_id,
+        base_root_id: reroot.base_root_id,
+        base_node_id: reroot.base_node_id,
+        attached_node_id: reroot.attached_node_id,
+        current_root_id: reroot.current_root_id,
+    }
+}
+
+fn js_remote_mutation_settlement(
+    settlement: remote::RemoteMutationSettlement,
+) -> JsRemoteMutationSettlement {
+    let (mutation_id, function_name, outcome, retained_revisions) = settlement.into_parts();
+    JsRemoteMutationSettlement {
+        mutation_id,
+        function_name,
+        outcome: outcome.as_str().to_owned(),
+        code: outcome.code().map(str::to_owned),
+        retained_revisions: retained_revisions.into_iter().map(js_reroot).collect(),
     }
 }
 
@@ -4651,5 +4679,12 @@ mod tests {
         assert_eq!(reroot.base_node_id.as_deref(), Some("node:client-base"));
         assert_eq!(reroot.attached_node_id.as_deref(), Some("node:loser"));
         assert_eq!(reroot.current_root_id.as_deref(), Some("root:server"));
+    }
+
+    #[test]
+    fn js_remote_tick_keeps_the_required_settlement_vector() {
+        let js = super::js_remote_tick(remote::RemoteTick::default());
+
+        assert!(js.settlements.is_empty());
     }
 }

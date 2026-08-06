@@ -36,12 +36,9 @@ An app writes normal local functions in the local roots it already gives the bun
 ```ts
 // local/setup.ts
 import { v } from "convex/values";
-import { defineLocal } from "@convex-dev/embedded/local";
 
-import schema from "../convex/schema";
+import { local } from "../convex/_generated/embedded";
 import { rewritePreferences } from "./preferences";
-
-const local = defineLocal(schema);
 
 export const setup = local.internalAction({
   args: {},
@@ -107,14 +104,75 @@ For a dropped table or an old shape that is no longer part of the target schema,
 may bind its functions to an explicit compatibility schema. That schema is used only while setup
 runs and is never published as the app's active schema.
 
+Use the generated `local` value directly; no migration registry or folder is introduced:
+
+```ts
+// local/setup.ts
+import { type GenericId, v } from "convex/values";
+
+import { local } from "../convex/_generated/embedded";
+import { legacySchema } from "./legacySchema";
+
+const legacy = local.compatibility(legacySchema);
+
+export const preferencesLegacyRead = legacy.internalQuery({
+  args: {},
+  handler: async (ctx) => await ctx.db.query("legacy_preferences").first(),
+});
+
+export const preferencesCurrentWrite = local.internalMutation({
+  args: { compact: v.boolean() },
+  handler: async (ctx, { compact }) => {
+    if ((await ctx.db.query("preferences").first()) === null) {
+      await ctx.db.insert("preferences", { compact });
+    }
+  },
+});
+
+export const preferencesLegacyDelete = legacy.internalMutation({
+  args: { id: v.id("legacy_preferences") },
+  handler: async (ctx, { id }) => {
+    await ctx.db.delete("legacy_preferences", id);
+  },
+});
+
+export const setup = local.internalAction({
+  args: {},
+  returns: v.null(),
+  handler: async (ctx) => {
+    const preference = (await ctx.runQuery(preferencesLegacyRead, {})) as {
+      _id: GenericId<"legacy_preferences">;
+      compact: boolean;
+    } | null;
+    if (preference !== null) {
+      await ctx.runMutation(preferencesCurrentWrite, { compact: preference.compact });
+      await ctx.runMutation(preferencesLegacyDelete, { id: preference._id });
+    }
+    return null;
+  },
+});
+```
+
+`legacySchema` is an ordinary historical `defineEmbeddedSchema` value. The returned `legacy`
+builders expose only `internalQuery`, `internalMutation`, and `internalAction`; their registrations
+are setup-only. Embedded materializes their schema in the candidate workspace, then excludes and
+rejects them from the active runner after cutover. Every local registration dispatched with
+`ctx.runQuery` or `ctx.runMutation` must be a named export so the configured bundler can stamp and
+register it. Keep the setup action and its target-schema
+helpers idempotent so a resumed candidate can safely run it again. For a dropped table, write the
+replacement and then explicitly delete the historical originated row through a compatibility
+mutation. Leaving it behind causes final target validation to fail and preserves the old active
+generation; Embedded never silently drops application data.
+
 ## Explicit Client Lifecycle
 
 Constructors are inert. Creating a public browser, Expo, or Node client does not acquire a storage
 lease, create a worker or native store, start a scheduler, or connect to Convex. Those resources are
 created only by `open()`.
 
-Operations that need the runtime fail with `EMBEDDED_NOT_OPEN` before `open()`. Calls to `setAuth`
-and event subscription may configure the client before opening without starting it.
+Operations that need the runtime fail with `EMBEDDED_NOT_OPEN` before `open()`. Calls to `setAuth`,
+connection-state subscription, and mutation-settlement subscription may configure the client before
+opening without starting it.
 
 Concurrent calls obey these rules:
 
@@ -304,7 +362,7 @@ Build a private compatibility schema from:
 
 1. the stored source physical schema;
 2. the current target schema; and
-3. explicit schemas attached to imported local setup functions.
+3. explicit schemas attached to imported `local.compatibility(...)` setup helpers.
 
 The store persists the source tables, placement, columns, indexes, CRDT fields, and local-field
 names. An imported compatibility schema supplies any historical application validator the current
@@ -324,8 +382,9 @@ Bind ordinary local database operations to the candidate generation and run the 
 empty arguments and an unauthenticated context. Each `ctx.runMutation` commits to the candidate.
 Queries observe candidate state, including changes committed by earlier migration batches.
 
-If the action throws, unbind and close. The active pointer does not change. A later open with the
-same setup identity resumes the candidate and reruns the idempotent action.
+If the action throws, unbind and close. The active pointer does not change. That client instance is
+terminal: close it, construct a new client, then open with the same setup identity to resume the
+candidate and rerun the idempotent action.
 
 If no action is supplied, this phase is skipped. Compatible package and schema upgrades still
 continue automatically.
@@ -412,6 +471,7 @@ The public migration-related surface is only:
 ```ts
 client.open(setup?);
 local.internalAction(...);
+local.compatibility(legacySchema).internalQuery(...);
 ctx.runQuery(...);
 ctx.runMutation(...);
 ```
@@ -460,7 +520,9 @@ The implementation is not complete unless automated tests cover:
 ## Implementation Map
 
 - `packages/embedded/src/client.ts`: explicit lifecycle, setup validation, candidate orchestration
-- `packages/embedded/src/local.ts`: typed internal local actions and generated stamps
+- `convex/_generated/embedded.ts`: generated schema-bound `local` authoring contract
+- `packages/embedded/src/local.ts`: public local function types
+- `packages/embedded/src/local/internal.ts`: private builders, stamps, and setup identity markers
 - `packages/embedded/src/storage/workspace.ts`: private source/target compatibility schema
 - `packages/embedded/src/migrations.ts`: internal candidate and authoritative-origin validation
 - `packages/embedded/src/browser/runtime.ts`: worker-owned candidate execution

@@ -1,8 +1,13 @@
 import { v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vite-plus/test";
 
-import { defineLocal, isLocalFunction, local, type LocalBuilders } from "../../src/local";
-import { localFunctionSchema } from "../../src/local/internal";
+import type { LocalBuilders, LocalCompatibilityBuilders } from "../../src/local";
+import {
+  defineLocal,
+  isLocalFunction,
+  localCompatibilitySchema,
+  localFunctionSchema,
+} from "../../src/local/internal";
 import { NativeStore } from "../../src/node/native";
 import { createWriter, toSchema } from "../../src/runtime/database";
 import { defineFunctions } from "../../src/runtime/functions";
@@ -207,6 +212,31 @@ describe("device-only function modules", () => {
     await expect(runner.runQuery(module.readCompact, {})).resolves.toEqual([]);
   });
 
+  test("admits historical helpers only while candidate setup is running", async () => {
+    const compatibility = device.compatibility(deviceSchema);
+    const readLegacy = compatibility.internalQuery({
+      args: {},
+      returns: v.null(),
+      handler: () => null,
+    });
+    const localModules = { "local/setup": () => Promise.resolve({ readLegacy }) };
+    const setup = createRunner({}, fakeStore(), deviceStoreSchema, {
+      localModules,
+      mode: "setup",
+    });
+    const active = createRunner({}, fakeStore(), deviceStoreSchema, {
+      localModules,
+      mode: "active",
+    });
+
+    await setup.localReady;
+    await active.localReady;
+    await expect(setup.runQuery(readLegacy, {}, { allowInternal: true })).resolves.toBeNull();
+    await expect(active.runQuery(readLegacy, {})).rejects.toThrow(
+      "local/setup:readLegacy is setup-only and cannot run after candidate setup.",
+    );
+  });
+
   test("refuses file storage in a local query and a local mutation", async () => {
     const module = {
       read: device.query({
@@ -360,27 +390,11 @@ describe("device overlay reactivity", () => {
 });
 
 describe("device-only namespace typing", () => {
-  test("demands the schema declaration before any builder accepts a definition", () => {
-    expectTypeOf(local.query).parameter(0).toEqualTypeOf<UnregisteredSchema>();
-    expectTypeOf(local.mutation).parameter(0).toEqualTypeOf<UnregisteredSchema>();
-    expectTypeOf(local.internalQuery).parameter(0).toEqualTypeOf<UnregisteredSchema>();
-    expectTypeOf(local.internalMutation).parameter(0).toEqualTypeOf<UnregisteredSchema>();
-    expectTypeOf(local.query).returns.toBeNever();
-    expect(Object.keys(local)).toEqual([
-      "query",
-      "mutation",
-      "internalQuery",
-      "internalMutation",
-      "internalAction",
-    ]);
-  });
-
-  test("binds a declared schema to builders over its device data model", () => {
+  test("binds generated builders to their schema's device data model", () => {
     expectTypeOf<typeof deviceSchema>().toExtend<EmbeddedSchemaDefinition>();
     expectTypeOf(device).toEqualTypeOf<LocalBuilders<DeviceDataModel<typeof deviceSchema>>>();
 
-    const registered = local as unknown as LocalBuilders<DeviceDataModel<typeof deviceSchema>>;
-    const setCompact = registered.mutation({
+    const setCompact = device.mutation({
       args: { compact: v.boolean() },
       handler: async (ctx, args) => {
         await ctx.db.insert("preferences", { compact: args.compact });
@@ -389,20 +403,34 @@ describe("device-only namespace typing", () => {
     expect(isLocalFunction(setCompact)).toBe(true);
   });
 
-  test("treats generated-registration builders as runtime-schema neutral", () => {
-    const registered = local as unknown as LocalBuilders<DeviceDataModel<typeof deviceSchema>>;
-    const read = registered.query({
+  test("keeps the schema on generated builders for runtime validation", () => {
+    const read = device.query({
       args: {},
       handler: async () => null,
     });
 
-    expect(localFunctionSchema(read)).toBeUndefined();
+    expect(localFunctionSchema(read)).toBe(deviceSchema);
     expect(localFunctionSchema(undefined)).toBeUndefined();
   });
-});
 
-type UnregisteredSchema =
-  "The Embedded bundler plugin registers your schema through the module it generates in your convex directory; wire the plugin and include that module in this TypeScript program";
+  test("binds compatibility helpers to their historical device data model", () => {
+    const historical = defineEmbeddedSchema({ legacy: localTable({ name: v.string() }) });
+    const compatibility = device.compatibility(historical);
+    expectTypeOf(compatibility).toEqualTypeOf<
+      LocalCompatibilityBuilders<DeviceDataModel<typeof historical>>
+    >();
+
+    const readLegacy = compatibility.internalQuery({
+      args: {},
+      handler: async (ctx) => await ctx.db.query("legacy").collect(),
+    });
+    expect(localCompatibilitySchema(readLegacy)).toBe(historical);
+    // @ts-expect-error Historical helpers have no public query surface.
+    void compatibility.query;
+    // @ts-expect-error Compatibility scopes cannot recursively create another historical scope.
+    void compatibility.compatibility;
+  });
+});
 
 const deviceSchema = defineEmbeddedSchema({
   documents: replicatedTable({

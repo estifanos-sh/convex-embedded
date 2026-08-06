@@ -29,6 +29,7 @@ use crate::{
     },
     protocol, pull, push,
     store::{RemoteClock, RemoteStore, RemoteStoreFuture},
+    tick::RemoteMutationSettlementProducer,
     transport::{ConnectRequest, RemoteTransport, TransportEvent},
     upload,
     upload::{RemoteUploadRequest, RemoteUploader},
@@ -2225,6 +2226,7 @@ where
     ) -> RemoteResult<(RemoteTick, PushOutcome)> {
         let mut tick = RemoteTick::default();
         let response = mutation_push_response(envelope, result)?;
+        let response_outcome = response.outcome();
         let queued = self.read_queued_envelope()?.ok_or_else(|| {
             RemoteError::Protocol("remote push settlement lost its queued envelope".to_owned())
         })?;
@@ -2249,14 +2251,20 @@ where
         validate_upload_settlement(&queued, &response)?;
         let revisions = self.validate_revision_settlement(&queued, &response)?;
         let now = self.clock.now_ms()?;
-        if response.outcome == PushOutcome::Rebase {
+        if response_outcome == PushOutcome::Rebase {
             tick.push_rebases += 1;
             self.wait_for_rebase_remote_write();
             tick.merge(result_tick);
-            return Ok((tick, response.outcome));
+            return Ok((tick, response_outcome));
         }
+        let producer = RemoteMutationSettlementProducer::new(
+            &envelope.mutation_id,
+            &envelope.function,
+            response.verdict,
+        )
+        .expect("non-rebase push verdict produces a terminal settlement");
         let projections = self.authoritative_projections(&queued, envelope, &response, now)?;
-        let crdt = if response.outcome == PushOutcome::Applied {
+        let crdt = if response_outcome == PushOutcome::Applied {
             if response.crdt.len() != envelope.crdt.len()
                 || envelope.crdt.len() != queued.crdt.len()
             {
@@ -2317,7 +2325,7 @@ where
             }
             Vec::new()
         };
-        let outcome = match response.outcome {
+        let outcome = match response_outcome {
             PushOutcome::Applied => storage::RemoteSettlementOutcome::Applied {
                 ids,
                 schedules,
@@ -2337,7 +2345,7 @@ where
                                     &queued,
                                     &revisions,
                                     &key,
-                                    matches!(&response.outcome, PushOutcome::Rejected),
+                                    matches!(response_outcome, PushOutcome::Rejected),
                                 ),
                                 server_rev_id,
                                 table,
@@ -2368,7 +2376,7 @@ where
                 }
             }
         }
-        match response.outcome {
+        match response_outcome {
             PushOutcome::Applied => {
                 tick.push_accepted += 1;
                 tick.pushed += 1;
@@ -2377,10 +2385,15 @@ where
             PushOutcome::Rejected => tick.push_failed += 1,
             PushOutcome::Rebase => unreachable!("rebase returned before settlement"),
         }
-        tick.retained_revisions.extend(settled.projection.reroots);
+        let retained_revisions = settled.projection.reroots;
+        if !retained_revisions.is_empty() {
+            tick.retained_revisions
+                .extend(retained_revisions.iter().cloned());
+        }
+        tick.settlements.push(producer.complete(retained_revisions));
         self.receipt_queue_empty = false;
         tick.merge(result_tick);
-        Ok((tick, response.outcome))
+        Ok((tick, response_outcome))
     }
 
     fn wait_for_rebase_remote_write(&mut self) {
@@ -2496,27 +2509,87 @@ where
         table: &str,
         server_id: &str,
     ) -> RemoteResult<AuthoritativeLocalAddress> {
-        if let Some(insert) = response
+        if let Some(local_id) =
+            Self::authoritative_insert_local_id(queued, response, table, server_id)?
+        {
+            return Ok(AuthoritativeLocalAddress::Matched(local_id));
+        }
+        if let Some(local_id) = self.authoritative_hosted_local_id(queued, table, server_id)? {
+            return Ok(AuthoritativeLocalAddress::Matched(local_id));
+        }
+        let structural =
+            Self::authoritative_structural_local_ids(queued, prepared, table, server_id);
+        if structural.len() == 1 {
+            return Ok(AuthoritativeLocalAddress::Matched(
+                structural
+                    .into_iter()
+                    .next()
+                    .expect("one structural address"),
+            ));
+        }
+        if structural.len() > 1 {
+            return Err(RemoteError::Protocol(
+                "authoritative row has ambiguous local addresses".to_owned(),
+            ));
+        }
+        // A cached hosted settlement can outlive the prepared after-image that originally named
+        // the row (for example, an older runtime omitted an unresolved image while still sending
+        // the mutation). A single durable address for this table is still unambiguous. Do not guess
+        // when the envelope touched more than one possible row.
+        let durable = Self::authoritative_durable_local_ids(queued, table);
+        if durable.len() == 1 {
+            return Ok(AuthoritativeLocalAddress::SoleDurable(
+                durable.into_iter().next().expect("one durable address"),
+            ));
+        }
+        if durable.len() > 1 {
+            return Err(RemoteError::Protocol(
+                "authoritative row has ambiguous durable local addresses".to_owned(),
+            ));
+        }
+        // No durable local address survived. The hosted mutation is already terminal, so adopt this
+        // row exactly like an ordinary pull: passing the hosted id as the proposed address makes the
+        // store allocate its deterministic local projection id. This preserves the authoritative
+        // result and drains the envelope without inventing an association to unrelated local state.
+        Ok(AuthoritativeLocalAddress::AdoptHosted)
+    }
+
+    fn authoritative_insert_local_id(
+        queued: &PushEnvelope,
+        response: &storage::PushResponse,
+        table: &str,
+        server_id: &str,
+    ) -> RemoteResult<Option<String>> {
+        let Some(insert) = response
             .inserts
             .iter()
             .find(|insert| insert.table == table && insert.id == server_id)
-        {
-            return queued
-                .id_allocations
-                .get(insert.ordinal)
-                .cloned()
-                .map(AuthoritativeLocalAddress::Matched)
-                .ok_or_else(|| {
-                    RemoteError::Protocol(
-                        "authoritative insert has no matching local allocation".to_owned(),
-                    )
-                });
-        }
+        else {
+            return Ok(None);
+        };
+        queued
+            .id_allocations
+            .get(insert.ordinal)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                RemoteError::Protocol(
+                    "authoritative insert has no matching local allocation".to_owned(),
+                )
+            })
+    }
+
+    fn authoritative_hosted_local_id(
+        &self,
+        queued: &PushEnvelope,
+        table: &str,
+        server_id: &str,
+    ) -> RemoteResult<Option<String>> {
         for candidate in &queued.after_images {
             if candidate.table == table
                 && self.hosted_id_of(&candidate.row_id)?.as_deref() == Some(server_id)
             {
-                return Ok(AuthoritativeLocalAddress::Matched(candidate.row_id.clone()));
+                return Ok(Some(candidate.row_id.clone()));
             }
         }
         for witness in &queued.read_set {
@@ -2527,10 +2600,19 @@ where
             } = witness
             {
                 if witness_table == table && self.hosted_id_of(id)?.as_deref() == Some(server_id) {
-                    return Ok(AuthoritativeLocalAddress::Matched(id.clone()));
+                    return Ok(Some(id.clone()));
                 }
             }
         }
+        Ok(None)
+    }
+
+    fn authoritative_structural_local_ids(
+        queued: &PushEnvelope,
+        prepared: &PushEnvelope,
+        table: &str,
+        server_id: &str,
+    ) -> BTreeSet<String> {
         let mut structural = BTreeSet::new();
         for prepared_candidate in &prepared.after_images {
             if prepared_candidate.table != table || prepared_candidate.row_id != server_id {
@@ -2570,7 +2652,7 @@ where
                     continue;
                 };
                 if queued_table == table
-                    && queued_version == prepared_version
+                    && Self::same_logical_clock(*queued_version, *prepared_version)
                     && queued_hash == prepared_hash
                     && queued_crdt == prepared_crdt
                 {
@@ -2578,23 +2660,10 @@ where
                 }
             }
         }
-        if structural.len() == 1 {
-            return Ok(AuthoritativeLocalAddress::Matched(
-                structural
-                    .into_iter()
-                    .next()
-                    .expect("one structural address"),
-            ));
-        }
-        if structural.len() > 1 {
-            return Err(RemoteError::Protocol(
-                "authoritative row has ambiguous local addresses".to_owned(),
-            ));
-        }
-        // A cached hosted settlement can outlive the prepared after-image that originally named
-        // the row (for example, an older runtime omitted an unresolved image while still sending
-        // the mutation). A single durable address for this table is still unambiguous. Do not guess
-        // when the envelope touched more than one possible row.
+        structural
+    }
+
+    fn authoritative_durable_local_ids(queued: &PushEnvelope, table: &str) -> BTreeSet<String> {
         let mut durable = BTreeSet::new();
         durable.extend(
             queued
@@ -2618,21 +2687,14 @@ where
                 .filter(|effect| effect.table == table)
                 .map(|effect| effect.row_id.clone()),
         );
-        if durable.len() == 1 {
-            return Ok(AuthoritativeLocalAddress::SoleDurable(
-                durable.into_iter().next().expect("one durable address"),
-            ));
-        }
-        if durable.len() > 1 {
-            return Err(RemoteError::Protocol(
-                "authoritative row has ambiguous durable local addresses".to_owned(),
-            ));
-        }
-        // No durable local address survived. The hosted mutation is already terminal, so adopt this
-        // row exactly like an ordinary pull: passing the hosted id as the proposed address makes the
-        // store allocate its deterministic local projection id. This preserves the authoritative
-        // result and drains the envelope without inventing an association to unrelated local state.
-        Ok(AuthoritativeLocalAddress::AdoptHosted)
+        durable
+    }
+
+    /// `logicalClock` is a durable version identity here, not a numeric measurement. Only a
+    /// finite, bit-identical clock can prove that the queued and prepared witnesses describe the
+    /// same row version.
+    fn same_logical_clock(queued: f64, prepared: f64) -> bool {
+        queued.is_finite() && prepared.is_finite() && queued.to_bits() == prepared.to_bits()
     }
 
     async fn enqueue_pull_result(
@@ -3356,7 +3418,10 @@ where
         envelope: &PushEnvelope,
         response: &storage::PushResponse,
     ) -> RemoteResult<BTreeMap<(String, String), String>> {
-        if matches!(response.outcome, PushOutcome::Applied | PushOutcome::Rebase) {
+        if matches!(
+            response.outcome(),
+            PushOutcome::Applied | PushOutcome::Rebase
+        ) {
             if !response.revisions.is_empty() {
                 return Err(RemoteError::Protocol(
                     "an applied or rebase settlement cannot retain rejected revisions".to_owned(),
@@ -3462,7 +3527,7 @@ fn validate_insert_settlement(
             ));
         }
     }
-    if response.outcome != PushOutcome::Applied {
+    if response.outcome() != PushOutcome::Applied {
         if !response.inserts.is_empty() {
             return Err(RemoteError::Protocol(
                 "a non-applied push settlement cannot contain hosted inserts".to_owned(),
@@ -3523,7 +3588,7 @@ fn validate_schedule_settlement(
         }
     }
 
-    if response.outcome != PushOutcome::Applied {
+    if response.outcome() != PushOutcome::Applied {
         if !response.schedules.is_empty() {
             return Err(RemoteError::Protocol(
                 "a non-applied push settlement cannot contain hosted schedules".to_owned(),
@@ -3572,7 +3637,7 @@ fn validate_upload_settlement(
             ));
         }
     }
-    if response.outcome != PushOutcome::Applied {
+    if response.outcome() != PushOutcome::Applied {
         if !response.uploads.is_empty() {
             return Err(RemoteError::Protocol(
                 "a non-applied push settlement cannot contain hosted upload URLs".to_owned(),
@@ -4013,6 +4078,7 @@ mod tests {
         RemoteError, RemotePending, RemoteTick, SystemRemoteClock,
     };
     use convex::{base_client::FunctionResult, ConvexError, Value};
+    use storage::PushOutcome;
 
     #[test]
     fn identity_response_accepts_only_the_current_protocol() {
@@ -4074,7 +4140,7 @@ mod tests {
         prepared.after_images[0].row_id = "j575pnjjhzf95ze91djp5v26b188xreb".to_owned();
         let response = storage::PushResponse {
             mutation_id: "edit".to_owned(),
-            outcome: storage::PushOutcome::Applied,
+            verdict: storage::PushVerdict::Applied,
             inserts: vec![],
             schedules: vec![],
             uploads: vec![],
@@ -4149,7 +4215,7 @@ mod tests {
         prepared.after_images.clear();
         let response = storage::PushResponse {
             mutation_id: "edit".to_owned(),
-            outcome: storage::PushOutcome::Applied,
+            verdict: storage::PushVerdict::Applied,
             inserts: vec![],
             schedules: vec![],
             uploads: vec![],
@@ -4512,10 +4578,7 @@ mod tests {
                 Value::String(mutation_id.to_owned()),
             ),
             ("outcome".to_owned(), Value::String("rebase".to_owned())),
-            (
-                "error".to_owned(),
-                Value::String("crdt base sequence is stale".to_owned()),
-            ),
+            ("error".to_owned(), settlement_error("EMBEDDED_REBASE")),
             ("inserts".to_owned(), Value::Array(Vec::new())),
             ("schedules".to_owned(), Value::Array(Vec::new())),
             ("uploads".to_owned(), Value::Array(Vec::new())),
@@ -4532,10 +4595,7 @@ mod tests {
                 Value::String(mutation_id.to_owned()),
             ),
             ("outcome".to_owned(), Value::String("conflict".to_owned())),
-            (
-                "error".to_owned(),
-                Value::String("authoritative state changed".to_owned()),
-            ),
+            ("error".to_owned(), settlement_error("EMBEDDED_CONFLICT")),
             ("inserts".to_owned(), Value::Array(Vec::new())),
             ("schedules".to_owned(), Value::Array(Vec::new())),
             ("uploads".to_owned(), Value::Array(Vec::new())),
@@ -4543,6 +4603,30 @@ mod tests {
             ("crdt".to_owned(), Value::Array(Vec::new())),
             ("authoritative".to_owned(), Value::Array(Vec::new())),
         ])))
+    }
+
+    fn rejected_push_result(mutation_id: &str, code: &str) -> FunctionResult {
+        FunctionResult::Value(Value::Object(BTreeMap::from([
+            (
+                "mutationId".to_owned(),
+                Value::String(mutation_id.to_owned()),
+            ),
+            ("outcome".to_owned(), Value::String("rejected".to_owned())),
+            ("error".to_owned(), settlement_error(code)),
+            ("inserts".to_owned(), Value::Array(Vec::new())),
+            ("schedules".to_owned(), Value::Array(Vec::new())),
+            ("uploads".to_owned(), Value::Array(Vec::new())),
+            ("revisions".to_owned(), Value::Array(Vec::new())),
+            ("crdt".to_owned(), Value::Array(Vec::new())),
+            ("authoritative".to_owned(), Value::Array(Vec::new())),
+        ])))
+    }
+
+    fn settlement_error(code: &str) -> Value {
+        Value::Object(BTreeMap::from([(
+            "code".to_owned(),
+            Value::String(code.to_owned()),
+        )]))
     }
 
     fn mutation_reuse_result(outcome: &str) -> FunctionResult {
@@ -5718,6 +5802,96 @@ mod tests {
             "first"
         );
         first_send.send(applied_push_result("first")).unwrap();
+
+        let settled = driver.remote_settlement_write().unwrap();
+        assert_eq!(
+            settled
+                .settlements
+                .iter()
+                .map(crate::tick::RemoteMutationSettlement::mutation_id)
+                .collect::<Vec<_>>(),
+            ["first", "second"],
+            "the front-only durable drain preserves settlement order",
+        );
+    }
+
+    #[test]
+    fn terminal_settlement_is_emitted_only_after_its_durable_write_commits() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let store = test_store("remote-terminal-settlement-rollback.db");
+        store
+            .remote_push_envelope_write("applied", 1, &replay_envelope_json("applied", 1), 1)
+            .unwrap();
+        let envelope = crate::push::decode_envelope(&replay_envelope_json("applied", 1)).unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            TraceTransport { trace },
+            SystemRemoteClock::default(),
+        );
+
+        storage::testkit::fail_next_commit();
+        assert!(matches!(
+            driver.complete_remote_push(
+                &envelope,
+                &applied_push_result("applied"),
+                RemoteTick::default()
+            ),
+            Err(RemoteError::Storage(_))
+        ));
+        assert_eq!(
+            store.remote_push_envelope_read(1).unwrap().len(),
+            1,
+            "a rollback retains the envelope and emits no tick settlement",
+        );
+
+        let (tick, outcome) = driver
+            .complete_remote_push(
+                &envelope,
+                &applied_push_result("applied"),
+                RemoteTick::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome, PushOutcome::Applied);
+        assert_eq!(tick.settlements.len(), 1);
+        let settlement = &tick.settlements[0];
+        assert_eq!(settlement.mutation_id(), "applied");
+        assert_eq!(settlement.function(), "documents:write");
+        assert_eq!(settlement.outcome().as_str(), "applied");
+        assert_eq!(settlement.outcome().code(), None);
+        assert!(settlement.retained_revisions().is_empty());
+    }
+
+    #[test]
+    fn rejected_settlement_keeps_only_its_closed_code() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let store = test_store("remote-terminal-settlement-rejected.db");
+        store
+            .remote_push_envelope_write("rejected", 1, &replay_envelope_json("rejected", 1), 1)
+            .unwrap();
+        let envelope = crate::push::decode_envelope(&replay_envelope_json("rejected", 1)).unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            store,
+            TraceTransport { trace },
+            SystemRemoteClock::default(),
+        );
+
+        let (tick, outcome) = driver
+            .complete_remote_push(
+                &envelope,
+                &rejected_push_result("rejected", "EMBEDDED_DIVERGENCE"),
+                RemoteTick::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome, PushOutcome::Rejected);
+        assert_eq!(tick.settlements.len(), 1);
+        let settlement = &tick.settlements[0];
+        assert_eq!(settlement.mutation_id(), "rejected");
+        assert_eq!(settlement.function(), "documents:write");
+        assert_eq!(settlement.outcome().as_str(), "rejected");
+        assert_eq!(settlement.outcome().code(), Some("EMBEDDED_DIVERGENCE"));
+        assert!(settlement.retained_revisions().is_empty());
     }
 
     #[tokio::test]
@@ -6394,6 +6568,7 @@ mod tests {
         assert_eq!(tick.push_rebases, 1);
         assert_eq!(tick.push_accepted, 0);
         assert_eq!(tick.pushed, 0);
+        assert!(tick.settlements.is_empty(), "rebase is not terminal");
 
         assert_eq!(driver.inflight_remote_push.len(), 1);
         assert!(driver.replay_inflight_discarding);
@@ -6461,6 +6636,13 @@ mod tests {
         let conflict = driver.remote_settlement_write().unwrap();
 
         assert_eq!(conflict.push_conflicts, 1);
+        assert_eq!(conflict.settlements.len(), 1);
+        let settlement = &conflict.settlements[0];
+        assert_eq!(settlement.mutation_id(), "first");
+        assert_eq!(settlement.function(), "documents:write");
+        assert_eq!(settlement.outcome().as_str(), "conflict");
+        assert_eq!(settlement.outcome().code(), Some("EMBEDDED_CONFLICT"));
+        assert!(settlement.retained_revisions().is_empty());
         assert!(driver.replay_inflight_invalidated);
         assert_eq!(driver.inflight_remote_push.len(), 1);
         assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 1);
@@ -6473,6 +6655,7 @@ mod tests {
         suffix_send.send(rebase_push_result("suffix")).unwrap();
         let rebase = driver.remote_settlement_write().unwrap();
         assert_eq!(rebase.push_rebases, 1);
+        assert!(rebase.settlements.is_empty(), "rebase is not terminal");
         assert!(driver.replay_waiting_for_remote_write);
         assert!(!driver.replay_inflight_invalidated);
         assert!(driver.inflight_remote_push.is_empty());

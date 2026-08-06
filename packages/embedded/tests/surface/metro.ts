@@ -71,7 +71,7 @@ describe("embedded Metro adapter", () => {
       expect(() =>
         first.resolver.resolveRequest(
           context,
-          toVirtualSourceId(path.join(convexDir, "embedded.generated.ts")),
+          toVirtualSourceId(path.join(convexDir, "_generated", "embedded.ts")),
           "android",
         ),
       ).toThrow("outside the generated module graph");
@@ -91,7 +91,7 @@ describe("embedded Metro adapter", () => {
       await file(convexDir, "embedded.ts", embeddedEntrypoint());
       const localDir = path.join(root, "local");
       const deviceDir = path.join(root, "device");
-      await file(localDir, "sync/drafts.ts", localFunctions());
+      await file(localDir, "sync/drafts.ts", localFunctions(2));
       await file(deviceDir, "prefs.ts", localFunctions());
       const previous = vi.fn((_context, moduleName: string, _platform: string | null) => ({
         moduleName,
@@ -226,8 +226,8 @@ export const ${name} = ${placement}.${builder}({});
 `;
 }
 
-function localFunctions(): string {
-  return `import { local } from "@convex-dev/embedded/local";
+function localFunctions(depth = 1): string {
+  return `import { local } from "${"../".repeat(depth)}convex/_generated/embedded";
 
 export const setCompact = local.mutation({ args: {}, handler: async () => null });
 `;

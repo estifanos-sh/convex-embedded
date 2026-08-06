@@ -176,12 +176,16 @@ type SettlementBase = {
   revisions: Array<{ table: string; rowId: string; revId: string }>;
 };
 
+type ConflictSettlementError = { code: "EMBEDDED_CONFLICT" };
+type RejectedSettlementError = { code: "EMBEDDED_REJECTED" | "EMBEDDED_DIVERGENCE" };
+type RebaseSettlementError = { code: "EMBEDDED_REBASE" };
+
 type SettlementInput = SettlementBase &
   (
     | { outcome: "applied"; result: unknown }
-    | { outcome: "conflict"; error: unknown }
-    | { outcome: "rejected"; error: unknown }
-    | { outcome: "rebase"; error: unknown }
+    | { outcome: "conflict"; error: ConflictSettlementError }
+    | { outcome: "rejected"; error: RejectedSettlementError }
+    | { outcome: "rebase"; error: RebaseSettlementError }
   );
 
 type FailureSettlementInput = Exclude<SettlementInput, { outcome: "applied" }>;
@@ -742,11 +746,29 @@ const settlementFields = {
   ),
 };
 
+const conflictSettlementErrorValidator = v.object({ code: v.literal("EMBEDDED_CONFLICT") });
+const rejectedSettlementErrorValidator = v.object({
+  code: v.union(v.literal("EMBEDDED_REJECTED"), v.literal("EMBEDDED_DIVERGENCE")),
+});
+const rebaseSettlementErrorValidator = v.object({ code: v.literal("EMBEDDED_REBASE") });
+
 const settlementValidator = v.union(
   v.object({ ...settlementFields, outcome: v.literal("applied"), result: v.any() }),
-  v.object({ ...settlementFields, outcome: v.literal("conflict"), error: v.any() }),
-  v.object({ ...settlementFields, outcome: v.literal("rejected"), error: v.any() }),
-  v.object({ ...settlementFields, outcome: v.literal("rebase"), error: v.any() }),
+  v.object({
+    ...settlementFields,
+    outcome: v.literal("conflict"),
+    error: conflictSettlementErrorValidator,
+  }),
+  v.object({
+    ...settlementFields,
+    outcome: v.literal("rejected"),
+    error: rejectedSettlementErrorValidator,
+  }),
+  v.object({
+    ...settlementFields,
+    outcome: v.literal("rebase"),
+    error: rebaseSettlementErrorValidator,
+  }),
 );
 
 type RevisionRunMutation = (
@@ -1363,7 +1385,9 @@ function buildPush(
           expiresAt: readTime() + REPLAY_TTL_MS,
         })) as Settlement | null;
         if (prior) {
-          return await refreshAppliedSettlement(ctx, prior, tableNames, crdtFields, placements);
+          return normalizeSettlement(
+            await refreshAppliedSettlement(ctx, prior, tableNames, crdtFields, placements),
+          );
         }
 
         const authoredArgs = (await resolveArgRefs(
@@ -1384,7 +1408,7 @@ function buildPush(
               message: "Only mutations created by defineEmbedded can be replayed.",
             });
           }
-          return result.settlement;
+          return normalizeSettlement(result.settlement);
         } catch (error) {
           // A function removed or narrowed by a later deployment fails before its embedded wrapper
           // can translate the error. Convex has already retried internal mutation failures before
@@ -1420,30 +1444,24 @@ function buildPush(
                   changes,
                   crdtFields,
                 );
-          const settlement: FailureSettlementInput = {
-            mutationId: args.mutationId,
-            outcome,
-            error: { code: failure.code, ...(failure.reason ? { reason: failure.reason } : {}) },
-            inserts: [],
-            schedules: [],
-            uploads: [],
-            revisions: [],
-          };
-          return (await ctx.runMutation(component.protocol.commit, {
-            request: {
-              kind: "failure",
-              clientId: args.clientId,
-              replayId: args.replayId,
-              fingerprint,
-              logicalFingerprint,
-              runtime: args.runtime,
-              ...(identity === null ? {} : { identity }),
-              acknowledgeReplayId: args.acknowledgeReplayId,
-              settlement,
-              changes,
-              revisions,
-            },
-          })) as Settlement;
+          const settlement = failureSettlement(args.mutationId, failure.code);
+          return normalizeSettlement(
+            (await ctx.runMutation(component.protocol.commit, {
+              request: {
+                kind: "failure",
+                clientId: args.clientId,
+                replayId: args.replayId,
+                fingerprint,
+                logicalFingerprint,
+                runtime: args.runtime,
+                ...(identity === null ? {} : { identity }),
+                acknowledgeReplayId: args.acknowledgeReplayId,
+                settlement,
+                changes,
+                revisions,
+              },
+            })) as Settlement,
+          );
         }
       }
       if (args.kind === "blob") {
@@ -1470,6 +1488,59 @@ function buildPush(
       throw new Error("Unknown Embedded protocol push.");
     },
   });
+}
+
+/**
+ * Normalize a cached v26 failure at the v27 server response boundary.
+ *
+ * Historic component rows may contain an arbitrary `error` object and reason text. Their exact
+ * payload is never forwarded: the outcome determines conflict/rebase, while rejected preserves
+ * only the one safe legacy distinction (`EMBEDDED_DIVERGENCE`). New records already use this
+ * shape, so the same boundary guarantees every Rust client receives the closed form.
+ */
+function normalizeSettlement(settlement: Settlement): Settlement {
+  switch (settlement.outcome) {
+    case "applied":
+      return settlement;
+    case "conflict":
+      return { ...settlement, error: { code: "EMBEDDED_CONFLICT" } };
+    case "rebase":
+      return { ...settlement, error: { code: "EMBEDDED_REBASE" } };
+    case "rejected": {
+      const legacyCode = readSettlementErrorCode(settlement.error);
+      return {
+        ...settlement,
+        error: {
+          code: legacyCode === "EMBEDDED_DIVERGENCE" ? "EMBEDDED_DIVERGENCE" : "EMBEDDED_REJECTED",
+        },
+      };
+    }
+  }
+}
+
+function failureSettlement(mutationId: string, code: ReplayFailureCode): FailureSettlementInput {
+  const base = {
+    mutationId,
+    inserts: [],
+    schedules: [],
+    uploads: [],
+    revisions: [],
+  };
+  switch (code) {
+    case "EMBEDDED_CONFLICT":
+      return { ...base, outcome: "conflict", error: { code } };
+    case "EMBEDDED_REBASE":
+      return { ...base, outcome: "rebase", error: { code } };
+    case "EMBEDDED_DIVERGENCE":
+    case "EMBEDDED_REJECTED":
+      return { ...base, outcome: "rejected", error: { code } };
+  }
+}
+
+function readSettlementErrorCode(error: unknown): string | undefined {
+  if (error === null || typeof error !== "object" || Array.isArray(error)) return undefined;
+  const code = (error as Record<string, unknown>).code;
+  return typeof code === "string" ? code : undefined;
 }
 
 function assertWireAfterImages(
