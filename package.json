@@ -61,7 +61,6 @@
   },
   "devDependencies": {
     "fallow": "catalog:",
-    "pkg-pr-new": "catalog:",
     "vite": "catalog:",
     "vite-plus": "catalog:",
     "vitest": "catalog:"
