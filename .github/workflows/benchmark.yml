@@ -1,13 +1,24 @@
-name: Benchmark
+name: Runner sizing
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Git ref or commit to benchmark
+        description: Immutable 40-character commit SHA to measure
         required: true
-        default: main
         type: string
+      workload:
+        description: Runtime is the cross-platform package workload; Android builds every shipping ABI.
+        required: true
+        default: runtime
+        type: choice
+        options: [runtime, android, all]
+      cache:
+        description: Cold bypasses and does not save caches; warm seeds one cache per provider and architecture before measuring.
+        required: true
+        default: cold
+        type: choice
+        options: [cold, warm]
 
 permissions:
   contents: read
@@ -16,21 +27,92 @@ env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/target
   CARGO_TERM_COLOR: always
 
+# This workflow exists solely for controlled runner comparisons. It must remain manually
+# dispatched: the matrix can deliberately consume substantial Linux, ARM, and macOS capacity.
+concurrency:
+  group: runner-sizing-${{ inputs.ref }}-${{ inputs.workload }}-${{ inputs.cache }}
+  cancel-in-progress: false
+
 jobs:
-  runtime:
-    name: Runtime
-    runs-on: depot-ubuntu-24.04-8
-    timeout-minutes: 60
+  resolve:
+    name: Source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
 
     steps:
-      - name: Checkout exact benchmark source
+      - name: Validate
+        env:
+          REQUESTED_SHA: ${{ inputs.ref }}
+        run: |
+          if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::ref must be an immutable lowercase 40-character commit SHA."
+            exit 1
+          fi
+
+      - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
           ref: ${{ inputs.ref }}
 
-      - name: Install pinned Rust toolchain
+      - name: Resolve
+        id: source
+        env:
+          REQUESTED_SHA: ${{ inputs.ref }}
+        run: |
+          actual=$(git rev-parse HEAD)
+          if [[ "$actual" != "$REQUESTED_SHA" ]]; then
+            echo "::error::Checkout resolved $actual instead of requested $REQUESTED_SHA."
+            exit 1
+          fi
+          echo "sha=$actual" >> "$GITHUB_OUTPUT"
+
+  warm-runtime:
+    name: Warm runtime ${{ matrix.label }}
+    needs: resolve
+    if: >-
+      inputs.cache == 'warm'
+      && (inputs.workload == 'runtime' || inputs.workload == 'all')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Blacksmith Linux
+            runner: blacksmith-8vcpu-ubuntu-2404
+            cache: blacksmith-linux-x64
+          - label: Depot Linux
+            runner: depot-ubuntu-24.04-8
+            cache: depot-linux-x64
+          - label: Blacksmith ARM
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+            cache: blacksmith-linux-arm64
+          - label: Depot ARM
+            runner: depot-ubuntu-24.04-arm-8
+            cache: depot-linux-arm64
+          - label: Blacksmith macOS
+            runner: blacksmith-6vcpu-macos-15
+            cache: blacksmith-macos-arm64
+          - label: Depot macOS
+            runner: depot-macos-15
+            cache: depot-macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.sha }}"
+
+      - name: Install Rust
         uses: ./.github/actions/rust
 
       - name: Setup Vite+
@@ -44,11 +126,122 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: embedded-benchmark
+          shared-key: runner-sizing-${{ needs.resolve.outputs.sha }}-${{ matrix.cache }}-warm
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: false
+          save-if: true
+
+      # Build the artifacts that dominate the later runtime job. This seed is intentionally not
+      # included in the measured artifact, and all like-for-like sizes restore the same cache.
+      - name: Seed
+        run: |
+          vp run '@estifanos-sh/convex-embedded#build:ts'
+          vp run '@estifanos-sh/convex-embedded#native'
+          vp run '@estifanos-sh/convex-embedded#wasm'
+
+  runtime:
+    name: Runtime ${{ matrix.label }}
+    needs: [resolve, warm-runtime]
+    if: >-
+      always()
+      && needs.resolve.result == 'success'
+      && (inputs.workload == 'runtime' || inputs.workload == 'all')
+      && (inputs.cache == 'cold' || needs.warm-runtime.result == 'success')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: blacksmith-linux-8
+            label: Blacksmith Linux 8
+            runner: blacksmith-8vcpu-ubuntu-2404
+            cache: blacksmith-linux-x64
+          - id: blacksmith-linux-16
+            label: Blacksmith Linux 16
+            runner: blacksmith-16vcpu-ubuntu-2404
+            cache: blacksmith-linux-x64
+          - id: blacksmith-linux-32
+            label: Blacksmith Linux 32
+            runner: blacksmith-32vcpu-ubuntu-2404
+            cache: blacksmith-linux-x64
+          - id: depot-linux-8
+            label: Depot Linux 8
+            runner: depot-ubuntu-24.04-8
+            cache: depot-linux-x64
+          - id: depot-linux-16
+            label: Depot Linux 16
+            runner: depot-ubuntu-24.04-16
+            cache: depot-linux-x64
+          - id: depot-linux-32
+            label: Depot Linux 32
+            runner: depot-ubuntu-24.04-32
+            cache: depot-linux-x64
+          - id: blacksmith-arm-8
+            label: Blacksmith ARM 8
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+            cache: blacksmith-linux-arm64
+          - id: blacksmith-arm-16
+            label: Blacksmith ARM 16
+            runner: blacksmith-16vcpu-ubuntu-2404-arm
+            cache: blacksmith-linux-arm64
+          - id: depot-arm-8
+            label: Depot ARM 8
+            runner: depot-ubuntu-24.04-arm-8
+            cache: depot-linux-arm64
+          - id: depot-arm-16
+            label: Depot ARM 16
+            runner: depot-ubuntu-24.04-arm-16
+            cache: depot-linux-arm64
+          - id: blacksmith-macos-6
+            label: Blacksmith macOS 6
+            runner: blacksmith-6vcpu-macos-15
+            cache: blacksmith-macos-arm64
+          - id: blacksmith-macos-12
+            label: Blacksmith macOS 12
+            runner: blacksmith-12vcpu-macos-15
+            cache: blacksmith-macos-arm64
+          - id: depot-macos-8
+            label: Depot macOS 8
+            runner: depot-macos-15
+            cache: depot-macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.sha }}"
+
+      - name: Install Rust
+        uses: ./.github/actions/rust
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: ${{ inputs.cache == 'warm' }}
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: runner-sizing-${{ needs.resolve.outputs.sha }}-${{ matrix.cache }}-${{ inputs.cache == 'cold' && github.run_id || 'warm' }}
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
+          save-if: false
 
-      - name: Build and exercise the runtime
+      - name: Start
+        id: start
+        run: node --input-type=module -e 'console.log(`unix_ms=${Date.now()}`)' >> "$GITHUB_OUTPUT"
+
+      - name: Exercise
+        id: exercise
         run: |
           vp run '@estifanos-sh/convex-embedded#build:ts'
           vp run '@estifanos-sh/convex-embedded#native'
@@ -60,29 +253,105 @@ jobs:
           cargo test -p storage --features testkit --test fixture
           cargo test -p storage --features testkit --test migration
 
-  android:
-    name: Android
-    runs-on: depot-ubuntu-24.04-16
-    timeout-minutes: 120
+      - name: Record
+        if: always()
+        env:
+          BENCHMARK_START_MS: ${{ steps.start.outputs.unix_ms }}
+          BENCHMARK_OUTCOME: ${{ steps.exercise.outcome }}
+          BENCHMARK_ID: ${{ matrix.id }}
+          BENCHMARK_LABEL: ${{ matrix.label }}
+          BENCHMARK_RUNNER: ${{ matrix.runner }}
+          BENCHMARK_CACHE: ${{ inputs.cache }}
+          BENCHMARK_REF: ${{ needs.resolve.outputs.sha }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { writeFileSync } from "node:fs";
+          import { execFileSync } from "node:child_process";
+          import { join } from "node:path";
+
+          const command = (name, args) => {
+            try {
+              return execFileSync(name, args, { encoding: "utf8" }).trim();
+            } catch {
+              return undefined;
+            }
+          };
+          const endedAtMs = Date.now();
+          const startedAtMs = Number(process.env.BENCHMARK_START_MS);
+          const report = {
+            id: process.env.BENCHMARK_ID,
+            label: process.env.BENCHMARK_LABEL,
+            runner: process.env.BENCHMARK_RUNNER,
+            ref: process.env.BENCHMARK_REF,
+            checkedOutSha: command("git", ["rev-parse", "HEAD"]),
+            cache: process.env.BENCHMARK_CACHE,
+            outcome: process.env.BENCHMARK_OUTCOME,
+            startedAtMs,
+            endedAtMs,
+            durationMs: Number.isFinite(startedAtMs) ? endedAtMs - startedAtMs : undefined,
+            platform: process.platform,
+            arch: process.arch,
+            runnerName: process.env.RUNNER_NAME,
+            runnerOs: process.env.RUNNER_OS,
+            uname: command("uname", ["-a"]),
+            cpuCount: command("getconf", ["_NPROCESSORS_ONLN"]) ?? command("sysctl", ["-n", "hw.ncpu"]),
+          };
+          writeFileSync(join(process.env.RUNNER_TEMP, "runner-sizing.json"), `${JSON.stringify(report, null, 2)}\n`);
+          EOF
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runner-sizing-${{ matrix.id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runner-sizing.json
+          if-no-files-found: error
+          retention-days: 14
+
+  warm-android:
+    name: Warm Android ${{ matrix.label }}
+    needs: resolve
+    if: >-
+      inputs.cache == 'warm'
+      && (inputs.workload == 'android' || inputs.workload == 'all')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Blacksmith Linux
+            runner: blacksmith-8vcpu-ubuntu-2404
+            cache: blacksmith-android-x64
+          - label: Depot Linux
+            runner: depot-ubuntu-24.04-8
+            cache: depot-android-x64
 
     steps:
-      - name: Checkout exact benchmark source
+      - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          fetch-depth: 1
           persist-credentials: false
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.resolve.outputs.sha }}
 
-      - name: Install pinned Rust toolchain
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.sha }}"
+
+      - name: Install Rust
         uses: ./.github/actions/rust
 
-      - name: Setup Java
+      - name: Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
-      - name: Setup Gradle
+      - name: Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+          cache-read-only: false
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -95,18 +364,163 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: embedded-benchmark-android
+          shared-key: runner-sizing-${{ needs.resolve.outputs.sha }}-${{ matrix.cache }}-warm
           key: ${{ hashFiles('rust-toolchain.toml') }}
-          cache-on-failure: true
+          cache-on-failure: false
+          save-if: true
 
-      - name: Enable pnpm for the Expo compile fixture
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.5.2 --activate
-
-      - name: Build and compile all Android ABIs
+      - name: Seed
         env:
           EAS_BUILD_PLATFORM: android
         run: |
           node demos/expo/scripts/native.ts eas
           node packages/embedded/scripts/mobilecompile.ts android
+
+  android:
+    name: Android ${{ matrix.label }}
+    needs: [resolve, warm-android]
+    if: >-
+      always()
+      && needs.resolve.result == 'success'
+      && (inputs.workload == 'android' || inputs.workload == 'all')
+      && (inputs.cache == 'cold' || needs.warm-android.result == 'success')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: blacksmith-linux-8
+            label: Blacksmith Linux 8
+            runner: blacksmith-8vcpu-ubuntu-2404
+            cache: blacksmith-android-x64
+          - id: blacksmith-linux-16
+            label: Blacksmith Linux 16
+            runner: blacksmith-16vcpu-ubuntu-2404
+            cache: blacksmith-android-x64
+          - id: blacksmith-linux-32
+            label: Blacksmith Linux 32
+            runner: blacksmith-32vcpu-ubuntu-2404
+            cache: blacksmith-android-x64
+          - id: depot-linux-8
+            label: Depot Linux 8
+            runner: depot-ubuntu-24.04-8
+            cache: depot-android-x64
+          - id: depot-linux-16
+            label: Depot Linux 16
+            runner: depot-ubuntu-24.04-16
+            cache: depot-android-x64
+          - id: depot-linux-32
+            label: Depot Linux 32
+            runner: depot-ubuntu-24.04-32
+            cache: depot-android-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "${{ needs.resolve.outputs.sha }}"
+
+      - name: Install Rust
+        uses: ./.github/actions/rust
+
+      - name: Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+          cache-disabled: ${{ inputs.cache == 'cold' }}
+          cache-read-only: true
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: ${{ inputs.cache == 'warm' }}
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: runner-sizing-${{ needs.resolve.outputs.sha }}-${{ matrix.cache }}-${{ inputs.cache == 'cold' && github.run_id || 'warm' }}
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+          save-if: false
+
+      - name: Start
+        id: start
+        run: node --input-type=module -e 'console.log(`unix_ms=${Date.now()}`)' >> "$GITHUB_OUTPUT"
+
+      - name: Exercise
+        id: exercise
+        env:
+          EAS_BUILD_PLATFORM: android
+        run: |
+          node demos/expo/scripts/native.ts eas
+          node packages/embedded/scripts/mobilecompile.ts android
+
+      - name: Record
+        if: always()
+        env:
+          BENCHMARK_START_MS: ${{ steps.start.outputs.unix_ms }}
+          BENCHMARK_OUTCOME: ${{ steps.exercise.outcome }}
+          BENCHMARK_ID: ${{ matrix.id }}
+          BENCHMARK_LABEL: ${{ matrix.label }}
+          BENCHMARK_RUNNER: ${{ matrix.runner }}
+          BENCHMARK_CACHE: ${{ inputs.cache }}
+          BENCHMARK_REF: ${{ needs.resolve.outputs.sha }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { writeFileSync } from "node:fs";
+          import { execFileSync } from "node:child_process";
+          import { join } from "node:path";
+
+          const command = (name, args) => {
+            try {
+              return execFileSync(name, args, { encoding: "utf8" }).trim();
+            } catch {
+              return undefined;
+            }
+          };
+          const endedAtMs = Date.now();
+          const startedAtMs = Number(process.env.BENCHMARK_START_MS);
+          const report = {
+            id: process.env.BENCHMARK_ID,
+            label: process.env.BENCHMARK_LABEL,
+            runner: process.env.BENCHMARK_RUNNER,
+            ref: process.env.BENCHMARK_REF,
+            checkedOutSha: command("git", ["rev-parse", "HEAD"]),
+            cache: process.env.BENCHMARK_CACHE,
+            outcome: process.env.BENCHMARK_OUTCOME,
+            startedAtMs,
+            endedAtMs,
+            durationMs: Number.isFinite(startedAtMs) ? endedAtMs - startedAtMs : undefined,
+            platform: process.platform,
+            arch: process.arch,
+            runnerName: process.env.RUNNER_NAME,
+            runnerOs: process.env.RUNNER_OS,
+            uname: command("uname", ["-a"]),
+            cpuCount: command("getconf", ["_NPROCESSORS_ONLN"]) ?? command("sysctl", ["-n", "hw.ncpu"]),
+          };
+          writeFileSync(join(process.env.RUNNER_TEMP, "runner-sizing.json"), `${JSON.stringify(report, null, 2)}\n`);
+          EOF
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runner-sizing-android-${{ matrix.id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runner-sizing.json
+          if-no-files-found: error
+          retention-days: 14
