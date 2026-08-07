@@ -97,6 +97,16 @@ type EmbeddedRegisteredQuery = RegisteredQuery<any, any, any> & {
   __embeddedPlacement?: "replicated";
 };
 
+export function assertReplicatedIndex(
+  placements: EmbeddedSchemaPlacements,
+  table: string,
+  index: unknown,
+): void {
+  if (typeof index === "string" && placements.indexes[table]?.remote.includes(index) === true) {
+    throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
+  }
+}
+
 const runtimeValidator = v.object({
   schemaHash: v.string(),
   moduleGraphHash: v.string(),
@@ -616,7 +626,7 @@ class QueryCapture {
         const value = Reflect.get(target, property, receiver);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
-          if (property === "withIndex") this.assertReplicatedIndex(table, args[0]);
+          if (property === "withIndex") assertReplicatedIndex(this.placements, table, args[0]);
           const next = value.apply(target, args);
           if (property === "collect" || property === "take") {
             return Promise.resolve(next).then((rows: unknown[]) => {
@@ -666,15 +676,6 @@ class QueryCapture {
   private assertReplicatedTable(table: string): void {
     if (!this.tableNames.includes(table)) {
       throw new Error(`Replicated functions cannot access non-replicated table ${table}.`);
-    }
-  }
-
-  private assertReplicatedIndex(table: string, index: unknown): void {
-    if (
-      typeof index === "string" &&
-      this.placements.indexes[table]?.remote.includes(index) === true
-    ) {
-      throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
     }
   }
 

@@ -67,6 +67,7 @@ import {
 import { normalizeMutationResult } from "../result";
 import {
   assertReplicatedReference,
+  assertReplicatedIndex,
   assertReplicatedTarget,
   buildQueryBuilder,
   completeQueryRows,
@@ -1876,15 +1877,6 @@ class WriteCapture {
     }
   }
 
-  private assertReplicatedIndex(table: string, index: unknown): void {
-    if (
-      typeof index === "string" &&
-      this.placements.indexes[table]?.remote.includes(index) === true
-    ) {
-      throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
-    }
-  }
-
   private project(table: string, value: unknown): unknown {
     if (typeof value !== "object" || value === null) return value;
     return projectWireDoc(this.placements, table, value as Record<string, unknown>);
@@ -1902,7 +1894,7 @@ class WriteCapture {
         const value = Reflect.get(target, property, receiver);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
-          if (property === "withIndex") this.assertReplicatedIndex(table, args[0]);
+          if (property === "withIndex") assertReplicatedIndex(this.placements, table, args[0]);
           const next = value.apply(target, args);
           if (property === "collect" || property === "take") {
             return Promise.resolve(next).then((rows: unknown[]) =>
