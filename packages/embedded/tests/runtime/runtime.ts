@@ -29,6 +29,7 @@ import type {
   IdMapping,
   MutationCall,
   MutationRecord,
+  OneDocWriteCommit,
   RemoteScope,
   RemoteSurface,
   RuntimeStorage,
@@ -814,6 +815,10 @@ class FakeStorage implements RuntimeStorage {
   private readonly ids = new Map<string, IdMapping>();
   private readonly mutations = new Map<string, MutationRecord & { args: string; name: string }>();
   commitFailures = 0;
+  commitOneDocWrite?: (
+    commit: OneDocWriteCommit,
+    options?: CommitOptions,
+  ) => ReturnType<FakeStorage["commit"]>;
   mutationWriteCalls = 0;
   readonly pushEnvelopes: Array<{
     afterImages: unknown[];
@@ -3192,6 +3197,35 @@ describe("runtime", () => {
 
     expect(calls).toBe(2);
     expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "retry" });
+  });
+
+  test("one-document mutations use the storage shortcut when batching is unnecessary", async () => {
+    const store = new FakeStorage();
+    let oneDocWriteCalls = 0;
+    store.commitOneDocWrite = (commit, options) => {
+      oneDocWriteCalls += 1;
+      return store.commit(
+        {
+          dataOnlyIds: commit.dataOnly
+            ? [{ id: commit.docWrite.id, table: commit.docWrite.table }]
+            : [],
+          deletes: [],
+          docWrites: [commit.docWrite],
+          freshIds: commit.fresh ? [{ id: commit.docWrite.id, table: commit.docWrite.table }] : [],
+        },
+        options,
+      );
+    };
+    const r = createRunner({ messages }, store, storeSchema);
+
+    const id = (await r.runMutation("messages:send", {
+      body: "before",
+      channel: "fast",
+    })) as string;
+    await r.runMutation("messages:rename", { body: "shortcut", id });
+
+    expect(oneDocWriteCalls).toBe(1);
+    expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "shortcut" });
   });
 
   test("fresh mutation id commits terminal row without a pre-handler begin", async () => {

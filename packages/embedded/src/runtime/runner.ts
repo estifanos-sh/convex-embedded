@@ -468,6 +468,59 @@ interface ScopedMutationBatch {
   touchedKeys: string[];
 }
 
+interface MutationCommitInput {
+  checked: Record<string, unknown>;
+  encodedMutationArgs: ReturnType<typeof encode> | undefined;
+  fn: RunnableFunction;
+  generatedUploadUrls: string[];
+  options: RunMutationOptions;
+  pendingScheduleRows: ScheduledJob[];
+  pendingSchedules: Array<() => Promise<void>>;
+  pushEnvelopeTimeHlc: number | undefined;
+  readSetCollector: ReturnType<typeof createReadSetCollector> | undefined;
+  recordsMutation: boolean;
+  resolved: { name: string; scope: RuntimeScope };
+  revisionReplay: RevisionReplay | undefined;
+  root: ScopedMutationTransaction;
+  scheduledJobs: string[];
+  timing: RunMutationTiming | undefined;
+  timingPhaseStartedAt: number;
+  timingStartedAt: number;
+  validated: unknown;
+}
+
+type MutationCommitPlan =
+  | {
+      batch: ScopedMutationBatch;
+      commitOptions: CommitOptions;
+      kind: "batch";
+      pushEnvelopeJson: string | undefined;
+      requiresCommitTs: boolean;
+      timingCommitStartedAt: number;
+      watching: boolean;
+    }
+  | {
+      commitOptions: CommitOptions;
+      kind: "oneDoc";
+      oneDocWrite: OneDocWriteCommit;
+      pushEnvelopeJson: undefined;
+      requiresCommitTs: false;
+      timingCommitStartedAt: number;
+      watching: false;
+    };
+
+type MutationCommitTarget =
+  | { batch: ScopedMutationBatch; kind: "batch"; localSchedules: boolean; watching: boolean }
+  | { kind: "oneDoc"; oneDocWrite: OneDocWriteCommit };
+
+interface MutationCommitMaterial {
+  afterImagesHaveCommitTs: boolean;
+  encodedMutationResult: ReturnType<typeof encode> | undefined;
+  requiresCommitTs: boolean;
+  resultHasCommitTs: boolean;
+  timingCommitStartedAt: number;
+}
+
 interface ScopedMutationSnapshot {
   revisionRestores: number;
   writers: Map<ComponentInstancePath, ReturnType<ReturnType<typeof createWriter>["snapshot"]>>;
@@ -1172,82 +1225,17 @@ export function createRunner(
    * what makes storage failures retryable: callers restore the transaction, but do not write a
    * terminal mutation failure.
    */
-  const commitMutation = async ({
-    checked,
-    encodedMutationArgs,
-    fn,
-    generatedUploadUrls,
-    options,
-    pendingScheduleRows,
-    pendingSchedules,
-    pushEnvelopeTimeHlc,
-    readSetCollector,
-    recordsMutation,
-    resolved,
-    revisionReplay,
-    root,
-    scheduledJobs,
-    timing,
-    timingPhaseStartedAt,
-    timingStartedAt,
-    validated,
-  }: {
-    checked: Record<string, unknown>;
-    encodedMutationArgs: ReturnType<typeof encode> | undefined;
-    fn: RunnableFunction;
-    generatedUploadUrls: string[];
-    options: RunMutationOptions;
-    pendingScheduleRows: ScheduledJob[];
-    pendingSchedules: Array<() => Promise<void>>;
-    pushEnvelopeTimeHlc: number | undefined;
-    readSetCollector: ReturnType<typeof createReadSetCollector> | undefined;
-    recordsMutation: boolean;
-    resolved: { name: string; scope: RuntimeScope };
-    revisionReplay: RevisionReplay | undefined;
-    root: ScopedMutationTransaction;
-    scheduledJobs: string[];
-    timing: RunMutationTiming | undefined;
-    timingPhaseStartedAt: number;
-    timingStartedAt: number;
-    validated: unknown;
-  }): Promise<unknown> => {
-    await root.validateRevisionRestores();
-    const watching = watchers.size > 0;
-    const localSchedules = !remoteEnabled && pendingScheduleRows.length > 0;
-    const canCommitOneDocWrite =
-      !watching &&
-      !hasEventListeners() &&
-      !!store.commitOneDocWrite &&
-      !options.pushCall &&
-      !localSchedules &&
-      !hasPendingCommitTs(validated);
-    const oneDocWrite = canCommitOneDocWrite ? root.oneDocWrite() : undefined;
-    const batchInfo = oneDocWrite ? undefined : root.toBatch(watching);
-    const resultHasCommitTs = hasPendingCommitTs(validated);
-    const batchHasCommitTs = batchInfo?.batch.pendingCommitTs === true;
-    const afterImagesHaveCommitTs =
-      batchHasCommitTs === true &&
-      batchInfo!.rootBatch.docWrites.some((write) => write.pendingCommitTs === true);
-    const requiresCommitTs = resultHasCommitTs || batchHasCommitTs;
-    let phaseStartedAt = timingPhaseStartedAt;
-    if (timing) {
-      timing.batchMs = getTimerTime() - phaseStartedAt;
-      phaseStartedAt = getTimerTime();
-    }
-    const encodedMutationResult = recordsMutation ? encode(validated) : undefined;
-    if (timing) {
-      timing.resultEncodeMs = getTimerTime() - phaseStartedAt;
-      phaseStartedAt = getTimerTime();
-    }
-    let pushEnvelopeJson: string | undefined;
-    let pushEnvelopeNowMs: number | undefined;
-    if (options.pushCall !== undefined && readSetCollector !== undefined) {
-      const mutationId = options.mutationId;
-      if (mutationId === undefined) {
-        throw new Error("A remote push requires the local mutation ID.");
-      }
-      pushEnvelopeNowMs = pushEnvelopeTimeHlc ?? store.clock.read();
-      pushEnvelopeJson = JSON.stringify({
+  const preparePushEnvelope = async (
+    input: MutationCommitInput,
+    batch: ScopedMutationBatch,
+  ): Promise<{ json: string; nowMs: number } | undefined> => {
+    const { options, readSetCollector } = input;
+    if (options.pushCall === undefined || readSetCollector === undefined) return undefined;
+    const mutationId = options.mutationId;
+    if (mutationId === undefined) throw new Error("A remote push requires the local mutation ID.");
+    const nowMs = input.pushEnvelopeTimeHlc ?? store.clock.read();
+    return {
+      json: JSON.stringify({
         clientRuntime: {
           schemaHash: storeSchema.hash ?? "local",
           moduleGraphHash,
@@ -1255,20 +1243,20 @@ export function createRunner(
         },
         mutationId,
         commitSeq: 0,
-        localInserts: (batchInfo?.rootBatch.freshIds ?? []).map((fresh) => fresh.id),
-        localSchedules: scheduledJobs,
-        idPaths: idPathsForArgs(fn, checked),
+        localInserts: (batch.rootBatch.freshIds ?? []).map((fresh) => fresh.id),
+        localSchedules: input.scheduledJobs,
+        idPaths: idPathsForArgs(input.fn, input.checked),
         functionName: options.pushCall.fn,
-        args: convexToJson(checked as Value),
+        args: convexToJson(input.checked as Value),
         resultHash: await resultHash(
           store,
-          fn,
-          checked,
-          validated ?? null,
+          input.fn,
+          input.checked,
+          input.validated ?? null,
           mutationId,
-          batchInfo?.rootBatch.freshIds ?? [],
-          scheduledJobs,
-          generatedUploadUrls,
+          batch.rootBatch.freshIds ?? [],
+          input.scheduledJobs,
+          input.generatedUploadUrls,
           new Map(
             storeSchema.tables.map((table) => [
               table.name,
@@ -1277,108 +1265,275 @@ export function createRunner(
           ),
         ),
         argRefs: [],
-        inserts: (batchInfo?.rootBatch.freshIds ?? []).map((fresh, ordinal) => ({
+        inserts: (batch.rootBatch.freshIds ?? []).map((fresh, ordinal) => ({
           mutationId,
           ordinal,
           table: fresh.table,
         })),
         reads: readSetCollector.readSet().map(readWitness),
-        mutationTime: pushEnvelopeNowMs,
+        mutationTime: nowMs,
         randomSeed: options.pushCall.rngSeed,
-        schedules: scheduledJobs.map((_, ordinal) => ({ mutationId, ordinal })),
-        uploads: generatedUploadUrls.map((_, ordinal) => ({ mutationId, ordinal })),
-        afterImages: afterImages(batchInfo!.rootBatch),
-        crdt: await crdtEffects(batchInfo!.rootBatch),
-        revisionCheckpoints: (revisionReplay?.checkpoints ?? []).map((checkpoint) => ({
+        schedules: input.scheduledJobs.map((_, ordinal) => ({ mutationId, ordinal })),
+        uploads: input.generatedUploadUrls.map((_, ordinal) => ({ mutationId, ordinal })),
+        afterImages: afterImages(batch.rootBatch),
+        crdt: await crdtEffects(batch.rootBatch),
+        revisionCheckpoints: (input.revisionReplay?.checkpoints ?? []).map((checkpoint) => ({
           ...checkpoint,
           snapshots: checkpoint.snapshots.map((snapshot) => ({
             ...snapshot,
             bytes: convexToJson(snapshot.bytes),
           })),
         })),
-      });
+      }),
+      nowMs,
+    };
+  };
+
+  const mutationCommitOptions = (
+    input: MutationCommitInput,
+    encodedMutationResult: ReturnType<typeof encode> | undefined,
+    pushEnvelope: { json: string; nowMs: number } | undefined,
+    resultHasCommitTs: boolean,
+    afterImagesHaveCommitTs: boolean,
+    requiresCommitTs: boolean,
+  ): CommitOptions => {
+    const { fn, options } = input;
+    if (fn.placement === "local") {
+      return { changes: "omit", source: "device", commitTs: requiresCommitTs };
     }
-    const commitOptions = (
-      fn.placement === "local"
-        ? { changes: "omit", source: "device", commitTs: requiresCommitTs }
-        : options.mutationId === undefined
-          ? { changes: "omit", mutation: "none", source: "local", commitTs: requiresCommitTs }
-          : options.mutationIsFresh &&
-              pushEnvelopeJson !== undefined &&
-              pushEnvelopeNowMs !== undefined
-            ? {
-                changes: "omit",
-                mutation: "push",
-                mutationId: options.mutationId,
-                push: {
-                  json: pushEnvelopeJson,
-                  nowMs: pushEnvelopeNowMs,
-                  ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
-                },
-                source: "local",
-                commitTs: requiresCommitTs,
-              }
-            : {
-                changes: "omit",
-                mutation: "terminal",
-                mutationArgs: encodedMutationArgs!,
-                mutationIsFresh: options.mutationIsFresh === true,
-                mutationId: options.mutationId,
-                mutationName: resolved.name,
-                mutationResult: encodedMutationResult!,
-                ...(resultHasCommitTs ? { mutationResultCommitTs: true as const } : {}),
-                ...(pushEnvelopeJson === undefined || pushEnvelopeNowMs === undefined
-                  ? {}
-                  : {
-                      push: {
-                        json: pushEnvelopeJson,
-                        nowMs: pushEnvelopeNowMs,
-                        ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
-                      },
-                    }),
-                source: "local",
-                commitTs: requiresCommitTs,
-              }
-    ) satisfies CommitOptions;
-    if (localSchedules) batchInfo!.batch.schedules = pendingScheduleRows;
-    const commit = oneDocWrite
-      ? await store.commitOneDocWrite!(oneDocWrite, commitOptions)
-      : await runSpan("storage.commit", () => store.commit(batchInfo!.batch, commitOptions));
-    if (requiresCommitTs && commit.commitTs === undefined) {
+    if (options.mutationId === undefined) {
+      return { changes: "omit", mutation: "none", source: "local", commitTs: requiresCommitTs };
+    }
+    if (options.mutationIsFresh && pushEnvelope !== undefined) {
+      return {
+        changes: "omit",
+        mutation: "push",
+        mutationId: options.mutationId,
+        push: {
+          json: pushEnvelope.json,
+          nowMs: pushEnvelope.nowMs,
+          ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
+        },
+        source: "local",
+        commitTs: requiresCommitTs,
+      };
+    }
+    return {
+      changes: "omit",
+      mutation: "terminal",
+      mutationArgs: input.encodedMutationArgs!,
+      mutationIsFresh: options.mutationIsFresh === true,
+      mutationId: options.mutationId,
+      mutationName: input.resolved.name,
+      mutationResult: encodedMutationResult!,
+      ...(resultHasCommitTs ? { mutationResultCommitTs: true as const } : {}),
+      ...(pushEnvelope === undefined
+        ? {}
+        : {
+            push: {
+              json: pushEnvelope.json,
+              nowMs: pushEnvelope.nowMs,
+              ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
+            },
+          }),
+      source: "local",
+      commitTs: requiresCommitTs,
+    };
+  };
+
+  const canCommitOneDocWrite = (
+    input: MutationCommitInput,
+    watching: boolean,
+    localSchedules: boolean,
+  ): boolean =>
+    !watching &&
+    !hasEventListeners() &&
+    !!store.commitOneDocWrite &&
+    !input.options.pushCall &&
+    !localSchedules &&
+    !hasPendingCommitTs(input.validated);
+
+  const prepareMutationCommitTarget = (input: MutationCommitInput): MutationCommitTarget => {
+    const watching = watchers.size > 0;
+    const localSchedules = !remoteEnabled && input.pendingScheduleRows.length > 0;
+    const oneDocWrite = canCommitOneDocWrite(input, watching, localSchedules)
+      ? input.root.oneDocWrite()
+      : undefined;
+    if (oneDocWrite) return { kind: "oneDoc", oneDocWrite };
+    return { batch: input.root.toBatch(watching), kind: "batch", localSchedules, watching };
+  };
+
+  const prepareMutationCommitMaterial = (
+    input: MutationCommitInput,
+    target: MutationCommitTarget,
+  ): MutationCommitMaterial => {
+    const batch = target.kind === "batch" ? target.batch : undefined;
+    const resultHasCommitTs = hasPendingCommitTs(input.validated);
+    const batchHasCommitTs = batch?.batch.pendingCommitTs === true;
+    const afterImagesHaveCommitTs =
+      batchHasCommitTs === true &&
+      batch.rootBatch.docWrites.some((write) => write.pendingCommitTs === true);
+    const requiresCommitTs = resultHasCommitTs || batchHasCommitTs;
+    let phaseStartedAt = input.timingPhaseStartedAt;
+    if (input.timing) {
+      input.timing.batchMs = getTimerTime() - phaseStartedAt;
+      phaseStartedAt = getTimerTime();
+    }
+    const encodedMutationResult = input.recordsMutation ? encode(input.validated) : undefined;
+    if (input.timing) {
+      input.timing.resultEncodeMs = getTimerTime() - phaseStartedAt;
+      phaseStartedAt = getTimerTime();
+    }
+    return {
+      afterImagesHaveCommitTs,
+      encodedMutationResult,
+      requiresCommitTs,
+      resultHasCommitTs,
+      timingCommitStartedAt: phaseStartedAt,
+    };
+  };
+
+  const prepareOneDocMutationCommit = (
+    input: MutationCommitInput,
+    target: Extract<MutationCommitTarget, { kind: "oneDoc" }>,
+    material: MutationCommitMaterial,
+  ): MutationCommitPlan => ({
+    commitOptions: mutationCommitOptions(
+      input,
+      material.encodedMutationResult,
+      undefined,
+      material.resultHasCommitTs,
+      material.afterImagesHaveCommitTs,
+      material.requiresCommitTs,
+    ),
+    kind: "oneDoc",
+    oneDocWrite: target.oneDocWrite,
+    pushEnvelopeJson: undefined,
+    requiresCommitTs: false,
+    timingCommitStartedAt: material.timingCommitStartedAt,
+    watching: false,
+  });
+
+  const prepareBatchMutationCommit = async (
+    input: MutationCommitInput,
+    target: Extract<MutationCommitTarget, { kind: "batch" }>,
+    material: MutationCommitMaterial,
+  ): Promise<MutationCommitPlan> => {
+    const pushEnvelope = await preparePushEnvelope(input, target.batch);
+    if (target.localSchedules) target.batch.batch.schedules = input.pendingScheduleRows;
+    return {
+      batch: target.batch,
+      commitOptions: mutationCommitOptions(
+        input,
+        material.encodedMutationResult,
+        pushEnvelope,
+        material.resultHasCommitTs,
+        material.afterImagesHaveCommitTs,
+        material.requiresCommitTs,
+      ),
+      kind: "batch",
+      pushEnvelopeJson: pushEnvelope?.json,
+      requiresCommitTs: material.requiresCommitTs,
+      timingCommitStartedAt: material.timingCommitStartedAt,
+      watching: target.watching,
+    };
+  };
+
+  const prepareMutationCommit = async (input: MutationCommitInput): Promise<MutationCommitPlan> => {
+    const target = prepareMutationCommitTarget(input);
+    const material = prepareMutationCommitMaterial(input, target);
+    return target.kind === "oneDoc"
+      ? prepareOneDocMutationCommit(input, target, material)
+      : await prepareBatchMutationCommit(input, target, material);
+  };
+
+  const resolveMutationCommit = (
+    input: MutationCommitInput,
+    plan: MutationCommitPlan,
+    commit: Awaited<ReturnType<RuntimeStorageWriter["commit"]>>,
+  ): unknown => {
+    if (plan.requiresCommitTs && commit.commitTs === undefined) {
       throw new Error(
         "storage committed db.vars.commitTs without returning its allocated timestamp",
       );
     }
+    const batch = plan.kind === "batch" ? plan.batch : undefined;
     const resolvedResult =
-      commit.commitTs === undefined ? validated : pendingCommitTsRead(validated, commit.commitTs);
-    if (commit.commitTs !== undefined && batchInfo !== undefined) {
-      resolveBatchCommitTs(batchInfo.batch, commit.commitTs);
-    }
-    if (timing) {
-      timing.commitMs = getTimerTime() - phaseStartedAt;
-      phaseStartedAt = getTimerTime();
-    }
-    if (hasEventListeners()) emitCommit(emit, commit, batchInfo!.batch, "local");
-    if (pushEnvelopeJson !== undefined) {
-      for (const listener of Array.from(remoteWakeListeners)) listener();
-    }
-    if (watching) {
-      scheduleNotify({
-        dataOnlyDocIds: batchInfo!.dataOnlyDocIds ?? new Map(),
-        tables: batchInfo!.dataOnlyDocIds ? new Set() : new Set(batchInfo!.touchedKeys),
-      });
-    }
-    if (timing) {
-      timing.notifyMs = getTimerTime() - phaseStartedAt;
-      timing.totalMs = getTimerTime() - timingStartedAt;
-      options.onTiming?.(timing);
-    }
-    if (remoteEnabled) {
-      for (const apply of pendingSchedules) await apply().catch(() => undefined);
-    } else {
-      for (const apply of pendingSchedules) await apply();
+      commit.commitTs === undefined
+        ? input.validated
+        : pendingCommitTsRead(input.validated, commit.commitTs);
+    if (commit.commitTs !== undefined && batch !== undefined) {
+      resolveBatchCommitTs(batch.batch, commit.commitTs);
     }
     return resolvedResult;
+  };
+
+  const finishMutationCommitTiming = (
+    input: MutationCommitInput,
+    timingCommitStartedAt: number,
+  ): number => {
+    if (!input.timing) return timingCommitStartedAt;
+    input.timing.commitMs = getTimerTime() - timingCommitStartedAt;
+    return getTimerTime();
+  };
+
+  const notifyMutationCommit = (
+    plan: MutationCommitPlan,
+    commit: Awaited<ReturnType<RuntimeStorageWriter["commit"]>>,
+  ): void => {
+    const batch = plan.kind === "batch" ? plan.batch : undefined;
+    if (hasEventListeners()) emitCommit(emit, commit, batch!.batch, "local");
+    if (plan.pushEnvelopeJson !== undefined) {
+      for (const listener of Array.from(remoteWakeListeners)) listener();
+    }
+    if (plan.kind === "batch" && plan.watching) {
+      scheduleNotify({
+        dataOnlyDocIds: plan.batch.dataOnlyDocIds ?? new Map(),
+        tables: plan.batch.dataOnlyDocIds ? new Set() : new Set(plan.batch.touchedKeys),
+      });
+    }
+  };
+
+  const finishMutationNotificationTiming = (
+    input: MutationCommitInput,
+    phaseStartedAt: number,
+  ): void => {
+    if (input.timing) {
+      input.timing.notifyMs = getTimerTime() - phaseStartedAt;
+      input.timing.totalMs = getTimerTime() - input.timingStartedAt;
+      input.options.onTiming?.(input.timing);
+    }
+  };
+
+  const applyPendingMutationSchedules = async (input: MutationCommitInput): Promise<void> => {
+    if (remoteEnabled) {
+      for (const apply of input.pendingSchedules) await apply().catch(() => undefined);
+    } else {
+      for (const apply of input.pendingSchedules) await apply();
+    }
+  };
+
+  const finishMutationCommit = async (
+    input: MutationCommitInput,
+    plan: MutationCommitPlan,
+    commit: Awaited<ReturnType<RuntimeStorageWriter["commit"]>>,
+  ): Promise<unknown> => {
+    const resolvedResult = resolveMutationCommit(input, plan, commit);
+    const phaseStartedAt = finishMutationCommitTiming(input, plan.timingCommitStartedAt);
+    notifyMutationCommit(plan, commit);
+    finishMutationNotificationTiming(input, phaseStartedAt);
+    await applyPendingMutationSchedules(input);
+    return resolvedResult;
+  };
+
+  const commitMutation = async (input: MutationCommitInput): Promise<unknown> => {
+    await input.root.validateRevisionRestores();
+    const plan = await prepareMutationCommit(input);
+    const commit =
+      plan.kind === "oneDoc"
+        ? await store.commitOneDocWrite!(plan.oneDocWrite, plan.commitOptions)
+        : await runSpan("storage.commit", () => store.commit(plan.batch.batch, plan.commitOptions));
+    return await finishMutationCommit(input, plan, commit);
   };
 
   const runMutationDirect = async (
