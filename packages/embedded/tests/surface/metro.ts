@@ -23,6 +23,7 @@ interface TestMetroConfig {
 }
 
 interface TestResolverContext {
+  originModulePath?: string;
   resolveRequest(
     context: TestResolverContext,
     moduleName: string,
@@ -68,13 +69,9 @@ describe("embedded Metro adapter", () => {
       const dependency = path.join(convexDir, "helper.ts");
       first.resolver.resolveRequest(context, toVirtualSourceId(dependency), "ios");
       expect(previous).toHaveBeenLastCalledWith(context, dependency, "ios");
-      expect(() =>
-        first.resolver.resolveRequest(
-          context,
-          toVirtualSourceId(path.join(convexDir, "_generated", "embedded.ts")),
-          "android",
-        ),
-      ).toThrow("outside the generated module graph");
+      const generated = path.join(convexDir, "_generated", "embedded.ts");
+      first.resolver.resolveRequest(context, toVirtualSourceId(generated), "android");
+      expect(previous).toHaveBeenLastCalledWith(context, generated, "android");
       expect(fallback).not.toHaveBeenCalled();
 
       expect(first.resolver.resolveRequest(context, "react", "ios")).toEqual({
@@ -82,6 +79,15 @@ describe("embedded Metro adapter", () => {
         source: "previous",
       });
       expect(previous).toHaveBeenCalledWith(context, "react", "ios");
+
+      const sourceContext = {
+        ...context,
+        originModulePath: path.join(root, "local", "pins.ts"),
+      };
+      expect(
+        first.resolver.resolveRequest(sourceContext, "../convex/_generated/embedded.js", "ios"),
+      ).toEqual({ moduleName: generated, source: "previous" });
+      expect(previous).toHaveBeenLastCalledWith(sourceContext, generated, "ios");
     });
   });
 

@@ -44,6 +44,7 @@ export interface ConvexEmbeddedMetroOptions extends Omit<EmbeddedBundleInput, "a
 }
 
 interface MetroResolverContext {
+  originModulePath?: string;
   resolveRequest(
     context: MetroResolverContext,
     moduleName: string,
@@ -127,6 +128,7 @@ export async function withConvexEmbedded<Config extends object>(
   const sourceFiles = new Set(
     [
       bundle.schemaPath,
+      bundle.generatedPath,
       ...bundle.sourceFiles,
       ...Object.values(bundle.modules),
       ...Object.values(bundle.localModules).map((module) => module.file),
@@ -157,6 +159,10 @@ export async function withConvexEmbedded<Config extends object>(
       }
       return resolveMapped(context, sourcePath, platform);
     }
+    const importedSourcePath = resolveSourceImport(context, moduleName, sourceFiles);
+    if (importedSourcePath !== undefined) {
+      return resolveMapped(context, importedSourcePath, platform);
+    }
     const resolved = previous
       ? previous(context, moduleName, platform)
       : context.resolveRequest(context, moduleName, platform);
@@ -172,6 +178,28 @@ export async function withConvexEmbedded<Config extends object>(
       resolveRequest,
     },
   } as Config;
+}
+
+/**
+ * Metro resolves the literal filename in a relative import. TypeScript's ESM
+ * convention deliberately writes `.js` in source imports that compile to
+ * JavaScript, while this adapter serves the original TypeScript graph. Map
+ * only those requests whose TypeScript target was already admitted to the
+ * embedded graph; unrelated imports stay entirely under Metro's resolver.
+ */
+function resolveSourceImport(
+  context: MetroResolverContext,
+  moduleName: string,
+  sourceFiles: ReadonlySet<string>,
+): string | undefined {
+  if (!moduleName.startsWith(".") || !moduleName.endsWith(".js")) return undefined;
+  if (context.originModulePath === undefined) return undefined;
+  const stem = path.resolve(path.dirname(context.originModulePath), moduleName.slice(0, -3));
+  for (const extension of [".ts", ".tsx", ".mts", ".cts"] as const) {
+    const candidate = path.normalize(`${stem}${extension}`);
+    if (sourceFiles.has(candidate)) return candidate;
+  }
+  return undefined;
 }
 
 function resolvedMetroSourcePath(resolution: unknown): string | undefined {
