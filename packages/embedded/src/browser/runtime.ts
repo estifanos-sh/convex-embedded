@@ -157,6 +157,74 @@ const REMOTE_DEPLOYMENT_MISMATCH_PREFIX = "remote deployment mismatch:";
  */
 const REMOTE_RESPONSE_KEEPALIVE_MS = 500;
 
+/** The scheduling outcome of one completed browser remote actor turn. @internal */
+export interface WorkerRemoteTurnDecision {
+  awaitingResponse: boolean;
+  idle: boolean;
+  nextDelay: number | undefined;
+  status: "starting" | "tick" | "idle";
+}
+
+/**
+ * Derives the post-turn scheduler state without performing transport, storage, or event work.
+ *
+ * @internal
+ */
+export function decideWorkerRemoteTurn({
+  active,
+  awaitingResponse,
+  connected,
+  networkOnline,
+  pending,
+  pullAttempted,
+  pushPending,
+  pushUnblocked,
+  sent,
+  wakePending,
+}: {
+  active: boolean;
+  awaitingResponse: boolean;
+  connected: boolean;
+  networkOnline: boolean;
+  pending: RemotePending | undefined;
+  pullAttempted: number;
+  pushPending: boolean;
+  pushUnblocked: boolean;
+  sent: number;
+  wakePending: boolean;
+}): WorkerRemoteTurnDecision {
+  const pendingIsEmpty = remotePendingIsEmpty(pending);
+  const nextAwaitingResponse = pendingIsEmpty
+    ? false
+    : pullAttempted > 0
+      ? false
+      : sent > 0
+        ? true
+        : active
+          ? false
+          : awaitingResponse;
+  const idle =
+    connected &&
+    networkOnline &&
+    !nextAwaitingResponse &&
+    !wakePending &&
+    !pushPending &&
+    pendingIsEmpty;
+  const nextDelay = wakePending
+    ? 0
+    : nextAwaitingResponse
+      ? REMOTE_RESPONSE_KEEPALIVE_MS
+      : pushUnblocked && !pendingIsEmpty
+        ? 0
+        : undefined;
+  return {
+    awaitingResponse: nextAwaitingResponse,
+    idle,
+    nextDelay,
+    status: idle ? "idle" : connected ? "tick" : "starting",
+  };
+}
+
 /** Sink for boot-lifecycle and degradation events surfaced during {@link initRuntime}. */
 export type RuntimeEventSink = (event: EmbeddedRuntimeEvent) => void;
 
@@ -1368,25 +1436,21 @@ export function startWorkerRemoteLoop(
         // it must clear the response fence even when the turn also reports outbound protocol
         // messages. Otherwise an empty follow-up has nothing left to receive and the browser polls
         // forever while connectionState remains `starting`.
-        if (remotePendingIsEmpty(state.remotePending)) awaitingResponse = false;
-        else if (pulled.pullAttempted > 0) awaitingResponse = false;
-        else if (pulled.sent > 0) awaitingResponse = true;
-        else if (active) awaitingResponse = false;
-        const idle =
-          state.remoteConnected === true &&
-          state.remoteNetworkOnline !== false &&
-          !awaitingResponse &&
-          !wakePending &&
-          pushPending === undefined &&
-          remotePendingIsEmpty(state.remotePending);
-        if (idle) state.recovery?.onRemoteIdle();
-        const delay = wakePending
-          ? 0
-          : awaitingResponse
-            ? REMOTE_RESPONSE_KEEPALIVE_MS
-            : pushUnblocked && !remotePendingIsEmpty(state.remotePending)
-              ? 0
-              : undefined;
+        const decision = decideWorkerRemoteTurn({
+          active,
+          awaitingResponse,
+          connected: state.remoteConnected === true,
+          networkOnline: state.remoteNetworkOnline !== false,
+          pending: state.remotePending,
+          pullAttempted: pulled.pullAttempted,
+          pushPending: pushPending !== undefined,
+          pushUnblocked,
+          sent: pulled.sent,
+          wakePending,
+        });
+        awaitingResponse = decision.awaitingResponse;
+        if (decision.idle) state.recovery?.onRemoteIdle();
+        const { nextDelay: delay, status } = decision;
         if (pullDiagnostic) {
           emit("error", {
             durationMs: getElapsedTime(startedAt),
@@ -1398,7 +1462,7 @@ export function startWorkerRemoteLoop(
           nextDelay = delay;
           return;
         }
-        emit(idle ? "idle" : state.remoteConnected === true ? "tick" : "starting", {
+        emit(status, {
           durationMs: getElapsedTime(startedAt),
           foreground,
           nextRunIn: delay,
