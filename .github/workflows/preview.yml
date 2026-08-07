@@ -90,22 +90,13 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.5.2 --activate
-
-      - name: Node setup
-        uses: actions/setup-node@v6
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: 24
-          cache: "pnpm"
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Expose local binaries
-        run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
 
       - name: Build embedded TypeScript
         run: vp run @estifanos-sh/convex-embedded#build:ts
@@ -175,22 +166,13 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Enable pnpm
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.5.2 --activate
-
-      - name: Node setup
-        uses: actions/setup-node@v6
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
         with:
-          node-version: 24
-          cache: "pnpm"
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Expose local binaries
-        run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
 
       - name: Build the WASM runtime
         run: vp run @estifanos-sh/convex-embedded#wasm
