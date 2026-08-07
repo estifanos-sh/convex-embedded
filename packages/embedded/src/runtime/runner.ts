@@ -985,6 +985,402 @@ export function createRunner(
     }
   };
 
+  /**
+   * Runs the user handler and the revision bookkeeping that is part of its transaction. This is
+   * deliberately separate from persistence below: a handler/return failure is deterministic and
+   * terminal, whereas a later storage failure must leave the accepted mutation retryable.
+   */
+  const runMutationHandler = async ({
+    checked,
+    componentRevision,
+    fn,
+    generatedUploadUrls,
+    options,
+    pendingScheduleRows,
+    pendingSchedules,
+    pushEnvelopeTimeHlc,
+    resolved,
+    resolvedWriter,
+    revisionReplay,
+    root,
+    scheduledJobs,
+  }: {
+    checked: Record<string, unknown>;
+    componentRevision: string | undefined;
+    fn: RunnableFunction;
+    generatedUploadUrls: string[];
+    options: RunMutationOptions;
+    pendingScheduleRows: ScheduledJob[];
+    pendingSchedules: Array<() => Promise<void>> | undefined;
+    resolved: { name: string; scope: RuntimeScope };
+    resolvedWriter: ReturnType<ScopedMutationTransaction["writer"]>;
+    revisionReplay: RevisionReplay | undefined;
+    root: ScopedMutationTransaction;
+    scheduledJobs: string[];
+    pushEnvelopeTimeHlc: number | undefined;
+  }): Promise<unknown> => {
+    let schedulerService: SchedulerService | undefined;
+    let storageService: StorageWriterService | undefined;
+    const run = () =>
+      fn.handler(
+        {
+          auth: authService(options.auth ?? null),
+          db: resolvedWriter.db,
+          meta: {},
+          runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+            runQuery(childRef, childArgs, resolved.scope, undefined, resolvedWriter.db, root, {
+              ...options,
+              allowInternal: true,
+              callerPlacement: fn.placement,
+            }),
+          runSnapshotQuery: (
+            childRef: FunctionReference,
+            childArgs: Record<string, unknown> = {},
+          ) =>
+            runQuery(childRef, childArgs, resolved.scope, undefined, undefined, root, {
+              ...options,
+              allowInternal: true,
+              callerPlacement: fn.placement,
+            }),
+          runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+            fn.placement === "replicated" && extractReferencePath(childRef) === null
+              ? Promise.reject(
+                  new Error(
+                    "Embedded replicated mutations cannot call nested app mutations until their writes can join the parent replay capture.",
+                  ),
+                )
+              : runMutationDirect(
+                  childRef,
+                  childArgs,
+                  resolved.scope,
+                  {
+                    ...options,
+                    allowInternal: true,
+                    callerPlacement: fn.placement,
+                    revisionReplay,
+                  },
+                  // Same-placement is checked by the child before its handler runs.
+                  root,
+                ),
+          get scheduler(): SchedulerService {
+            if (fn.placement === "local") {
+              throw new Error("Local functions cannot schedule functions.");
+            }
+            return (schedulerService ??= createSchedulerService(
+              store,
+              emit,
+              {
+                kind: functionKind,
+                runMutation: (childRef, childArgs = {}) =>
+                  enqueueMutation(() =>
+                    runMutationDirect(childRef, childArgs, resolved.scope, {
+                      ...options,
+                      allowInternal: true,
+                      callerPlacement: fn.placement,
+                    }),
+                  ),
+                runQuery: (childRef, childArgs = {}) =>
+                  runQuery(
+                    childRef,
+                    childArgs,
+                    resolved.scope,
+                    undefined,
+                    resolvedWriter.db,
+                    root,
+                    {
+                      ...options,
+                      allowInternal: true,
+                      callerPlacement: fn.placement,
+                    },
+                  ),
+              },
+              remoteEnabled,
+              wakeScheduler,
+              pendingSchedules,
+              scheduledJobs,
+              remoteEnabled ? undefined : pendingScheduleRows,
+            ));
+          },
+          get storage(): StorageWriterService {
+            if (fn.placement === "local") {
+              throw new Error("Local functions cannot access file storage.");
+            }
+            return (storageService ??= createStorageService(
+              namespaceStore(store, resolved.scope.instancePath),
+              uploadUrls,
+              objectUrls,
+              "writer",
+              emit,
+              generatedUploadUrls,
+            ));
+          },
+        },
+        checked,
+      );
+    const result = await (pushEnvelopeTimeHlc === undefined || options.pushCall === undefined
+      ? run()
+      : withEntropySpan(pushEnvelopeTimeHlc, options.pushCall.rngSeed, run));
+    const validated = validateReturn(fn, result, true);
+    if (componentRevision !== "restore") return validated;
+
+    const revision = validated as RevisionRestoreExpectation;
+    const snapshots = (await runQuery(
+      embeddedComponentReference("rev/restoreRead"),
+      checked,
+      rootScope,
+      undefined,
+      undefined,
+      root,
+      { ...options, allowInternal: true },
+    )) as Array<{
+      field: string;
+      kind: "text" | "count" | "set";
+      headSeq: number;
+      projectionHash: string;
+      bytes: ArrayBuffer;
+      hash: string;
+    }>;
+    const restoredFields = new Set(snapshots.map((snapshot) => snapshot.field));
+    for (const snapshot of snapshots) {
+      root.writer(rootScope).crdtRestore({
+        table: revision.table,
+        id: revision.rowId,
+        ...snapshot,
+      });
+    }
+    const table = storeSchema.tables.find((candidate) => candidate.name === revision.table);
+    for (const field of table?.crdtFields ?? []) {
+      if (restoredFields.has(field.field)) continue;
+      root.writer(rootScope).crdtRestore({
+        table: revision.table,
+        id: revision.rowId,
+        field: field.field,
+        kind: field.kind,
+        headSeq: 0,
+        projectionHash: "",
+        bytes: new ArrayBuffer(0),
+        hash: "",
+      });
+    }
+    root.writer(rootScope).revisionRestore(revision);
+    root.revisionRestore(revision);
+    return validated;
+  };
+
+  /**
+   * Builds and persists the mutation's durable commit. Keeping it after the handler boundary is
+   * what makes storage failures retryable: callers restore the transaction, but do not write a
+   * terminal mutation failure.
+   */
+  const commitMutation = async ({
+    checked,
+    encodedMutationArgs,
+    fn,
+    generatedUploadUrls,
+    options,
+    pendingScheduleRows,
+    pendingSchedules,
+    pushEnvelopeTimeHlc,
+    readSetCollector,
+    recordsMutation,
+    resolved,
+    revisionReplay,
+    root,
+    scheduledJobs,
+    timing,
+    timingPhaseStartedAt,
+    timingStartedAt,
+    validated,
+  }: {
+    checked: Record<string, unknown>;
+    encodedMutationArgs: ReturnType<typeof encode> | undefined;
+    fn: RunnableFunction;
+    generatedUploadUrls: string[];
+    options: RunMutationOptions;
+    pendingScheduleRows: ScheduledJob[];
+    pendingSchedules: Array<() => Promise<void>>;
+    pushEnvelopeTimeHlc: number | undefined;
+    readSetCollector: ReturnType<typeof createReadSetCollector> | undefined;
+    recordsMutation: boolean;
+    resolved: { name: string; scope: RuntimeScope };
+    revisionReplay: RevisionReplay | undefined;
+    root: ScopedMutationTransaction;
+    scheduledJobs: string[];
+    timing: RunMutationTiming | undefined;
+    timingPhaseStartedAt: number;
+    timingStartedAt: number;
+    validated: unknown;
+  }): Promise<unknown> => {
+    await root.validateRevisionRestores();
+    const watching = watchers.size > 0;
+    const localSchedules = !remoteEnabled && pendingScheduleRows.length > 0;
+    const canCommitOneDocWrite =
+      !watching &&
+      !hasEventListeners() &&
+      !!store.commitOneDocWrite &&
+      !options.pushCall &&
+      !localSchedules &&
+      !hasPendingCommitTs(validated);
+    const oneDocWrite = canCommitOneDocWrite ? root.oneDocWrite() : undefined;
+    const batchInfo = oneDocWrite ? undefined : root.toBatch(watching);
+    const resultHasCommitTs = hasPendingCommitTs(validated);
+    const batchHasCommitTs = batchInfo?.batch.pendingCommitTs === true;
+    const afterImagesHaveCommitTs =
+      batchHasCommitTs === true &&
+      batchInfo!.rootBatch.docWrites.some((write) => write.pendingCommitTs === true);
+    const requiresCommitTs = resultHasCommitTs || batchHasCommitTs;
+    let phaseStartedAt = timingPhaseStartedAt;
+    if (timing) {
+      timing.batchMs = getTimerTime() - phaseStartedAt;
+      phaseStartedAt = getTimerTime();
+    }
+    const encodedMutationResult = recordsMutation ? encode(validated) : undefined;
+    if (timing) {
+      timing.resultEncodeMs = getTimerTime() - phaseStartedAt;
+      phaseStartedAt = getTimerTime();
+    }
+    let pushEnvelopeJson: string | undefined;
+    let pushEnvelopeNowMs: number | undefined;
+    if (options.pushCall !== undefined && readSetCollector !== undefined) {
+      const mutationId = options.mutationId;
+      if (mutationId === undefined) {
+        throw new Error("A remote push requires the local mutation ID.");
+      }
+      pushEnvelopeNowMs = pushEnvelopeTimeHlc ?? store.clock.read();
+      pushEnvelopeJson = JSON.stringify({
+        clientRuntime: {
+          schemaHash: storeSchema.hash ?? "local",
+          moduleGraphHash,
+          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+        },
+        mutationId,
+        commitSeq: 0,
+        localInserts: (batchInfo?.rootBatch.freshIds ?? []).map((fresh) => fresh.id),
+        localSchedules: scheduledJobs,
+        idPaths: idPathsForArgs(fn, checked),
+        functionName: options.pushCall.fn,
+        args: convexToJson(checked as Value),
+        resultHash: await resultHash(
+          store,
+          fn,
+          checked,
+          validated ?? null,
+          mutationId,
+          batchInfo?.rootBatch.freshIds ?? [],
+          scheduledJobs,
+          generatedUploadUrls,
+          new Map(
+            storeSchema.tables.map((table) => [
+              table.name,
+              new Set((table.crdtFields ?? []).map((field) => field.field)),
+            ]),
+          ),
+        ),
+        argRefs: [],
+        inserts: (batchInfo?.rootBatch.freshIds ?? []).map((fresh, ordinal) => ({
+          mutationId,
+          ordinal,
+          table: fresh.table,
+        })),
+        reads: readSetCollector.readSet().map(readWitness),
+        mutationTime: pushEnvelopeNowMs,
+        randomSeed: options.pushCall.rngSeed,
+        schedules: scheduledJobs.map((_, ordinal) => ({ mutationId, ordinal })),
+        uploads: generatedUploadUrls.map((_, ordinal) => ({ mutationId, ordinal })),
+        afterImages: afterImages(batchInfo!.rootBatch),
+        crdt: await crdtEffects(batchInfo!.rootBatch),
+        revisionCheckpoints: (revisionReplay?.checkpoints ?? []).map((checkpoint) => ({
+          ...checkpoint,
+          snapshots: checkpoint.snapshots.map((snapshot) => ({
+            ...snapshot,
+            bytes: convexToJson(snapshot.bytes),
+          })),
+        })),
+      });
+    }
+    const commitOptions = (
+      fn.placement === "local"
+        ? { changes: "omit", source: "device", commitTs: requiresCommitTs }
+        : options.mutationId === undefined
+          ? { changes: "omit", mutation: "none", source: "local", commitTs: requiresCommitTs }
+          : options.mutationIsFresh &&
+              pushEnvelopeJson !== undefined &&
+              pushEnvelopeNowMs !== undefined
+            ? {
+                changes: "omit",
+                mutation: "push",
+                mutationId: options.mutationId,
+                push: {
+                  json: pushEnvelopeJson,
+                  nowMs: pushEnvelopeNowMs,
+                  ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
+                },
+                source: "local",
+                commitTs: requiresCommitTs,
+              }
+            : {
+                changes: "omit",
+                mutation: "terminal",
+                mutationArgs: encodedMutationArgs!,
+                mutationIsFresh: options.mutationIsFresh === true,
+                mutationId: options.mutationId,
+                mutationName: resolved.name,
+                mutationResult: encodedMutationResult!,
+                ...(resultHasCommitTs ? { mutationResultCommitTs: true as const } : {}),
+                ...(pushEnvelopeJson === undefined || pushEnvelopeNowMs === undefined
+                  ? {}
+                  : {
+                      push: {
+                        json: pushEnvelopeJson,
+                        nowMs: pushEnvelopeNowMs,
+                        ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
+                      },
+                    }),
+                source: "local",
+                commitTs: requiresCommitTs,
+              }
+    ) satisfies CommitOptions;
+    if (localSchedules) batchInfo!.batch.schedules = pendingScheduleRows;
+    const commit = oneDocWrite
+      ? await store.commitOneDocWrite!(oneDocWrite, commitOptions)
+      : await runSpan("storage.commit", () => store.commit(batchInfo!.batch, commitOptions));
+    if (requiresCommitTs && commit.commitTs === undefined) {
+      throw new Error(
+        "storage committed db.vars.commitTs without returning its allocated timestamp",
+      );
+    }
+    const resolvedResult =
+      commit.commitTs === undefined ? validated : pendingCommitTsRead(validated, commit.commitTs);
+    if (commit.commitTs !== undefined && batchInfo !== undefined) {
+      resolveBatchCommitTs(batchInfo.batch, commit.commitTs);
+    }
+    if (timing) {
+      timing.commitMs = getTimerTime() - phaseStartedAt;
+      phaseStartedAt = getTimerTime();
+    }
+    if (hasEventListeners()) emitCommit(emit, commit, batchInfo!.batch, "local");
+    if (pushEnvelopeJson !== undefined) {
+      for (const listener of Array.from(remoteWakeListeners)) listener();
+    }
+    if (watching) {
+      scheduleNotify({
+        dataOnlyDocIds: batchInfo!.dataOnlyDocIds ?? new Map(),
+        tables: batchInfo!.dataOnlyDocIds ? new Set() : new Set(batchInfo!.touchedKeys),
+      });
+    }
+    if (timing) {
+      timing.notifyMs = getTimerTime() - phaseStartedAt;
+      timing.totalMs = getTimerTime() - timingStartedAt;
+      options.onTiming?.(timing);
+    }
+    if (remoteEnabled) {
+      for (const apply of pendingSchedules) await apply().catch(() => undefined);
+    } else {
+      for (const apply of pendingSchedules) await apply();
+    }
+    return resolvedResult;
+  };
+
   const runMutationDirect = async (
     ref: FunctionReference,
     args: Record<string, unknown>,
@@ -1182,8 +1578,6 @@ export function createRunner(
     const pendingScheduleRows: ScheduledJob[] = [];
     const scheduledJobs: string[] = [];
     const generatedUploadUrls: string[] = [];
-    let schedulerService: SchedulerService | undefined;
-    let storageService: StorageWriterService | undefined;
     const pushEnvelopeTimeHlc = options.pushCall ? store.clock.read() : undefined;
     const revisionReplay =
       options.revisionReplay ??
@@ -1197,149 +1591,21 @@ export function createRunner(
           }
         : undefined);
     try {
-      const runHandler = () =>
-        fn.handler(
-          {
-            auth: authService(options.auth ?? null),
-            db: resolvedWriter.db,
-            meta: {},
-            runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-              runQuery(childRef, childArgs, resolved.scope, undefined, resolvedWriter.db, root, {
-                ...options,
-                allowInternal: true,
-                callerPlacement: fn.placement,
-              }),
-            runSnapshotQuery: (
-              childRef: FunctionReference,
-              childArgs: Record<string, unknown> = {},
-            ) =>
-              runQuery(childRef, childArgs, resolved.scope, undefined, undefined, root, {
-                ...options,
-                allowInternal: true,
-                callerPlacement: fn.placement,
-              }),
-            runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-              fn.placement === "replicated" && extractReferencePath(childRef) === null
-                ? Promise.reject(
-                    new Error(
-                      "Embedded replicated mutations cannot call nested app mutations until their writes can join the parent replay capture.",
-                    ),
-                  )
-                : runMutationDirect(
-                    childRef,
-                    childArgs,
-                    resolved.scope,
-                    {
-                      ...options,
-                      allowInternal: true,
-                      callerPlacement: fn.placement,
-                      revisionReplay,
-                    },
-                    // Same-placement is checked by the child before its handler runs.
-                    root,
-                  ),
-            get scheduler(): SchedulerService {
-              if (fn.placement === "local") {
-                throw new Error("Local functions cannot schedule functions.");
-              }
-              return (schedulerService ??= createSchedulerService(
-                store,
-                emit,
-                {
-                  kind: functionKind,
-                  runMutation: (childRef, childArgs = {}) =>
-                    enqueueMutation(() =>
-                      runMutationDirect(childRef, childArgs, resolved.scope, {
-                        ...options,
-                        allowInternal: true,
-                        callerPlacement: fn.placement,
-                      }),
-                    ),
-                  runQuery: (childRef, childArgs = {}) =>
-                    runQuery(
-                      childRef,
-                      childArgs,
-                      resolved.scope,
-                      undefined,
-                      resolvedWriter.db,
-                      root,
-                      {
-                        ...options,
-                        allowInternal: true,
-                        callerPlacement: fn.placement,
-                      },
-                    ),
-                },
-                remoteEnabled,
-                wakeScheduler,
-                tx ? undefined : pendingSchedules,
-                scheduledJobs,
-                remoteEnabled ? undefined : pendingScheduleRows,
-              ));
-            },
-            get storage(): StorageWriterService {
-              if (fn.placement === "local") {
-                throw new Error("Local functions cannot access file storage.");
-              }
-              return (storageService ??= createStorageService(
-                namespaceStore(store, resolved.scope.instancePath),
-                uploadUrls,
-                objectUrls,
-                "writer",
-                emit,
-                generatedUploadUrls,
-              ));
-            },
-          },
-          checked,
-        );
-      const result = await (!tx && options.pushCall && pushEnvelopeTimeHlc !== undefined
-        ? withEntropySpan(pushEnvelopeTimeHlc, options.pushCall.rngSeed, runHandler)
-        : runHandler());
-      validated = validateReturn(fn, result, true);
-      if (componentRevision === "restore") {
-        const revision = validated as RevisionRestoreExpectation;
-        const snapshots = (await runQuery(
-          embeddedComponentReference("rev/restoreRead"),
-          checked,
-          rootScope,
-          undefined,
-          undefined,
-          root,
-          { ...options, allowInternal: true },
-        )) as Array<{
-          field: string;
-          kind: "text" | "count" | "set";
-          headSeq: number;
-          projectionHash: string;
-          bytes: ArrayBuffer;
-          hash: string;
-        }>;
-        const restoredFields = new Set(snapshots.map((snapshot) => snapshot.field));
-        for (const snapshot of snapshots) {
-          root.writer(rootScope).crdtRestore({
-            table: revision.table,
-            id: revision.rowId,
-            ...snapshot,
-          });
-        }
-        const table = storeSchema.tables.find((candidate) => candidate.name === revision.table);
-        for (const field of table?.crdtFields ?? []) {
-          if (restoredFields.has(field.field)) continue;
-          root.writer(rootScope).crdtRestore({
-            table: revision.table,
-            id: revision.rowId,
-            field: field.field,
-            kind: field.kind,
-            headSeq: 0,
-            projectionHash: "",
-            bytes: new ArrayBuffer(0),
-            hash: "",
-          });
-        }
-        root.writer(rootScope).revisionRestore(revision);
-        root.revisionRestore(revision);
-      }
+      validated = await runMutationHandler({
+        checked,
+        componentRevision,
+        fn,
+        generatedUploadUrls,
+        options,
+        pendingScheduleRows,
+        pendingSchedules: tx ? undefined : pendingSchedules,
+        pushEnvelopeTimeHlc: tx ? undefined : pushEnvelopeTimeHlc,
+        resolved,
+        resolvedWriter,
+        revisionReplay,
+        root,
+        scheduledJobs,
+      });
       if (timing) {
         timing.handlerMs = getTimerTime() - timingPhaseStartedAt;
         timingPhaseStartedAt = getTimerTime();
@@ -1367,174 +1633,26 @@ export function createRunner(
     }
     if (tx) return validated;
     try {
-      await root.validateRevisionRestores();
-      const watching = watchers.size > 0;
-      const localSchedules = !remoteEnabled && pendingScheduleRows.length > 0;
-      const canCommitOneDocWrite =
-        !watching &&
-        !hasEventListeners() &&
-        !!store.commitOneDocWrite &&
-        !options.pushCall &&
-        !localSchedules &&
-        !hasPendingCommitTs(validated);
-      const oneDocWrite = canCommitOneDocWrite ? root.oneDocWrite() : undefined;
-      const batchInfo = oneDocWrite ? undefined : root.toBatch(watching);
-      const resultHasCommitTs = hasPendingCommitTs(validated);
-      const batchHasCommitTs = batchInfo?.batch.pendingCommitTs === true;
-      const afterImagesHaveCommitTs =
-        batchHasCommitTs === true &&
-        batchInfo!.rootBatch.docWrites.some((write) => write.pendingCommitTs === true);
-      const requiresCommitTs = resultHasCommitTs || batchHasCommitTs;
-      if (timing) {
-        timing.batchMs = getTimerTime() - timingPhaseStartedAt;
-        timingPhaseStartedAt = getTimerTime();
-      }
-      const encodedMutationResult = recordsMutation ? encode(validated) : undefined;
-      if (timing) {
-        timing.resultEncodeMs = getTimerTime() - timingPhaseStartedAt;
-        timingPhaseStartedAt = getTimerTime();
-      }
-      let pushEnvelopeJson: string | undefined;
-      let pushEnvelopeNowMs: number | undefined;
-      if (options.pushCall !== undefined && readSetCollector !== undefined) {
-        const mutationId = options.mutationId;
-        if (mutationId === undefined) {
-          throw new Error("A remote push requires the local mutation ID.");
-        }
-        pushEnvelopeNowMs = pushEnvelopeTimeHlc ?? store.clock.read();
-        pushEnvelopeJson = JSON.stringify({
-          clientRuntime: {
-            schemaHash: storeSchema.hash ?? "local",
-            moduleGraphHash,
-            protocolVersion: EMBEDDED_PROTOCOL_VERSION,
-          },
-          mutationId,
-          commitSeq: 0,
-          localInserts: (batchInfo?.rootBatch.freshIds ?? []).map((fresh) => fresh.id),
-          localSchedules: scheduledJobs,
-          idPaths: idPathsForArgs(fn, checked),
-          functionName: options.pushCall.fn,
-          args: convexToJson(checked as Value),
-          resultHash: await resultHash(
-            store,
-            fn,
-            checked,
-            validated ?? null,
-            mutationId,
-            batchInfo?.rootBatch.freshIds ?? [],
-            scheduledJobs,
-            generatedUploadUrls,
-            new Map(
-              storeSchema.tables.map((table) => [
-                table.name,
-                new Set((table.crdtFields ?? []).map((field) => field.field)),
-              ]),
-            ),
-          ),
-          argRefs: [],
-          inserts: (batchInfo?.rootBatch.freshIds ?? []).map((fresh, ordinal) => ({
-            mutationId,
-            ordinal,
-            table: fresh.table,
-          })),
-          reads: readSetCollector.readSet().map(readWitness),
-          mutationTime: pushEnvelopeNowMs,
-          randomSeed: options.pushCall.rngSeed,
-          schedules: scheduledJobs.map((_, ordinal) => ({ mutationId, ordinal })),
-          uploads: generatedUploadUrls.map((_, ordinal) => ({ mutationId, ordinal })),
-          afterImages: afterImages(batchInfo!.rootBatch),
-          crdt: await crdtEffects(batchInfo!.rootBatch),
-          revisionCheckpoints: (revisionReplay?.checkpoints ?? []).map((checkpoint) => ({
-            ...checkpoint,
-            snapshots: checkpoint.snapshots.map((snapshot) => ({
-              ...snapshot,
-              bytes: convexToJson(snapshot.bytes),
-            })),
-          })),
-        });
-      }
-      const commitOptions: CommitOptions =
-        fn.placement === "local"
-          ? { changes: "omit", source: "device", commitTs: requiresCommitTs }
-          : options.mutationId === undefined
-            ? { changes: "omit", mutation: "none", source: "local", commitTs: requiresCommitTs }
-            : options.mutationIsFresh &&
-                pushEnvelopeJson !== undefined &&
-                pushEnvelopeNowMs !== undefined
-              ? {
-                  changes: "omit",
-                  mutation: "push",
-                  mutationId: options.mutationId,
-                  push: {
-                    json: pushEnvelopeJson,
-                    nowMs: pushEnvelopeNowMs,
-                    ...(afterImagesHaveCommitTs ? { afterImagesCommitTs: true as const } : {}),
-                  },
-                  source: "local",
-                  commitTs: requiresCommitTs,
-                }
-              : {
-                  changes: "omit",
-                  mutation: "terminal",
-                  mutationArgs: encodedMutationArgs!,
-                  mutationIsFresh: options.mutationIsFresh === true,
-                  mutationId: options.mutationId,
-                  mutationName: resolved.name,
-                  mutationResult: encodedMutationResult!,
-                  ...(resultHasCommitTs ? { mutationResultCommitTs: true as const } : {}),
-                  ...(pushEnvelopeJson === undefined || pushEnvelopeNowMs === undefined
-                    ? {}
-                    : {
-                        push: {
-                          json: pushEnvelopeJson,
-                          nowMs: pushEnvelopeNowMs,
-                          ...(afterImagesHaveCommitTs
-                            ? { afterImagesCommitTs: true as const }
-                            : {}),
-                        },
-                      }),
-                  source: "local",
-                  commitTs: requiresCommitTs,
-                };
-      if (localSchedules) batchInfo!.batch.schedules = pendingScheduleRows;
-      const commit = oneDocWrite
-        ? await store.commitOneDocWrite!(oneDocWrite, commitOptions)
-        : await runSpan("storage.commit", () => store.commit(batchInfo!.batch, commitOptions));
-      if (requiresCommitTs && commit.commitTs === undefined) {
-        throw new Error(
-          "storage committed db.vars.commitTs without returning its allocated timestamp",
-        );
-      }
-      const resolvedResult =
-        commit.commitTs === undefined ? validated : pendingCommitTsRead(validated, commit.commitTs);
-      if (commit.commitTs !== undefined && batchInfo !== undefined) {
-        resolveBatchCommitTs(batchInfo.batch, commit.commitTs);
-      }
-      if (timing) {
-        timing.commitMs = getTimerTime() - timingPhaseStartedAt;
-        timingPhaseStartedAt = getTimerTime();
-      }
-      if (hasEventListeners()) emitCommit(emit, commit, batchInfo!.batch, "local");
-      if (pushEnvelopeJson !== undefined) {
-        for (const listener of Array.from(remoteWakeListeners)) listener();
-      }
-      if (watching) {
-        scheduleNotify({
-          dataOnlyDocIds: batchInfo!.dataOnlyDocIds ?? new Map(),
-          tables: batchInfo!.dataOnlyDocIds ? new Set() : new Set(batchInfo!.touchedKeys),
-        });
-      }
-      if (timing) {
-        timing.notifyMs = getTimerTime() - timingPhaseStartedAt;
-        timing.totalMs = getTimerTime() - timingStartedAt;
-        options.onTiming?.(timing);
-      }
-      if (remoteEnabled) {
-        for (const apply of pendingSchedules) await apply().catch(() => undefined);
-      } else {
-        for (const apply of pendingSchedules) await apply();
-      }
-      return resolvedResult;
+      return await commitMutation({
+        checked,
+        encodedMutationArgs,
+        fn,
+        generatedUploadUrls,
+        options,
+        pendingScheduleRows,
+        pendingSchedules,
+        pushEnvelopeTimeHlc,
+        readSetCollector,
+        recordsMutation,
+        resolved,
+        revisionReplay,
+        root,
+        scheduledJobs,
+        timing,
+        timingPhaseStartedAt,
+        timingStartedAt,
+        validated,
+      });
     } catch (error) {
       // Transient storage failure: NOT recorded as `failed`, so the mutation can be retried. The
       // ledger entry stays pending and a later replay re-runs the handler.

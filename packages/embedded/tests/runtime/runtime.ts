@@ -813,6 +813,7 @@ class FakeStorage implements RuntimeStorage {
   private readonly docs = new Map<string, StoredDoc>();
   private readonly ids = new Map<string, IdMapping>();
   private readonly mutations = new Map<string, MutationRecord & { args: string; name: string }>();
+  commitFailures = 0;
   mutationWriteCalls = 0;
   readonly pushEnvelopes: Array<{
     afterImages: unknown[];
@@ -962,6 +963,10 @@ class FakeStorage implements RuntimeStorage {
   }
 
   commit(batch: WriteBatch, options?: CommitOptions) {
+    if (this.commitFailures > 0) {
+      this.commitFailures -= 1;
+      return Promise.reject(new Error("transient commit failure"));
+    }
     const commitTs = options?.commitTs === true ? (this.commitTs += 1n) : undefined;
     if (commitTs !== undefined && options !== undefined) {
       for (const write of batch.docWrites) {
@@ -3157,6 +3162,36 @@ describe("runtime", () => {
     expect(second).toBe(first);
     const seen = (await r.runQuery("messages:list", { channel: "dedupe" })) as { body: string }[];
     expect(seen.map((message) => message.body)).toEqual(["a"]);
+  });
+
+  test("storage commit failures leave an accepted mutation retryable", async () => {
+    let calls = 0;
+    const store = new FakeStorage();
+    store.commitFailures = 1;
+    const r = createRunner(
+      {
+        messages: {
+          ...messages,
+          count: mutation({
+            args: {},
+            handler: async (ctx) => {
+              calls += 1;
+              return await ctx.db.insert("messages", { body: "retry", channel: "retry" });
+            },
+          }),
+        },
+      },
+      store,
+      storeSchema,
+    );
+
+    await expect(
+      r.runMutation("messages:count", {}, { mutationId: "mutation:retry" }),
+    ).rejects.toThrow("transient commit failure");
+    const id = await r.runMutation("messages:count", {}, { mutationId: "mutation:retry" });
+
+    expect(calls).toBe(2);
+    expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "retry" });
   });
 
   test("fresh mutation id commits terminal row without a pre-handler begin", async () => {
