@@ -5,10 +5,11 @@ import {
   makeFunctionReference,
   type RegisteredQuery,
 } from "convex/server";
-import { v } from "convex/values";
+import { type ValidatorJSON, v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { defineEmbedded } from "../../src/server";
+import { settlementValidator } from "../../src/component/model";
 import { restore as revisionRestore } from "../../src/component/rev";
 import { hashDocument, hashValue } from "../../src/hash";
 import { pull as componentPull } from "../../src/component/protocol";
@@ -28,6 +29,7 @@ import {
 } from "../../src/crdt/intent";
 import { e } from "../../src/values";
 import { defineEmbeddedSchema, replicatedTable } from "../../src/schema";
+import { validateJson } from "../../src/runtime/validate";
 
 const schema = defineEmbeddedSchema({
   documents: replicatedTable({
@@ -1674,6 +1676,69 @@ describe("v5 server surface", () => {
         settlement: { mutationId: "mutation-1", outcome: "rejected" },
       },
     });
+  });
+
+  test("keeps component opaque failures and server wire validators protocol-specific", () => {
+    const embedded = defineEmbedded({ component, schema });
+    const returns = JSON.parse(
+      (
+        embedded.push as unknown as {
+          exportReturns: () => string;
+        }
+      ).exportReturns(),
+    ) as ValidatorJSON;
+    const wire = (returns as Extract<ValidatorJSON, { type: "union" }>).value[0] as Extract<
+      ValidatorJSON,
+      { type: "union" }
+    >;
+    const [strict, legacy] = wire.value;
+    const opaqueLegacyFailure = {
+      mutationId: "mutation-1",
+      inserts: [],
+      schedules: [],
+      uploads: [],
+      revisions: [],
+      crdt: [
+        {
+          table: "documents",
+          rowId: "documents|local",
+          field: "body",
+          kind: "text",
+          headSeq: 4,
+          projectionHash: "projection-4",
+        },
+      ],
+      authoritative: [
+        {
+          op: "put",
+          table: "documents",
+          rowId: "documents|local",
+          fields: { title: "authoritative" },
+          plainHash: "plain-4",
+        },
+      ],
+      outcome: "rejected" as const,
+      error: { legacy: "opaque" },
+    };
+
+    expect(() =>
+      validateJson(
+        opaqueLegacyFailure,
+        (settlementValidator as unknown as { json: ValidatorJSON }).json,
+        "settlement",
+      ),
+    ).not.toThrow();
+    expect(() => validateJson(opaqueLegacyFailure, strict!, "settlement")).toThrow(
+      "settlement does not match any union member",
+    );
+    expect(() => validateJson(opaqueLegacyFailure, legacy!, "settlement")).not.toThrow();
+    expect(() =>
+      validateJson(
+        { ...opaqueLegacyFailure, error: { code: "EMBEDDED_REJECTED" } },
+        strict!,
+        "settlement",
+      ),
+    ).not.toThrow();
   });
 
   test("normalizes cached v26 failure payloads before returning a v27 push settlement", async () => {

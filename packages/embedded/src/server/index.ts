@@ -47,7 +47,12 @@ import {
 } from "../protocol";
 import { withEntropy } from "../entropy";
 import { read as readTime } from "../component/time";
-import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../component/model";
+import {
+  pullChangeValidator,
+  pullCrdtValidator,
+  resultRowValidator,
+  settlementFields,
+} from "../component/model";
 import {
   analyzeEmbeddedSchema,
   embeddedSchemaMeta,
@@ -723,47 +728,6 @@ const replayValidator = v.object({
     }),
   ),
 });
-
-const settlementFields = {
-  mutationId: v.string(),
-  inserts: v.array(v.object({ ordinal: v.number(), table: v.string(), id: v.string() })),
-  schedules: v.array(v.object({ ordinal: v.number(), id: v.string() })),
-  uploads: v.array(v.object({ ordinal: v.number(), url: v.string() })),
-  revisions: v.array(
-    v.object({
-      table: v.string(),
-      rowId: v.string(),
-      revId: v.string(),
-    }),
-  ),
-  crdt: v.array(
-    v.object({
-      table: v.string(),
-      rowId: v.string(),
-      field: v.string(),
-      kind: v.union(v.literal("text"), v.literal("count"), v.literal("set")),
-      headSeq: v.number(),
-      projectionHash: v.string(),
-    }),
-  ),
-  authoritative: v.array(
-    v.union(
-      v.object({
-        op: v.literal("put"),
-        table: v.string(),
-        rowId: v.string(),
-        fields: v.any(),
-        plainHash: v.string(),
-      }),
-      v.object({
-        op: v.literal("del"),
-        table: v.string(),
-        rowId: v.string(),
-        plainHash: v.string(),
-      }),
-    ),
-  ),
-};
 
 const conflictSettlementErrorValidator = v.object({ code: v.literal("EMBEDDED_CONFLICT") });
 const rejectedSettlementErrorValidator = v.object({

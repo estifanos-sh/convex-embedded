@@ -40,7 +40,7 @@ export const failureSettlementInputValidator = v.union(
   v.object({ ...settlementInputFields, outcome: v.literal("rebase"), error: v.any() }),
 );
 
-const settlementFields = {
+export const settlementFields = {
   ...settlementInputFields,
   crdt: v.array(
     v.object({
