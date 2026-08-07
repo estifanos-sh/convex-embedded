@@ -50,7 +50,7 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain('REPOSITORY" != "get-convex/embedded"');
     expect(workflow).not.toContain("github.repository == 'robelest/convex-embedded'");
     expect(workflow).toContain("Refusing to publish unexpected package");
-    expect(workflow).toContain("Verify packaged Node candidate conformance and process death");
+    expect(workflow).toContain("Verify packaged Linux Node durability");
     expect(workflow).toContain(
       "Verify production WASM OPFS conformance, worker death, stress, and memory ceilings",
     );
@@ -65,6 +65,11 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).not.toContain("labels.*.name, 'npm package'");
     expect(workflow).toContain('PACKAGE_PREVIEW" == "true"');
     expect(workflow).toContain('INPUT_MODE" == "prerelease"');
+    expect(workflow).toContain('"self-hosted", "linux", "arm64", "xlarge"');
+    expect(workflow).toContain('"self-hosted", "linux", "arm64", "large"');
+    expect(workflow).toContain("Preview PR code stays on GitHub-hosted hardware");
+    expect(workflow).toContain("Download exact JavaScript and WASM artifact");
+    expect(workflow).not.toContain("Build production Node and WASM artifacts");
     expect(workflow).toMatch(
       /name: Checkout exact source[\s\S]*?fetch-depth: 0[\s\S]*?name: Verify Preview2 baseline/,
     );

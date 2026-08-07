@@ -131,9 +131,12 @@ jobs:
 
   qualification:
     name: Qualify exact source for publication
-    needs: gate
+    # Preview PR code stays on GitHub-hosted hardware. A manually dispatched release is trusted
+    # code from main and can use the organization-managed ARM64 xlarge pool for its Rust, WASM,
+    # and migration-heavy qualification work.
+    needs: [gate, javascript]
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["self-hosted", "linux", "arm64", "xlarge"]' || '["large-runner"]') }}
     timeout-minutes: 60
 
     steps:
@@ -159,8 +162,11 @@ jobs:
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
-      - name: Build package declarations for source checks
-        run: vp run '@convex-dev/embedded#build:ts'
+      - name: Download exact JavaScript and WASM artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: robelest-dist
+          path: packages/embedded/dist
 
       - name: Check source contracts and reachability
         run: |
@@ -180,26 +186,9 @@ jobs:
           cargo test -p storage --release --features testkit --test stress result_only_cursor_updates_batch_projection_dependencies -- --ignored --exact --nocapture
           vp test run packages/embedded/tests/unit/expo.ts
 
-      - name: Build production Node and WASM artifacts
-        working-directory: packages/embedded
-        env:
-          CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
-        run: |
-          node scripts/publish.ts prepare-build
-          vp pack
-          vp run native
-          vp run wasm
-
       - name: Install Chromium for production OPFS gates
         working-directory: packages/embedded
         run: vp exec playwright install --with-deps chromium
-
-      - name: Verify packaged Node candidate conformance and process death
-        working-directory: packages/embedded
-        run: |
-          vp run test:fixture:node
-          vp run test:stress:node
-          vp run test:kill:node
 
       - name: Verify production WASM OPFS conformance, worker death, stress, and memory ceilings
         working-directory: packages/embedded
@@ -212,7 +201,7 @@ jobs:
     name: Build JavaScript and WASM
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["self-hosted", "linux", "arm64", "xlarge"]' || '["large-runner"]') }}
     timeout-minutes: 45
 
     steps:
@@ -261,21 +250,28 @@ jobs:
     name: Build Node ${{ matrix.target }}
     needs: [gate, javascript]
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: ${{ matrix.runner }}
+    # Only manually dispatched releases use the organization-managed ARM64 runners. PR previews
+    # execute contributor code and remain on GitHub-hosted runners.
+    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && matrix.release_runner || matrix.runner) }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: '["large-runner"]'
+            release_runner: '["large-runner"]'
             target: linux-x64-gnu
-          - runner: ubuntu-24.04-arm
+          - runner: '["ubuntu-24.04-arm"]'
+            release_runner: '["self-hosted", "linux", "arm64", "large"]'
             target: linux-arm64-gnu
-          - runner: macos-15
+          - runner: '["macos-15"]'
+            release_runner: '["macos-15"]'
             target: darwin-arm64
-          - runner: macos-15-intel
+          - runner: '["macos-15-intel"]'
+            release_runner: '["macos-15-intel"]'
             target: darwin-x64
-          - runner: windows-2025
+          - runner: '["windows-2025"]'
+            release_runner: '["windows-2025"]'
             target: win32-x64
 
     steps:
@@ -311,6 +307,13 @@ jobs:
         run: |
           vp run '@convex-dev/embedded#native'
           vp run '@convex-dev/embedded#test:node'
+
+      - name: Verify packaged Linux Node durability
+        if: matrix.target == 'linux-x64-gnu'
+        run: |
+          vp run '@convex-dev/embedded#test:fixture:node'
+          vp run '@convex-dev/embedded#test:stress:node'
+          vp run '@convex-dev/embedded#test:kill:node'
 
       - name: Upload Node addon
         uses: actions/upload-artifact@v7
