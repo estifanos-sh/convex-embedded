@@ -13,10 +13,13 @@ import { toEmbeddedGeneratedSchema } from "../../src/bundler/generated";
 import { analyzeEmbeddedSchema, defineEmbeddedSchema, replicatedTable } from "../../src/schema";
 import { convexEmbeddedUnplugin } from "../../src/unplugin";
 import {
+  fromVirtualFacadeId,
   fromVirtualSourceId,
   renderEmbeddedBundle,
   renderEmbeddedIdentity,
+  toVirtualFacadeId,
   toVirtualSourceId,
+  VIRTUAL_FACADE_MODULE_PREFIX,
   VIRTUAL_MODULE_ID,
   VIRTUAL_SOURCE_MODULE_PREFIX,
 } from "../../src/bundler/virtual";
@@ -1045,6 +1048,30 @@ describe("embedded unplugin adapter", () => {
         expect(fromVirtualSourceId(id)).toBeUndefined();
       }),
     );
+  });
+
+  test("round-trips facade paths through the virtual facade codec", () => {
+    fc.assert(
+      fc.property(sourcePath, (filePath) => {
+        expect(fromVirtualFacadeId(toVirtualFacadeId(filePath))).toBe(path.resolve(filePath));
+      }),
+    );
+  });
+
+  test("rejects wrong-prefix and malformed facade ids", () => {
+    expect(fromVirtualFacadeId(toVirtualSourceId("/fixture/source.ts"))).toBeUndefined();
+    expect(fromVirtualFacadeId(VIRTUAL_FACADE_MODULE_PREFIX)).toBeUndefined();
+    expect(fromVirtualFacadeId(`${VIRTUAL_FACADE_MODULE_PREFIX}@@@`)).toBeUndefined();
+  });
+
+  test("rejects source and facade ids with inserted or appended invalid payload characters", () => {
+    const source = toVirtualSourceId("/fixture/source.ts");
+    const facade = toVirtualFacadeId("/fixture/facade.ts");
+
+    expect(fromVirtualSourceId(`${source.slice(0, -1)}!${source.slice(-1)}`)).toBeUndefined();
+    expect(fromVirtualSourceId(`${source}!`)).toBeUndefined();
+    expect(fromVirtualFacadeId(`${facade.slice(0, -1)}!${facade.slice(-1)}`)).toBeUndefined();
+    expect(fromVirtualFacadeId(`${facade}!`)).toBeUndefined();
   });
 
   test("resolves and loads the virtual embedded registry", async () => {

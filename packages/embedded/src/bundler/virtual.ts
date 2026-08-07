@@ -8,38 +8,20 @@ export const VIRTUAL_SOURCE_MODULE_PREFIX = `${VIRTUAL_MODULE_ID}/source/`;
 export const VIRTUAL_FACADE_MODULE_PREFIX = `${VIRTUAL_MODULE_ID}/facade/`;
 
 export function toVirtualSourceId(filePath: string): string {
-  return `${VIRTUAL_SOURCE_MODULE_PREFIX}${Buffer.from(path.resolve(filePath), "utf8").toString(
-    "base64url",
-  )}`;
+  return virtualId.encode(VIRTUAL_SOURCE_MODULE_PREFIX, filePath);
 }
 
 export function fromVirtualSourceId(id: string): string | undefined {
-  if (!id.startsWith(VIRTUAL_SOURCE_MODULE_PREFIX)) return undefined;
-  const encoded = id.slice(VIRTUAL_SOURCE_MODULE_PREFIX.length);
-  try {
-    const decoded = Buffer.from(encoded, "base64url").toString("utf8");
-    return path.isAbsolute(decoded) ? path.normalize(decoded) : undefined;
-  } catch {
-    return undefined;
-  }
+  return virtualId.decode(VIRTUAL_SOURCE_MODULE_PREFIX, id);
 }
 
 /** A generated immutable facade for an application import of a local module. */
 export function toVirtualFacadeId(filePath: string): string {
-  return `${VIRTUAL_FACADE_MODULE_PREFIX}${Buffer.from(path.resolve(filePath), "utf8").toString(
-    "base64url",
-  )}`;
+  return virtualId.encode(VIRTUAL_FACADE_MODULE_PREFIX, filePath);
 }
 
 export function fromVirtualFacadeId(id: string): string | undefined {
-  if (!id.startsWith(VIRTUAL_FACADE_MODULE_PREFIX)) return undefined;
-  const encoded = id.slice(VIRTUAL_FACADE_MODULE_PREFIX.length);
-  try {
-    const decoded = Buffer.from(encoded, "base64url").toString("utf8");
-    return path.isAbsolute(decoded) ? path.normalize(decoded) : undefined;
-  } catch {
-    return undefined;
-  }
+  return virtualId.decode(VIRTUAL_FACADE_MODULE_PREFIX, id);
 }
 
 export function renderEmbeddedBundle(bundle: EmbeddedBundleResult): string {
@@ -119,3 +101,24 @@ export function renderEmbeddedIdentity(bundle: EmbeddedBundleResult): string {
 function objectKey(value: string): string {
   return /^[$A-Z_a-z][$\w]*$/.test(value) ? value : JSON.stringify(value);
 }
+
+const virtualId = {
+  encode(prefix: string, filePath: string): string {
+    return `${prefix}${Buffer.from(path.resolve(filePath), "utf8").toString("base64url")}`;
+  },
+
+  decode(prefix: string, id: string): string | undefined {
+    if (!id.startsWith(prefix)) return undefined;
+    const encoded = id.slice(prefix.length);
+    if (!/^[A-Za-z0-9_-]+$/.test(encoded)) return undefined;
+    try {
+      const bytes = Buffer.from(encoded, "base64url");
+      if (bytes.toString("base64url") !== encoded) return undefined;
+      const decoded = bytes.toString("utf8");
+      if (Buffer.from(decoded, "utf8").toString("base64url") !== encoded) return undefined;
+      return path.isAbsolute(decoded) ? path.normalize(decoded) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+};
