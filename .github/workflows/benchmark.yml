@@ -1,4 +1,4 @@
-name: Depot benchmark
+name: Benchmark
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ env:
 
 jobs:
   runtime:
-    name: Runtime Depot
+    name: Runtime
     runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 60
 
@@ -61,7 +61,7 @@ jobs:
           cargo test -p storage --features testkit --test migration
 
   android:
-    name: Android Depot
+    name: Android
     runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 120
 

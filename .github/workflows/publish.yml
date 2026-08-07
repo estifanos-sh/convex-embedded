@@ -1,4 +1,4 @@
-name: Embedded package
+name: Package
 
 on:
   pull_request:
@@ -34,7 +34,7 @@ env:
 
 jobs:
   gate:
-    name: Package build gate
+    name: Gate
     runs-on: ubuntu-24.04
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}
@@ -133,7 +133,7 @@ jobs:
           fi
 
   qualification:
-    name: Qualify exact source for publication
+    name: Qualify
     # This job is deliberately credential-free. Depot runs the native build and qualification
     # workload; release authority stays in GitHub-hosted tag and npm OIDC jobs below.
     needs: [gate, javascript]
@@ -203,7 +203,7 @@ jobs:
           vp test run --config vite/tests.ts --project browser tests/browser/memory.ts
 
   javascript:
-    name: Build JavaScript and WASM
+    name: JavaScript
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
     runs-on: depot-ubuntu-24.04-8
@@ -255,7 +255,7 @@ jobs:
           retention-days: 2
 
   node:
-    name: Build Node ${{ matrix.target }}
+    name: Node ${{ matrix.target }}
     needs: [gate, javascript]
     if: needs.gate.outputs.enabled == 'true'
     runs-on: ${{ matrix.runner }}
@@ -326,7 +326,7 @@ jobs:
           retention-days: 2
 
   apple:
-    name: Build complete Apple XCFramework
+    name: Apple
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
     runs-on: depot-macos-15
@@ -379,7 +379,7 @@ jobs:
           retention-days: 2
 
   android:
-    name: Build complete Android libraries
+    name: Android
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
     # The complete four-ABI cargo-ndk build needs Depot's largest Linux allocation.
@@ -442,7 +442,7 @@ jobs:
           retention-days: 2
 
   assemble:
-    name: Assemble and verify package
+    name: Assemble
     needs: [gate, qualification, javascript, node, apple, android]
     if: needs.gate.outputs.enabled == 'true'
     runs-on: ubuntu-24.04
@@ -546,7 +546,7 @@ jobs:
           retention-days: 2
 
   release-tag:
-    name: Bind release tag to validated source
+    name: Tag
     needs: [gate, qualification, assemble]
     if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
     runs-on: ubuntu-24.04
@@ -612,7 +612,7 @@ jobs:
           echo "tarball_sha256=$ASSEMBLED_TARBALL_SHA256" >> "$GITHUB_OUTPUT"
 
   preview:
-    name: Publish complete package preview
+    name: Preview
     needs: [gate, assemble]
     if: needs.gate.outputs.mode == 'preview'
     runs-on: ubuntu-24.04
@@ -717,7 +717,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
-    name: Publish Embedded npm package
+    name: Publish
     needs: [gate, qualification, assemble, release-tag]
     if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
     runs-on: ubuntu-24.04

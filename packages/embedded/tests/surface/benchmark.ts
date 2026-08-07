@@ -6,11 +6,11 @@ import { describe, expect, test } from "vite-plus/test";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
 
-describe("Depot benchmark workflow", () => {
+describe("benchmark workflow", () => {
   test("exercises the release workload on the configured provider without credentials", () => {
     const workflow = readFileSync(join(root, ".github/workflows/benchmark.yml"), "utf8");
 
-    expect(workflow).toContain("name: Depot benchmark");
+    expect(workflow).toContain("name: Benchmark");
     expect(workflow).toContain("depot-ubuntu-24.04-8");
     expect(workflow).toContain("depot-ubuntu-24.04-16");
     expect(workflow).not.toContain("blacksmith");

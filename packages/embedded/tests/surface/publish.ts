@@ -71,10 +71,8 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toMatch(
       /name: Checkout exact source[\s\S]*?fetch-depth: 0[\s\S]*?name: Verify Preview2 baseline/,
     );
-    expect(workflow).toMatch(
-      /name: Assemble and verify package[\s\S]*?name: Checkout[\s\S]*?fetch-depth: 0/,
-    );
-    expect(workflow).toContain("Qualify exact source for publication");
+    expect(workflow).toMatch(/name: Assemble[\s\S]*?name: Checkout[\s\S]*?fetch-depth: 0/);
+    expect(workflow).toContain("name: Qualify");
     expect(workflow).toContain("Bind packed artifact digest");
     expect(workflow).toContain("tarball_sha256: ${{ steps.tarball.outputs.sha256 }}");
     expect(workflow).toContain(
@@ -86,7 +84,7 @@ describe("Embedded publishing workflow", () => {
     );
     expect(workflow).toContain("Downloaded package digest $ACTUAL_TARBALL_SHA256");
     expect(workflow).toContain("needs: [gate, qualification, javascript, node, apple, android]");
-    expect(workflow).toContain("Bind release tag to validated source");
+    expect(workflow).toContain("name: Tag");
     expect(workflow).toContain("Credentials are deliberately removed from this job");
     expect(workflow).not.toContain("git fetch --no-tags origin main");
     expect(workflow).toContain('git merge-base --is-ancestor "$SOURCE_SHA" origin/main');

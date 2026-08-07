@@ -69,7 +69,7 @@ jobs:
               - 'vendor/**'
 
   verify:
-    name: Build and test
+    name: Verify
     runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 30
 
@@ -154,7 +154,7 @@ jobs:
           vp run @estifanos-sh/convex-embedded#test:runtime
 
   wasm:
-    name: Build wasm
+    name: WASM
     runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 30
 
@@ -206,7 +206,7 @@ jobs:
   # Per-push this job is a compile smoke, not a release build: it produces the single Apple slice
   # the smoke app below links against. Release Native builds the full triple set.
   mobile-apple:
-    name: Build iOS
+    name: iOS
     runs-on: depot-macos-15
     timeout-minutes: 45
     continue-on-error: true
@@ -265,7 +265,7 @@ jobs:
   # Per-push this job is a compile smoke, not a release build: it produces the single ABI the
   # smoke app below packages. Release Native builds the full ABI set.
   mobile-android:
-    name: Build Android
+    name: Android
     runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 45
     continue-on-error: true

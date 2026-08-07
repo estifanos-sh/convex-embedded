@@ -1,4 +1,4 @@
-name: Release native
+name: Native release
 
 # CI (preview.yml) builds one Apple triple and one Android ABI per push, which is all the
 # autolinking smoke apps consume. This workflow is the only place the shippable artifacts are
@@ -33,7 +33,7 @@ env:
 
 jobs:
   mobile-apple:
-    name: Build iOS
+    name: iOS
     runs-on: depot-macos-15
     timeout-minutes: 90
 
@@ -80,7 +80,7 @@ jobs:
           if-no-files-found: error
 
   mobile-android:
-    name: Build Android
+    name: Android
     runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 90
 
