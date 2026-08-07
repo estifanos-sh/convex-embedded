@@ -6,6 +6,16 @@ import { describe, expect, test } from "vite-plus/test";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
 
+function jobBody(workflow: string, name: string) {
+  const header = `  ${name}:\n`;
+  const start = workflow.indexOf(header);
+  expect(start, `missing ${name} job`).toBeGreaterThanOrEqual(0);
+
+  const remaining = workflow.slice(start + header.length);
+  const next = remaining.search(/\n  [a-z][a-z-]*:\n/);
+  return next === -1 ? remaining : remaining.slice(0, next);
+}
+
 describe("Embedded publishing workflow", () => {
   test("every production workflow uses a declared Blacksmith runner", () => {
     const workflows = [
@@ -143,8 +153,23 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toContain("blacksmith-6vcpu-macos-15");
     expect(native).not.toContain("large-runner");
     expect(native).not.toContain("depot");
+    expect(native).not.toContain('tags: ["v*"]');
+    expect(native).toContain('cron: "27 7 * * *"');
+    expect(native).toContain("workflow_dispatch:");
     expect(native).toContain("blacksmith-16vcpu-ubuntu-2404");
     expect(native).toContain("blacksmith-6vcpu-macos-15");
+    for (const name of ["verify", "wasm"]) {
+      const job = jobBody(workflow, name);
+
+      expect(job).toContain("uses: voidzero-dev/setup-vp@v1");
+      expect(job).toContain("node-version: 24.18.0");
+      expect(job).toContain("cache: true");
+      expect(job).toContain("args: ['--frozen-lockfile']");
+      expect(job).not.toContain("actions/setup-node@v6");
+      expect(job).not.toContain("corepack enable");
+      expect(job).not.toContain("pnpm install --frozen-lockfile");
+      expect(job).not.toContain("node_modules/.bin");
+    }
     expect(rust).toContain("toolchain: nightly-2026-06-09");
     expect(rust).toContain("wasm32-wasip1-threads");
   });

@@ -11,12 +11,11 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  push:
-    tags: ["v*"]
-  # Tags are cut rarely, so the nightly run of this same full matrix is what catches ABI-specific
-  # breakage — a triple or ABI the per-push smoke never compiles — before release day. 07:27 UTC
-  # is off the hour and outside working hours, and because a scheduled run reports
-  # `refs/heads/main` it also refreshes the shared `apple` and `android` caches for every slice.
+  # Package publishing already builds and verifies the full shipping matrix. This independent
+  # nightly run catches ABI-specific breakage — a triple or ABI the per-push smoke never
+  # compiles — before the next release. 07:27 UTC is off the hour and outside working hours,
+  # and because a scheduled run reports `refs/heads/main` it also refreshes the shared `apple`
+  # and `android` caches for every slice.
   schedule:
     - cron: "27 7 * * *"
   workflow_dispatch:
