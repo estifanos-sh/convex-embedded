@@ -1,4 +1,4 @@
-name: Runner benchmark
+name: Depot benchmark
 
 on:
   workflow_dispatch:
@@ -18,17 +18,9 @@ env:
 
 jobs:
   runtime:
-    name: Runtime ${{ matrix.provider }}
-    runs-on: ${{ matrix.runner }}
+    name: Runtime Depot
+    runs-on: depot-ubuntu-24.04-8
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - provider: blacksmith
-            runner: blacksmith-8vcpu-ubuntu-2404
-          - provider: depot
-            runner: depot-ubuntu-24.04-8
 
     steps:
       - name: Checkout exact benchmark source
@@ -37,6 +29,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ inputs.ref }}
+
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/rust
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -49,7 +44,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: embedded-benchmark-${{ matrix.provider }}
+          shared-key: embedded-benchmark
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
@@ -66,17 +61,9 @@ jobs:
           cargo test -p storage --features testkit --test migration
 
   android:
-    name: Android ${{ matrix.provider }}
-    runs-on: ${{ matrix.runner }}
+    name: Android Depot
+    runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - provider: blacksmith
-            runner: blacksmith-16vcpu-ubuntu-2404
-          - provider: depot
-            runner: depot-ubuntu-24.04-16
 
     steps:
       - name: Checkout exact benchmark source
@@ -84,6 +71,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
+
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/rust
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -105,7 +95,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: embedded-benchmark-${{ matrix.provider }}-android
+          shared-key: embedded-benchmark-android
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 

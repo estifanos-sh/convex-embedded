@@ -34,7 +34,7 @@ env:
 jobs:
   mobile-apple:
     name: Build iOS
-    runs-on: macos-15
+    runs-on: depot-macos-15
     timeout-minutes: 90
 
     steps:
@@ -42,6 +42,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/rust
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -78,7 +81,7 @@ jobs:
 
   mobile-android:
     name: Build Android
-    runs-on: large-runner
+    runs-on: depot-ubuntu-24.04-16
     timeout-minutes: 90
 
     steps:
@@ -86,6 +89,9 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/rust
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -95,8 +101,8 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # The Expo hook shells out to sdkmanager for the pinned NDK, and the large-runner pool
-      # images default to JDK 11. No Gradle runs here, so the CI build-cache setup is not needed.
+      # The Expo hook shells out to sdkmanager for the pinned NDK. No Gradle runs here, so the
+      # CI build-cache setup is not needed.
       - name: Java setup
         uses: actions/setup-java@v5
         with:
