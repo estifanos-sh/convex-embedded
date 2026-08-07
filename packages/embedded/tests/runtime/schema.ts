@@ -277,6 +277,76 @@ describe("Convex schema storage conversion", () => {
     );
   });
 
+  test("rejects a storage id path shared with an ordinary document id union branch", () => {
+    const schema = defineSchema({
+      docs: defineTable({
+        variant: v.union(
+          v.object({ kind: v.literal("user"), value: v.id("users") }),
+          v.object({ kind: v.literal("file"), value: v.id("_storage") }),
+        ),
+      }),
+      users: defineTable({ name: v.string() }),
+    });
+
+    expect(() => analyzeEmbeddedSchema(schema)).toThrow(
+      "storage id path variant.value is ambiguous",
+    );
+  });
+
+  test("rejects a storage id path shared with an any union branch", () => {
+    const schema = defineSchema({
+      docs: defineTable({
+        variant: v.union(
+          v.object({ kind: v.literal("unknown"), value: v.any() }),
+          v.object({ kind: v.literal("file"), value: v.id("_storage") }),
+        ),
+      }),
+    });
+
+    expect(() => analyzeEmbeddedSchema(schema)).toThrow(
+      "storage id path variant.value is ambiguous",
+    );
+  });
+
+  test.each([
+    ["array", "variant.values[]", () => v.array(v.id("_storage")), () => v.array(v.string())],
+    [
+      "record",
+      "variant.values{}",
+      () => v.record(v.string(), v.id("_storage")),
+      () => v.record(v.string(), v.string()),
+    ],
+  ] as const)(
+    "rejects mixed storage id and string %s union paths",
+    (_kind, path, storage, string) => {
+      const schema = defineSchema({
+        docs: defineTable({
+          variant: v.union(
+            v.object({ kind: v.literal("text"), values: string() }),
+            v.object({ kind: v.literal("file"), values: storage() }),
+          ),
+        }),
+      });
+
+      expect(() => analyzeEmbeddedSchema(schema)).toThrow(`storage id path ${path} is ambiguous`);
+    },
+  );
+
+  test("keeps disjoint storage id union paths in the exported path ABI", () => {
+    const schema = defineSchema({
+      docs: defineTable({
+        variant: v.union(
+          v.object({ avatar: v.id("_storage"), kind: v.literal("avatar") }),
+          v.object({ attachment: v.id("_storage"), kind: v.literal("file") }),
+        ),
+      }),
+    });
+
+    expect(analyzeEmbeddedSchema(schema).storageIdPaths).toEqual({
+      docs: ["variant.attachment", "variant.avatar"],
+    });
+  });
+
   test("escapes literal storage id field path separators and collection markers", () => {
     const schema = defineSchema({
       docs: defineTable(
