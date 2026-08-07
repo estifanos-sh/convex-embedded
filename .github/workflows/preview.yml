@@ -140,6 +140,7 @@ jobs:
         run: |
           vp check
           vp run style
+          cargo fmt --check
           vp run clippy
 
       - name: Build the node native addon
