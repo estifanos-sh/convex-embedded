@@ -3,12 +3,6 @@ name: Runner benchmark
 on:
   workflow_dispatch:
     inputs:
-      provider:
-        description: Run Blacksmith, Depot, or both providers
-        required: true
-        default: both
-        type: choice
-        options: [blacksmith, depot, both]
       ref:
         description: Git ref or commit to benchmark
         required: true
@@ -25,7 +19,6 @@ env:
 jobs:
   runtime:
     name: Runtime ${{ matrix.provider }}
-    if: inputs.provider == matrix.provider || inputs.provider == 'both'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -74,7 +67,6 @@ jobs:
 
   android:
     name: Android ${{ matrix.provider }}
-    if: inputs.provider == matrix.provider || inputs.provider == 'both'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
