@@ -28,6 +28,7 @@ import {
 import type { WorkerState } from "../../src/browser/runtime";
 import {
   controlChannelName,
+  ControlOp,
   CoordinatorProtocol,
   PeerOp,
   RejectCode,
@@ -77,6 +78,143 @@ describe("browser deployment coordination", () => {
     await waitUntil(() => result(responses, 2) !== undefined);
     expect(result(responses, 2)).toEqual({ id: 2, op: WorkerEvent.Result });
     expect(opens).toBe(1);
+    await runtime.close();
+  });
+
+  test("cleans an opened runtime when durable fence allocation fails", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const responses: WorkerResponse[] = [];
+    const closed: string[] = [];
+    const runtime = createCoordinatorRuntime(
+      {
+        clientId: "owner",
+        id: 1,
+        identity: identity(),
+        op: WorkerCommand.Init,
+        storagePath: "documents.db",
+        storageOwner: true,
+      },
+      {
+        assertCapabilities: () => undefined,
+        channels: { open: () => recordingChannel([]) },
+        closeSelf: () => undefined,
+        locks: { request: async (_name, callback) => await callback() },
+        openRuntime: async () =>
+          ({
+            opfs: { closeAll: () => closed.push("opfs") },
+            pthreads: { terminateAll: () => closed.push("pthreads") },
+            runner: { subscribeEvents: () => () => undefined },
+            stops: new Map(),
+            store: {
+              close: async () => closed.push("store"),
+              remote: { close: async () => closed.push("remote") },
+            },
+          }) as unknown as WorkerState,
+        postLocal: (response) => responses.push(response),
+        randomId: (prefix) => `${prefix}-owner`,
+      },
+    );
+
+    await runtime.start();
+
+    expect(result(responses, 1)?.error?.message).toContain("durable leader fencing");
+    expect(closed).toEqual(["remote", "store", "pthreads", "opfs"]);
+  });
+
+  test("legacy discovery probe rejects a v2 leader without attaching or opening storage", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const channels = new ChannelBus();
+    const responses: WorkerResponse[] = [];
+    const legacy = channels.open(controlChannelName(identity().storageId));
+    legacy.addEventListener("message", ({ data }) => {
+      const probe = data as { op?: unknown; protocol?: unknown };
+      if (probe.op !== ControlOp.SeekLeader || probe.protocol !== 2) return;
+      legacy.postMessage({
+        identity: identity(),
+        leaderEpoch: "legacy-session",
+        leaderId: "legacy-worker",
+        op: ControlOp.BroadcastLeader,
+        protocol: 2,
+        scope: runtimeScope(identity()),
+      });
+    });
+    let opens = 0;
+    const runtime = createCoordinatorRuntime(
+      {
+        clientId: "follower",
+        id: 1,
+        identity: identity(),
+        op: WorkerCommand.Init,
+        storageOwner: false,
+        storagePath: "documents.db",
+      },
+      {
+        assertCapabilities: () => undefined,
+        channels: { open: (name) => channels.open(name) },
+        closeSelf: () => undefined,
+        locks: { request: async (_name, callback) => await callback() },
+        openRuntime: async () => {
+          opens += 1;
+          return pendingRemoteRuntime();
+        },
+        postLocal: (response) => responses.push(response),
+        randomId: (prefix) => `${prefix}-follower`,
+      },
+    );
+
+    await runtime.start();
+
+    expect(result(responses, 1)?.error?.message).toContain("different browser protocol");
+    expect(opens).toBe(0);
+    legacy.close();
+  });
+
+  test("an active v3 leader ignores a legacy discovery seek", async () => {
+    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
+    const channels = new ChannelBus();
+    const responses: WorkerResponse[] = [];
+    const runtime = createCoordinatorRuntime(
+      {
+        clientId: "owner",
+        id: 1,
+        identity: identity(),
+        op: WorkerCommand.Init,
+        storageOwner: true,
+        storagePath: "documents.db",
+      },
+      {
+        assertCapabilities: () => undefined,
+        channels: { open: (name) => channels.open(name) },
+        closeSelf: () => undefined,
+        locks: { request: async (_name, callback) => await callback() },
+        openRuntime: async () => testRuntime("owner", [], async () => "still-active"),
+        postLocal: (response) => responses.push(response),
+        randomId: (prefix) => `${prefix}-owner`,
+      },
+    );
+    await runtime.start();
+
+    const legacy = channels.open(controlChannelName(identity().storageId));
+    legacy.postMessage({
+      clientId: "legacy-client",
+      identity: identity(),
+      op: ControlOp.SeekLeader,
+      protocol: 2,
+      scope: runtimeScope(identity()),
+      storagePath: "documents.db",
+      workerId: "legacy-worker",
+    });
+    runtime.handle({
+      args: {},
+      clientId: "owner",
+      id: 2,
+      name: "documents:read",
+      op: WorkerCommand.Query,
+    });
+    await waitUntil(() => result(responses, 2) !== undefined);
+
+    expect(result(responses, 2)).toEqual({ id: 2, op: WorkerEvent.Result, result: "still-active" });
+    legacy.close();
     await runtime.close();
   });
 
@@ -149,6 +287,7 @@ describe("browser deployment coordination", () => {
     } as unknown as WorkerState;
     const leader = new LeaderRuntime({
       epoch: "leader",
+      fence: "1",
       identity: identity(),
       runtime,
       scope: runtimeScope(identity()),
@@ -233,8 +372,8 @@ describe("browser deployment coordination", () => {
 
   test("runtime identity carries the local store format version", () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
-    expect(EMBEDDED_EPOCH).toBe(48);
-    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(48);
+    expect(EMBEDDED_EPOCH).toBe(49);
+    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(49);
   });
 
   test("a store format version mismatch surfaces as a runtime identity mismatch", () => {
@@ -291,6 +430,7 @@ describe("browser deployment coordination", () => {
       followers: new Map(),
       identity: oldIdentity,
       leaderEpoch: "leader-old",
+      leaderFence: "0",
       scope: runtimeScope(oldIdentity),
       storagePath: "convex-embedded-documents.db",
     } as unknown as LeaderState;
@@ -302,6 +442,8 @@ describe("browser deployment coordination", () => {
       {
         clientId: "client-new",
         identity: newIdentity,
+        leaderEpoch: "leader-old",
+        leaderFence: "0",
         op: PeerOp.Attach,
         protocol: CoordinatorProtocol,
         scope: runtimeScope(newIdentity),
@@ -375,6 +517,7 @@ describe("browser deployment coordination", () => {
     };
     const leader = new LeaderRuntime({
       epoch: "leader-incarnation",
+      fence: "1",
       identity: identity(),
       runtime,
       scope: "scope",
@@ -385,6 +528,8 @@ describe("browser deployment coordination", () => {
       {
         clientId: "client",
         identity: identity(),
+        leaderEpoch: "leader-incarnation",
+        leaderFence: "1",
         op: PeerOp.Attach,
         protocol: CoordinatorProtocol,
         remote: {
@@ -467,6 +612,7 @@ describe("browser deployment coordination", () => {
     runtime.remoteEvent = event;
     const leader = new LeaderRuntime({
       epoch: "leader-incarnation",
+      fence: "1",
       identity: identity(),
       runtime,
       scope: "scope",
@@ -594,10 +740,27 @@ describe("browser deployment coordination", () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
     const channels = new ChannelBus();
     const locks = new LockQueue();
+    const handoffOrder: string[] = [];
+    channels.onSend = (message) => {
+      if (
+        typeof message === "object" &&
+        message !== null &&
+        (message as { op?: unknown; leaderId?: unknown }).op === ControlOp.BroadcastLeader &&
+        (message as { leaderId?: unknown }).leaderId === "worker-second-incarnation"
+      ) {
+        handoffOrder.push("barrier");
+      }
+    };
     const firstResponses: WorkerResponse[] = [];
     const secondResponses: WorkerResponse[] = [];
     const firstRuntime = remoteRuntime();
-    const secondRuntime = remoteRuntime();
+    const secondRuntime = remoteRuntime(handoffOrder);
+    (
+      secondRuntime.store as unknown as { leader: { fence: { write(): Promise<string> } } }
+    ).leader.fence.write = async () => {
+      handoffOrder.push("fence");
+      return "10";
+    };
     const first = coordinator("first-incarnation", firstResponses, {
       channels,
       locks,
@@ -627,6 +790,9 @@ describe("browser deployment coordination", () => {
     await first.close();
     second.handle({ id: 99, op: WorkerCommand.StorageOwnerWrite });
     await waitUntil(() => secondRuntime.emit !== undefined);
+    await waitUntil(() => handoffOrder.includes("remote"));
+    expect(handoffOrder.indexOf("fence")).toBeLessThan(handoffOrder.indexOf("barrier"));
+    expect(handoffOrder.indexOf("barrier")).toBeLessThan(handoffOrder.indexOf("remote"));
     secondRuntime.emit?.({
       at: 2,
       attempt: 1,
@@ -642,6 +808,31 @@ describe("browser deployment coordination", () => {
 
     expect(oldEvent.incarnation).toBe("leader-first-incarnation");
     expect(nextEvent.incarnation).toBe("leader-second-incarnation");
+    expect(Number(nextEvent.leaderFence)).toBeGreaterThan(Number(oldEvent.leaderFence));
+
+    // A delayed peer frame from the retired leader cannot reattach this worker or settle a
+    // request after the replacement owner has allocated its higher durable term.
+    const stalePeer = channels.open(
+      workerChannelName(runtimeScope(identity()), "worker-second-incarnation"),
+    );
+    stalePeer.postMessage({
+      leaderEpoch: "leader-first-incarnation",
+      leaderFence: oldEvent.leaderFence!,
+      leaderId: "first-incarnation",
+      op: PeerOp.Attached,
+      protocol: CoordinatorProtocol,
+    } satisfies PeerMessage);
+    stalePeer.postMessage({
+      leaderEpoch: "leader-first-incarnation",
+      leaderFence: oldEvent.leaderFence!,
+      op: PeerOp.Response,
+      protocol: CoordinatorProtocol,
+      response: { id: 777, op: WorkerEvent.Result, result: "late-first-result" },
+    } satisfies PeerMessage);
+    await Promise.resolve();
+    expect(result(secondResponses, 777)).toBeUndefined();
+    stalePeer.close();
+
     let emit: ((event: EmbeddedEvent) => void) | undefined;
     const runner = {
       identity: { read: async () => undefined, write: async () => undefined },
@@ -806,6 +997,7 @@ function testRuntime(
         await closeReady;
         closed.push(name);
       },
+      leader: { fence: { write: async () => String(++nextLeaderFence) } },
     },
   } as unknown as WorkerState;
 }
@@ -837,6 +1029,7 @@ function deferred<T>() {
 }
 
 class ChannelBus {
+  onSend?: (message: unknown) => void;
   private readonly channels = new Map<string, Set<ChannelEndpoint>>();
 
   open(name: string): BroadcastChannelLike {
@@ -852,6 +1045,7 @@ class ChannelBus {
   }
 
   send(sender: ChannelEndpoint, message: unknown): void {
+    this.onSend?.(message);
     for (const endpoint of this.channels.get(sender.name) ?? []) {
       if (endpoint !== sender) endpoint.receive(message);
     }
@@ -936,12 +1130,13 @@ function pendingRemoteRuntime(): WorkerState {
     stops: new Map(),
     store: {
       close: async () => undefined,
+      leader: { fence: { write: async () => String(++nextLeaderFence) } },
       remote: { close: async () => undefined },
     },
   } as unknown as WorkerState;
 }
 
-function remoteRuntime(): WorkerState {
+function remoteRuntime(order?: string[]): WorkerState {
   return {
     closed: false,
     opfs: { closeAll: () => undefined },
@@ -954,11 +1149,14 @@ function remoteRuntime(): WorkerState {
     stops: new Map(),
     store: {
       close: async () => undefined,
+      leader: { fence: { write: async () => String(++nextLeaderFence) } },
       remote: {
         close: async () => undefined,
         identity: async () => ({ identity: null, identityKey: "unauthenticated" }),
         pull: async () => new Promise(() => undefined),
-        start: async () => undefined,
+        start: async () => {
+          order?.push("remote");
+        },
       },
     },
   } as unknown as WorkerState;
@@ -991,3 +1189,5 @@ function recordingChannel(messages: PeerMessage[]): BroadcastChannelLike {
     removeEventListener: () => undefined,
   };
 }
+
+let nextLeaderFence = 0;

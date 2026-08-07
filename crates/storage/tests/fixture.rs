@@ -319,14 +319,19 @@ fn preview2_fixture_matches_checksum_and_semantic_oracle() {
             .migration_commit(&target, candidate.candidate_generation)
             .unwrap();
     }
-    // Preview 2's V1 contract is readable only long enough to publish a V2 contract through the
-    // candidate pointer transaction. The setup identity moved to its own bootstrap record.
+    // Preview 2's V1 contract is readable only long enough to publish the current V3 contract
+    // through the candidate pointer transaction. The setup identity remains separate and the
+    // coordinator fence is initialized with the same publication.
     let contract = store.active_contract_debug_read().unwrap();
-    assert_eq!(contract.format, 2);
-    assert_eq!(contract.package_epoch, 48);
+    assert_eq!(contract.format, 3);
+    assert_eq!(contract.package_epoch, 49);
     assert!(contract.setup_hash.is_none());
     assert_eq!(store.active_setup_hash_debug_read().unwrap(), "");
-    assert_eq!(store.store_epoch_debug_read().unwrap(), 48);
+    assert_eq!(store.store_epoch_debug_read().unwrap(), 49);
+    assert_eq!(
+        store.leader_fence_debug_read().unwrap().as_deref(),
+        Some(b"0".as_slice())
+    );
     let mut kinds = store
         .origin_page_read(candidate.active_generation, None, 1_000)
         .unwrap()
@@ -381,6 +386,32 @@ fn preview2_reader_rejects_an_unrecognized_v1_layout_before_candidate_writes() {
         .contains("supported SQLite/bootstrap/schema contract"));
     assert_eq!(store.store_epoch_debug_read().unwrap(), 47);
     assert_eq!(store.active_contract_debug_read().unwrap().format, 1);
+}
+
+#[test]
+fn preview2_reader_rejects_an_unexpected_fence_before_candidate_writes() {
+    let opened_path = tmp_path("preview2_fixture_unexpected_fence.sqlite3");
+    std::fs::copy(fixture_path(), &opened_path).unwrap();
+    let store =
+        EmbeddedStore::open_with_identity_key(opened_path.to_str().unwrap(), "unauthenticated")
+            .unwrap();
+    let before = store.active_contract_debug_read().unwrap();
+    store.leader_fence_debug_write(b"0").unwrap();
+
+    let error = store.migration_begin(&fixture_target_schema()).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unexpectedly contains a leader fence"));
+    assert_eq!(store.store_epoch_debug_read().unwrap(), 47);
+    assert_eq!(store.active_contract_debug_read().unwrap(), before);
+    assert_eq!(
+        store.bootstrap_debug_read("candidate_generation").unwrap(),
+        None
+    );
+    assert_eq!(
+        store.leader_fence_debug_read().unwrap().as_deref(),
+        Some(b"0".as_slice())
+    );
 }
 
 /// Capture is deliberately ignored: the checked-in database is a release artifact from this exact

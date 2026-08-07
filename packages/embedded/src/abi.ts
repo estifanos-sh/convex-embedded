@@ -1,9 +1,9 @@
 import epoch from "../../../config/epoch.json" with { type: "json" };
 
 /** Native and WASM storage binding ABI required by this JavaScript bundle. @internal */
-// Remote ticks now carry required terminal settlement records. Reject an older native/WASM
-// artifact rather than silently treating its omitted field as an empty vector.
-export const EMBEDDED_STORAGE_ABI_VERSION = 32;
+// Browser leaders require an atomic durable-fence allocator. Reject an older native/WASM
+// artifact rather than permitting a browser runtime to begin remote work without one.
+export const EMBEDDED_STORAGE_ABI_VERSION = 33;
 
 /**
  * The package epoch: one identity for everything the package owns — the SQLite layout, the wire

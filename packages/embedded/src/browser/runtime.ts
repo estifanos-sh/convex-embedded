@@ -233,7 +233,7 @@ function emitDeploymentMismatch(state: WorkerState, error: unknown): boolean {
 export async function initFromMessage(
   request: Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>,
   postResponse: (message: WorkerResponse) => void = post,
-  options: { events?: boolean } = {},
+  options: { events?: boolean; remote?: boolean } = {},
 ): Promise<WorkerState> {
   postDebug(request.debug, "worker:bundle:import:start", undefined, postResponse);
   const embedded = await importEmbeddedBundle();
@@ -284,7 +284,7 @@ export async function initFromMessage(
     storeSchema: runtimeStoreSchema,
     remote: request.remote !== undefined,
   });
-  if (request.remote) {
+  if (request.remote && options.remote !== false) {
     postResponse({
       event: { at: getTimerTime(), phase: "remote-attach", type: "runtime" },
       op: WorkerEvent.Event,

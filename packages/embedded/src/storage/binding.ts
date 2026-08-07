@@ -414,6 +414,8 @@ export interface StoreBinding {
   mutationCacheWrite?(call: BindingMutationCall): Promise<BindingMutationRecord>;
   mutationFail(mutationId: string, error: string): Promise<void>;
   clockRead(): number;
+  // Expo's independently versioned bridge does not participate in browser coordination.
+  leaderFenceWrite?(): Promise<string>;
   commit(batch: BindingWriteBatch, options?: BindingCommitOptions): Promise<BindingCommitResult>;
   commitOneDocWrite?(
     table: string,
@@ -679,6 +681,17 @@ export class StoreAdapter implements StorageBackend {
   private readonly inner: StoreBinding;
   private readonly readCache = new ReadCache();
   readonly capabilities = { hasExactBounds: true };
+  /** Private browser-coordinator ownership term allocator. */
+  readonly leader = {
+    fence: {
+      write: async (): Promise<string> => {
+        if (!this.inner.leaderFenceWrite) {
+          throw new Error("This storage binding does not support durable leader fencing.");
+        }
+        return await this.inner.leaderFenceWrite();
+      },
+    },
+  };
   readonly remote: RemoteSurface | undefined;
   readonly identity: StorageBackend["identity"];
 

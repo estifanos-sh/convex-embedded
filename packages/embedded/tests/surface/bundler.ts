@@ -110,7 +110,7 @@ export const carryHistory = local.internalAction({ handler: () => null });
       await file(localDir, "entry.ts", 'export { openDevice as open } from "./lifecycle";\n');
 
       const first = await createFixtureBundle(root, localDir);
-      expect(first.artifact.expectedBinding).toEqual({ mobileAbi: 10, storageAbi: 32 });
+      expect(first.artifact.expectedBinding).toEqual({ mobileAbi: 10, storageAbi: 33 });
       expect(first.artifact.setups).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -792,7 +792,7 @@ export default defineComponent("defaultChild");
       artifact: {
         artifactHash: "artifact",
         executionHash: "graph",
-        expectedBinding: { mobileAbi: 10, storageAbi: 32 },
+        expectedBinding: { mobileAbi: 10, storageAbi: 33 },
         format: 1,
         modules: [],
         replicationHash: "manifest",

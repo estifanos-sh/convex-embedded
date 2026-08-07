@@ -31,7 +31,7 @@ use crate::types::{
     RevKey, RevState, RevWriteResult, RowChange, RowChangeOp, RowHead, RowKey, ScheduledJob,
     ScheduledState, StoreContract, StoreSchema, TableDef, TablePlacement, UploadLease,
     UploadLeaseWrite, WriteBatch, ORIGIN_FLAG_DISCARDED, ORIGIN_FLAG_QUARANTINED,
-    STORE_CONTRACT_V1_EPOCH, STORE_CONTRACT_V2_EPOCH,
+    STORE_CONTRACT_V1_EPOCH, STORE_CONTRACT_V2_EPOCH, STORE_CONTRACT_V3_EPOCH,
 };
 
 static PATH_LOCKS: LazyLock<Mutex<FxHashMap<String, Weak<Mutex<()>>>>> =
@@ -55,7 +55,7 @@ const ORIGIN_FLAGS_NONE: i64 = 0;
 /// future semantic codec may be binary and must never be asked to decode this JSON envelope.
 const ORIGIN_DISPOSITION_CODEC: i64 = 1;
 const MIN_SUPPORTED_EPOCH: i64 = STORE_CONTRACT_V1_EPOCH;
-const CURRENT_STORE_EPOCH: i64 = STORE_CONTRACT_V2_EPOCH;
+const CURRENT_STORE_EPOCH: i64 = STORE_CONTRACT_V3_EPOCH;
 const PREVIEW2_KERNEL_LAYOUT_HASH: &str =
     "5fa387957ed045e0e1c6e6f4357034af63a102c8180d7fd9f0f8437d41fe72fa";
 const PREVIEW2_GENERATION_LAYOUT_HASH: &str =
@@ -85,12 +85,24 @@ fn contract_matches_store_epoch(contract: &StoreContract, stored_epoch: i64) -> 
                 && contract.origin_writer_hash == PREVIEW2_ORIGIN_WRITER_HASH
                 && contract.origin_reader_hash == PREVIEW2_ORIGIN_READER_HASH
         }
-        2 => {
-            stored_epoch == STORE_CONTRACT_V2_EPOCH
-                && contract.package_epoch == STORE_CONTRACT_V2_EPOCH
-        }
+        2 => stored_epoch == STORE_CONTRACT_V2_EPOCH && contract.has_exact_v2_layout(),
+        3 => stored_epoch == STORE_CONTRACT_V3_EPOCH && contract.has_exact_v3_layout(),
         _ => false,
     }
+}
+
+fn is_v2_to_v3_kernel_bridge(active: &StoreContract, target: &StoreContract) -> bool {
+    // App schema and setup identity are candidate-owned concerns. Restrict this bridge only to
+    // the exact durable engine layouts so an ordinary app migration can compose with the engine
+    // upgrade in one candidate lifecycle.
+    active.has_exact_v2_layout() && target.has_exact_v3_layout()
+}
+
+// Preview 2 stores predate both the V2 setup-plan split and the coordinator fence. Retain this
+// one exact legacy reader so the already-shipped V1 fixture can reach the current contract; it is
+// deliberately separate from V2 admission, which remains the only normal no-fence bridge source.
+fn is_v1_to_v3_legacy_bridge(active: &StoreContract, target: &StoreContract) -> bool {
+    active.is_v1() && target.has_exact_v3_layout()
 }
 
 /// How long a claimed scheduled job holds its lease before another worker may reclaim it. A worker
@@ -557,11 +569,12 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let requested = StoreContract::for_schema(schema);
         let active_setup =
             self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
         let requested_setup = Self::target_setup_hash(&active_setup, schema);
-        if !active.is_v2()
+        if !active.is_v3()
             || !active.has_same_candidate_identity(&requested)
             || requested_setup != active_setup
         {
@@ -618,6 +631,7 @@ impl EmbeddedStore {
                 sql::ACTIVE_SETUP_HASH_KEY,
                 schema.setup_hash.as_bytes(),
             )?;
+            self.write_bootstrap_unlocked(sql::LEADER_FENCE_KEY, b"0")?;
             let contract = serde_json::to_vec(&StoreContract::for_schema(schema))
                 .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
             self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
@@ -644,6 +658,58 @@ impl EmbeddedStore {
             sql::WRITE_BOOTSTRAP,
             vec![text_value(key.to_owned()), Value::Blob(value.to_vec())],
         )
+    }
+
+    fn leader_fence_read_unlocked(&self) -> Result<i64, StorageError> {
+        let bytes = self
+            .bootstrap_read_unlocked(sql::LEADER_FENCE_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "leader fence is missing; the store was preserved".to_owned(),
+                )
+            })?;
+        let value = std::str::from_utf8(&bytes).map_err(|error| {
+            StorageError::IncompatibleStore(format!(
+                "leader fence is not UTF-8: {error}; the store was preserved"
+            ))
+        })?;
+        let canonical = value == "0"
+            || value
+                .as_bytes()
+                .first()
+                .is_some_and(|first| first.is_ascii_digit() && *first != b'0')
+                && value.as_bytes()[1..].iter().all(u8::is_ascii_digit);
+        if !canonical {
+            return Err(StorageError::IncompatibleStore(
+                "leader fence is not a canonical nonnegative integer; the store was preserved"
+                    .to_owned(),
+            ));
+        }
+        value.parse::<i64>().map_err(|error| {
+            StorageError::IncompatibleStore(format!(
+                "leader fence is outside the signed integer range: {error}; the store was preserved"
+            ))
+        })
+    }
+
+    fn leader_fence_validate_for_contract_unlocked(
+        &self,
+        contract: &StoreContract,
+    ) -> Result<(), StorageError> {
+        if contract.is_v3() {
+            self.leader_fence_read_unlocked().map(|_| ())
+        } else if (contract.is_v1() || contract.is_v2())
+            && self
+                .bootstrap_read_unlocked(sql::LEADER_FENCE_KEY)?
+                .is_some()
+        {
+            Err(StorageError::IncompatibleStore(
+                "legacy store unexpectedly contains a leader fence; the store was preserved"
+                    .to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Writes one originated semantic record in the caller's transaction.
@@ -1375,6 +1441,7 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let active_setup_hash =
             self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
         let target_setup_hash = Self::target_setup_hash(&active_setup_hash, schema);
@@ -1384,15 +1451,18 @@ impl EmbeddedStore {
         let source_contract_hash = active
             .hash()
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        let v2_to_v3_bridge = is_v2_to_v3_kernel_bridge(&active, &target);
+        let legacy_v1_to_v3_bridge = is_v1_to_v3_legacy_bridge(&active, &target);
         if active.kernel_layout_hash != target.kernel_layout_hash
-            && !(active.is_v1() && target.is_v2())
+            && !v2_to_v3_bridge
+            && !legacy_v1_to_v3_bridge
         {
             return Err(StorageError::IncompatibleStore(
                 "the kernel layout fingerprint changed without a supported store-contract upgrade; the store was preserved"
                     .to_owned(),
             ));
         }
-        if active.is_v2()
+        if active.is_v3()
             && active.has_same_candidate_identity(&target)
             && target_setup_hash == active_setup_hash
         {
@@ -1553,9 +1623,11 @@ impl EmbeddedStore {
             )?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_STATE_KEY, b"pending")?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"pending")?;
+            let setup_skipped = target_setup_hash.is_empty()
+                || (v2_to_v3_bridge && target_setup_hash == active_setup_hash);
             self.write_bootstrap_unlocked(
                 sql::CANDIDATE_SETUP_STATE_KEY,
-                if target_setup_hash.is_empty() {
+                if setup_skipped {
                     b"skipped"
                 } else {
                     b"pending"
@@ -1603,7 +1675,8 @@ impl EmbeddedStore {
             candidate_generation,
             cleanup_generation: None,
             source_schema,
-            setup_complete: target_setup_hash.is_empty(),
+            setup_complete: target_setup_hash.is_empty()
+                || (v2_to_v3_bridge && target_setup_hash == active_setup_hash),
             source_contract_hash,
             target_contract_hash,
             retired_generations,
@@ -2575,6 +2648,7 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
         if !matches!(
             self.bootstrap_read_unlocked(sql::CANDIDATE_SETUP_STATE_KEY)?
                 .as_deref(),
@@ -2685,6 +2759,8 @@ impl EmbeddedStore {
             self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
         let target_setup = Self::target_setup_hash(&active_setup, schema);
         let candidate_setup = self.setup_hash_read_unlocked(sql::CANDIDATE_SETUP_HASH_KEY, None)?;
+        let v2_to_v3_bridge = is_v2_to_v3_kernel_bridge(&active, &target);
+        let seed_leader_fence = v2_to_v3_bridge || is_v1_to_v3_legacy_bridge(&active, &target);
         if candidate_target != target {
             return Err(StorageError::IncompatibleStore(
                 "candidate contract no longer matches the target".to_owned(),
@@ -2696,6 +2772,7 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let previous_generation = self.driver.generation();
         let previous_tables = lock(&self.tables).clone();
         *lock(&self.tables) = schema
@@ -2768,6 +2845,21 @@ impl EmbeddedStore {
             )?;
             self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
             self.write_bootstrap_unlocked(sql::ACTIVE_SETUP_HASH_KEY, target_setup.as_bytes())?;
+            if seed_leader_fence {
+                if self
+                    .bootstrap_read_unlocked(sql::LEADER_FENCE_KEY)?
+                    .is_some()
+                {
+                    return Err(StorageError::IncompatibleStore(
+                        "V2-to-V3 bridge found an existing leader fence; the store was preserved"
+                            .to_owned(),
+                    ));
+                }
+                // This is deliberately inside the same FULL-synchronous cutover transaction as
+                // the V3 contract and SQLite epoch: a restart observes either V2-without-fence
+                // or V3-with-canonical-zero, never a mixed coordinator state.
+                self.write_bootstrap_unlocked(sql::LEADER_FENCE_KEY, b"0")?;
+            }
             // The semantic contract and SQLite epoch describe one published store version. Keep
             // them in the same cutover transaction so a process restart can never observe the new
             // generation through the old runtime epoch (or vice versa).
@@ -4098,6 +4190,59 @@ impl EmbeddedStore {
     pub fn clock_read(&self) -> Result<f64, StorageError> {
         let wall = wall_ms()?;
         Ok(lock(&self.clock).now(wall))
+    }
+
+    /// Advance the private browser-coordinator leadership fence and return its exact decimal
+    /// representation. The counter is a string at the binding boundary so JavaScript never rounds
+    /// values above `Number.MAX_SAFE_INTEGER`.
+    pub fn leader_fence_write(&self) -> Result<String, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let stored_epoch = self.read_user_version()?;
+        let active = self
+            .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore(
+                    "active contract is missing; the store was preserved".to_owned(),
+                )
+            })?;
+        if !contract_matches_store_epoch(&active, stored_epoch) || !active.is_v3() {
+            return Err(StorageError::IncompatibleStore(
+                "leader fence requires the published V3 store contract; the store was preserved"
+                    .to_owned(),
+            ));
+        }
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
+        self.driver
+            .execute("PRAGMA synchronous = FULL", Vec::new())?;
+        let advanced = self.transaction_unlocked(|| {
+            let next = self
+                .leader_fence_read_unlocked()?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StorageError::IncompatibleStore(
+                        "leader fence overflow; the store was preserved".to_owned(),
+                    )
+                })?;
+            let encoded = next.to_string();
+            self.write_bootstrap_unlocked(sql::LEADER_FENCE_KEY, encoded.as_bytes())?;
+            Ok(encoded)
+        });
+        // Attempt restoration after both a successful commit and every rollback/error path. A
+        // failed restoration is surfaced only when publication succeeded; on a failed claim the
+        // original failure remains the causally useful result.
+        let restored = self
+            .driver
+            .execute("PRAGMA synchronous = NORMAL", Vec::new());
+        match advanced {
+            Ok(value) => {
+                restored?;
+                Ok(value)
+            }
+            Err(error) => {
+                drop(restored);
+                Err(error)
+            }
+        }
     }
 
     pub fn mutation_write(&self, call: &MutationCall) -> Result<MutationRecord, StorageError> {
@@ -8669,6 +8814,57 @@ impl EmbeddedStore {
         let _guard = lock(&self.operation_lock);
         self.bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
             .ok_or_else(|| StorageError::IncompatibleStore("active contract is missing".to_owned()))
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn v2_kernel_layout_hash_debug_read(&self) -> String {
+        StoreContract::v2_kernel_layout_hash()
+    }
+
+    /// Replaces the active contract and header epoch together for bridge-admission tests.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn active_contract_debug_write(
+        &self,
+        contract: &StoreContract,
+        epoch: i64,
+    ) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        let encoded = serde_json::to_vec(contract)
+            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
+        self.transaction_unlocked(|| {
+            self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &encoded)?;
+            self.driver
+                .execute(&sql::write_user_version(epoch), Vec::new())
+        })
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn leader_fence_debug_read(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.bootstrap_read_unlocked(sql::LEADER_FENCE_KEY)
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn bootstrap_debug_read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.bootstrap_read_unlocked(key)
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn leader_fence_debug_write(&self, value: &[u8]) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.transaction_unlocked(|| self.write_bootstrap_unlocked(sql::LEADER_FENCE_KEY, value))
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn leader_fence_debug_delete(&self) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.transaction_unlocked(|| {
+            self.driver.execute(
+                sql::DELETE_BOOTSTRAP,
+                vec![text_value(sql::LEADER_FENCE_KEY.to_owned())],
+            )
+        })
     }
 
     /// Reads the published setup-plan identity without exposing bootstrap internals to bindings.

@@ -550,6 +550,10 @@ export class EmbeddedClient {
   private persistence: "durable" | "temporary" = "durable";
   private replicationPullError: EmbeddedConnectionError | undefined;
   private remoteStart: Promise<void> | undefined;
+  /** Highest durable browser ownership term admitted by the remote-event ingress fence. */
+  private remoteLeaderFence: string | undefined;
+  /** Once browser framing begins, native/unframed events may no longer regress this client. */
+  private remoteLeaderFramed = false;
   private remoteIncarnation: string | undefined;
   private remoteGeneration = -1;
   private remoteSequence = -1;
@@ -1522,69 +1526,133 @@ export class EmbeddedClient {
 
   private emitDiagnostic(event: DiagnosticEvent): boolean {
     if (event.type === "runtime") this.updateLocalConnection(event);
-    if (event.type === "remote") {
-      if (event.incarnation !== undefined && event.incarnation !== this.remoteIncarnation) {
-        this.remoteIncarnation = event.incarnation;
+    if (event.type === "remote" && !this.admitRemoteDiagnostic(event)) return false;
+    this.devtools.emit(event);
+    return true;
+  }
+
+  /**
+   * Admit one remote diagnostic before it can affect connection state, devtools, or its paired
+   * browser settlement vector. This is deliberately the only remote-event ingress fence.
+   */
+  private admitRemoteDiagnostic(event: EmbeddedRemoteEvent): boolean {
+    if (event.leaderFence !== undefined) {
+      if (
+        !isCanonicalLeaderFence(event.leaderFence) ||
+        !isCanonicalLeaderIncarnation(event.incarnation)
+      ) {
+        return false;
+      }
+      const currentFence = this.remoteLeaderFence;
+      if (currentFence !== undefined) {
+        const comparison = compareLeaderFence(event.leaderFence, currentFence);
+        if (comparison < 0) return false;
+        if (comparison > 0) {
+          this.remoteLeaderFence = event.leaderFence;
+          this.remoteIncarnation = undefined;
+          this.remoteGeneration = -1;
+          this.remoteSequence = -1;
+        }
+      } else {
+        this.remoteLeaderFence = event.leaderFence;
+        this.remoteIncarnation = undefined;
         this.remoteGeneration = -1;
         this.remoteSequence = -1;
       }
-      if (event.generation !== undefined) {
-        if (event.generation < this.remoteGeneration) return false;
-        if (event.generation > this.remoteGeneration) {
-          this.remoteGeneration = event.generation;
-          this.remoteSequence = -1;
-        }
-        if (event.sequence !== undefined) {
-          if (event.sequence <= this.remoteSequence) return false;
-          this.remoteSequence = event.sequence;
-        }
+      this.remoteLeaderFramed = true;
+      // A term identifies the durable owner; its random incarnation identifies precisely one
+      // session. A second session at the same term is a split-brain signal, never a handoff.
+      if (
+        this.remoteIncarnation !== undefined &&
+        event.incarnation !== undefined &&
+        event.incarnation !== this.remoteIncarnation
+      ) {
+        return false;
       }
-      if ((event.tick?.pullSnapshots ?? 0) > 0) this.replicationPullError = undefined;
-      if ((event.tick?.pullDiagnostics ?? 0) > 0) {
-        this.replicationPullError = toConnectionError(
-          event.error ?? event.tick?.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR,
-          "EMBEDDED_REPLICATION",
-        );
-      }
-      if (event.status === "error") {
-        this.setReplicationConnection({
-          error:
-            event.error?.includes("remote command channel closed") && this.replicationPullError
-              ? this.replicationPullError
-              : toConnectionError(
-                  event.error ?? "Remote replication failed.",
-                  "EMBEDDED_REPLICATION",
-                ),
-          status: "error",
-        });
-      } else if (this.replicationPullError !== undefined && event.status !== "closed") {
-        this.setReplicationConnection({ error: this.replicationPullError, status: "error" });
-      } else if (event.status === "offline") {
-        this.setReplicationConnection({ status: "offline" });
-      } else if (event.status === "closed") {
-        this.setReplicationConnection({ status: "closed" });
-      } else if (event.status === "starting") {
-        this.setReplicationConnection({ status: "starting" });
-      } else if (event.status === "started") {
-        if (
-          this.replicationConnection.status !== "offline" &&
-          this.replicationConnection.status !== "online"
-        ) {
-          this.setReplicationConnection({ status: "starting" });
-        }
-      } else if (event.status === "connected") {
-        this.setReplicationConnection(this.onlineConnection(event.tick));
-      } else if (event.status === "tick") {
-        if (this.replicationConnection.status !== "offline") {
-          this.setReplicationConnection(this.onlineConnection(event.tick));
-        }
-      } else if (event.status === "idle") {
-        this.setReplicationConnection(this.onlineConnection(event.tick));
-      }
-      this.acceptedRemoteSettlementEvents.add(event);
+    } else if (this.remoteLeaderFramed) {
+      return false;
     }
-    this.devtools.emit(event);
+    if (event.incarnation !== undefined && event.incarnation !== this.remoteIncarnation) {
+      this.remoteIncarnation = event.incarnation;
+      this.remoteGeneration = -1;
+      this.remoteSequence = -1;
+    }
+    if (event.generation !== undefined) {
+      if (event.generation < this.remoteGeneration) return false;
+      if (event.generation > this.remoteGeneration) {
+        this.remoteGeneration = event.generation;
+        this.remoteSequence = -1;
+      }
+      if (event.sequence !== undefined) {
+        if (event.sequence <= this.remoteSequence) return false;
+        this.remoteSequence = event.sequence;
+      }
+    }
+    this.updateRemoteConnection(event);
+    this.acceptedRemoteSettlementEvents.add(event);
     return true;
+  }
+
+  /** Reduce one admitted remote diagnostic into its observable connection state. */
+  private updateRemoteConnection(event: EmbeddedRemoteEvent): void {
+    if ((event.tick?.pullSnapshots ?? 0) > 0) this.replicationPullError = undefined;
+    if ((event.tick?.pullDiagnostics ?? 0) > 0) {
+      this.replicationPullError = toConnectionError(
+        event.error ?? event.tick?.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR,
+        "EMBEDDED_REPLICATION",
+      );
+    }
+    if (event.status === "error") {
+      this.setReplicationConnection({
+        error:
+          event.error?.includes("remote command channel closed") && this.replicationPullError
+            ? this.replicationPullError
+            : toConnectionError(
+                event.error ?? "Remote replication failed.",
+                "EMBEDDED_REPLICATION",
+              ),
+        status: "error",
+      });
+      return;
+    }
+    if (this.replicationPullError !== undefined && event.status !== "closed") {
+      this.setReplicationConnection({ error: this.replicationPullError, status: "error" });
+      return;
+    }
+    if (event.status === "offline") {
+      this.setReplicationConnection({ status: "offline" });
+      return;
+    }
+    if (event.status === "closed") {
+      this.setReplicationConnection({ status: "closed" });
+      return;
+    }
+    if (event.status === "starting") {
+      this.setReplicationConnection({ status: "starting" });
+      return;
+    }
+    if (event.status === "started") {
+      if (
+        this.replicationConnection.status !== "offline" &&
+        this.replicationConnection.status !== "online"
+      ) {
+        this.setReplicationConnection({ status: "starting" });
+      }
+      return;
+    }
+    if (event.status === "connected") {
+      this.setReplicationConnection(this.onlineConnection(event.tick));
+      return;
+    }
+    if (event.status === "tick") {
+      if (this.replicationConnection.status !== "offline") {
+        this.setReplicationConnection(this.onlineConnection(event.tick));
+      }
+      return;
+    }
+    if (event.status === "idle") {
+      this.setReplicationConnection(this.onlineConnection(event.tick));
+    }
   }
 
   private updateLocalConnection(event: Extract<DiagnosticEvent, { type: "runtime" }>): void {
@@ -1775,6 +1843,24 @@ export class EmbeddedClient {
     this.auth.identity = accepted.identity;
     this.auth.onChange?.(accepted.identity !== null);
   }
+}
+
+/** Compare canonical decimal fences without coercing potentially 64-bit terms to Number. */
+function compareLeaderFence(left: string, right: string): -1 | 0 | 1 {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+function isCanonicalLeaderFence(value: string): boolean {
+  return /^(0|[1-9][0-9]*)$/.test(value);
+}
+
+/** Browser leader sessions are opaque tokens, but never empty or whitespace-normalized values. */
+function isCanonicalLeaderIncarnation(value: unknown): value is string {
+  return (
+    typeof value === "string" && value.length > 0 && value.trim() === value && !/\s/.test(value)
+  );
 }
 
 /** @internal */

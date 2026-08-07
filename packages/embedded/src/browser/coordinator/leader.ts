@@ -65,6 +65,8 @@ export interface LeaderState {
   followers: Map<string, FollowerHandle>;
   identity: import("../protocol").RuntimeIdentity;
   leaderEpoch: string;
+  /** Durable, canonical ownership term allocated by this physical store instance. */
+  leaderFence: string;
   mutations: Map<string, RunningMutation>;
   /** Serializes a last-client remote stop with a concurrently attaching remote client. */
   remoteIdleStop?: Promise<void>;
@@ -84,6 +86,7 @@ export class LeaderRuntime {
 
   constructor(options: {
     epoch: string;
+    fence: string;
     identity: LeaderState["identity"];
     runtime: WorkerState;
     scope: string;
@@ -92,6 +95,7 @@ export class LeaderRuntime {
     this.state = createLeaderState({
       identity: options.identity,
       leaderEpoch: options.epoch,
+      leaderFence: assertLeaderFence(options.fence),
       runtime: options.runtime,
       scope: options.scope,
       storagePath: options.storagePath,
@@ -100,6 +104,10 @@ export class LeaderRuntime {
 
   get epoch(): string {
     return this.state.leaderEpoch;
+  }
+
+  get fence(): string {
+    return this.state.leaderFence;
   }
 
   get identity(): LeaderState["identity"] {
@@ -121,6 +129,7 @@ export class LeaderRuntime {
     const follower = this.state.followers.get(message.workerId);
     follower?.channel.postMessage({
       leaderEpoch: this.epoch,
+      leaderFence: this.fence,
       leaderId,
       localConfigured: this.state.runtime.runner.localConfigured,
       op: PeerOp.Attached,
@@ -178,6 +187,13 @@ export class LeaderRuntime {
     this.closePromise ??= closeLeader(this.state);
     return this.closePromise;
   }
+}
+
+function assertLeaderFence(fence: string): string {
+  if (!/^(0|[1-9][0-9]*)$/.test(fence)) {
+    throw new Error("LeaderRuntime requires a canonical durable leader fence.");
+  }
+  return fence;
 }
 
 interface SharedWatch {
@@ -238,6 +254,7 @@ const leaderRequestHandlers = {
 export function createLeaderState(options: {
   identity: LeaderState["identity"];
   leaderEpoch: string;
+  leaderFence: string;
   runtime: WorkerState;
   scope: string;
   storagePath: string;
@@ -247,6 +264,7 @@ export function createLeaderState(options: {
     followers: new Map(),
     identity: options.identity,
     leaderEpoch: options.leaderEpoch,
+    leaderFence: options.leaderFence,
     mutations: new Map(),
     runtime: options.runtime,
     scope: options.scope,
@@ -295,6 +313,15 @@ export function attachFollower(
   const channel = openChannel(workerChannelName(message.scope, message.workerId));
   try {
     try {
+      if (
+        message.leaderFence !== leader.leaderFence ||
+        message.leaderEpoch !== leader.leaderEpoch
+      ) {
+        throw new AttachRejection(
+          RejectCode.Internal,
+          "ConvexEmbeddedClient attempted to attach through a stale browser leader term.",
+        );
+      }
       assertSameRuntimeIdentity(message.identity, leader.identity);
     } catch (error) {
       if (error instanceof RuntimeIdentityMismatchError) {
@@ -345,6 +372,7 @@ export function attachFollower(
     const post = (response: WorkerResponse) =>
       follower.channel.postMessage({
         leaderEpoch: leader.leaderEpoch,
+        leaderFence: leader.leaderFence,
         op: PeerOp.Response,
         protocol: CoordinatorProtocol,
         response,
@@ -381,6 +409,7 @@ export function attachFollower(
       code: error instanceof AttachRejection ? error.code : RejectCode.Internal,
       error: serializeError(error),
       leaderEpoch: leader.leaderEpoch,
+      leaderFence: leader.leaderFence,
       op: PeerOp.Rejected,
       protocol: CoordinatorProtocol,
     } satisfies PeerMessage);
@@ -392,13 +421,16 @@ export async function handlePeerRequest(
   leader: LeaderState,
   message: Extract<PeerMessage, { op: typeof PeerOp.Request }>,
 ): Promise<void> {
-  if (message.leaderEpoch !== leader.leaderEpoch) return;
+  if (message.leaderEpoch !== leader.leaderEpoch || message.leaderFence !== leader.leaderFence) {
+    return;
+  }
   const key = localClientKey(message.fromWorkerId, clientId(message.request));
   const client = leader.clients.get(key);
   if (!client) {
     const follower = leader.followers.get(message.fromWorkerId);
     follower?.channel.postMessage({
       leaderEpoch: leader.leaderEpoch,
+      leaderFence: leader.leaderFence,
       op: PeerOp.Response,
       protocol: CoordinatorProtocol,
       response: {
@@ -413,7 +445,7 @@ export async function handlePeerRequest(
   }
   leader.followers
     .get(message.fromWorkerId)
-    ?.channel.postMessage(requestAck(leader.leaderEpoch, message.request.id));
+    ?.channel.postMessage(requestAck(leader.leaderEpoch, leader.leaderFence, message.request.id));
   await handleLeaderRequest(leader, client, message.request);
 }
 
@@ -891,7 +923,14 @@ function postEvent(
   event: DiagnosticEvent,
   settlements?: readonly RemoteMutationSettlement[],
 ): void {
-  const forwarded = event.type === "remote" ? { ...event, incarnation: leader.leaderEpoch } : event;
+  const forwarded =
+    event.type === "remote"
+      ? {
+          ...event,
+          incarnation: leader.leaderEpoch,
+          leaderFence: leader.leaderFence,
+        }
+      : event;
   const response: WorkerResponse = {
     event: forwarded,
     op: WorkerEvent.Event,
@@ -907,7 +946,11 @@ function postEvent(
 function postRemoteSnapshot(leader: LeaderState, client: ClientState): void {
   if (!client.remoteConfigured || !leader.runtime.remoteEvent) return;
   client.post({
-    event: { ...leader.runtime.remoteEvent, incarnation: leader.leaderEpoch },
+    event: {
+      ...leader.runtime.remoteEvent,
+      incarnation: leader.leaderEpoch,
+      leaderFence: leader.leaderFence,
+    },
     op: WorkerEvent.Event,
   });
 }

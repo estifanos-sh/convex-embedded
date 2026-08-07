@@ -620,6 +620,7 @@ describe("dead-instance fast-fail", () => {
     } as unknown as WorkerState;
     const leader = new LeaderRuntime({
       epoch: "leader",
+      fence: "1",
       identity: { storageId: "documents" } as never,
       runtime,
       scope: "scope",
@@ -640,6 +641,7 @@ describe("dead-instance fast-fail", () => {
     } as unknown as WorkerState;
     const leader = new LeaderRuntime({
       epoch: "leader",
+      fence: "1",
       identity: { storageId: "documents" } as never,
       runtime,
       scope: "scope",

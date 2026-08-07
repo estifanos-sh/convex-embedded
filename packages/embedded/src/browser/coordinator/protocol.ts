@@ -39,7 +39,9 @@ export const PeerOp = {
 } as const;
 
 export type PeerOpCode = (typeof PeerOp)[keyof typeof PeerOp];
-export const CoordinatorProtocol = 2;
+export const CoordinatorProtocol = 3;
+/** Read-only discovery compatibility for the immediately preceding coordinator protocol. */
+export const LegacyCoordinatorProtocol = 2;
 
 /**
  * Why a leader rejected an attach. Identity and storage-path mismatches are permanent — the
@@ -80,6 +82,8 @@ export type ControlMessage =
   | {
       identity: RuntimeIdentity;
       leaderEpoch: string;
+      /** Canonical decimal term allocated by the physical store owner. */
+      leaderFence: string;
       leaderId: string;
       op: typeof ControlOp.BroadcastLeader;
       protocol: typeof CoordinatorProtocol;
@@ -90,6 +94,9 @@ export type PeerMessage =
   | {
       clientId: string;
       identity: RuntimeIdentity;
+      leaderEpoch: string;
+      /** The term advertised by the leader this attach is targeting. */
+      leaderFence: string;
       op: typeof PeerOp.Attach;
       protocol: typeof CoordinatorProtocol;
       remote?: InitRequest["remote"];
@@ -100,18 +107,21 @@ export type PeerMessage =
   | {
       fromWorkerId: string;
       leaderEpoch: string;
+      leaderFence: string;
       op: typeof PeerOp.Request;
       protocol: typeof CoordinatorProtocol;
       request: WorkerRequest;
     }
   | {
       leaderEpoch: string;
+      leaderFence: string;
       op: typeof PeerOp.RequestAck;
       protocol: typeof CoordinatorProtocol;
       requestId: number;
     }
   | {
       leaderEpoch: string;
+      leaderFence: string;
       leaderId: string;
       /** The leader's device-only module configuration, which a follower cannot read itself. */
       localConfigured?: boolean;
@@ -122,11 +132,13 @@ export type PeerMessage =
       code: RejectCodeValue;
       error: SerializedError;
       leaderEpoch: string;
+      leaderFence: string;
       op: typeof PeerOp.Rejected;
       protocol: typeof CoordinatorProtocol;
     }
   | {
       leaderEpoch: string;
+      leaderFence: string;
       op: typeof PeerOp.Response;
       protocol: typeof CoordinatorProtocol;
       response: WorkerResponse;
@@ -149,6 +161,7 @@ const controlValidators = new Map<ControlOpCode, Validator>([
     (value) =>
       isRuntimeIdentity(value.identity) &&
       typeof value.leaderEpoch === "string" &&
+      isCanonicalFence(value.leaderFence) &&
       typeof value.leaderId === "string" &&
       typeof value.scope === "string",
   ],
@@ -160,6 +173,8 @@ const peerValidators = new Map<PeerOpCode, Validator>([
     (value) =>
       typeof value.clientId === "string" &&
       isRuntimeIdentity(value.identity) &&
+      typeof value.leaderEpoch === "string" &&
+      isCanonicalFence(value.leaderFence) &&
       (value.remote === undefined || isRemoteInit(value.remote)) &&
       typeof value.scope === "string" &&
       typeof value.storagePath === "string" &&
@@ -170,26 +185,37 @@ const peerValidators = new Map<PeerOpCode, Validator>([
     (value) =>
       typeof value.fromWorkerId === "string" &&
       typeof value.leaderEpoch === "string" &&
+      isCanonicalFence(value.leaderFence) &&
       isWorkerRequest(value.request),
   ],
   [
     PeerOp.RequestAck,
-    (value) => typeof value.leaderEpoch === "string" && typeof value.requestId === "number",
+    (value) =>
+      typeof value.leaderEpoch === "string" &&
+      isCanonicalFence(value.leaderFence) &&
+      typeof value.requestId === "number",
   ],
   [
     PeerOp.Attached,
-    (value) => typeof value.leaderEpoch === "string" && typeof value.leaderId === "string",
+    (value) =>
+      typeof value.leaderEpoch === "string" &&
+      isCanonicalFence(value.leaderFence) &&
+      typeof value.leaderId === "string",
   ],
   [
     PeerOp.Rejected,
     (value) =>
       typeof value.code === "number" &&
       typeof value.leaderEpoch === "string" &&
+      isCanonicalFence(value.leaderFence) &&
       isSerializedError(value.error),
   ],
   [
     PeerOp.Response,
-    (value) => typeof value.leaderEpoch === "string" && isWorkerResponse(value.response),
+    (value) =>
+      typeof value.leaderEpoch === "string" &&
+      isCanonicalFence(value.leaderFence) &&
+      isWorkerResponse(value.response),
   ],
 ]);
 
@@ -211,14 +237,28 @@ export function workerLockName(scope: string, workerId: string): string {
 
 export function requestAck(
   leaderEpoch: string,
+  leaderFence: string,
   requestId: number,
 ): Extract<PeerMessage, { op: typeof PeerOp.RequestAck }> {
   return {
     leaderEpoch,
+    leaderFence,
     op: PeerOp.RequestAck,
     protocol: CoordinatorProtocol,
     requestId,
   };
+}
+
+/** A decimal term is a wire value, not a JavaScript number: no signs, exponents, or leading zeroes. */
+export function isCanonicalFence(value: unknown): value is string {
+  return typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value);
+}
+
+/** Compare two validated decimal terms without losing precision to Number. */
+export function compareFence(left: string, right: string): -1 | 0 | 1 {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
 }
 
 export function isControlMessage(value: unknown): value is ControlMessage {
@@ -229,6 +269,30 @@ export function isControlMessage(value: unknown): value is ControlMessage {
 export function isPeerMessage(value: unknown): value is PeerMessage {
   if (!isRecord(value) || value.protocol !== CoordinatorProtocol) return false;
   return peerValidators.get(value.op as PeerOpCode)?.(value) ?? false;
+}
+
+/**
+ * Do not silently wait out an attach timeout when another package version uses this channel.
+ * Version three intentionally makes fenced ownership frames incompatible with version two.
+ */
+export function isLegacyLeaderBroadcast(value: unknown): value is {
+  identity: RuntimeIdentity;
+  leaderEpoch: string;
+  leaderId: string;
+  op: typeof ControlOp.BroadcastLeader;
+  protocol: typeof LegacyCoordinatorProtocol;
+  scope: string;
+} {
+  return (
+    isRecord(value) &&
+    value.protocol === LegacyCoordinatorProtocol &&
+    value.op === ControlOp.BroadcastLeader &&
+    isRuntimeIdentity(value.identity) &&
+    typeof value.leaderEpoch === "string" &&
+    typeof value.leaderId === "string" &&
+    typeof value.scope === "string" &&
+    !("leaderFence" in value)
+  );
 }
 
 function isRuntimeIdentity(value: unknown): value is RuntimeIdentity {
