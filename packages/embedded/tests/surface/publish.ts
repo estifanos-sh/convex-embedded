@@ -16,8 +16,7 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).not.toContain("target: darwin-x64");
     expect(workflow).toContain("Build every Apple slice through the Expo hook");
     expect(workflow).toContain("Build every Android ABI through the Expo hook");
-    expect(workflow).not.toContain("blacksmith");
-    expect(workflow).toContain("depot-ubuntu-24.04-16");
+    expect(workflow).toContain("blacksmith-16vcpu-ubuntu-2404");
     expect(workflow).toContain("needs: [gate, javascript]");
     expect(workflow).toContain("Download JavaScript bundle for the Node smoke test");
     expect(workflow).toContain("Enable pnpm for the Expo compile fixture");
@@ -63,7 +62,7 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toContain(
       'npm dist-tag add "${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}" preview',
     );
-    expect(workflow).toContain("depot-ubuntu-24.04-arm-8");
+    expect(workflow).toContain("blacksmith-8vcpu-ubuntu-2404-arm");
     expect(workflow).toContain("This job is deliberately credential-free");
     expect(workflow).toContain("Package releases must dispatch the reviewed workflow from main.");
     expect(workflow).toContain("Download exact JavaScript and WASM artifact");
@@ -96,7 +95,7 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).not.toContain("Tag merged release and start the trusted build");
   });
 
-  test("ordinary CI uses Depot and no longer publishes an incomplete JavaScript-only preview", () => {
+  test("ordinary CI uses Blacksmith and no longer publishes an incomplete JavaScript-only preview", () => {
     const workflow = readFileSync(join(root, ".github/workflows/preview.yml"), "utf8");
     const native = readFileSync(join(root, ".github/workflows/release-native.yml"), "utf8");
     const rust = readFileSync(join(root, ".github/actions/rust/action.yml"), "utf8");
@@ -104,12 +103,12 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).not.toContain("pkg-pr-new publish");
     expect(workflow).not.toContain("Publish preview");
     expect(workflow).not.toContain("large-runner");
-    expect(workflow).toContain("depot-ubuntu-24.04-8");
-    expect(workflow).toContain("depot-ubuntu-24.04-16");
-    expect(workflow).toContain("depot-macos-15");
+    expect(workflow).toContain("blacksmith-8vcpu-ubuntu-2404");
+    expect(workflow).toContain("blacksmith-16vcpu-ubuntu-2404");
+    expect(workflow).toContain("blacksmith-6vcpu-macos-15");
     expect(native).not.toContain("large-runner");
-    expect(native).toContain("depot-ubuntu-24.04-16");
-    expect(native).toContain("depot-macos-15");
+    expect(native).toContain("blacksmith-16vcpu-ubuntu-2404");
+    expect(native).toContain("blacksmith-6vcpu-macos-15");
     expect(rust).toContain("toolchain: nightly-2026-06-09");
     expect(rust).toContain("wasm32-wasip1-threads");
   });
