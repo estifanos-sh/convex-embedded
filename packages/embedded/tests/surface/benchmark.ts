@@ -7,13 +7,13 @@ import { describe, expect, test } from "vite-plus/test";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
 
 describe("benchmark workflow", () => {
-  test("exercises the release workload on the configured provider without credentials", () => {
+  test("exercises the release workload on Blacksmith without credentials", () => {
     const workflow = readFileSync(join(root, ".github/workflows/benchmark.yml"), "utf8");
 
     expect(workflow).toContain("name: Benchmark");
-    expect(workflow).toContain("depot-ubuntu-24.04-8");
-    expect(workflow).toContain("depot-ubuntu-24.04-16");
-    expect(workflow).not.toContain("blacksmith");
+    expect(workflow).toContain("blacksmith-8vcpu-ubuntu-2404");
+    expect(workflow).toContain("blacksmith-16vcpu-ubuntu-2404");
+    expect(workflow).not.toContain("depot");
     expect(workflow).toContain("Build and exercise the runtime");
     expect(workflow).toContain("Build and compile all Android ABIs");
     expect(workflow).toContain("@estifanos-sh/convex-embedded#test:kill:node");
