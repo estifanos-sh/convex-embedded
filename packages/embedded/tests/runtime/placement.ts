@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vite-plus/test";
 
+import type { EmbeddedDataEvent } from "../../src/events";
 import type { LocalBuilders } from "../../src/local";
 import { defineLocal, isLocalFunction } from "../../src/local/internal";
 import { NativeStore } from "../../src/node/native";
@@ -35,7 +36,7 @@ const schema: StoreSchema = {
     {
       name: "preferences",
       placement: "device",
-      columns: [],
+      columns: [{ field: "compact", name: "compact" }],
       indexes: [],
     },
   ],
@@ -75,6 +76,25 @@ test("device writer uses ordinary document batches for local tables", async () =
   expect(batch.docWrites[0]).toMatchObject({ table: "preferences", id, data: { compact: true } });
   expect(batch.freshIds).toEqual([]);
   expect(batch.idMappings).toEqual([]);
+});
+
+test("device writer preserves columns for an unindexed patch of a persisted local table", async () => {
+  const writer = createWriter(fakeStore(), toSchema(schema), undefined, "device");
+  const id = "preferences|00000000000040008000000000000002";
+
+  await writer.db.patch("preferences" as never, id as never, { note: "after" } as never);
+
+  expect(writer.toBatch()).toMatchObject({
+    dataOnlyIds: [],
+    docWrites: [
+      {
+        table: "preferences",
+        id,
+        data: { compact: true, note: "after" },
+        cols: [["compact", true]],
+      },
+    ],
+  });
 });
 
 test("replicated writer rejects device fields before staging a base row", async () => {
@@ -377,6 +397,37 @@ describe("device overlay reactivity", () => {
     expect(await nextUpdate(updates, 1)).toEqual([documentId]);
     off();
   });
+
+  test("reruns watchers and emits a local event for a persisted device-table patch", async () => {
+    const module = draftsModule();
+    const runner = await localRunner({ "local/sync/drafts": () => Promise.resolve(module) });
+    const id = (await runner.runMutation(module.setCompact, { compact: true })) as string;
+    const updates: string[][] = [];
+    const events: EmbeddedDataEvent[] = [];
+    const off = runner.onUpdate(module.readNotes, {}, (value) => updates.push(value as string[]));
+    const unsubscribe = runner.subscribeEvents?.((event) => {
+      if (event.type === "data") events.push(event);
+    });
+    expect(await nextUpdate(updates, 0)).toEqual(["before"]);
+
+    await runner.runMutation(module.patchNote, { id, note: "after" });
+
+    expect(await nextUpdate(updates, 1)).toEqual(["after"]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        source: "local",
+        docWrites: [
+          expect.objectContaining({
+            table: "preferences",
+            id,
+            row: expect.objectContaining({ compact: true, note: "after" }),
+          }),
+        ],
+      }),
+    );
+    unsubscribe?.();
+    off();
+  });
 });
 
 describe("device-only namespace typing", () => {
@@ -387,7 +438,7 @@ describe("device-only namespace typing", () => {
     const setCompact = device.mutation({
       args: { compact: v.boolean() },
       handler: async (ctx, args) => {
-        await ctx.db.insert("preferences", { compact: args.compact });
+        await ctx.db.insert("preferences", { compact: args.compact, note: "before" });
       },
     });
     expect(isLocalFunction(setCompact)).toBe(true);
@@ -399,7 +450,9 @@ const deviceSchema = defineEmbeddedSchema({
     expanded: e.local(v.boolean()),
     title: v.string(),
   }),
-  preferences: localTable({ compact: v.boolean() }),
+  preferences: localTable({ compact: v.boolean(), note: v.string() }).index("by_compact", [
+    "compact",
+  ]),
 });
 const deviceStoreSchema = toRuntimeStoreSchema(deviceSchema);
 const device = defineLocal(deviceSchema);
@@ -423,7 +476,7 @@ function viewModule() {
     expandWithPreference: device.mutation({
       args: { compact: v.boolean(), documentId: v.id("documents") },
       handler: async (ctx, args) => {
-        await ctx.db.insert("preferences", { compact: args.compact });
+        await ctx.db.insert("preferences", { compact: args.compact, note: "before" });
         await ctx.db.patch("documents", args.documentId, { expanded: true });
       },
     }),
@@ -464,6 +517,10 @@ function draftsModule() {
       handler: async (ctx) =>
         (await ctx.db.query("preferences").collect()).map((row) => row.compact),
     }),
+    readNotes: device.query({
+      args: {},
+      handler: async (ctx) => (await ctx.db.query("preferences").collect()).map((row) => row.note),
+    }),
     reset: device.mutation({
       args: {},
       handler: async (ctx) => {
@@ -472,9 +529,12 @@ function draftsModule() {
     }),
     setCompact: device.mutation({
       args: { compact: v.boolean() },
-      handler: async (ctx, args) => {
-        await ctx.db.insert("preferences", { compact: args.compact });
-      },
+      handler: async (ctx, args) =>
+        await ctx.db.insert("preferences", { compact: args.compact, note: "before" }),
+    }),
+    patchNote: device.mutation({
+      args: { id: v.id("preferences"), note: v.string() },
+      handler: async (ctx, args) => await ctx.db.patch("preferences", args.id, { note: args.note }),
     }),
   };
 }
@@ -493,6 +553,7 @@ async function localRunner(localModules: LocalModuleMap): Promise<Runner> {
 
 function fakeStore(): RuntimeStorageWriter {
   const id = "documents|00000000000040008000000000000001";
+  const preferenceId = "preferences|00000000000040008000000000000002";
   return {
     capabilities: { hasExactBounds: true },
     clock: { read: () => 10 },
@@ -501,7 +562,9 @@ function fakeStore(): RuntimeStorageWriter {
       read: async (table: string, rowId: string) =>
         table === "documents" && rowId === id
           ? { _id: id, _creationTime: 1, title: "wire" }
-          : undefined,
+          : table === "preferences" && rowId === preferenceId
+            ? { _id: preferenceId, _creationTime: 2, compact: true, note: "before" }
+            : undefined,
       device: { read: async () => ({ expanded: true }) },
       version: { read: async () => 1 },
       crdt: {
