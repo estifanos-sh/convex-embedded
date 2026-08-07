@@ -77,6 +77,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          # `fallow audit` compares this change against the PR base (or the preceding main
+          # commit), so the base must be available locally. Keep the analysis in this existing
+          # job rather than spending another runner allocation on a small Node-only gate.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
@@ -141,6 +145,63 @@ jobs:
           vp check
           vp run style
           vp run clippy
+
+      - name: Audit
+        # This is deliberately a changed-code gate. The repository-wide cleanup is tracked by
+        # the normal style/dead-code checks; `fallow audit` blocks only findings introduced by
+        # the current PR or main push, so inherited complexity and clone findings cannot make a
+        # previously green release candidate fail.
+        env:
+          FALLOW_AUDIT_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="$FALLOW_AUDIT_BASE"
+          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]] || ! git cat-file -e "$base^{commit}"; then
+            requested_base="$base"
+            if ! base=$(git rev-parse --verify HEAD^ 2>/dev/null); then
+              echo "No prior commit is available for a changed-code audit; skipping." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            {
+              echo "### Fallow audit base fallback"
+              echo
+              if [[ -n "$requested_base" && "$requested_base" != "0000000000000000000000000000000000000000" ]]; then
+                echo "> Warning: requested base \`$requested_base\` is unavailable; auditing only since \`$base\`."
+              else
+                echo "> Warning: this event has no audit base; auditing only since \`$base\`."
+              fi
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Type-aware Fallow reports support Markdown, not GitHub workflow annotations. Keep
+          # the typed analysis and surface its deterministic report in the run summary instead.
+          report="$RUNNER_TEMP/fallow-audit.md"
+          # GitHub limits each job summary to 1 MiB. Reserve half for surrounding CI output,
+          # while retaining enough detail for a useful changed-code report.
+          max_report_bytes=524288
+          set +e
+          vp exec fallow audit --changed-since "$base" --format markdown --no-css-deep > "$report"
+          status=$?
+          set -e
+          {
+            echo "## Fallow audit"
+            echo
+            echo "Changed since: \`$base\`"
+            echo
+            if [[ -s "$report" ]]; then
+              report_bytes=$(wc -c < "$report")
+              head -c "$max_report_bytes" "$report"
+              if (( report_bytes > max_report_bytes )); then
+                echo
+                echo "_Report truncated at $max_report_bytes bytes; see the step log for the full output._"
+              fi
+            elif [[ "$status" -eq 0 ]]; then
+              echo "No changed-code findings."
+            else
+              echo "Audit failed before producing a Markdown report; see the step log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Build the node native addon
         run: vp run @estifanos-sh/convex-embedded#native
