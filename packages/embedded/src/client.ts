@@ -1081,50 +1081,7 @@ export class EmbeddedClient {
     setup?: LocalSetupAction,
   ): Promise<ClientState> {
     if ("runner" in options) {
-      let unsubscribeEvents: (() => void) | undefined;
-      let unsubscribeSettlements: (() => void) | undefined;
-      let cleaned = false;
-      const cleanup = async (): Promise<void> => {
-        if (cleaned) return;
-        cleaned = true;
-        unsubscribeEvents?.();
-        unsubscribeSettlements?.();
-        await options.close?.();
-      };
-      try {
-        unsubscribeEvents = options.eagerRunner?.subscribeEvents?.((event) =>
-          this.emitDiagnostic(event),
-        );
-        unsubscribeSettlements = options.eagerRunner?.subscribeRemoteSettlements?.(
-          (event, settlements) => this.publishBrowserMutationSettlements(event, settlements),
-        );
-        const runner = await options.runner;
-        unsubscribeEvents ??= runner.subscribeEvents?.((event) => this.emitDiagnostic(event));
-        unsubscribeSettlements ??= runner.subscribeRemoteSettlements?.((event, settlements) =>
-          this.publishBrowserMutationSettlements(event, settlements),
-        );
-        if (this.closed) throw new EmbeddedClosedError();
-        await this.readCachedIdentity(runner, this.authGeneration);
-        // Worker-backed runtimes execute candidate setup as part of their Init protocol before this
-        // runner resolves. Never execute it again against the now-published generation.
-        if (options.remoteConfigured === true) {
-          void this.refreshRunnerIdentity(runner, this.authGeneration);
-        }
-        return {
-          close: cleanup,
-          remote: undefined,
-          remoteConfigured: options.remoteConfigured === true,
-          runner,
-        };
-      } catch (error) {
-        try {
-          await cleanup();
-        } catch {
-          // Preserve the initialization error while still making the best effort to release the
-          // runner owner that may have been acquired before it rejected.
-        }
-        throw error;
-      }
+      return this.initPrebuilt(options);
     }
 
     const baseSchema = options.storeSchema ?? toRuntimeStoreSchema(options.schema);
@@ -1278,6 +1235,53 @@ export class EmbeddedClient {
       runner,
       store,
     };
+  }
+
+  private async initPrebuilt(options: EmbeddedRuntimeClientOptions): Promise<ClientState> {
+    let unsubscribeEvents: (() => void) | undefined;
+    let unsubscribeSettlements: (() => void) | undefined;
+    let cleaned = false;
+    const cleanup = async (): Promise<void> => {
+      if (cleaned) return;
+      cleaned = true;
+      unsubscribeEvents?.();
+      unsubscribeSettlements?.();
+      await options.close?.();
+    };
+    try {
+      unsubscribeEvents = options.eagerRunner?.subscribeEvents?.((event) =>
+        this.emitDiagnostic(event),
+      );
+      unsubscribeSettlements = options.eagerRunner?.subscribeRemoteSettlements?.(
+        (event, settlements) => this.publishBrowserMutationSettlements(event, settlements),
+      );
+      const runner = await options.runner;
+      unsubscribeEvents ??= runner.subscribeEvents?.((event) => this.emitDiagnostic(event));
+      unsubscribeSettlements ??= runner.subscribeRemoteSettlements?.((event, settlements) =>
+        this.publishBrowserMutationSettlements(event, settlements),
+      );
+      if (this.closed) throw new EmbeddedClosedError();
+      await this.readCachedIdentity(runner, this.authGeneration);
+      // Worker-backed runtimes execute candidate setup as part of their Init protocol before this
+      // runner resolves. Never execute it again against the now-published generation.
+      if (options.remoteConfigured === true) {
+        void this.refreshRunnerIdentity(runner, this.authGeneration);
+      }
+      return {
+        close: cleanup,
+        remote: undefined,
+        remoteConfigured: options.remoteConfigured === true,
+        runner,
+      };
+    } catch (error) {
+      try {
+        await cleanup();
+      } catch {
+        // Preserve the initialization error while still making the best effort to release the
+        // runner owner that may have been acquired before it rejected.
+      }
+      throw error;
+    }
   }
 
   private listen(

@@ -524,21 +524,77 @@ describe("browser network lifecycle", () => {
 });
 
 describe("connection invariants", () => {
+  test("observes an eager remote frame before its runner resolves without double subscribing", async () => {
+    let resolveRunner: (runner: Runner) => void = () => undefined;
+    const pendingRunner = new Promise<Runner>((resolve) => {
+      resolveRunner = resolve;
+    });
+    let eventSubscriptions = 0;
+    let settlementSubscriptions = 0;
+    let emit: ((event: EmbeddedEvent) => void) | undefined;
+    const runner = {
+      identity: { read: async () => undefined, write: async () => undefined },
+      subscribeEvents: (listener: (event: EmbeddedEvent) => void) => {
+        eventSubscriptions += 1;
+        emit = listener;
+        return () => {
+          emit = undefined;
+        };
+      },
+      subscribeRemoteSettlements: () => {
+        settlementSubscriptions += 1;
+        return () => undefined;
+      },
+    } as unknown as Runner;
+    const client = new EmbeddedClient({
+      eagerRunner: runner,
+      remoteConfigured: true,
+      runner: pendingRunner,
+    });
+    try {
+      expect(eventSubscriptions).toBe(1);
+      expect(settlementSubscriptions).toBe(1);
+
+      emit?.({
+        at: 1,
+        attempt: 1,
+        generation: 1,
+        incarnation: "first-owner",
+        leaderFence: "1",
+        sequence: 1,
+        status: "offline",
+        type: "remote",
+      });
+      expect(client.connectionState().replication).toEqual({ status: "offline" });
+
+      resolveRunner(runner);
+      await client.open();
+      expect(eventSubscriptions).toBe(1);
+      expect(settlementSubscriptions).toBe(1);
+    } finally {
+      await client.close();
+    }
+  });
+
   test("releases eager runner ownership when initialization rejects", async () => {
     let eventStops = 0;
     let settlementStops = 0;
     let closes = 0;
+    const cleanup: string[] = [];
     const eagerRunner = {
       subscribeEvents: () => () => {
         eventStops += 1;
+        cleanup.push("events");
       },
       subscribeRemoteSettlements: () => () => {
         settlementStops += 1;
+        cleanup.push("settlements");
       },
     } as unknown as Runner;
     const client = new EmbeddedClient({
       close: async () => {
         closes += 1;
+        cleanup.push("owner");
       },
       eagerRunner,
       remoteConfigured: true,
@@ -549,6 +605,7 @@ describe("connection invariants", () => {
       expect(eventStops).toBe(1);
       expect(settlementStops).toBe(1);
       expect(closes).toBe(1);
+      expect(cleanup).toEqual(["events", "settlements", "owner"]);
       expect(client.connectionState().local.status).toBe("failed");
 
       await client.close();
@@ -558,6 +615,36 @@ describe("connection invariants", () => {
     } finally {
       await client.close();
     }
+  });
+
+  test("closes a pending prebuilt runner after it resolves", async () => {
+    let resolveRunner: (runner: Runner) => void = () => undefined;
+    const pendingRunner = new Promise<Runner>((resolve) => {
+      resolveRunner = resolve;
+    });
+    const cleanup: string[] = [];
+    const runner = {
+      subscribeEvents: () => () => cleanup.push("events"),
+      subscribeRemoteSettlements: () => () => cleanup.push("settlements"),
+    } as unknown as Runner;
+    const client = new EmbeddedClient({
+      close: () => {
+        cleanup.push("owner");
+      },
+      eagerRunner: runner,
+      runner: pendingRunner,
+    });
+    const closing = client.close();
+    let closed = false;
+    void closing.then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+
+    resolveRunner(runner);
+    await closing;
+    expect(cleanup).toEqual(["events", "settlements", "owner"]);
   });
 
   test("local mutations do not allocate replication metadata", async () => {
