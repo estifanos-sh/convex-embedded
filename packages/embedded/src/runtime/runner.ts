@@ -100,7 +100,7 @@ import {
   type StorageWriterService,
   type UploadUrl,
 } from "./storage/service";
-import { fullStore, functionName, type RuntimeCalls } from "./service";
+import { fullStore, functionName, type RuntimeCalls, type ServiceStore } from "./service";
 import { EMBEDDED_PROTOCOL_VERSION, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
 
 /**
@@ -2674,67 +2674,93 @@ export function createRunner(
 
   async function devtoolsStorage(): Promise<RunnerDevtoolsStorage> {
     const service = fullStore(store);
-    const idMappings: Record<string, unknown>[] = [];
-    if (service.id) {
-      const mapped = storeSchema.tables
-        .filter((def) => def.placement === "replicated")
-        .map((def) => def.name);
-      for (const table of [...mapped, "_storage"]) {
-        for (const mapping of await service.id.page.read(table)) {
-          idMappings.push(normalizeCopy(mapping) as Record<string, unknown>);
-        }
-      }
-    }
+    const idMappings = await devtoolsIdMappingsRead(service, storeSchema);
     const uploads = service.upload
       ? (await service.upload.read()).map(
           (upload) => normalizeCopy(upload) as Record<string, unknown>,
         )
       : [];
     const dirtyHeads = service.dirtyHeadsDebugRead ? await service.dirtyHeadsDebugRead() : [];
-    const crdtHeads: RunnerDevtoolsStorage["crdtHeads"] = [];
-    const tables = new Map(storeSchema.tables.map((table) => [table.name, table] as const));
-    for (const mapping of idMappings) {
-      if (typeof mapping.table !== "string" || typeof mapping.localId !== "string") continue;
-      const table = tables.get(mapping.table);
-      if (!table) continue;
-      for (const field of table.crdtFields ?? []) {
-        const headSeq = await service.doc.crdt.read(mapping.table, mapping.localId, field.field);
-        if (headSeq !== undefined) {
-          crdtHeads.push({
-            field: field.field,
-            headSeq,
-            id: mapping.localId,
-            table: mapping.table,
-          });
-        }
-      }
-    }
-    const projections: Record<string, unknown>[] = [];
-    if (service.remoteDocDebugRead) {
-      for (const mapping of idMappings) {
-        if (typeof mapping.table !== "string" || typeof mapping.localId !== "string") continue;
-        const projection = await service.remoteDocDebugRead(mapping.table, mapping.localId);
-        if (projection) projections.push(normalizeCopy(projection) as Record<string, unknown>);
-      }
-    }
-    const storageIds = new Set<string>();
-    for (const mapping of idMappings) {
-      if (mapping.table === "_storage" && typeof mapping.localId === "string") {
-        storageIds.add(mapping.localId);
-      }
-    }
-    for (const upload of uploads) {
-      if (typeof upload.localStorageId === "string") storageIds.add(upload.localStorageId);
-    }
-    const files: Record<string, unknown>[] = [];
-    if (service.file) {
-      for (const storageId of storageIds) {
-        const metadata = await service.file.read(storageId);
-        if (metadata) files.push(normalizeCopy(metadata) as Record<string, unknown>);
-      }
-    }
+    const crdtHeads = await devtoolsCrdtHeadsRead(service, storeSchema, idMappings);
+    const projections = await devtoolsProjectionsRead(service, idMappings);
+    const files = await devtoolsFilesRead(service, idMappings, uploads);
     return { crdtHeads, dirtyHeads, files, idMappings, projections, uploads };
   }
+}
+
+async function devtoolsIdMappingsRead(
+  service: ServiceStore,
+  storeSchema: StoreSchema,
+): Promise<Record<string, unknown>[]> {
+  const idMappings: Record<string, unknown>[] = [];
+  if (!service.id) return idMappings;
+  const mapped = storeSchema.tables
+    .filter((def) => def.placement === "replicated")
+    .map((def) => def.name);
+  for (const table of [...mapped, "_storage"]) {
+    for (const mapping of await service.id.page.read(table)) {
+      idMappings.push(normalizeCopy(mapping) as Record<string, unknown>);
+    }
+  }
+  return idMappings;
+}
+
+async function devtoolsCrdtHeadsRead(
+  service: ServiceStore,
+  storeSchema: StoreSchema,
+  idMappings: Record<string, unknown>[],
+): Promise<RunnerDevtoolsStorage["crdtHeads"]> {
+  const crdtHeads: RunnerDevtoolsStorage["crdtHeads"] = [];
+  const tables = new Map(storeSchema.tables.map((table) => [table.name, table] as const));
+  for (const mapping of idMappings) {
+    if (typeof mapping.table !== "string" || typeof mapping.localId !== "string") continue;
+    const table = tables.get(mapping.table);
+    if (!table) continue;
+    for (const field of table.crdtFields ?? []) {
+      const headSeq = await service.doc.crdt.read(mapping.table, mapping.localId, field.field);
+      if (headSeq !== undefined) {
+        crdtHeads.push({ field: field.field, headSeq, id: mapping.localId, table: mapping.table });
+      }
+    }
+  }
+  return crdtHeads;
+}
+
+async function devtoolsProjectionsRead(
+  service: ServiceStore,
+  idMappings: Record<string, unknown>[],
+): Promise<Record<string, unknown>[]> {
+  const projections: Record<string, unknown>[] = [];
+  if (!service.remoteDocDebugRead) return projections;
+  for (const mapping of idMappings) {
+    if (typeof mapping.table !== "string" || typeof mapping.localId !== "string") continue;
+    const projection = await service.remoteDocDebugRead(mapping.table, mapping.localId);
+    if (projection) projections.push(normalizeCopy(projection) as Record<string, unknown>);
+  }
+  return projections;
+}
+
+async function devtoolsFilesRead(
+  service: ServiceStore,
+  idMappings: Record<string, unknown>[],
+  uploads: Record<string, unknown>[],
+): Promise<Record<string, unknown>[]> {
+  const storageIds = new Set<string>();
+  for (const mapping of idMappings) {
+    if (mapping.table === "_storage" && typeof mapping.localId === "string") {
+      storageIds.add(mapping.localId);
+    }
+  }
+  for (const upload of uploads) {
+    if (typeof upload.localStorageId === "string") storageIds.add(upload.localStorageId);
+  }
+  const files: Record<string, unknown>[] = [];
+  if (!service.file) return files;
+  for (const storageId of storageIds) {
+    const metadata = await service.file.read(storageId);
+    if (metadata) files.push(normalizeCopy(metadata) as Record<string, unknown>);
+  }
+  return files;
 }
 
 function manifestFunction(

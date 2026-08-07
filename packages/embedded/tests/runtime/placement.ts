@@ -138,6 +138,157 @@ test("the devtools snapshot reads id mappings only for replicated tables", async
   expect(snapshot.storage.idMappings).toEqual([]);
 });
 
+test("the devtools snapshot collects supported storage diagnostics sequentially", async () => {
+  const base = fakeStore();
+  const reads: string[] = [];
+  const crdtReads: string[] = [];
+  const projectionReads: string[] = [];
+  const fileReads: string[] = [];
+  const store = {
+    ...base,
+    doc: {
+      ...base.doc,
+      crdt: {
+        read: async (table: string, id: string, field: string) => {
+          reads.push(`crdt:${table}:${id}:${field}`);
+          crdtReads.push(`${table}:${id}:${field}`);
+          return id === "documents|good" ? 7 : undefined;
+        },
+        snapshot: { read: async () => [] },
+      },
+    },
+    file: {
+      read: async (storageId: string) => {
+        reads.push(`file:${storageId}`);
+        fileReads.push(storageId);
+        return storageId === "_storage|mapped" || storageId === "_storage|upload"
+          ? { contentType: "text/plain", id: storageId, size: 1 }
+          : undefined;
+      },
+    },
+    id: {
+      page: {
+        read: async (table: string) =>
+          (reads.push(`mapping:${table}`), table === "documents")
+            ? [
+                { localId: "documents|good", table: "documents" },
+                { localId: 1, table: "documents" },
+                { localId: "documents|missing", table: "missing" },
+              ]
+            : table === "_storage"
+              ? [{ localId: "_storage|mapped", table: "_storage" }]
+              : [],
+      },
+    },
+    remoteDocDebugRead: async (table: string, id: string) => {
+      reads.push(`projection:${table}:${id}`);
+      projectionReads.push(`${table}:${id}`);
+      return id === "documents|good" ? { localDocumentId: id, table } : undefined;
+    },
+    dirtyHeadsDebugRead: async () => {
+      reads.push("dirtyHeads");
+      return [];
+    },
+    upload: {
+      read: async () => {
+        reads.push("uploads");
+        return [
+          { localStorageId: "_storage|mapped" },
+          { localStorageId: "_storage|upload" },
+          { localStorageId: 1 },
+        ];
+      },
+    },
+  } as unknown as RuntimeStorageWriter;
+  const runner = createRunner({}, store, {
+    hash: "devtools-collectors",
+    tables: [
+      {
+        columns: [],
+        crdtFields: [{ field: "body", kind: "text" }],
+        indexes: [],
+        name: "documents",
+        placement: "replicated",
+      },
+    ],
+  });
+
+  const snapshot = (await runner.devtools({ kind: "snapshot" })) as {
+    storage: {
+      crdtHeads: unknown[];
+      files: Array<{ id: string }>;
+      idMappings: unknown[];
+      projections: unknown[];
+    };
+  };
+
+  expect(snapshot.storage.idMappings).toEqual([
+    { localId: "documents|good", table: "documents" },
+    { localId: 1, table: "documents" },
+    { localId: "documents|missing", table: "missing" },
+    { localId: "_storage|mapped", table: "_storage" },
+  ]);
+  expect(snapshot.storage.crdtHeads).toEqual([
+    { field: "body", headSeq: 7, id: "documents|good", table: "documents" },
+  ]);
+  expect(snapshot.storage.projections).toEqual([
+    { localDocumentId: "documents|good", table: "documents" },
+  ]);
+  expect(snapshot.storage.files).toEqual([
+    { contentType: "text/plain", id: "_storage|mapped", size: 1 },
+    { contentType: "text/plain", id: "_storage|upload", size: 1 },
+  ]);
+  expect(crdtReads).toEqual(["documents:documents|good:body"]);
+  expect(projectionReads).toEqual([
+    "documents:documents|good",
+    "missing:documents|missing",
+    "_storage:_storage|mapped",
+  ]);
+  expect(fileReads).toEqual(["_storage|mapped", "_storage|upload"]);
+  expect(reads).toEqual([
+    "mapping:documents",
+    "mapping:_storage",
+    "uploads",
+    "dirtyHeads",
+    "crdt:documents:documents|good:body",
+    "projection:documents:documents|good",
+    "projection:missing:documents|missing",
+    "projection:_storage:_storage|mapped",
+    "file:_storage|mapped",
+    "file:_storage|upload",
+  ]);
+});
+
+test("the devtools snapshot tolerates unavailable optional storage diagnostics", async () => {
+  const base = fakeStore();
+  const runner = createRunner(
+    {},
+    {
+      ...base,
+      file: undefined,
+      id: undefined,
+      upload: undefined,
+    } as unknown as RuntimeStorageWriter,
+    schema,
+  );
+
+  const snapshot = (await runner.devtools({ kind: "snapshot" })) as {
+    storage: {
+      crdtHeads: unknown[];
+      files: unknown[];
+      idMappings: unknown[];
+      projections: unknown[];
+    };
+  };
+
+  expect(snapshot.storage).toMatchObject({
+    crdtHeads: [],
+    files: [],
+    idMappings: [],
+    projections: [],
+  });
+});
+
 describe("device-only function modules", () => {
   test("names every registration and dispatches it by that name", async () => {
     const module = draftsModule();
