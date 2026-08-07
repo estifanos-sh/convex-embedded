@@ -10,6 +10,7 @@ import { v } from "convex/values";
 
 import { createEmbeddedBundle, generateEmbedded, toModuleId } from "../../src/bundler";
 import { toEmbeddedGeneratedSchema } from "../../src/bundler/generated";
+import { maskCommentsAndStrings } from "../../src/bundler/scanner";
 import { analyzeEmbeddedSchema, defineEmbeddedSchema, replicatedTable } from "../../src/schema";
 import { convexEmbeddedUnplugin } from "../../src/unplugin";
 import {
@@ -38,6 +39,43 @@ interface BundlerPlugin {
 }
 
 describe("embedded bundler core", () => {
+  test("masks lexical trivia without moving UTF-16 offsets", () => {
+    const comment = "// export const ghost = /fake/;";
+    const block = "/* export { missing }; */";
+    const source = `\uFEFFconst emoji = "🚀";\r\n${comment}\r\n${block}\r\nexport const live = 6 / 2;\n`;
+    const masked = maskCommentsAndStrings(source);
+
+    expect(masked).toBe(
+      `\uFEFFconst emoji =     ;\r\n${" ".repeat(comment.length)}\r\n${" ".repeat(
+        block.length,
+      )}\r\nexport const live = 6 / 2;\n`,
+    );
+    expect(masked.length).toBe(source.length);
+    expect(masked.indexOf("export const live")).toBe(source.indexOf("export const live"));
+    for (let index = 0; index < source.length; index += 1) {
+      if (source[index] === "\r" || source[index] === "\n") {
+        expect(masked[index]).toBe(source[index]);
+      }
+    }
+  });
+
+  test("masks strings, templates, and regex literals while retaining division", () => {
+    const string = '"a \\"quoted\\" / fake"';
+    const template = "`export const ghost = ${value}; /fake/`";
+    const regex = "/a\\/b[\\/]/gi";
+    const source = `const string = ${string};
+const template = ${template};
+const regex = ${regex};
+const division = numerator / 2 / divisor;
+`;
+
+    expect(maskCommentsAndStrings(source)).toBe(`const string = ${" ".repeat(string.length)};
+const template = ${" ".repeat(template.length)};
+const regex = ${" ".repeat(regex.length - 2)}gi;
+const division = numerator / 2 / divisor;
+`);
+  });
+
   test("discovers Convex modules and renders a lazy virtual registry", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
