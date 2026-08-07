@@ -20,8 +20,7 @@ import type {
 import { EMBEDDED_ERROR_CODES, EmbeddedClientRetiredError, errorMessage } from "../error";
 import { randomId } from "../id/random";
 import { createRunner, type Runner } from "../runtime/runner";
-import type { ConvexEmbeddedSchema } from "../schema";
-import { localCompatibilitySchema, localGraphHash, localReferenceName } from "../local/internal";
+import { localGraphHash, localReferenceName } from "../local/internal";
 import {
   consumeRemoteTick,
   mergeRemoteTicks,
@@ -274,7 +273,6 @@ export async function initFromMessage(
               ...(settlements.length === 0 ? {} : { settlements: [...settlements] }),
             }),
     localModules: embedded.localModules,
-    compatibilitySchemas: await localModuleCompatibilitySchemas(embedded.localModules),
     modules: embedded.modules,
     manifest: embedded.embeddedManifest,
     moduleGraphHash: request.identity?.moduleGraphHash,
@@ -1477,7 +1475,6 @@ export async function initRuntime(options: {
     settlements: readonly RemoteMutationSettlement[],
   ) => void;
   localModules?: import("../runtime/runner").LocalModuleMap;
-  compatibilitySchemas?: readonly ConvexEmbeddedSchema[];
   modules: ConvexModules;
   manifest?: import("../runtime/runner").RuntimeFunctionManifest;
   moduleGraphHash?: string;
@@ -1554,7 +1551,6 @@ export async function initRuntime(options: {
         options.setup === undefined
           ? undefined
           : {
-              compatibilitySchemas: options.compatibilitySchemas ?? [],
               run: async (setupRunner) => {
                 await setupRunner.runAction(
                   options.setup!.reference,
@@ -1591,22 +1587,6 @@ export async function initRuntime(options: {
     opfs.closeAll();
     throw error;
   }
-}
-
-async function localModuleCompatibilitySchemas(
-  modules: import("../runtime/runner").LocalModuleMap | undefined,
-): Promise<ConvexEmbeddedSchema[]> {
-  if (modules === undefined) return [];
-  const schemas = new Set<ConvexEmbeddedSchema>();
-  for (const load of Object.values(modules)) {
-    const module = await load();
-    if (typeof module !== "object" || module === null) continue;
-    for (const value of Object.values(module as Record<string, unknown>)) {
-      const schema = localCompatibilitySchema(value);
-      if (schema !== undefined) schemas.add(schema);
-    }
-  }
-  return [...schemas];
 }
 
 /**

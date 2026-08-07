@@ -9,6 +9,7 @@ import { describe, expect, test } from "vite-plus/test";
 import { EmbeddedClient } from "../../src/client";
 import { readDevtoolsBridge } from "../../src/devtools/bridge";
 import { createConvexEmbeddedClientForTest } from "../../src/node/client";
+import type { LedgerReader } from "../../src/runtime/ledger";
 import { NativeStore } from "../../src/node/native";
 import type { Runner } from "../../src/runtime/runner";
 import {
@@ -186,19 +187,6 @@ const writeLegacyPreference = legacyPreferences.mutation({
 const legacyPreferencesModule = { writeLegacyPreference };
 stampLocal("local/legacy", "legacy-preferences-v1", legacyPreferencesModule);
 
-const historicalPreferences = device.compatibility(legacyPreferencesSchema);
-export const readLegacyPreferences = historicalPreferences.internalQuery({
-  args: {},
-  handler: async (ctx) => await ctx.db.query("legacy_preferences").first(),
-});
-export const deleteLegacyPreference = historicalPreferences.internalMutation({
-  args: { id: v.id("legacy_preferences") },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    await ctx.db.delete("legacy_preferences", args.id);
-    return null;
-  },
-});
 export const writeCurrentPreference = device.internalMutation({
   args: { compact: v.boolean() },
   returns: v.null(),
@@ -209,25 +197,31 @@ export const writeCurrentPreference = device.internalMutation({
     return null;
   },
 });
+let completedSetupLedger: LedgerReader | undefined;
 export const migrateDroppedPreferences = device.internalAction({
   args: {},
   returns: v.null(),
   handler: async (ctx) => {
-    const preference = (await ctx.runQuery(readLegacyPreferences, {})) as {
-      _id: string;
-      compact: boolean;
-    } | null;
-    if (preference !== null) {
-      await ctx.runMutation(writeCurrentPreference, { compact: preference.compact });
-      await ctx.runMutation(deleteLegacyPreference, { id: preference._id });
-    }
+    completedSetupLedger = ctx.ledger;
+    let cursor: string | null = null;
+    do {
+      const page: { cursor: string | null; docs: readonly { _id: string; compact: boolean }[] } =
+        await ctx.ledger.read({
+          cursor,
+          table: "legacy_preferences",
+          validator: v.object({ compact: v.boolean() }),
+        });
+      for (const preference of page.docs) {
+        await ctx.runMutation(writeCurrentPreference, { compact: preference.compact });
+        await ctx.ledger.delete({ id: preference._id, table: "legacy_preferences" });
+      }
+      cursor = page.cursor;
+    } while (cursor !== null);
     return null;
   },
 });
 const droppedPreferencesModule = {
-  deleteLegacyPreference,
   migrateDroppedPreferences,
-  readLegacyPreferences,
   writeCurrentPreference,
 };
 stampLocal("local/upgrade", "dropped-preferences-v2", droppedPreferencesModule);
@@ -388,7 +382,7 @@ describe("v5 embedded client", () => {
     }
   });
 
-  test("moves a removed local table through a setup-only compatibility helper", async () => {
+  test("moves a removed local table through the candidate ledger", async () => {
     const path = join(tmpdir(), `convex-embedded-v5-dropped-table-${crypto.randomUUID()}.sqlite3`);
     const native = nativeModule();
     const original = createConvexEmbeddedClientForTest(
@@ -421,9 +415,11 @@ describe("v5 embedded client", () => {
         await upgraded.open(migrateDroppedPreferences);
         await expect(upgraded.query(prefs.readCompact, {})).resolves.toEqual([true]);
         await expect(
-          // @ts-expect-error Historical helpers are never part of the active client surface.
-          upgraded.query(readLegacyPreferences, {}),
-        ).rejects.toThrow("local/upgrade:readLegacyPreferences is setup-only");
+          completedSetupLedger?.read({
+            table: "legacy_preferences",
+            validator: v.object({ compact: v.boolean() }),
+          }),
+        ).rejects.toThrow("ctx.ledger is available only while client.open(setup) is running.");
       } finally {
         await upgraded.close();
       }
@@ -433,7 +429,7 @@ describe("v5 embedded client", () => {
     }
   });
 
-  test("plain open ignores setup-only compatibility helpers", async () => {
+  test("plain open does not expose a candidate ledger", async () => {
     const path = join(
       tmpdir(),
       `convex-embedded-v5-plain-compatibility-${crypto.randomUUID()}.sqlite3`,
@@ -453,10 +449,6 @@ describe("v5 embedded client", () => {
     try {
       await expect(client.open()).resolves.toBeUndefined();
       await expect(client.query(prefs.readCompact, {})).resolves.toEqual([]);
-      await expect(
-        // @ts-expect-error Historical helpers are never part of the active client surface.
-        client.query(readLegacyPreferences, {}),
-      ).rejects.toThrow("local/upgrade:readLegacyPreferences is setup-only");
     } finally {
       await client.close();
       rmSync(path, { force: true });

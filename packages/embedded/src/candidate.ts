@@ -1,6 +1,5 @@
 import type { StoreSetupCandidate } from "./migrations";
 import type { RunnerMode } from "./runtime/mode";
-import type { ConvexEmbeddedSchema } from "./schema";
 import type { StorageBackend, StoreSchema } from "./storage/types";
 import { setupWorkspaceSchema } from "./storage/workspace";
 
@@ -27,8 +26,6 @@ export interface CandidateStep {
 }
 
 export interface CandidateSetup<R> {
-  /** Historical schemas named by setup-only local helpers. */
-  readonly compatibilitySchemas: readonly ConvexEmbeddedSchema[];
   run(runner: R): Promise<void>;
 }
 
@@ -142,11 +139,7 @@ export async function openCandidate<R>(
             "The prepared store candidate requires its matching setup action; the active generation was preserved.",
           );
         }
-        const workspace = setupWorkspaceSchema(
-          prepared.sourceSchema,
-          dependencies.targetSchema,
-          dependencies.setup.compatibilitySchemas,
-        );
+        const workspace = setupWorkspaceSchema(prepared.sourceSchema, dependencies.targetSchema);
         await candidate.bind(workspace, prepared.generation);
         bound = true;
         await advance(

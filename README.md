@@ -429,23 +429,15 @@ export const setup = local.internalAction({
 await client.open(setup);
 ```
 
-When setup must read a device table that the current schema removed, bind that helper to an
-explicit historical schema. The main generated `local` value remains bound to the current schema;
-`local.compatibility(legacySchema)` returns only internal, setup-only builders:
+When setup must read a device table that the current schema removed, use the candidate ledger. It
+contains a frozen, bounded view of the pre-cutover table and is available only inside setup; the
+generated `local` value remains bound to the current schema.
 
 ```ts
 // local/setup.ts
-import { type GenericId, v } from "convex/values";
+import { v } from "convex/values";
 
 import { local } from "../convex/_generated/embedded";
-import { legacySchema } from "./legacySchema";
-
-const legacy = local.compatibility(legacySchema);
-
-export const preferencesLegacyRead = legacy.internalQuery({
-  args: {},
-  handler: async (ctx) => await ctx.db.query("legacy_preferences").first(),
-});
 
 export const preferencesCurrentWrite = local.internalMutation({
   args: { compact: v.boolean() },
@@ -456,46 +448,41 @@ export const preferencesCurrentWrite = local.internalMutation({
   },
 });
 
-export const preferencesLegacyDelete = legacy.internalMutation({
-  args: { id: v.id("legacy_preferences") },
-  handler: async (ctx, { id }) => {
-    await ctx.db.delete("legacy_preferences", id);
-  },
-});
-
 export const setup = local.internalAction({
   args: {},
   returns: v.null(),
   handler: async (ctx) => {
-    const preference = (await ctx.runQuery(preferencesLegacyRead, {})) as {
-      _id: GenericId<"legacy_preferences">;
-      compact: boolean;
-    } | null;
-    if (preference !== null) {
-      await ctx.runMutation(preferencesCurrentWrite, { compact: preference.compact });
-      await ctx.runMutation(preferencesLegacyDelete, { id: preference._id });
-    }
+    let cursor: string | null = null;
+    do {
+      const page = await ctx.ledger.read({
+        cursor,
+        table: "legacy_preferences",
+        validator: v.object({ compact: v.boolean() }),
+      });
+      for (const preference of page.docs) {
+        await ctx.runMutation(preferencesCurrentWrite, { compact: preference.compact });
+        await ctx.ledger.delete({ id: preference._id, table: "legacy_preferences" });
+      }
+      cursor = page.cursor;
+    } while (cursor !== null);
     return null;
   },
 });
 ```
 
-`legacySchema` is an ordinary `defineEmbeddedSchema` value that describes the historical table.
-Embedded includes it only in the unpublished setup workspace. Functions returned by
-`local.compatibility(...)` are private setup helpers: they can run through the setup action, but
-the active runner excludes and rejects them after cutover. They therefore cannot become a hidden
-long-lived API for removed tables. Every local registration dispatched with `ctx.runQuery` or
-`ctx.runMutation` must be a named export so the configured bundler can stamp and register it. A
-dropped table's originated rows must be explicitly deleted by
-an idempotent setup mutation after their replacement is written; otherwise final target validation
-fails and preserves the old active generation.
+`ctx.ledger` reads only historical `localTable` records. `ctx.ledger.read` validates each
+historical value with the supplied Convex validator.
+`ctx.ledger.delete` consumes one historical record only after its replacement has committed. Both
+reject outside the running setup action. Every local registration dispatched with `ctx.runQuery` or
+`ctx.runMutation` must be a named export so the configured bundler can stamp and register it.
 
 `setup` must be an imported, bundled internal local action with empty arguments and a `null`
 result; callbacks, strings, server references, public actions, queries, and mutations are rejected.
 Each `ctx.runMutation` is a separate durable setup batch, so setup code must be idempotent and
 paginate instead of collecting an unbounded table. Setup runs unauthenticated and has no hosted
-function, scheduling, file-storage, nested-action, or raw-package-record context. It is still normal
-JavaScript, so avoid non-idempotent external side effects: Embedded cannot roll back a `fetch()` if
+function, scheduling, file-storage, nested-action, or arbitrary raw-record context beyond
+`ctx.ledger`. It is still normal JavaScript, so avoid non-idempotent external side effects: Embedded
+cannot roll back a `fetch()` if
 the process dies afterward. A throw preserves the previously opened data and terminally fails that
 client instance. Close it, construct a new client, and open with the same setup identity to resume
 and rerun the action.

@@ -93,18 +93,15 @@ describe("embedded bundler core", () => {
     await withFixture(async ({ convexDir, localDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
-      await file(localDir, "legacy.ts", "export const legacySchema = {};\n");
       await file(localDir, "helper.ts", 'export const phase = "one";\n');
       await file(
         localDir,
         "lifecycle.ts",
         `import { local } from "../convex/_generated/embedded";
-import { legacySchema } from "./legacy";
 import { phase } from "./helper";
-const compatibility = local.compatibility(legacySchema);
 export const namedSetup = local.internalMutation({ handler: () => phase });
 export const openDevice = local.internalAction({ handler: () => null });
-export const carryHistory = compatibility.internalAction({ handler: () => null });
+export const carryHistory = local.internalAction({ handler: () => null });
 `,
       );
       await file(localDir, "entry.ts", 'export { openDevice as open } from "./lifecycle";\n');
@@ -116,17 +113,14 @@ export const carryHistory = compatibility.internalAction({ handler: () => null }
           expect.objectContaining({
             name: "carryHistory",
             reference: "local/lifecycle:carryHistory",
-            setupOnly: true,
           }),
           expect.objectContaining({
             name: "openDevice",
             reference: "local/lifecycle:openDevice",
-            setupOnly: false,
           }),
           expect.objectContaining({
             name: "open",
             reference: "local/entry:open",
-            setupOnly: false,
           }),
         ]),
       );
@@ -1200,21 +1194,17 @@ describe("embedded unplugin adapter", () => {
     });
   });
 
-  test("keeps setup compatibility registrations in the unmodified source module", async () => {
+  test("keeps ordinary setup registrations in the unmodified source module", async () => {
     await withFixture(async ({ convexDir, localDir }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       const source = `import { local } from "../convex/_generated/embedded";
-import { legacySchema } from "./legacySchema";
-
-const legacy = local.compatibility(legacySchema);
-export const legacyRead = legacy.internalQuery({});
-export const legacyDelete = legacy.internalMutation({});
+export const legacyRead = local.internalQuery({});
+export const legacyDelete = local.internalMutation({});
 export const currentWrite = local.internalMutation({});
 export const setup = local.internalAction({});
 `;
       const modulePath = path.join(localDir, "setup.ts");
-      await file(localDir, "legacySchema.ts", "export const legacySchema = {};\n");
       await file(localDir, "setup.ts", source);
 
       const plugin = convexEmbeddedUnplugin.rollup({

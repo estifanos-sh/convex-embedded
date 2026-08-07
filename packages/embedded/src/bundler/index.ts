@@ -176,12 +176,10 @@ export interface LocalExportDescriptor {
  * One candidate setup entrypoint discovered from a real local registration.
  *
  * `closureHash` is the generated local module-graph identity the runtime stamps onto the exported
- * registration, while `setupOnly` mirrors the generated compatibility marker. Neither property
- * is inferred from the export's spelling.
+ * registration. It is discovered from local action semantics rather than export spelling.
  */
 export interface LocalSetupDescriptor extends LocalExportDescriptor {
   closureHash: string;
-  setupOnly: boolean;
 }
 
 export interface AppArtifactModule {
@@ -450,11 +448,10 @@ async function createEmbeddedBundleInner(
   }
   const setups = [...localSetups]
     .flatMap(([moduleId, exports]) =>
-      [...exports].map(([name, setupOnly]) => ({
+      [...exports].map((name) => ({
         closureHash: executionHash,
         name,
         reference: `${moduleId}:${name}`,
-        setupOnly,
       })),
     )
     .sort((left, right) =>
@@ -500,8 +497,6 @@ const LOCAL_VARIABLE_EXPORT = /export\s+(?:const|let|var)\s+/g;
 const LOCAL_EXPORT_LIST = /export\s+(type\s+)?\{([^}]*)\}(\s*from\b)?/g;
 const LOCAL_STAR_EXPORT = /\bexport\s*\*(?:\s+as\s+[$A-Z_a-z][$\w]*)?\s+from\b/;
 const LOCAL_EXPORT_ALIAS = /^([$A-Z_a-z][$\w]*)\s+as\s+([$A-Z_a-z][$\w]*)$/;
-const LOCAL_COMPATIBILITY_BINDING =
-  /\b(?:const|let|var)\s+([$A-Z_a-z][$\w]*)(?:\s*:[^=;\n]+)?\s*=\s*local\s*\.\s*compatibility\s*\(/g;
 const LOCAL_NAMED_REEXPORT = /export\s*\{([^}]*)\}\s*from\s*(["'])([^"']+)\2/g;
 const AMBIENT_DECLARATION = /\bdeclare\b/g;
 const IDENTIFIER = /^[$A-Z_a-z][$\w]*$/;
@@ -625,14 +620,12 @@ export function readLocalExportNames(source: string): Array<[string, string]> {
 /**
  * Reads setup candidates from local-builder semantics, not an export-name convention.
  *
- * A lifecycle setup must be an internal local action. Compatibility-bound actions retain their
- * generated setup-only marker; ordinary internal actions remain valid explicit `open(action)`
- * candidates and are marked `setupOnly: false` for consumers that need to distinguish them.
+ * A lifecycle setup is an internal local action; there is no migration-specific registration form.
  */
 function readLocalSetupDescriptors(
   localModules: EmbeddedBundleResult["localModules"],
   sources: ReadonlyMap<string, string>,
-): Map<string, Map<string, boolean>> {
+): Map<string, Set<string>> {
   const modules = new Map(
     Object.entries(localModules).map(([moduleId, module]) => [
       moduleId,
@@ -640,30 +633,28 @@ function readLocalSetupDescriptors(
     ]),
   );
   const moduleByFile = new Map([...modules].map(([moduleId, module]) => [module.file, moduleId]));
-  const cache = new Map<string, Map<string, boolean>>();
+  const cache = new Map<string, Set<string>>();
   const reading = new Set<string>();
-  const readModule = (moduleId: string): Map<string, boolean> => {
+  const readModule = (moduleId: string): Set<string> => {
     const cached = cache.get(moduleId);
     if (cached !== undefined) return cached;
     if (reading.has(moduleId)) {
       throw new Error(`device-only setup exports contain a cycle at ${moduleId}`);
     }
     const module = modules.get(moduleId);
-    if (module === undefined) return new Map();
+    if (module === undefined) return new Set();
     reading.add(moduleId);
-    const exported = new Map<string, boolean>();
+    const exported = new Set<string>();
     const setupBindings = readLocalSetupBindings(module.source);
     for (const [name, binding] of readLocalExportNames(module.source)) {
-      const setupOnly = setupBindings.get(binding);
-      if (setupOnly !== undefined) exported.set(name, setupOnly);
+      if (setupBindings.has(binding)) exported.add(name);
     }
     for (const reexport of readLocalNamedReexports(module.source)) {
       const target = resolveLocalReexport(module.file, reexport.specifier, moduleByFile);
       if (target === undefined) continue;
       const targetExports = readModule(target);
       for (const [sourceName, exportedName] of reexport.names) {
-        const setupOnly = targetExports.get(sourceName);
-        if (setupOnly !== undefined) exported.set(exportedName, setupOnly);
+        if (targetExports.has(sourceName)) exported.add(exportedName);
       }
     }
     reading.delete(moduleId);
@@ -673,13 +664,9 @@ function readLocalSetupDescriptors(
   return new Map([...modules.keys()].sort().map((moduleId) => [moduleId, readModule(moduleId)]));
 }
 
-function readLocalSetupBindings(source: string): Map<string, boolean> {
+function readLocalSetupBindings(source: string): Set<string> {
   const code = maskAmbientDeclarations(maskCommentsAndStrings(source));
-  const compatibilityBindings = new Set<string>();
-  for (const match of code.matchAll(LOCAL_COMPATIBILITY_BINDING)) {
-    compatibilityBindings.add(match[1]!);
-  }
-  const bindings = new Map<string, boolean>();
+  const bindings = new Set<string>();
   for (const match of code.matchAll(LOCAL_VARIABLE_EXPORT)) {
     const declarators = code.slice(match.index + match[0].length);
     const end = indexOfTopLevel(declarators, ";");
@@ -688,27 +675,18 @@ function readLocalSetupBindings(source: string): Map<string, boolean> {
       if (equals === -1) continue;
       const name = declarator.slice(0, equals).trim();
       if (!IDENTIFIER.test(name)) continue;
-      const setupOnly = localInternalActionSetupOnly(
-        declarator.slice(equals + 1),
-        compatibilityBindings,
-      );
-      if (setupOnly !== undefined) bindings.set(name, setupOnly);
+      if (isLocalInternalAction(declarator.slice(equals + 1))) bindings.add(name);
     }
   }
   return bindings;
 }
 
-function localInternalActionSetupOnly(
-  expression: string,
-  compatibilityBindings: ReadonlySet<string>,
-): boolean | undefined {
+function isLocalInternalAction(expression: string): boolean {
   const marker = ".internalAction";
   const markerIndex = expression.indexOf(marker);
-  if (markerIndex === -1 || !/\.\s*internalAction\s*\(/.test(expression)) return undefined;
+  if (markerIndex === -1 || !/\.\s*internalAction\s*\(/.test(expression)) return false;
   const receiver = expression.slice(0, markerIndex).replaceAll(/\s/g, "");
-  if (receiver === "local") return false;
-  if (compatibilityBindings.has(receiver)) return true;
-  return receiver.startsWith("local.compatibility(") ? true : undefined;
+  return receiver === "local";
 }
 
 function readLocalNamedReexports(

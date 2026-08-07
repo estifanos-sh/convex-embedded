@@ -1,10 +1,8 @@
 import { describe, expect, test, vi } from "vite-plus/test";
-import { v } from "convex/values";
 
 import { applyQueuedMutationPolicy, validateStoreSetup } from "../../src/migrations";
 import { setupWorkspaceSchema } from "../../src/storage/workspace";
 import type { RuntimeStorage, StoreSchema } from "../../src/storage/types";
-import { defineEmbeddedSchema, localTable } from "../../src/schema";
 
 const source: StoreSchema = {
   hash: "source",
@@ -36,7 +34,7 @@ const target: StoreSchema = {
 
 describe("candidate setup workspace", () => {
   test("keeps source projections privately while target semantics own public names", () => {
-    const workspace = setupWorkspaceSchema(source, target, []);
+    const workspace = setupWorkspaceSchema(source, target);
     const table = workspace.tables[0]!;
     const sourceColumn = table.columns.find((column) => column.field === "state")!;
     const sourceIndex = table.indexes.find((index) => index.fields[0] === "state")!;
@@ -66,8 +64,8 @@ describe("candidate setup workspace", () => {
         },
       ],
     };
-    const sourceToCompatibility = setupWorkspaceSchema(source, compatibility, []);
-    const workspace = setupWorkspaceSchema(sourceToCompatibility, target, []);
+    const sourceToCompatibility = setupWorkspaceSchema(source, compatibility);
+    const workspace = setupWorkspaceSchema(sourceToCompatibility, target);
     const table = workspace.tables[0]!;
     const columnNames = table.columns.map((column) => column.name);
     const indexNames = table.indexes.map((index) => index.name);
@@ -79,16 +77,6 @@ describe("candidate setup workspace", () => {
     expect(
       table.columns.map((column) => column.field).sort((a, b) => a!.localeCompare(b!)),
     ).toEqual(["phase", "stage", "state"]);
-  });
-
-  test("rejects a compatibility function that would silently bind a changed index name", () => {
-    const compatibility = defineEmbeddedSchema({
-      docs: localTable({ state: v.string() }).index("by_status", ["state"]),
-    });
-
-    expect(() => setupWorkspaceSchema(source, target, [compatibility])).toThrow(
-      "Setup compatibility index conflict for docs.by_status",
-    );
   });
 
   test("rejects carried documents that the target validator does not accept", async () => {

@@ -100,25 +100,16 @@ completed setup identity even when its executable hook is retired, so an older b
 that action as new work and rerun it. Passing a different setup action replaces the remembered
 identity through a new candidate.
 
-For a dropped table or an old shape that is no longer part of the target schema, the setup module
-may bind its functions to an explicit compatibility schema. That schema is used only while setup
-runs and is never published as the app's active schema.
+For a dropped table or an old shape that is no longer part of the target schema, setup reads the
+candidate ledger. It is a bounded, frozen pre-cutover view and is never part of the active schema.
 
 Use the generated `local` value directly; no migration registry or folder is introduced:
 
 ```ts
 // local/setup.ts
-import { type GenericId, v } from "convex/values";
+import { v } from "convex/values";
 
 import { local } from "../convex/_generated/embedded";
-import { legacySchema } from "./legacySchema";
-
-const legacy = local.compatibility(legacySchema);
-
-export const preferencesLegacyRead = legacy.internalQuery({
-  args: {},
-  handler: async (ctx) => await ctx.db.query("legacy_preferences").first(),
-});
 
 export const preferencesCurrentWrite = local.internalMutation({
   args: { compact: v.boolean() },
@@ -129,40 +120,33 @@ export const preferencesCurrentWrite = local.internalMutation({
   },
 });
 
-export const preferencesLegacyDelete = legacy.internalMutation({
-  args: { id: v.id("legacy_preferences") },
-  handler: async (ctx, { id }) => {
-    await ctx.db.delete("legacy_preferences", id);
-  },
-});
-
 export const setup = local.internalAction({
   args: {},
   returns: v.null(),
   handler: async (ctx) => {
-    const preference = (await ctx.runQuery(preferencesLegacyRead, {})) as {
-      _id: GenericId<"legacy_preferences">;
-      compact: boolean;
-    } | null;
-    if (preference !== null) {
-      await ctx.runMutation(preferencesCurrentWrite, { compact: preference.compact });
-      await ctx.runMutation(preferencesLegacyDelete, { id: preference._id });
-    }
+    let cursor: string | null = null;
+    do {
+      const page = await ctx.ledger.read({
+        cursor,
+        table: "legacy_preferences",
+        validator: v.object({ compact: v.boolean() }),
+      });
+      for (const preference of page.docs) {
+        await ctx.runMutation(preferencesCurrentWrite, { compact: preference.compact });
+        await ctx.ledger.delete({ id: preference._id, table: "legacy_preferences" });
+      }
+      cursor = page.cursor;
+    } while (cursor !== null);
     return null;
   },
 });
 ```
 
-`legacySchema` is an ordinary historical `defineEmbeddedSchema` value. The returned `legacy`
-builders expose only `internalQuery`, `internalMutation`, and `internalAction`; their registrations
-are setup-only. Embedded materializes their schema in the candidate workspace, then excludes and
-rejects them from the active runner after cutover. Every local registration dispatched with
-`ctx.runQuery` or `ctx.runMutation` must be a named export so the configured bundler can stamp and
-register it. Keep the setup action and its target-schema
-helpers idempotent so a resumed candidate can safely run it again. For a dropped table, write the
-replacement and then explicitly delete the historical originated row through a compatibility
-mutation. Leaving it behind causes final target validation to fail and preserves the old active
-generation; Embedded never silently drops application data.
+`ctx.ledger` reads only historical `localTable` records. `ctx.ledger.read` validates each
+historical value with the supplied Convex validator.
+`ctx.ledger.delete` consumes one historical record only after its replacement has committed. Both
+reject outside the running setup action. Keep setup and its target-schema helpers idempotent so a resumed
+candidate can safely run them again.
 
 ## Explicit Client Lifecycle
 
@@ -358,20 +342,18 @@ therefore cannot append new push envelopes after this policy phase.
 
 ### 4. Materialize a setup workspace
 
-Build a private compatibility schema from:
+Build a private setup workspace from:
 
 1. the stored source physical schema;
-2. the current target schema; and
-3. explicit schemas attached to imported `local.compatibility(...)` setup helpers.
+2. the current target schema.
 
 The store persists the source tables, placement, columns, indexes, CRDT fields, and local-field
-names. An imported compatibility schema supplies any historical application validator the current
-setup code still needs. Target definitions own every public name. Conflicting source columns and
+names. Setup supplies a Convex validator only for the historical record shape it reads through
+`ctx.ledger.read`; it never registers a second schema. Target definitions own every public name.
+Conflicting source columns and
 indexes receive deterministic, content-derived private `setup_*` aliases that remain unique and
-within the physical identifier limit across several skipped shapes. A compatibility function may
-not reuse a target index name for different fields, because that would make an ordinary
-`withIndex()` call ambiguous; give the compatibility index a distinct name or scan the historical
-table. Source-only tables remain readable so a skipped release can migrate data out of a table the
+within the physical identifier limit across several skipped shapes. Source-only device tables remain
+readable through the candidate ledger so a skipped release can migrate data out of a table the
 target removed.
 
 The workspace is never a publishable contract.
@@ -471,15 +453,16 @@ The public migration-related surface is only:
 ```ts
 client.open(setup?);
 local.internalAction(...);
-local.compatibility(legacySchema).internalQuery(...);
+ctx.ledger.read(...);
+ctx.ledger.delete(...);
 ctx.runQuery(...);
 ctx.runMutation(...);
 ```
 
 There is intentionally no public `carry`, `deviceMigration`, `defineDeviceMigrations`, migration
-manifest, staging reader, raw record kind, quarantine exporter, or migration event payload. Package
-upgrade details stay private so the storage team can evolve codecs and recovery without freezing a
-second application ABI.
+manifest, raw-record kind, quarantine exporter, or migration event payload. `ctx.ledger` is the one
+bounded, validator-checked reader for historical `localTable` records; package upgrade details otherwise stay
+private so the storage team can evolve codecs and recovery without freezing a second application ABI.
 
 The setup action is not a general application bootstrap callback. It is contract-triggered,
 restartable candidate work. Routine per-launch tasks belong in ordinary application code after

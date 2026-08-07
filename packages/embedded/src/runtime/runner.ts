@@ -40,7 +40,7 @@ import {
   type ValidatorIdValue,
 } from "../id/path";
 import { EmbeddedUnsupportedError } from "../error";
-import { isLocalFunction, isLocalSetupOnly, stampLocal } from "../local/internal";
+import { isLocalFunction, stampLocal } from "../local/internal";
 import { normalizeMutationResult } from "../result";
 import { embeddedComponentModules } from "../component/local";
 import { embeddedComponentStoreSchema } from "../schema";
@@ -83,6 +83,7 @@ import {
   type ComponentInstancePath,
 } from "./components";
 import type { FunctionPlacement, FunctionReference, RegisteredFunction } from "./functions";
+import { createLedgerReader } from "./ledger";
 import type { RunnerMode } from "./mode";
 import type { BaseVersion, ReadBound, ReadTracker } from "./query";
 import { validateFields, validateJson, validateValue } from "./validate";
@@ -665,6 +666,7 @@ export function createRunner(
   options: RunnerOptions = {},
 ): Runner {
   const rootScope = createRootScope(modules, storeSchema);
+  const runnerMode = options.mode ?? "active";
   const remoteEnabled = options.remote === true;
   const moduleGraphHash = options.moduleGraphHash ?? storeSchema.hash ?? "local";
   const deferNotify = options.deferNotify ?? ((run: () => void) => run());
@@ -680,15 +682,9 @@ export function createRunner(
   const moduleCache = new Map<string, Promise<ModuleExports>>();
   const functionCache = new Map<string, Promise<RunnableFunction>>();
   const localFunctions = new Map<string, RunnableFunction>();
-  const setupOnlyLocalFunctions = new Set<string>();
   const localConfigured = Object.keys(options.localModules ?? {}).length > 0;
   const localReady = options.localModules
-    ? ingestLocalModules(
-        options.localModules,
-        localFunctions,
-        setupOnlyLocalFunctions,
-        options.mode ?? "active",
-      )
+    ? ingestLocalModules(options.localModules, localFunctions, runnerMode)
     : undefined;
   if (localReady) void localReady.catch(() => undefined);
   const watchers = new Map<string, Watcher>();
@@ -775,9 +771,6 @@ export function createRunner(
     if (localReady) await localReady;
     const local = localFunctions.get(name);
     if (!local) {
-      if (setupOnlyLocalFunctions.has(name)) {
-        throw new Error(`${name} is setup-only and cannot run after candidate setup.`);
-      }
       throw new Error(
         localConfigured
           ? `${name} is not registered under the configured local directories.`
@@ -1567,76 +1560,93 @@ export function createRunner(
     ensureVisible(fn, ref, options);
     ensureSamePlacement(fn, ref, options.callerPlacement);
     const checked = validateArgs(fn, args);
-    const result = await fn.handler(
-      {
-        auth: authService(options.auth ?? null),
-        meta: {},
-        runAction: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-          fn.placement === "local"
-            ? Promise.reject(new Error("Local actions cannot call nested actions."))
-            : runAction(childRef, childArgs, resolved.scope, {
+    let ledgerOpen = true;
+    const ledger = createLedgerReader(
+      store,
+      () => ledgerOpen && runnerMode === "setup",
+      deleteDoc,
+      (table) => rootScope.schema.get(table)?.placement === "device",
+    );
+    try {
+      const result = await fn.handler(
+        {
+          auth: authService(options.auth ?? null),
+          ledger,
+          meta: {},
+          runAction: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+            fn.placement === "local"
+              ? Promise.reject(new Error("Local actions cannot call nested actions."))
+              : runAction(childRef, childArgs, resolved.scope, {
+                  ...options,
+                  allowInternal: true,
+                  callerPlacement: fn.placement,
+                }),
+          runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+            enqueueMutation(() =>
+              runMutationDirect(childRef, childArgs, resolved.scope, {
                 ...options,
                 allowInternal: true,
                 callerPlacement: fn.placement,
               }),
-        runMutation: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-          enqueueMutation(() =>
-            runMutationDirect(childRef, childArgs, resolved.scope, {
+            ),
+          runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
+            runQuery(childRef, childArgs, resolved.scope, undefined, undefined, undefined, {
               ...options,
               allowInternal: true,
               callerPlacement: fn.placement,
             }),
-          ),
-        runQuery: (childRef: FunctionReference, childArgs: Record<string, unknown> = {}) =>
-          runQuery(childRef, childArgs, resolved.scope, undefined, undefined, undefined, {
-            ...options,
-            allowInternal: true,
-            callerPlacement: fn.placement,
-          }),
-        get scheduler() {
-          if (fn.placement === "local") {
-            throw new Error("Local actions cannot schedule functions.");
-          }
-          return createSchedulerService(
-            store,
-            emit,
-            {
-              kind: functionKind,
-              runAction: (childRef, childArgs = {}) =>
-                runAction(childRef, childArgs, resolved.scope, { ...options, allowInternal: true }),
-              runMutation: (childRef, childArgs = {}) =>
-                enqueueMutation(() =>
-                  runMutationDirect(childRef, childArgs, resolved.scope, {
+          get scheduler() {
+            if (fn.placement === "local") {
+              throw new Error("Local actions cannot schedule functions.");
+            }
+            return createSchedulerService(
+              store,
+              emit,
+              {
+                kind: functionKind,
+                runAction: (childRef, childArgs = {}) =>
+                  runAction(childRef, childArgs, resolved.scope, {
                     ...options,
                     allowInternal: true,
                   }),
-                ),
-              runQuery: (childRef, childArgs = {}) =>
-                runQuery(childRef, childArgs, resolved.scope, undefined, undefined, undefined, {
-                  ...options,
-                  allowInternal: true,
-                }),
-            },
-            remoteEnabled,
-            wakeScheduler,
-          );
+                runMutation: (childRef, childArgs = {}) =>
+                  enqueueMutation(() =>
+                    runMutationDirect(childRef, childArgs, resolved.scope, {
+                      ...options,
+                      allowInternal: true,
+                    }),
+                  ),
+                runQuery: (childRef, childArgs = {}) =>
+                  runQuery(childRef, childArgs, resolved.scope, undefined, undefined, undefined, {
+                    ...options,
+                    allowInternal: true,
+                  }),
+              },
+              remoteEnabled,
+              wakeScheduler,
+            );
+          },
+          get storage() {
+            if (fn.placement === "local") {
+              throw new Error("Local actions cannot access file storage.");
+            }
+            return createStorageService(
+              namespaceStore(store, resolved.scope.instancePath),
+              uploadUrls,
+              objectUrls,
+              "action",
+              emit,
+            );
+          },
         },
-        get storage() {
-          if (fn.placement === "local") {
-            throw new Error("Local actions cannot access file storage.");
-          }
-          return createStorageService(
-            namespaceStore(store, resolved.scope.instancePath),
-            uploadUrls,
-            objectUrls,
-            "action",
-            emit,
-          );
-        },
-      },
-      checked,
-    );
-    return validateReturn(fn, result);
+        checked,
+      );
+      return validateReturn(fn, result);
+    } finally {
+      // A setup handler may retain `ctx.ledger` in a closure. Its authority ends exactly when the
+      // action settles, before candidate completion can bind or publish another generation.
+      ledgerOpen = false;
+    }
   };
 
   const functionKind = async (ref: FunctionReference): Promise<ScheduledFunctionKind> => {
@@ -2314,11 +2324,21 @@ export function createRunner(
     if ("_id" in fields || "_creationTime" in fields) {
       throw new Error("devtools patch cannot change system fields.");
     }
-    const root = createWriter<GenericDataModel>(store, rootScope.schema);
+    const root = createWriter<GenericDataModel>(
+      store,
+      rootScope.schema,
+      undefined,
+      rootScope.schema.get(table)?.placement === "device" ? "device" : "replicated",
+    );
     await root.db.patch(table as never, id as never, normalizeCopy(fields) as never);
     const batch = root.toBatch();
     const commit = await runSpan("storage.commit", () =>
-      store.commit(batch, { changes: "omit", mutation: "none", source: "local" }),
+      store.commit(
+        batch,
+        rootScope.schema.get(table)?.placement === "device"
+          ? { changes: "omit", source: "device" }
+          : { changes: "omit", mutation: "none", source: "local" },
+      ),
     );
     if (hasEventListeners()) emitCommit(emit, commit, batch, "local");
     scheduleNotify({ dataOnlyDocIds: new Map(), tables: new Set(commit.changedTables) });
@@ -2328,12 +2348,30 @@ export function createRunner(
     if (!rootScope.schema.has(table)) {
       throw new Error(`devtools delete only supports app table rows: ${table}`);
     }
-    const root = createWriter<GenericDataModel>(store, rootScope.schema);
+    await deleteDoc(table, id);
+  }
+
+  /** Delete one application record from either the active or candidate workspace. */
+  async function deleteDoc(table: string, id: string): Promise<void> {
+    if (!rootScope.schema.has(table)) {
+      throw new Error(`document delete only supports app table rows: ${table}`);
+    }
+    const root = createWriter<GenericDataModel>(
+      store,
+      rootScope.schema,
+      undefined,
+      rootScope.schema.get(table)?.placement === "device" ? "device" : "replicated",
+    );
     if ((await root.db.get(table as never, id as never)) === null) return;
     await root.db.delete(table as never, id as never);
     const batch = root.toBatch();
     const commit = await runSpan("storage.commit", () =>
-      store.commit(batch, { changes: "omit", mutation: "none", source: "local" }),
+      store.commit(
+        batch,
+        rootScope.schema.get(table)?.placement === "device"
+          ? { changes: "omit", source: "device" }
+          : { changes: "omit", mutation: "none", source: "local" },
+      ),
     );
     if (hasEventListeners()) emitCommit(emit, commit, batch, "local");
     scheduleNotify({ dataOnlyDocIds: new Map(), tables: new Set(commit.changedTables) });
@@ -2961,8 +2999,7 @@ function kindMismatch(
 async function ingestLocalModules(
   localModules: LocalModuleMap,
   table: Map<string, RunnableFunction>,
-  setupOnly: Set<string>,
-  mode: RunnerMode,
+  _mode: RunnerMode,
 ): Promise<void> {
   await Promise.all(
     Object.entries(localModules).map(async ([moduleId, load]) => {
@@ -2971,10 +3008,6 @@ async function ingestLocalModules(
       for (const [exportName, value] of Object.entries(exports)) {
         if (!isLocalFunction(value)) continue;
         const name = `${moduleId}:${exportName}`;
-        if (isLocalSetupOnly(value)) {
-          setupOnly.add(name);
-          if (mode === "active") continue;
-        }
         const registration = toRunnable(value);
         if (!registration) continue;
         table.set(name, registration);

@@ -1,5 +1,3 @@
-import type { ConvexEmbeddedSchema } from "../schema";
-import { toRuntimeStoreSchema } from "../schema";
 import { sha256Text } from "../sha";
 import type { StoreSchema, TableDef } from "./types";
 
@@ -10,17 +8,11 @@ import type { StoreSchema, TableDef } from "./types";
  *
  * @internal
  */
-export function setupWorkspaceSchema(
-  source: StoreSchema,
-  target: StoreSchema,
-  compatibilitySchemas: readonly ConvexEmbeddedSchema[],
-): StoreSchema {
+export function setupWorkspaceSchema(source: StoreSchema, target: StoreSchema): StoreSchema {
   const tables = new Map<string, TableDef>();
-  const localStoreSchemas = compatibilitySchemas.map(toRuntimeStoreSchema);
-  validateCompatibilityIndexes(target, localStoreSchemas);
-  // Compatibility schemas contribute historical shapes, but the release target is applied last
-  // and therefore owns every public table/index/field name used at cutover.
-  for (const schema of [source, ...localStoreSchemas, target]) {
+  // The source remains bound only while setup runs, so ctx.ledger can read data from tables which
+  // the target has removed. The target remains authoritative for every published name at cutover.
+  for (const schema of [source, target]) {
     for (const table of schema.tables) {
       const prior = tables.get(table.name);
       tables.set(table.name, prior === undefined ? cloneTable(table) : mergeTable(prior, table));
@@ -34,28 +26,6 @@ export function setupWorkspaceSchema(
     hash: sha256Text(JSON.stringify(materialized)),
     tables: materialized,
   };
-}
-
-function validateCompatibilityIndexes(
-  target: StoreSchema,
-  compatibilitySchemas: readonly StoreSchema[],
-): void {
-  const targetTables = new Map(target.tables.map((table) => [table.name, table]));
-  for (const schema of compatibilitySchemas) {
-    for (const table of schema.tables) {
-      const targetIndexes = new Map(
-        (targetTables.get(table.name)?.indexes ?? []).map((index) => [index.name, index]),
-      );
-      for (const index of table.indexes) {
-        const current = targetIndexes.get(index.name);
-        if (current !== undefined && !sameIndex(current, index)) {
-          throw new Error(
-            `Setup compatibility index conflict for ${table.name}.${index.name}: use a distinct compatibility index name or scan the historical table`,
-          );
-        }
-      }
-    }
-  }
 }
 
 function sameIndex(left: TableDef["indexes"][number], right: TableDef["indexes"][number]): boolean {

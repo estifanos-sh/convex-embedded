@@ -241,7 +241,6 @@ const ENTRYPOINTS = {
       "LocalActionBuilder",
       "LocalActionCtx",
       "LocalBuilders",
-      "LocalCompatibilityBuilders",
       "LocalFunction",
       "LocalFunctionArgs",
       "LocalFunctionReturns",
@@ -255,7 +254,6 @@ const ENTRYPOINTS = {
     signatures: [
       'readonly placement: "local";',
       "type LocalBuilders<DataModel extends GenericDataModel> = {",
-      "compatibility<Schema extends EmbeddedSchemaDefinition>(schema: Schema): LocalCompatibilityBuilders<DeviceDataModel<Schema>>;",
       'internalAction: LocalActionBuilder<DataModel, "internal">;',
     ],
   },

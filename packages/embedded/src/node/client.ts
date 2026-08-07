@@ -14,9 +14,9 @@ import {
   type ConvexModules,
   validateLoadedSetupIdentity,
 } from "../client";
-import type { ConvexEmbeddedSchema } from "../schema";
 import { EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "../protocol";
-import { localCompatibilitySchema, localGraphHash, localReferenceName } from "../local/internal";
+import { localGraphHash, localReferenceName } from "../local/internal";
+import type { ConvexEmbeddedSchema } from "../schema";
 import { loadNativeModule, validateNativeModule, type NativeModule } from "./artifact";
 import { NativeStore } from "./native";
 
@@ -130,7 +130,6 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
           schema: options.schema,
           modules: options.modules,
           localModules: local?.modules,
-          compatibilitySchemas: local?.compatibilitySchemas,
           localSetupIdentities: local?.setupIdentities,
           store: openStore(native, options.path),
           authState,
@@ -145,10 +144,8 @@ async function namespaceLocalModules(
   local: NonNullable<ConvexEmbeddedClientOptions["local"]>,
 ): Promise<{
   modules: ConvexLocalModules;
-  compatibilitySchemas: ConvexEmbeddedSchema[];
   setupIdentities: Record<string, string>;
 }> {
-  const compatibilitySchemas = new Set<ConvexEmbeddedSchema>();
   const setupIdentities: Record<string, string> = {};
   const entries = await Promise.all(
     Object.entries(local).map(async ([modulePath, load]) => {
@@ -158,8 +155,6 @@ async function namespaceLocalModules(
       // registration remains usable as a normal local function but fails closed for `open(setup)`.
       if (typeof loaded === "object" && loaded !== null) {
         for (const value of Object.values(loaded as Record<string, unknown>)) {
-          const schema = localCompatibilitySchema(value);
-          if (schema !== undefined) compatibilitySchemas.add(schema);
           const reference = localReferenceName(value);
           const graphHash = localGraphHash(value);
           if (reference !== undefined && graphHash !== undefined) {
@@ -172,7 +167,6 @@ async function namespaceLocalModules(
   );
   return {
     modules: Object.fromEntries(entries),
-    compatibilitySchemas: [...compatibilitySchemas],
     setupIdentities,
   };
 }

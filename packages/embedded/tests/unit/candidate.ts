@@ -126,7 +126,7 @@ describe("candidate startup", () => {
 
   test("resumes setup in a remote-free workspace before exact-target validation", async () => {
     const events: string[] = [];
-    const workspace = setupWorkspaceSchema(source, target, []);
+    const workspace = setupWorkspaceSchema(source, target);
     const store = storeWithCandidate(prepared({ resumed: true, setupComplete: false }), events);
 
     const opened = await openCandidate(store as unknown as StorageBackend, {
@@ -140,7 +140,6 @@ describe("candidate startup", () => {
       remote: true,
       runnerSchema: target,
       setup: {
-        compatibilitySchemas: [],
         run: async (runner) => {
           events.push(`action:${runner.mode}:${String(runner.remote)}`);
         },
@@ -174,7 +173,7 @@ describe("candidate startup", () => {
 
   test("unbinds but leaves caller-owned storage open when setup fails", async () => {
     const events: string[] = [];
-    const workspace = setupWorkspaceSchema(source, target, []);
+    const workspace = setupWorkspaceSchema(source, target);
     const store = storeWithCandidate(prepared({ setupComplete: false }), events);
 
     await expect(
@@ -184,7 +183,6 @@ describe("candidate startup", () => {
         remote: false,
         runnerSchema: target,
         setup: {
-          compatibilitySchemas: [],
           run: async () => {
             events.push("action");
             throw new Error("setup failed");
@@ -235,7 +233,6 @@ describe("candidate startup", () => {
       remote: true,
       runnerSchema: target,
       setup: {
-        compatibilitySchemas: [],
         run: async (runner) => {
           expect(runner.mode).toBe("setup");
         },

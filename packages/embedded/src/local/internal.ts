@@ -1,6 +1,6 @@
 import type { GenericValidator, PropertyValidators } from "convex/values";
 
-import type { LocalBuilders, LocalCompatibilityBuilders } from "../local";
+import type { LocalBuilders } from "../local";
 import {
   hasEmbeddedSchemaMeta,
   type ConvexEmbeddedSchema,
@@ -11,8 +11,6 @@ import type { FunctionVisibility } from "../runtime/functions";
 
 export const EMBEDDED_LOCAL_REFERENCE = "__embeddedLocalReference";
 export const EMBEDDED_LOCAL_GRAPH_HASH = "__embeddedLocalGraphHash";
-const EMBEDDED_LOCAL_SCHEMA = "__embeddedLocalSchema";
-const EMBEDDED_LOCAL_SETUP_ONLY = "__embeddedLocalSetupOnly";
 
 /**
  * Builds the immutable application-facing view of one generated local module.
@@ -110,18 +108,6 @@ export function defineLocal<Schema extends EmbeddedSchemaDefinition>(
     throw new Error("defineLocal requires the schema exported by defineEmbeddedSchema.");
   }
   return {
-    compatibility: <CompatibilitySchema extends EmbeddedSchemaDefinition>(
-      compatibilitySchema: CompatibilitySchema,
-    ): LocalCompatibilityBuilders<DeviceDataModel<CompatibilitySchema>> => {
-      if (!hasEmbeddedSchemaMeta(compatibilitySchema as ConvexEmbeddedSchema)) {
-        throw new Error("local.compatibility requires a schema exported by defineEmbeddedSchema.");
-      }
-      return {
-        internalQuery: builder("query", "internal", compatibilitySchema, true),
-        internalMutation: builder("mutation", "internal", compatibilitySchema, true),
-        internalAction: builder("action", "internal", compatibilitySchema, true),
-      } as unknown as LocalCompatibilityBuilders<DeviceDataModel<CompatibilitySchema>>;
-    },
     query: builder("query", "public", schema),
     mutation: builder("mutation", "public", schema),
     internalQuery: builder("query", "internal", schema),
@@ -133,44 +119,24 @@ export function defineLocal<Schema extends EmbeddedSchemaDefinition>(
 function builder(
   kind: "query" | "mutation" | "action",
   visibility: FunctionVisibility,
-  schema: ConvexEmbeddedSchema,
-  setupOnly = false,
+  _schema: ConvexEmbeddedSchema,
 ) {
   return (definition: {
     args?: PropertyValidators | GenericValidator;
     returns?: PropertyValidators | GenericValidator;
     handler: (ctx: unknown, args: Record<string, unknown>) => unknown;
   }) => {
-    const registration = bindLocalSchema(
-      {
-        kind,
-        placement: "local" as const,
-        visibility,
-        args: definition.args,
-        returns: definition.returns,
-        handler: definition.handler,
-        __embeddedHandler: definition.handler,
-        __embeddedPlacement: "local" as const,
-      },
-      schema,
-    );
-    if (setupOnly) {
-      Object.defineProperty(registration, EMBEDDED_LOCAL_SETUP_ONLY, {
-        configurable: false,
-        enumerable: false,
-        value: true,
-        writable: false,
-      });
-    }
-    return registration;
+    return {
+      kind,
+      placement: "local" as const,
+      visibility,
+      args: definition.args,
+      returns: definition.returns,
+      handler: definition.handler,
+      __embeddedHandler: definition.handler,
+      __embeddedPlacement: "local" as const,
+    };
   };
-}
-
-export function bindLocalSchema(
-  value: Record<string, unknown>,
-  schema: ConvexEmbeddedSchema | undefined,
-): Record<string, unknown> {
-  return schema === undefined ? value : { ...value, [EMBEDDED_LOCAL_SCHEMA]: schema };
 }
 
 export function stampLocalGraph(value: Record<string, unknown>, graphHash: string): void {
@@ -181,27 +147,6 @@ export function localGraphHash(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const hash = (value as Record<string, unknown>)[EMBEDDED_LOCAL_GRAPH_HASH];
   return typeof hash === "string" ? hash : undefined;
-}
-
-export function localFunctionSchema(value: unknown): ConvexEmbeddedSchema | undefined {
-  if (typeof value !== "object" || value === null) return undefined;
-  const schema = (value as Record<string, unknown>)[EMBEDDED_LOCAL_SCHEMA];
-  return hasEmbeddedSchemaMeta(schema) ? schema : undefined;
-}
-
-/** Read the historical schema carried by a setup-only local registration. */
-export function localCompatibilitySchema(value: unknown): ConvexEmbeddedSchema | undefined {
-  if (!isLocalSetupOnly(value)) return undefined;
-  return localFunctionSchema(value);
-}
-
-/** Whether this registration may execute only in a candidate setup runner. */
-export function isLocalSetupOnly(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as Record<string, unknown>)[EMBEDDED_LOCAL_SETUP_ONLY] === true
-  );
 }
 
 function immutableLocalReference(

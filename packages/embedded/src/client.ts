@@ -40,12 +40,7 @@ import type {
   LocalMutation,
   LocalQuery,
 } from "./local";
-import {
-  isLocalFunction,
-  localGraphHash,
-  localCompatibilitySchema,
-  localReferenceName,
-} from "./local/internal";
+import { isLocalFunction, localGraphHash, localReferenceName } from "./local/internal";
 import { consumeRemoteTick, remotePendingIsEmpty, REMOTE_PULL_DIAGNOSTIC_ERROR } from "./rev";
 import { toRuntimeStoreSchema, type ConvexEmbeddedSchema } from "./schema";
 import { openCandidate } from "./candidate";
@@ -223,8 +218,6 @@ interface EmbeddedClientBaseOptions {
   modules: ConvexModules;
   /** Device-only function modules imported when the runtime starts. */
   localModules?: ConvexLocalModules;
-  /** Historical schemas carried by setup-only local registrations. @internal */
-  compatibilitySchemas?: readonly ConvexEmbeddedSchema[];
   /** Build-stamped setup identities actually present in the loaded local registry. @internal */
   localSetupIdentities?: Readonly<Record<string, string>>;
   /** Storage backend, or a promise for one, owned by the client. */
@@ -1141,17 +1134,6 @@ export class EmbeddedClient {
     const store = await options.store;
     let runner: Runner;
     try {
-      const compatibilitySchemas =
-        setup === undefined
-          ? []
-          : [
-              ...new Set([
-                ...(options.compatibilitySchemas ?? []),
-                ...[localCompatibilitySchema(setup)].filter(
-                  (value): value is ConvexEmbeddedSchema => value !== undefined,
-                ),
-              ]),
-            ];
       const opened = await openCandidate<Runner>(store, {
         createRunner: ({ schema: runnerSchema, mode, remote }) =>
           createRunner(options.modules, store, runnerSchema, {
@@ -1174,7 +1156,6 @@ export class EmbeddedClient {
           setup === undefined
             ? undefined
             : {
-                compatibilitySchemas,
                 run: async (setupRunner) => {
                   await setupRunner.runAction(
                     toReference(setup, setupRunner.localConfigured),

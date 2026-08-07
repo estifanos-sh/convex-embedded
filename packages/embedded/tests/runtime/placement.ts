@@ -1,13 +1,8 @@
 import { v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vite-plus/test";
 
-import type { LocalBuilders, LocalCompatibilityBuilders } from "../../src/local";
-import {
-  defineLocal,
-  isLocalFunction,
-  localCompatibilitySchema,
-  localFunctionSchema,
-} from "../../src/local/internal";
+import type { LocalBuilders } from "../../src/local";
+import { defineLocal, isLocalFunction } from "../../src/local/internal";
 import { NativeStore } from "../../src/node/native";
 import { createWriter, toSchema } from "../../src/runtime/database";
 import { defineFunctions } from "../../src/runtime/functions";
@@ -212,28 +207,23 @@ describe("device-only function modules", () => {
     await expect(runner.runQuery(module.readCompact, {})).resolves.toEqual([]);
   });
 
-  test("admits historical helpers only while candidate setup is running", async () => {
-    const compatibility = device.compatibility(deviceSchema);
-    const readLegacy = compatibility.internalQuery({
+  test("limits the setup ledger to device table records", async () => {
+    const setup = device.internalAction({
       args: {},
-      returns: v.null(),
-      handler: () => null,
+      handler: async (ctx) =>
+        await ctx.ledger.read({
+          table: "documents",
+          validator: v.object({ title: v.string() }),
+        }),
     });
-    const localModules = { "local/setup": () => Promise.resolve({ readLegacy }) };
-    const setup = createRunner({}, fakeStore(), deviceStoreSchema, {
-      localModules,
+    const runner = createRunner({}, fakeStore(), schema, {
+      localModules: { "local/setup": () => Promise.resolve({ setup }) },
       mode: "setup",
     });
-    const active = createRunner({}, fakeStore(), deviceStoreSchema, {
-      localModules,
-      mode: "active",
-    });
 
-    await setup.localReady;
-    await active.localReady;
-    await expect(setup.runQuery(readLegacy, {}, { allowInternal: true })).resolves.toBeNull();
-    await expect(active.runQuery(readLegacy, {})).rejects.toThrow(
-      "local/setup:readLegacy is setup-only and cannot run after candidate setup.",
+    await runner.localReady;
+    await expect(runner.runAction(setup, {}, { allowInternal: true })).rejects.toThrow(
+      "ctx.ledger only permits device table records.",
     );
   });
 
@@ -401,34 +391,6 @@ describe("device-only namespace typing", () => {
       },
     });
     expect(isLocalFunction(setCompact)).toBe(true);
-  });
-
-  test("keeps the schema on generated builders for runtime validation", () => {
-    const read = device.query({
-      args: {},
-      handler: async () => null,
-    });
-
-    expect(localFunctionSchema(read)).toBe(deviceSchema);
-    expect(localFunctionSchema(undefined)).toBeUndefined();
-  });
-
-  test("binds compatibility helpers to their historical device data model", () => {
-    const historical = defineEmbeddedSchema({ legacy: localTable({ name: v.string() }) });
-    const compatibility = device.compatibility(historical);
-    expectTypeOf(compatibility).toEqualTypeOf<
-      LocalCompatibilityBuilders<DeviceDataModel<typeof historical>>
-    >();
-
-    const readLegacy = compatibility.internalQuery({
-      args: {},
-      handler: async (ctx) => await ctx.db.query("legacy").collect(),
-    });
-    expect(localCompatibilitySchema(readLegacy)).toBe(historical);
-    // @ts-expect-error Historical helpers have no public query surface.
-    void compatibility.query;
-    // @ts-expect-error Compatibility scopes cannot recursively create another historical scope.
-    void compatibility.compatibility;
   });
 });
 

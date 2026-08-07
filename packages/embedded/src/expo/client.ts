@@ -7,8 +7,7 @@ import { embeddedManifest, embeddedSchema, localModules, modules } from "virtual
 import { embeddedIdentity } from "virtual:convex-embedded/identity";
 
 import { createEmbeddedAuthState, EmbeddedClient, validateLoadedSetupIdentity } from "../client";
-import { localCompatibilitySchema, localGraphHash, localReferenceName } from "../local/internal";
-import type { ConvexEmbeddedSchema } from "../schema";
+import { localGraphHash, localReferenceName } from "../local/internal";
 import { openExpoStore } from "./store";
 
 export type {
@@ -86,7 +85,6 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
         validateLoadedSetupIdentity(setup, local.setupIdentities, embeddedIdentity.moduleGraphHash);
         return {
           localModules,
-          compatibilitySchemas: local.compatibilitySchemas,
           localSetupIdentities: local.setupIdentities,
           manifest: embeddedManifest,
           moduleGraphHash: embeddedIdentity.moduleGraphHash,
@@ -108,17 +106,13 @@ export class ConvexEmbeddedClient extends EmbeddedClient {
 }
 
 async function localModuleMetadata(moduleLoaders: Record<string, () => Promise<unknown>>): Promise<{
-  compatibilitySchemas: ConvexEmbeddedSchema[];
   setupIdentities: Record<string, string>;
 }> {
-  const compatibilitySchemas = new Set<ConvexEmbeddedSchema>();
   const setupIdentities: Record<string, string> = {};
   for (const load of Object.values(moduleLoaders)) {
     const module = await load();
     if (typeof module !== "object" || module === null) continue;
     for (const value of Object.values(module as Record<string, unknown>)) {
-      const schema = localCompatibilitySchema(value);
-      if (schema !== undefined) compatibilitySchemas.add(schema);
       const reference = localReferenceName(value);
       const graphHash = localGraphHash(value);
       if (reference !== undefined && graphHash !== undefined) {
@@ -126,5 +120,5 @@ async function localModuleMetadata(moduleLoaders: Record<string, () => Promise<u
       }
     }
   }
-  return { compatibilitySchemas: [...compatibilitySchemas], setupIdentities };
+  return { setupIdentities };
 }

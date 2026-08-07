@@ -13,7 +13,7 @@ import type {
   MutationCtx as RuntimeMutationCtx,
   QueryCtx as RuntimeQueryCtx,
 } from "./runtime/functions";
-import type { DeviceDataModel, EmbeddedSchemaDefinition } from "./schema";
+import type { LedgerReader } from "./runtime/ledger";
 
 /** Context passed to device-only query handlers. */
 export type LocalQueryCtx<DataModel extends GenericDataModel> = Omit<
@@ -31,7 +31,10 @@ export type LocalMutationCtx<DataModel extends GenericDataModel> = Omit<
 export type LocalActionCtx<DataModel extends GenericDataModel> = Omit<
   RuntimeActionCtx<DataModel>,
   "scheduler" | "storage" | "runAction"
->;
+> & {
+  /** Frozen pre-cutover records, available only while `client.open(setup)` is running. */
+  ledger: LedgerReader;
+};
 
 declare const localFunction: unique symbol;
 
@@ -121,31 +124,8 @@ export type LocalActionBuilder<
   handler: (ctx: LocalActionCtx<DataModel>, ...args: OneOrZeroArgs) => ReturnValue;
 }) => LocalAction<Visibility, ArgsArrayToObject<OneOrZeroArgs>, Awaited<ReturnValue>>;
 
-/**
- * Builders for one historical schema while a candidate generation is being set up.
- *
- * Compatibility registrations are deliberately internal-only. The candidate runner can invoke
- * them during `client.open(setup)`, but the published runner does not register them after
- * cutover. This lets a setup action read a table that the current schema removed without making
- * that historical table or helper part of the active application surface.
- */
-export type LocalCompatibilityBuilders<DataModel extends GenericDataModel> = {
-  internalQuery: LocalQueryBuilder<DataModel, "internal">;
-  internalMutation: LocalMutationBuilder<DataModel, "internal">;
-  internalAction: LocalActionBuilder<DataModel, "internal">;
-};
-
 /** Device-only function builders typed against one Embedded schema. */
 export type LocalBuilders<DataModel extends GenericDataModel> = {
-  /**
-   * Bind internal setup helpers to a historical Embedded schema.
-   *
-   * The returned registrations are available only while a candidate generation is running its
-   * setup action. The active runner excludes them after the candidate is published.
-   */
-  compatibility<Schema extends EmbeddedSchemaDefinition>(
-    schema: Schema,
-  ): LocalCompatibilityBuilders<DeviceDataModel<Schema>>;
   query: LocalQueryBuilder<DataModel, "public">;
   mutation: LocalMutationBuilder<DataModel, "public">;
   internalQuery: LocalQueryBuilder<DataModel, "internal">;
