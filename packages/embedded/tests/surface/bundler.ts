@@ -10,7 +10,7 @@ import { v } from "convex/values";
 
 import { createEmbeddedBundle, generateEmbedded, toModuleId } from "../../src/bundler";
 import { toEmbeddedGeneratedSchema } from "../../src/bundler/generated";
-import { maskCommentsAndStrings } from "../../src/bundler/scanner";
+import { maskCommentsAndStrings, readModuleEdges } from "../../src/bundler/scanner";
 import { analyzeEmbeddedSchema, defineEmbeddedSchema, replicatedTable } from "../../src/schema";
 import { convexEmbeddedUnplugin } from "../../src/unplugin";
 import {
@@ -63,17 +63,52 @@ describe("embedded bundler core", () => {
     const string = '"a \\"quoted\\" / fake"';
     const template = "`export const ghost = ${value}; /fake/`";
     const regex = "/a\\/b[\\/]/gi";
+    const maskedTemplate = `${" ".repeat(template.indexOf("value"))}value${" ".repeat(
+      template.length - template.indexOf("value") - "value".length,
+    )}`;
     const source = `const string = ${string};
 const template = ${template};
 const regex = ${regex};
 const division = numerator / 2 / divisor;
 `;
 
-    expect(maskCommentsAndStrings(source)).toBe(`const string = ${" ".repeat(string.length)};
-const template = ${" ".repeat(template.length)};
+    const masked = maskCommentsAndStrings(source);
+
+    expect(masked).toBe(`const string = ${" ".repeat(string.length)};
+const template = ${maskedTemplate};
 const regex = ${" ".repeat(regex.length - 2)}gi;
 const division = numerator / 2 / divisor;
 `);
+    expect(masked).toHaveLength(source.length);
+    expect(masked.indexOf("value")).toBe(source.indexOf("value"));
+  });
+
+  test("reads only semantic module edges", () => {
+    const decoys = `// import "./comment";
+const string = 'import "./string";';
+const template = \`import "./template";\`;
+const regex = /import "\\.\\/regex"/;
+`;
+
+    expect(
+      readModuleEdges(`${decoys}
+import "./side-effect.js";
+import type { Type } from "./types.js";
+export { value } from "./named.js";
+export type { Type } from "./exported-types.js";
+export * from "./star.js";
+import("./dynamic.js");
+const template = \`text import("./template.js") \${import("./expression.js")}\`;
+`),
+    ).toEqual([
+      { specifier: "./side-effect.js", typeOnly: false },
+      { specifier: "./types.js", typeOnly: true },
+      { specifier: "./named.js", typeOnly: false },
+      { specifier: "./exported-types.js", typeOnly: true },
+      { specifier: "./star.js", typeOnly: false },
+      { specifier: "./dynamic.js", typeOnly: false },
+      { specifier: "./expression.js", typeOnly: false },
+    ]);
   });
 
   test("discovers Convex modules and renders a lazy virtual registry", async () => {
@@ -425,6 +460,23 @@ export const replicated = null;
     });
   });
 
+  test.each([
+    ["comments", '// import "@estifanos-sh/convex-embedded/local";'],
+    ["strings", "const decoy = 'import \"@estifanos-sh/convex-embedded/local\";';"],
+    ["templates", 'const decoy = `import "@estifanos-sh/convex-embedded/local";`;'],
+    ["regex literals", 'const decoy = /import "@estifanos-sh\\/convex-embedded\\/local"/;'],
+  ])("does not preflight %s as device-only imports", async (_kind, decoy) => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "feed.ts", `${decoy}\n${canonical("replicated", "query", "list")}`);
+
+      await expect(createFixtureBundle(root)).resolves.toMatchObject({
+        modules: { feed: path.join(convexDir, "feed.ts") },
+      });
+    });
+  });
+
   test("rejects multi-dot Convex modules that the Convex CLI would skip", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
@@ -487,6 +539,66 @@ export const replicated = null;
       await file(convexDir, "admin.ts", canonical("remote", "query", "audit"));
 
       await expect(createFixtureBundle(root)).rejects.toThrow("imports a remote module");
+    });
+  });
+
+  test.each([
+    ["comments", '// import "./admin";'],
+    ["strings", "const decoy = 'import \"./admin\";';"],
+    ["templates", 'const decoy = `import "./admin";`;'],
+    ["regex literals", 'const decoy = /import "\\.\\/admin"/;'],
+  ])("does not follow %s as device dependencies", async (_kind, decoy) => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "feed.ts", `${decoy}\n${canonical("replicated", "query", "list")}`);
+      await file(convexDir, "admin.ts", canonical("remote", "query", "audit"));
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.modules).toEqual({ feed: path.join(convexDir, "feed.ts") });
+      expect(bundle.sourceFiles).not.toContain(path.join(convexDir, "admin.ts"));
+    });
+  });
+
+  test.each([
+    ["static imports", 'import { helper } from "./helper.js";\nvoid helper;'],
+    ["named re-exports", 'export { helper } from "./helper.js";'],
+    ["dynamic imports", 'void import("./helper.js");'],
+    ["template-expression dynamic imports", 'const value = `${import("./helper.js")}`;'],
+    ["dynamic imports with trailing comments", 'void import("./helper.js" /* helper */);'],
+    ["dynamic imports with options", 'void import("./helper.js", { with: { type: "json" } });'],
+  ])("follows live %s with NodeNext specifiers", async (_kind, edge) => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(convexDir, "feed.ts", `${edge}\n${canonical("replicated", "query", "list")}`);
+      await file(convexDir, "helper.ts", "export const helper = 1;\n");
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.sourceFiles).toContain(path.join(convexDir, "helper.ts"));
+    });
+  });
+
+  test("keeps type-only preflight and device graph behavior distinct", async () => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.ts",
+        `import type { Helper } from "../local/helper.js";\n${canonical(
+          "replicated",
+          "query",
+          "list",
+        )}`,
+      );
+      await file(localDir, "helper.ts", "export type Helper = string;\n");
+
+      const bundle = await createFixtureBundle(root, localDir);
+
+      expect(bundle.sourceFiles).toContain(path.join(localDir, "helper.ts"));
     });
   });
 

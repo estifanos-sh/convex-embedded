@@ -15,7 +15,7 @@ import path from "node:path";
 
 import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
 import type { EmbeddedSchemaAnalysis } from "../schema";
-import { maskCommentsAndStrings } from "./scanner";
+import { maskCommentsAndStrings, readModuleEdges } from "./scanner";
 import {
   EMBEDDED_GENERATED_FORMAT_VERSION,
   toEmbeddedGeneratedSchema,
@@ -329,9 +329,8 @@ async function createEmbeddedBundleInner(
   for (const file of convexFiles) {
     const resolved = path.resolve(file);
     const source = sources.get(resolved)!;
-    for (const match of source.matchAll(STATIC_IMPORT)) {
-      const specifier = match[2]!;
-      if (/^(?:import|export)\s+type\b/.test(match[0]!)) continue;
+    for (const { specifier, typeOnly } of readModuleEdges(source)) {
+      if (typeOnly) continue;
       if (specifier === LOCAL_ENTRYPOINT) {
         throw new Error(
           `Convex module ${file} must not import ${LOCAL_ENTRYPOINT}; device-only functions live under the bundler local directories`,
@@ -797,9 +796,6 @@ function maskAmbientDeclarations(code: string): string {
   return output;
 }
 
-const STATIC_IMPORT =
-  /(?:\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?|\bimport\s*\()(["'])([^"']+)\1/g;
-
 interface ProjectResolver {
   baseUrl?: string;
   paths: Array<{ pattern: string; targets: string[] }>;
@@ -823,9 +819,7 @@ async function readDeviceImportGraph(options: {
     if (visited.has(file)) return;
     visited.add(file);
     const source = await readProjectSource(file, sources);
-    for (const match of source.matchAll(STATIC_IMPORT)) {
-      const specifier = match[2];
-      if (!specifier) continue;
+    for (const { specifier } of readModuleEdges(source)) {
       if (isGeneratedImport(file, specifier, generatedPath)) continue;
       const target = await resolveProjectImport(file, specifier, resolver);
       if (target === undefined) continue;
