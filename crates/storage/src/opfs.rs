@@ -14,9 +14,6 @@ struct OpfsFile {
     handle: i32,
 }
 
-unsafe impl Send for Opfs {}
-unsafe impl Sync for Opfs {}
-
 unsafe extern "C" {
     fn opfs_get_file(path: *const u8, path_len: usize) -> i32;
     fn opfs_close_file(handle: i32) -> i32;
