@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vite-plus/test";
 
+import type { DiagnosticEvent as EmbeddedEvent, EmbeddedDataEvent } from "../../src/events";
 import type { LocalBuilders } from "../../src/local";
 import { defineLocal, isLocalFunction } from "../../src/local/internal";
 import { NativeStore } from "../../src/node/native";
@@ -16,7 +17,7 @@ import {
   type EmbeddedSchemaDefinition,
   type ReplicatedDataModel,
 } from "../../src/schema";
-import type { RuntimeStorageWriter, StoreSchema } from "../../src/storage/types";
+import type { CommitOptions, RuntimeStorageWriter, StoreSchema } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { e } from "../../src/values";
 import { nativeModule } from "../testkit/native";
@@ -116,6 +117,81 @@ test("the devtools snapshot reads id mappings only for replicated tables", async
   };
 
   expect(snapshot.storage.idMappings).toEqual([]);
+});
+
+test("devtools keeps device-table writes device scoped and reactive", async () => {
+  const store = await deviceStore();
+  const commits: Array<{
+    batch: Parameters<RuntimeStorageWriter["commit"]>[0];
+    options: CommitOptions | undefined;
+  }> = [];
+  const commit = store.commit.bind(store);
+  store.commit = async (batch, options) => {
+    commits.push({ batch, options });
+    return commit(batch, options);
+  };
+  const module = draftsModule();
+  const runner = createRunner({ docs }, store, deviceStoreSchema, {
+    localModules: { "local/sync/drafts": () => Promise.resolve(module) },
+  });
+  await runner.localReady;
+  const events: EmbeddedEvent[] = [];
+  const unsubscribe = runner.subscribeEvents?.((event) => events.push(event));
+  await runner.runMutation(module.setCompact, { compact: false });
+  const rows = (await runner.devtools({ kind: "listRows", table: "preferences" })) as {
+    rows: Array<{ _id: string }>;
+  };
+  const id = rows.rows[0]?._id;
+  if (id === undefined) throw new Error("expected the device preference row");
+  const updates: string[][] = [];
+  const off = runner.onUpdate(module.readLabel, {}, (value) => updates.push(value as string[]));
+  expect(await nextUpdate(updates, 0)).toEqual(["initial"]);
+
+  const beforePatch = commits.length;
+  await runner.devtools({
+    fields: { label: "updated" },
+    id,
+    kind: "patchDocument",
+    table: "preferences",
+  });
+  expect(await nextUpdate(updates, 1)).toEqual(["updated"]);
+  expect(commits.slice(beforePatch)).toEqual([
+    expect.objectContaining({
+      batch: expect.objectContaining({
+        dataOnlyIds: [],
+        docWrites: [
+          expect.objectContaining({ cols: [["idx_compact", false]], id, table: "preferences" }),
+        ],
+      }),
+      options: { changes: "omit", source: "device" },
+    }),
+  ]);
+  const patchEvent = events.find(
+    (event): event is EmbeddedDataEvent =>
+      event.type === "data" &&
+      event.docWrites.some((write) => write.id === id && write.row.label === "updated"),
+  );
+  expect(patchEvent).toMatchObject({ source: "local", type: "data" });
+
+  const beforeDelete = commits.length;
+  await runner.devtools({ id, kind: "deleteDocument", table: "preferences" });
+  expect(await nextUpdate(updates, 2)).toEqual([]);
+  expect(commits.slice(beforeDelete)).toEqual([
+    expect.objectContaining({ options: { changes: "omit", source: "device" } }),
+  ]);
+  const deleteEvent = events.find(
+    (event): event is EmbeddedDataEvent =>
+      event.type === "data" && event.deletes.some((deleted) => deleted.id === id),
+  );
+  expect(deleteEvent).toMatchObject({ source: "local", type: "data" });
+
+  const afterDelete = commits.length;
+  await runner.devtools({ id, kind: "deleteDocument", table: "preferences" });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  expect(commits).toHaveLength(afterDelete);
+  expect(updates).toHaveLength(3);
+  off();
+  unsubscribe?.();
 });
 
 describe("device-only function modules", () => {
@@ -387,7 +463,7 @@ describe("device-only namespace typing", () => {
     const setCompact = device.mutation({
       args: { compact: v.boolean() },
       handler: async (ctx, args) => {
-        await ctx.db.insert("preferences", { compact: args.compact });
+        await ctx.db.insert("preferences", { compact: args.compact, label: "initial" });
       },
     });
     expect(isLocalFunction(setCompact)).toBe(true);
@@ -399,7 +475,9 @@ const deviceSchema = defineEmbeddedSchema({
     expanded: e.local(v.boolean()),
     title: v.string(),
   }),
-  preferences: localTable({ compact: v.boolean() }),
+  preferences: localTable({ compact: v.boolean(), label: v.string() }).index("by_compact", [
+    "compact",
+  ]),
 });
 const deviceStoreSchema = toRuntimeStoreSchema(deviceSchema);
 const device = defineLocal(deviceSchema);
@@ -423,7 +501,7 @@ function viewModule() {
     expandWithPreference: device.mutation({
       args: { compact: v.boolean(), documentId: v.id("documents") },
       handler: async (ctx, args) => {
-        await ctx.db.insert("preferences", { compact: args.compact });
+        await ctx.db.insert("preferences", { compact: args.compact, label: "initial" });
         await ctx.db.patch("documents", args.documentId, { expanded: true });
       },
     }),
@@ -464,6 +542,10 @@ function draftsModule() {
       handler: async (ctx) =>
         (await ctx.db.query("preferences").collect()).map((row) => row.compact),
     }),
+    readLabel: device.query({
+      args: {},
+      handler: async (ctx) => (await ctx.db.query("preferences").collect()).map((row) => row.label),
+    }),
     reset: device.mutation({
       args: {},
       handler: async (ctx) => {
@@ -473,7 +555,7 @@ function draftsModule() {
     setCompact: device.mutation({
       args: { compact: v.boolean() },
       handler: async (ctx, args) => {
-        await ctx.db.insert("preferences", { compact: args.compact });
+        await ctx.db.insert("preferences", { compact: args.compact, label: "initial" });
       },
     }),
   };

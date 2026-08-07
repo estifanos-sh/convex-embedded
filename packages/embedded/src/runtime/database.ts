@@ -633,7 +633,7 @@ export function createWriter<DM extends GenericDataModel>(
             : undefined;
         stage(def, id, mergedData, current._creationTime, {
           cols: previousCols,
-          dataOnly: !fresh && !previousCols,
+          dataOnly: view === "replicated" && !fresh && !previousCols,
         });
         return;
       }

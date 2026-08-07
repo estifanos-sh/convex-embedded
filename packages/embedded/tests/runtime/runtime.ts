@@ -2423,6 +2423,67 @@ describe("runtime", () => {
     expect(paths).not.toContain("convex.config");
   });
 
+  test("devtools app-record writes emit, notify, and leave missing deletes alone", async () => {
+    const r = await runner("rt_devtools_app_record_write.db");
+    const events: EmbeddedEvent[] = [];
+    const unsubscribe = r.subscribeEvents?.((event) => events.push(event));
+    const id = (await r.runMutation("messages:send", {
+      body: "before",
+      channel: "devtools",
+    })) as string;
+    const updates: Array<Array<{ body: string }>> = [];
+    const off = r.onUpdate("messages:list", { channel: "devtools" }, (value) => {
+      updates.push(value as Array<{ body: string }>);
+    });
+
+    expect((await nextUpdate(updates, 0)).map((row) => row.body)).toEqual(["before"]);
+    const beforePatch = events.length;
+    await r.devtools({
+      fields: { body: "after" },
+      id,
+      kind: "patchDocument",
+      table: "messages",
+    });
+    expect((await nextUpdate(updates, 1)).map((row) => row.body)).toEqual(["after"]);
+    const patchEvent = events
+      .slice(beforePatch)
+      .find(
+        (event): event is EmbeddedDataEvent =>
+          event.type === "data" &&
+          event.docWrites.some((write) => write.id === id && write.row.body === "after"),
+      );
+    expect(patchEvent).toMatchObject({
+      changedTables: expect.arrayContaining(["messages"]),
+      deletes: [],
+      source: "local",
+      type: "data",
+    });
+
+    const beforeDelete = events.length;
+    await r.devtools({ id, kind: "deleteDocument", table: "messages" });
+    expect(await nextUpdate(updates, 2)).toEqual([]);
+    const deleteEvent = events
+      .slice(beforeDelete)
+      .find(
+        (event): event is EmbeddedDataEvent =>
+          event.type === "data" && event.deletes.some((deleted) => deleted.id === id),
+      );
+    expect(deleteEvent).toMatchObject({
+      changedTables: expect.arrayContaining(["messages"]),
+      deletes: expect.arrayContaining([{ id, table: "messages" }]),
+      source: "local",
+      type: "data",
+    });
+
+    const afterDelete = events.filter((event) => event.type === "data").length;
+    await r.devtools({ id, kind: "deleteDocument", table: "messages" });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events.filter((event) => event.type === "data")).toHaveLength(afterDelete);
+    expect(updates).toHaveLength(3);
+    off();
+    unsubscribe?.();
+  });
+
   test("table/id overload rejects ids from another table", async () => {
     const r = await runner("rt_wrong_table_get.db");
     const id = (await r.runMutation("messages:send", { channel: "x", body: "x" })) as string;

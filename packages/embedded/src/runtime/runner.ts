@@ -72,6 +72,7 @@ import {
   hostedToLocal,
   toSchema,
   type DatabaseReader,
+  type DatabaseWriter,
   type Schema,
 } from "./database";
 import {
@@ -1564,7 +1565,7 @@ export function createRunner(
     const ledger = createLedgerReader(
       store,
       () => ledgerOpen && runnerMode === "setup",
-      deleteDoc,
+      docDelete,
       (table) => rootScope.schema.get(table)?.placement === "device",
     );
     try {
@@ -2324,46 +2325,43 @@ export function createRunner(
     if ("_id" in fields || "_creationTime" in fields) {
       throw new Error("devtools patch cannot change system fields.");
     }
-    const root = createWriter<GenericDataModel>(
-      store,
-      rootScope.schema,
-      undefined,
-      rootScope.schema.get(table)?.placement === "device" ? "device" : "replicated",
-    );
-    await root.db.patch(table as never, id as never, normalizeCopy(fields) as never);
-    const batch = root.toBatch();
-    const commit = await runSpan("storage.commit", () =>
-      store.commit(
-        batch,
-        rootScope.schema.get(table)?.placement === "device"
-          ? { changes: "omit", source: "device" }
-          : { changes: "omit", mutation: "none", source: "local" },
-      ),
-    );
-    if (hasEventListeners()) emitCommit(emit, commit, batch, "local");
-    scheduleNotify({ dataOnlyDocIds: new Map(), tables: new Set(commit.changedTables) });
+    await docWrite(table, async (db) => {
+      await db.patch(table as never, id as never, normalizeCopy(fields) as never);
+      return true;
+    });
   }
 
   async function devtoolsDelete(table: string, id: string): Promise<void> {
     if (!rootScope.schema.has(table)) {
       throw new Error(`devtools delete only supports app table rows: ${table}`);
     }
-    await deleteDoc(table, id);
+    await docDelete(table, id);
   }
 
   /** Delete one application record from either the active or candidate workspace. */
-  async function deleteDoc(table: string, id: string): Promise<void> {
+  async function docDelete(table: string, id: string): Promise<void> {
     if (!rootScope.schema.has(table)) {
       throw new Error(`document delete only supports app table rows: ${table}`);
     }
+    await docWrite(table, async (db) => {
+      if ((await db.get(table as never, id as never)) === null) return false;
+      await db.delete(table as never, id as never);
+      return true;
+    });
+  }
+
+  /** Commits a direct app-document write for devtools and setup deletion, with normal effects. */
+  async function docWrite(
+    table: string,
+    write: (db: DatabaseWriter<GenericDataModel>) => Promise<boolean>,
+  ): Promise<void> {
     const root = createWriter<GenericDataModel>(
       store,
       rootScope.schema,
       undefined,
       rootScope.schema.get(table)?.placement === "device" ? "device" : "replicated",
     );
-    if ((await root.db.get(table as never, id as never)) === null) return;
-    await root.db.delete(table as never, id as never);
+    if (!(await write(root.db))) return;
     const batch = root.toBatch();
     const commit = await runSpan("storage.commit", () =>
       store.commit(
