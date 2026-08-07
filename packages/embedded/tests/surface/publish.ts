@@ -10,15 +10,10 @@ describe("Embedded publishing workflow", () => {
   test("assembles every runtime before publishing the independently verified package", () => {
     const workflow = readFileSync(join(root, ".github/workflows/publish.yml"), "utf8");
 
-    for (const target of [
-      "darwin-arm64",
-      "darwin-x64",
-      "linux-arm64-gnu",
-      "linux-x64-gnu",
-      "win32-x64",
-    ]) {
+    for (const target of ["darwin-arm64", "linux-arm64-gnu", "linux-x64-gnu", "win32-x64"]) {
       expect(workflow).toContain(`target: ${target}`);
     }
+    expect(workflow).not.toContain("target: darwin-x64");
     expect(workflow).toContain("Build every Apple slice through the Expo hook");
     expect(workflow).toContain("Build every Android ABI through the Expo hook");
     expect(workflow).toContain("options: [blacksmith, depot]");

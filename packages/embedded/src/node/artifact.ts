@@ -32,6 +32,9 @@ const here = dirname(fileURLToPath(import.meta.url));
  * @internal
  */
 export function loadNativeModule(): NativeModule {
+  const explicit = process.env.CONVEX_EMBEDDED_NATIVE;
+  const unsupported = nativePlatformUnsupported();
+  if (!explicit && unsupported) throw new Error(unsupported);
   const candidates = nativeArtifactCandidates();
   const failures: string[] = [];
 
@@ -152,14 +155,27 @@ function nativeArtifactCandidates(): string[] {
   return unique([...(explicit ? [explicit] : []), ...devCandidates, ...packageCandidates]);
 }
 
-function nativeTarget(): string {
-  const arch = process.arch;
-  if (process.platform === "darwin") return `darwin-${arch}`;
-  if (process.platform === "win32") return `win32-${arch}`;
-  if (process.platform === "linux") {
+/** Return the actionable reason a Node target lacks a package-owned native artifact. @internal */
+export function nativePlatformUnsupported(
+  platform = process.platform,
+  arch = process.arch,
+): string | undefined {
+  if (platform === "darwin" && arch === "x64") {
+    return [
+      "Convex Embedded does not ship a prebuilt Node artifact for Intel macOS (darwin-x64).",
+      "Use an Apple Silicon Mac, or build a compatible .node artifact from source and set CONVEX_EMBEDDED_NATIVE to its absolute path.",
+    ].join(" ");
+  }
+  return undefined;
+}
+
+function nativeTarget(platform = process.platform, arch = process.arch): string {
+  if (platform === "darwin") return `darwin-${arch}`;
+  if (platform === "win32") return `win32-${arch}`;
+  if (platform === "linux") {
     return `linux-${arch}-${hasGlibc() ? "gnu" : "musl"}`;
   }
-  return `${process.platform}-${arch}`;
+  return `${platform}-${arch}`;
 }
 
 function hasGlibc(): boolean {

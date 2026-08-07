@@ -25,13 +25,7 @@ const preview2FixtureSha256 = "bd7e42b1af9227c31576c6fdcb08e87cf8a9136b4065e7318
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryDir = resolve(packageDir, "../..");
 const lifecycleScripts = ["install", "postinstall", "prepack", "prepare", "prepublishOnly"];
-const nodeTargets = [
-  "darwin-arm64",
-  "darwin-x64",
-  "linux-arm64-gnu",
-  "linux-x64-gnu",
-  "win32-x64",
-] as const;
+const nodeTargets = ["darwin-arm64", "linux-arm64-gnu", "linux-x64-gnu", "win32-x64"] as const;
 const androidAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] as const;
 const appleSlices = ["ios-arm64", "ios-arm64-simulator"] as const;
 

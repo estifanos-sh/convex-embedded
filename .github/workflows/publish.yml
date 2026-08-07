@@ -273,9 +273,6 @@ jobs:
           - blacksmith_runner: blacksmith-6vcpu-macos-15
             depot_runner: depot-macos-15
             target: darwin-arm64
-          - blacksmith_runner: macos-15-intel
-            depot_runner: macos-15-intel
-            target: darwin-x64
           - blacksmith_runner: blacksmith-8vcpu-windows-2025
             depot_runner: depot-windows-2025-8
             target: win32-x64
@@ -668,7 +665,7 @@ jobs:
             const body = `${marker}
             ## Complete Embedded package preview
 
-            This preview contains JavaScript, WASM, all five Node targets, both Apple slices, and all four Android ABIs. It is stored as an authenticated GitHub prerelease asset and is not published to npm.
+            This preview contains JavaScript, WASM, all four supported Node targets, both Apple slices, and all four Android ABIs. It is stored as an authenticated GitHub prerelease asset and is not published to npm.
 
             \`\`\`sh
             gh release download ${process.env.PREVIEW_TAG} --repo ${process.env.PREVIEW_REPOSITORY} --pattern convex-embedded.tgz --dir . --clobber

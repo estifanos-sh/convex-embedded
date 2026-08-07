@@ -7,7 +7,9 @@ local SQLite runtime owns the device projection and all Loro computation.
 ## Requirements
 
 - `convex` 1.43.0 or newer
-- Node.js 24 or newer for the Node runtime and package build tools
+- Node.js 24 or newer for the Node runtime and package build tools. Prebuilt Node artifacts support
+  Apple Silicon macOS, Linux x64/ARM64, and Windows x64; Intel macOS requires an explicitly supplied
+  source-built artifact.
 - Cross-origin isolation for browser builds that use the threaded WASM runtime
 
 Install the package alongside Convex:
@@ -26,7 +28,7 @@ pnpm add @estifanos-sh/convex-embedded@<version> convex
 ```
 
 The `package preview` pull-request label publishes an ephemeral package assembled from JavaScript,
-WASM, five Node targets, both Apple XCFramework slices, and all four Android ABIs. It is a GitHub
+WASM, four Node targets, both Apple XCFramework slices, and all four Android ABIs. It is a GitHub
 release asset, not an npm publication.
 
 Every npm publication is an explicit `publish.yml` workflow dispatch. Select `prerelease` or
