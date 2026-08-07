@@ -26,7 +26,7 @@ export function createNativeModuleLoader(resolve: () => NativeModule | null): ()
         [
           "Convex Embedded native storage is not linked into this application.",
           "Expo Go cannot load custom native modules; use an Expo development build or a release build.",
-          "After installing @convex-dev/embedded, rebuild the native application so Expo autolinking can include it.",
+          "After installing @estifanos-sh/convex-embedded, rebuild the native application so Expo autolinking can include it.",
         ].join(" "),
       );
     }

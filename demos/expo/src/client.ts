@@ -1,4 +1,4 @@
-import { ConvexEmbeddedClient } from "@convex-dev/embedded/expo";
+import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/expo";
 
 /** One native store and reactive cache for the lifetime of the application. */
 const scope = globalThis as typeof globalThis & {

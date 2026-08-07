@@ -11,7 +11,7 @@ await client.open(setup);
 `setup` is optional. When present, it is an imported internal local action with `{}` arguments and
 a `null` result. It is ordinary local Convex code: the action composes internal local queries and
 mutations through `ctx.runQuery` and `ctx.runMutation`. There is no migration registry, migration
-folder, string function name, raw-record callback, or `@convex-dev/embedded/migrations` export.
+folder, string function name, raw-record callback, or `@estifanos-sh/convex-embedded/migrations` export.
 
 The optional action does not enable the store migration mechanism. Every `open()` runs the same
 package-owned candidate-generation protocol. Package layout and codec upgrades therefore remain
@@ -53,7 +53,7 @@ export const setup = local.internalAction({
 Application startup imports the typed value and passes it directly:
 
 ```ts
-import { ConvexEmbeddedClient } from "@convex-dev/embedded/browser";
+import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/browser";
 import { setup } from "../local/setup";
 
 const client = new ConvexEmbeddedClient({ url });

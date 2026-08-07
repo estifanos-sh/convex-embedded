@@ -1,4 +1,4 @@
-name: Robelest package
+name: Embedded package
 
 on:
   pull_request:
@@ -18,11 +18,17 @@ on:
         default: main
         type: string
       tag:
-        description: Robelest release tag to create after validation; required for npm modes
+        description: Embedded release tag to create after validation; required for npm modes
         required: false
         type: string
+      provider:
+        description: Managed runner provider for native build and qualification jobs
+        required: true
+        default: blacksmith
+        type: choice
+        options: [blacksmith, depot]
 concurrency:
-  group: robelest-package-${{ inputs.tag || inputs.ref || github.event.pull_request.number || github.ref_name }}
+  group: embedded-package-${{ inputs.tag || inputs.ref || github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -35,7 +41,6 @@ env:
 jobs:
   gate:
     name: Package build gate
-    if: github.repository == 'get-convex/embedded'
     runs-on: ubuntu-24.04
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}
@@ -53,25 +58,27 @@ jobs:
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_REF: ${{ inputs.ref }}
           INPUT_TAG: ${{ inputs.tag }}
+          WORKFLOW_REF: ${{ github.ref }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           PACKAGE_PREVIEW: ${{ contains(github.event.pull_request.labels.*.name, 'package preview') }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
-          REPOSITORY: ${{ github.repository }}
         run: |
           echo "enabled=false" >> "$GITHUB_OUTPUT"
-          if [[ "$REPOSITORY" != "get-convex/embedded" ]]; then
-            exit 0
-          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+              echo "::error::Package releases must dispatch the reviewed workflow from main."
+              exit 1
+            fi
             echo "enabled=true" >> "$GITHUB_OUTPUT"
             echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
             if [[ "$INPUT_MODE" == "release" || "$INPUT_MODE" == "prerelease" ]]; then
               if [[ -z "$INPUT_TAG" ]]; then
-                echo "::error::Prerelease and release modes require a robelest-v* tag."
+                echo "::error::Prerelease and release modes require a v* tag."
                 exit 1
               fi
-              VERSION=${INPUT_TAG#robelest-v}
+              VERSION=${INPUT_TAG#v}
               if [[ "$VERSION" == "$INPUT_TAG" || -z "$VERSION" ]]; then
-                echo "::error::Prerelease and release tags must use robelest-v<version>."
+                echo "::error::Prerelease and release tags must use v<version>."
                 exit 1
               fi
               if [[ "$INPUT_MODE" == "prerelease" && "$VERSION" != *-* ]]; then
@@ -117,7 +124,7 @@ jobs:
             # Credentials are deliberately removed from this job, so a second fetch here would
             # turn an otherwise valid release gate into an interactive-authentication failure.
             if ! git merge-base --is-ancestor "$SOURCE_SHA" origin/main; then
-              echo "::error::Robelest npm releases must build a commit already reachable from main."
+              echo "::error::Embedded npm releases must build a commit already reachable from main."
               exit 1
             fi
             if git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
@@ -131,12 +138,11 @@ jobs:
 
   qualification:
     name: Qualify exact source for publication
-    # Preview PR code stays on GitHub-hosted hardware. A manually dispatched release is trusted
-    # code from main and can use the organization-managed ARM64 xlarge pool for its Rust, WASM,
-    # and migration-heavy qualification work.
+    # This job is deliberately credential-free. The provider choice changes only native build
+    # performance; release authority stays in GitHub-hosted tag and npm OIDC jobs below.
     needs: [gate, javascript]
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["self-hosted", "linux", "arm64", "xlarge"]' || '["large-runner"]') }}
+    runs-on: ${{ inputs.provider == 'depot' && 'depot-ubuntu-24.04-8' || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 60
 
     steps:
@@ -158,14 +164,14 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: robelest-qualification
+          shared-key: embedded-qualification
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
       - name: Download exact JavaScript and WASM artifact
         uses: actions/download-artifact@v8
         with:
-          name: robelest-dist
+          name: embedded-dist
           path: packages/embedded/dist
 
       - name: Check source contracts and reachability
@@ -201,7 +207,7 @@ jobs:
     name: Build JavaScript and WASM
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["self-hosted", "linux", "arm64", "xlarge"]' || '["large-runner"]') }}
+    runs-on: ${{ inputs.provider == 'depot' && 'depot-ubuntu-24.04-8' || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 45
 
     steps:
@@ -215,7 +221,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: robelest-wasm
+          shared-key: embedded-wasm
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
@@ -232,16 +238,16 @@ jobs:
           CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
         run: |
           node packages/embedded/scripts/publish.ts prepare-build
-          vp run '@convex-dev/embedded#build:ts'
-          vp run '@convex-dev/embedded#test:surface'
+          vp run '@estifanos-sh/convex-embedded#build:ts'
+          vp run '@estifanos-sh/convex-embedded#test:surface'
 
       - name: Build WASM
-        run: vp run '@convex-dev/embedded#wasm'
+        run: vp run '@estifanos-sh/convex-embedded#wasm'
 
       - name: Upload JavaScript and WASM
         uses: actions/upload-artifact@v7
         with:
-          name: robelest-dist
+          name: embedded-dist
           path: packages/embedded/dist
           if-no-files-found: error
           retention-days: 2
@@ -250,28 +256,26 @@ jobs:
     name: Build Node ${{ matrix.target }}
     needs: [gate, javascript]
     if: needs.gate.outputs.enabled == 'true'
-    # Only manually dispatched releases use the organization-managed ARM64 runners. PR previews
-    # execute contributor code and remain on GitHub-hosted runners.
-    runs-on: ${{ fromJSON(github.event_name == 'workflow_dispatch' && matrix.release_runner || matrix.runner) }}
+    runs-on: ${{ inputs.provider == 'depot' && matrix.depot_runner || matrix.blacksmith_runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: '["large-runner"]'
-            release_runner: '["large-runner"]'
+          - blacksmith_runner: blacksmith-8vcpu-ubuntu-2404
+            depot_runner: depot-ubuntu-24.04-8
             target: linux-x64-gnu
-          - runner: '["ubuntu-24.04-arm"]'
-            release_runner: '["self-hosted", "linux", "arm64", "large"]'
+          - blacksmith_runner: blacksmith-8vcpu-ubuntu-2404-arm
+            depot_runner: depot-ubuntu-24.04-arm-8
             target: linux-arm64-gnu
-          - runner: '["macos-15"]'
-            release_runner: '["macos-15"]'
+          - blacksmith_runner: blacksmith-6vcpu-macos-15
+            depot_runner: depot-macos-15
             target: darwin-arm64
-          - runner: '["macos-15-intel"]'
-            release_runner: '["macos-15-intel"]'
+          - blacksmith_runner: macos-15-intel
+            depot_runner: macos-15-intel
             target: darwin-x64
-          - runner: '["windows-2025"]'
-            release_runner: '["windows-2025"]'
+          - blacksmith_runner: blacksmith-8vcpu-windows-2025
+            depot_runner: depot-windows-2025-8
             target: win32-x64
 
     steps:
@@ -285,7 +289,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: robelest-node-${{ matrix.target }}
+          shared-key: embedded-node-${{ matrix.target }}
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
@@ -300,25 +304,25 @@ jobs:
       - name: Download JavaScript bundle for the Node smoke test
         uses: actions/download-artifact@v8
         with:
-          name: robelest-dist
+          name: embedded-dist
           path: packages/embedded/dist
 
       - name: Build and load Node addon
         run: |
-          vp run '@convex-dev/embedded#native'
-          vp run '@convex-dev/embedded#test:node'
+          vp run '@estifanos-sh/convex-embedded#native'
+          vp run '@estifanos-sh/convex-embedded#test:node'
 
       - name: Verify packaged Linux Node durability
         if: matrix.target == 'linux-x64-gnu'
         run: |
-          vp run '@convex-dev/embedded#test:fixture:node'
-          vp run '@convex-dev/embedded#test:stress:node'
-          vp run '@convex-dev/embedded#test:kill:node'
+          vp run '@estifanos-sh/convex-embedded#test:fixture:node'
+          vp run '@estifanos-sh/convex-embedded#test:stress:node'
+          vp run '@estifanos-sh/convex-embedded#test:kill:node'
 
       - name: Upload Node addon
         uses: actions/upload-artifact@v7
         with:
-          name: robelest-node-${{ matrix.target }}
+          name: embedded-node-${{ matrix.target }}
           path: packages/embedded/dist/native
           if-no-files-found: error
           retention-days: 2
@@ -327,7 +331,7 @@ jobs:
     name: Build complete Apple XCFramework
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: macos-15
+    runs-on: ${{ inputs.provider == 'depot' && 'depot-macos-15' || 'blacksmith-6vcpu-macos-15' }}
     timeout-minutes: 90
 
     steps:
@@ -340,7 +344,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: robelest-apple
+          shared-key: embedded-apple
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
@@ -368,7 +372,7 @@ jobs:
       - name: Upload Apple XCFramework
         uses: actions/upload-artifact@v7
         with:
-          name: robelest-apple
+          name: embedded-apple
           path: packages/embedded/native/apple
           if-no-files-found: error
           retention-days: 2
@@ -377,9 +381,8 @@ jobs:
     name: Build complete Android libraries
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
-    # The complete four-ABI cargo-ndk build exceeds a standard runner's workspace. Keep this on the
-    # same repository-managed runner class as the existing full native release workflow.
-    runs-on: large-runner
+    # The complete four-ABI cargo-ndk build needs the largest Linux allocation on either provider.
+    runs-on: ${{ inputs.provider == 'depot' && 'depot-ubuntu-24.04-16' || 'blacksmith-16vcpu-ubuntu-2404' }}
     timeout-minutes: 120
 
     steps:
@@ -392,7 +395,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: robelest-android
+          shared-key: embedded-android
           key: ${{ hashFiles('rust-toolchain.toml') }}
           cache-on-failure: true
 
@@ -429,7 +432,7 @@ jobs:
       - name: Upload Android libraries
         uses: actions/upload-artifact@v7
         with:
-          name: robelest-android
+          name: embedded-android
           path: packages/embedded/native/android
           if-no-files-found: error
           retention-days: 2
@@ -480,34 +483,34 @@ jobs:
       - name: Download JavaScript and WASM
         uses: actions/download-artifact@v8
         with:
-          name: robelest-dist
+          name: embedded-dist
           path: packages/embedded/dist
 
       - name: Download Node addons
         uses: actions/download-artifact@v8
         with:
-          pattern: robelest-node-*
+          pattern: embedded-node-*
           path: packages/embedded/dist/native
           merge-multiple: true
 
       - name: Download Apple XCFramework
         uses: actions/download-artifact@v8
         with:
-          name: robelest-apple
+          name: embedded-apple
           path: packages/embedded/native/apple
 
       - name: Download Android libraries
         uses: actions/download-artifact@v8
         with:
-          name: robelest-android
+          name: embedded-android
           path: packages/embedded/native/android
 
       - name: Verify native artifacts
         run: |
           node packages/embedded/scripts/mobile.ts verify
-          vp run '@convex-dev/embedded#test:node'
+          vp run '@estifanos-sh/convex-embedded#test:node'
 
-      - name: Prepare and pack the guarded Robelest package
+      - name: Prepare and pack the verified Embedded package
         env:
           CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
         run: |
@@ -533,7 +536,7 @@ jobs:
       - name: Upload assembled package
         uses: actions/upload-artifact@v7
         with:
-          name: robelest-package
+          name: embedded-package
           path: artifacts/convex-embedded.tgz
           if-no-files-found: error
           retention-days: 2
@@ -590,13 +593,13 @@ jobs:
               echo "::error::Tag $RELEASE_TAG must be annotated with its assembled package digest."
               exit 1
             fi
-            if ! git cat-file -p "refs/tags/$RELEASE_TAG" | grep -Fq "Robelest package SHA-256: $ASSEMBLED_TARBALL_SHA256"; then
+            if ! git cat-file -p "refs/tags/$RELEASE_TAG" | grep -Fq "Embedded package SHA-256: $ASSEMBLED_TARBALL_SHA256"; then
               echo "::error::Tag $RELEASE_TAG is not bound to the assembled package digest."
               exit 1
             fi
           else
             git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              tag -a "$RELEASE_TAG" "$EXPECTED_SHA" -m "Robelest package SHA-256: $ASSEMBLED_TARBALL_SHA256"
+              tag -a "$RELEASE_TAG" "$EXPECTED_SHA" -m "Embedded package SHA-256: $ASSEMBLED_TARBALL_SHA256"
             git push origin "refs/tags/$RELEASE_TAG"
           fi
 
@@ -619,7 +622,7 @@ jobs:
       - name: Download assembled package
         uses: actions/download-artifact@v8
         with:
-          name: robelest-package
+          name: embedded-package
           path: artifacts
 
       - name: Publish package preview prerelease
@@ -629,9 +632,9 @@ jobs:
           SHA: ${{ needs.assemble.outputs.sha }}
         run: |
           SHORT_SHA=${SHA:0:12}
-          TAG="robelest-preview-$SHORT_SHA"
+          TAG="embedded-preview-$SHORT_SHA"
           TITLE="Embedded preview $SHORT_SHA"
-          NOTES="Complete @robelest/convex-embedded preview assembled from $SHA. This is not an npm release."
+          NOTES="Complete @estifanos-sh/convex-embedded preview assembled from $SHA. This is not an npm release."
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" artifacts/convex-embedded.tgz \
@@ -667,7 +670,7 @@ jobs:
 
             \`\`\`sh
             gh release download ${process.env.PREVIEW_TAG} --repo ${process.env.PREVIEW_REPOSITORY} --pattern convex-embedded.tgz --dir . --clobber
-            pnpm add "@convex-dev/embedded@file:./convex-embedded.tgz" convex
+            pnpm add "@estifanos-sh/convex-embedded@file:./convex-embedded.tgz" convex
             \`\`\`
 
             Source: \`${process.env.SOURCE_SHA}\``;
@@ -706,11 +709,11 @@ jobs:
             echo
             echo "\`gh release download $PREVIEW_TAG --repo $GITHUB_REPOSITORY --pattern convex-embedded.tgz --dir . --clobber\`"
             echo
-            echo "\`pnpm add \"@convex-dev/embedded@file:./convex-embedded.tgz\" convex\`"
+            echo "\`pnpm add \"@estifanos-sh/convex-embedded@file:./convex-embedded.tgz\" convex\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
-    name: Publish Robelest npm package
+    name: Publish Embedded npm package
     needs: [gate, qualification, assemble, release-tag]
     if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
     runs-on: ubuntu-24.04
@@ -738,7 +741,7 @@ jobs:
       - name: Download assembled package
         uses: actions/download-artifact@v8
         with:
-          name: robelest-package
+          name: embedded-package
           path: artifacts
 
       - name: Resolve release metadata
@@ -757,9 +760,9 @@ jobs:
             tar -xOzf artifacts/convex-embedded.tgz package/package.json |
               node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version"
           )
-          TAG="robelest-v$VERSION"
+          TAG="v$VERSION"
 
-          if [[ "$PACKAGE_NAME" != "@robelest/convex-embedded" ]]; then
+          if [[ "$PACKAGE_NAME" != "@estifanos-sh/convex-embedded" ]]; then
             echo "::error::Refusing to publish unexpected package $PACKAGE_NAME."
             exit 1
           fi
@@ -776,7 +779,7 @@ jobs:
             echo "::error::Downloaded package digest $ACTUAL_TARBALL_SHA256 does not match release tag digest $EXPECTED_TARBALL_SHA256."
             exit 1
           fi
-          if ! git cat-file -p "refs/tags/$RELEASE_TAG" | grep -Fq "Robelest package SHA-256: $EXPECTED_TARBALL_SHA256"; then
+          if ! git cat-file -p "refs/tags/$RELEASE_TAG" | grep -Fq "Embedded package SHA-256: $EXPECTED_TARBALL_SHA256"; then
             echo "::error::Release tag $RELEASE_TAG is not bound to the downloaded package digest."
             exit 1
           fi
@@ -790,21 +793,23 @@ jobs:
           echo "package=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          # The Robelest scope is the pre-official test channel. Its newest
+          # The Embedded scope is the pre-official test channel. Its newest
           # qualified package must also be the default installation target,
           # including prereleases.
           echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
           echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
 
-      # npm Trusted Publishing supports private/internal repositories, but its
-      # public Sigstore provenance attestations do not. Keep the short-lived
-      # OIDC credential while explicitly disabling provenance until this
-      # repository is public.
+      # Trusted publishing is bound by npm to this repository's workflow and emits provenance
+      # for the public package. A copied workflow has no authority to obtain this credential.
       - name: Publish package with trusted publishing
         if: steps.release.outputs.published != 'true'
         env:
-          NPM_CONFIG_PROVENANCE: "false"
+          NPM_CONFIG_PROVENANCE: "true"
         run: npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public --tag "${{ steps.release.outputs.dist_tag }}"
+
+      - name: Move prerelease channel
+        if: needs.gate.outputs.mode == 'prerelease'
+        run: npm dist-tag add "${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}" preview
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3

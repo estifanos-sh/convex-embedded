@@ -1,6 +1,6 @@
 import path from "node:path";
 
-import { withConvexEmbedded } from "@convex-dev/embedded/metro";
+import { withConvexEmbedded } from "@estifanos-sh/convex-embedded/metro";
 import { getDefaultConfig } from "expo/metro-config";
 
 import schema from "../../convex/schema";

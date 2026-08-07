@@ -3,8 +3,8 @@
  *
  * @remarks
  * Most applications import {@link ConvexEmbeddedClient} from
- * `@convex-dev/embedded/browser` or from the separate
- * `@convex-dev/embedded/node` entrypoint. This module holds the shared types and
+ * `@estifanos-sh/convex-embedded/browser` or from the separate
+ * `@estifanos-sh/convex-embedded/node` entrypoint. This module holds the shared types and
  * base client implementation used by those public entrypoints and by internal
  * test runtimes.
  *

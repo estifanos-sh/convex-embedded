@@ -33,7 +33,10 @@ export default async function setup(): Promise<void> {
       { cause },
     );
   }
-  if (result.fixture !== "@convex-dev/embedded/remote-test-fixture" || result.version !== 1) {
+  if (
+    result.fixture !== "@estifanos-sh/convex-embedded/remote-test-fixture" ||
+    result.version !== 1
+  ) {
     throw new Error(`The Convex deployment at ${url} returned an incompatible fixture contract.`);
   }
 }

@@ -6,8 +6,8 @@ import { useBlockNoteEditor, useCreateBlockNote, useEditorState } from "@blockno
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 
-import { createTextField } from "@convex-dev/embedded/internal/text";
-import type { TextFieldWriter } from "@convex-dev/embedded/internal/text";
+import { createTextField } from "@estifanos-sh/convex-embedded/internal/text";
+import type { TextFieldWriter } from "@estifanos-sh/convex-embedded/internal/text";
 
 import "./editor.css";
 import {

@@ -2,12 +2,12 @@
  * Node client entrypoint for embedded Convex.
  *
  * @remarks
- * Import from `@convex-dev/embedded/node` when running Convex functions in a
+ * Import from `@estifanos-sh/convex-embedded/node` when running Convex functions in a
  * Node process with the Rust/NAPI storage backend.
  *
  * @example
  * ```ts
- * import { ConvexEmbeddedClient } from "@convex-dev/embedded/node";
+ * import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/node";
  * import { api } from "../convex/_generated/api";
  * import schema from "../convex/schema";
  *

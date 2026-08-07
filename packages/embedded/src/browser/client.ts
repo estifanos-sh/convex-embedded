@@ -2,7 +2,7 @@
  * Browser implementation of the embedded Convex client.
  *
  * @remarks
- * This module is re-exported by `@convex-dev/embedded/browser`. Prefer that
+ * This module is re-exported by `@estifanos-sh/convex-embedded/browser`. Prefer that
  * package entrypoint in application code so the generated virtual modules are
  * initialized before the client starts.
  *
@@ -112,7 +112,7 @@ export function setBrowserLocalModules(modules: LocalModuleMap | undefined): voi
  *
  * @example
  * ```ts
- * import { ConvexEmbeddedClient } from "@convex-dev/embedded/browser";
+ * import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/browser";
  * import { api } from "../convex/_generated/api";
  *
  * const client = new ConvexEmbeddedClient();
@@ -537,7 +537,7 @@ function defaultRuntimeWorker(): EmbeddedWorkerSource {
 function assertDedicatedWorkerSupport(): void {
   if (typeof Worker === "undefined") {
     throw new Error(
-      "ConvexEmbeddedClient browser runtime requires Dedicated Worker support. This browser cannot run @convex-dev/embedded/browser.",
+      "ConvexEmbeddedClient browser runtime requires Dedicated Worker support. This browser cannot run @estifanos-sh/convex-embedded/browser.",
     );
   }
 }

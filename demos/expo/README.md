@@ -11,10 +11,10 @@ From the repository root, install dependencies, build the artifact for your plat
 
 ```sh
 vp install
-vp run @convex-dev/embedded-demo-expo#build:package
-vp run @convex-dev/embedded-demo-expo#native:ios
-# or: vp run @convex-dev/embedded-demo-expo#native:android
-vp run @convex-dev/embedded-demo-expo#typecheck
+vp run @estifanos-sh/convex-embedded-demo-expo#build:package
+vp run @estifanos-sh/convex-embedded-demo-expo#native:ios
+# or: vp run @estifanos-sh/convex-embedded-demo-expo#native:android
+vp run @estifanos-sh/convex-embedded-demo-expo#typecheck
 ```
 
 Metro and the browser Vite demo share `VITE_CONVEX_URL` from the repository root `.env.local`.
@@ -27,8 +27,8 @@ demo.
 Build and open a native development app with one of these commands:
 
 ```sh
-vp run @convex-dev/embedded-demo-expo#ios
-vp run @convex-dev/embedded-demo-expo#android
+vp run @estifanos-sh/convex-embedded-demo-expo#ios
+vp run @estifanos-sh/convex-embedded-demo-expo#android
 ```
 
 The demo `ios` and `android` scripts first build the package's TypeScript exports, then install the
@@ -50,7 +50,7 @@ environment variables still take precedence for custom SDK installations.
 After the native app exists, Metro can be started separately with:
 
 ```sh
-vp run @convex-dev/embedded-demo-expo#start
+vp run @estifanos-sh/convex-embedded-demo-expo#start
 ```
 
 Restart Metro whenever the Convex schema or a device function changes. The Metro adapter regenerates

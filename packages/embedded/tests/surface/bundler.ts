@@ -381,11 +381,11 @@ export const replicated = null;
       await file(
         convexDir,
         "device.ts",
-        `import { local } from "@convex-dev/embedded/local";\nvoid local;\n`,
+        `import { local } from "@estifanos-sh/convex-embedded/local";\nvoid local;\n`,
       );
 
       await expect(createFixtureBundle(root)).rejects.toThrow(
-        "must not import @convex-dev/embedded/local",
+        "must not import @estifanos-sh/convex-embedded/local",
       );
     });
   });
@@ -1624,7 +1624,7 @@ void modules.messages;
           alias: {
             "convex/server": convexServerPath,
             "convex/values": convexValuesPath,
-            "@convex-dev/embedded/server": embeddedServerPath,
+            "@estifanos-sh/convex-embedded/server": embeddedServerPath,
           },
         },
         root,
@@ -1652,7 +1652,7 @@ void modules.messages;
         root,
         resolve: {
           alias: {
-            "@convex-dev/embedded/server": embeddedServerPath,
+            "@estifanos-sh/convex-embedded/server": embeddedServerPath,
             "convex/server": convexServerPath,
             "convex/values": convexValuesPath,
           },
@@ -1738,7 +1738,7 @@ export const query = queryGeneric;
   await file(
     convexDir,
     "embedded.ts",
-    `import { defineEmbedded } from "@convex-dev/embedded/server";
+    `import { defineEmbedded } from "@estifanos-sh/convex-embedded/server";
 import { components } from "./_generated/api";
 import schema from "./schema";
 import { mutation, query } from "./_generated/server";

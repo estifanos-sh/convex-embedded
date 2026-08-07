@@ -13,22 +13,22 @@ commands.
 Correctness smoke:
 
 ```sh
-vp run @convex-dev/embedded#test:metal
+vp run @estifanos-sh/convex-embedded#test:metal
 ```
 
 Small hosted scale smoke:
 
 ```sh
-vp run @convex-dev/embedded#bench:metal:scale -- --clients 2 --revs 1 --duration-ms 100 --timeout-ms 90000 --skip-rev-list --out tests/bench/.out/metal-scale-smoke.json
+vp run @estifanos-sh/convex-embedded#bench:metal:scale -- --clients 2 --revs 1 --duration-ms 100 --timeout-ms 90000 --skip-rev-list --out tests/bench/.out/metal-scale-smoke.json
 ```
 
 Default hosted scale matrix:
 
 ```sh
-vp run @convex-dev/embedded#bench:metal:reconnect
-vp run @convex-dev/embedded#bench:metal:scale
-vp run @convex-dev/embedded#bench:metal:scale:matrix
-vp run @convex-dev/embedded#bench:metal:scale:manual
+vp run @estifanos-sh/convex-embedded#bench:metal:reconnect
+vp run @estifanos-sh/convex-embedded#bench:metal:scale
+vp run @estifanos-sh/convex-embedded#bench:metal:scale:matrix
+vp run @estifanos-sh/convex-embedded#bench:metal:scale:manual
 ```
 
 `bench:metal:scale:matrix` runs `5`, `10`, and `20` clients with `10,000` revs

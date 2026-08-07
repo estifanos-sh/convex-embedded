@@ -105,7 +105,7 @@ jobs:
         run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Build embedded TypeScript
-        run: vp run @convex-dev/embedded#build:ts
+        run: vp run @estifanos-sh/convex-embedded#build:ts
 
       # The preview job packs this exact tree instead of rebuilding it, so upload before the
       # native addon step writes the host-only dist/native artifact into the same directory.
@@ -118,20 +118,20 @@ jobs:
           retention-days: 1
 
       - name: Typecheck Expo demo
-        run: vp run @convex-dev/embedded-demo-expo#typecheck
+        run: vp run @estifanos-sh/convex-embedded-demo-expo#typecheck
 
       - name: Test Expo editor helpers
-        run: vp run @convex-dev/embedded-demo-expo#test
+        run: vp run @estifanos-sh/convex-embedded-demo-expo#test
 
-      # Bundling the demo validates the @convex-dev/embedded metro and expo entrypoints.
+      # Bundling the demo validates the @estifanos-sh/convex-embedded metro and expo entrypoints.
       # The demo's metro config wires its own client-safe deployment URL into the bundle;
       # a build-only value satisfies it since an export never connects to a backend.
       - name: Export Expo bundles
         env:
           VITE_CONVEX_URL: https://embedded-ci.convex.cloud
         run: |
-          vp run @convex-dev/embedded-demo-expo#export:ios
-          vp run @convex-dev/embedded-demo-expo#export:android
+          vp run @estifanos-sh/convex-embedded-demo-expo#export:ios
+          vp run @estifanos-sh/convex-embedded-demo-expo#export:android
 
       - name: Check
         run: |
@@ -140,15 +140,15 @@ jobs:
           vp run clippy
 
       - name: Build the node native addon
-        run: vp run @convex-dev/embedded#native
+        run: vp run @estifanos-sh/convex-embedded#native
 
       - name: Test embedded
         run: |
-          vp run @convex-dev/embedded#test:unit
-          vp run @convex-dev/embedded#test:storage
-          vp run @convex-dev/embedded#test:server
-          vp run @convex-dev/embedded#test:surface
-          vp run @convex-dev/embedded#test:runtime
+          vp run @estifanos-sh/convex-embedded#test:unit
+          vp run @estifanos-sh/convex-embedded#test:storage
+          vp run @estifanos-sh/convex-embedded#test:server
+          vp run @estifanos-sh/convex-embedded#test:surface
+          vp run @estifanos-sh/convex-embedded#test:runtime
 
   wasm:
     name: Build wasm
@@ -187,7 +187,7 @@ jobs:
         run: echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Build the WASM runtime
-        run: vp run @convex-dev/embedded#wasm
+        run: vp run @estifanos-sh/convex-embedded#wasm
 
       - name: Upload the WASM runtime
         uses: actions/upload-artifact@v7

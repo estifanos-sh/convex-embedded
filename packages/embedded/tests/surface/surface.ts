@@ -408,7 +408,7 @@ describe("package entrypoint contract", () => {
   }
 
   test("the public local entry is types-only", async () => {
-    const local = await import("@convex-dev/embedded/local");
+    const local = await import("@estifanos-sh/convex-embedded/local");
     expect(Object.keys(local)).toEqual([]);
     for (const name of [
       "EMBEDDED_LOCAL_REFERENCE",
@@ -424,7 +424,7 @@ describe("package entrypoint contract", () => {
   });
 
   test("the generated-only local entry exposes only generated runtime helpers", async () => {
-    const internal = await import("@convex-dev/embedded/internal/local");
+    const internal = await import("@estifanos-sh/convex-embedded/internal/local");
     expect(Object.keys(internal).sort()).toEqual([
       "createLocalFacade",
       "defineLocal",
@@ -446,13 +446,13 @@ describe("package entrypoint contract", () => {
   });
 
   test("the Metro package entry is safe to require from CommonJS", () => {
-    const metro = require("@convex-dev/embedded/metro") as Record<string, unknown>;
+    const metro = require("@estifanos-sh/convex-embedded/metro") as Record<string, unknown>;
     expect(typeof metro.withConvexEmbedded).toBe("function");
   });
 
   test("schema-definition package entries are safe to require from CommonJS", () => {
-    const schema = require("@convex-dev/embedded/schema") as Record<string, unknown>;
-    const values = require("@convex-dev/embedded/values") as Record<string, unknown>;
+    const schema = require("@estifanos-sh/convex-embedded/schema") as Record<string, unknown>;
+    const values = require("@estifanos-sh/convex-embedded/values") as Record<string, unknown>;
 
     expect(typeof schema.defineEmbeddedSchema).toBe("function");
     expect(typeof schema.replicatedTable).toBe("function");
@@ -500,7 +500,7 @@ describe("package entrypoint contract", () => {
       join(consumer, "package.json"),
       JSON.stringify({ name: "embedded-entrypoint-consumer", private: true, type: "module" }),
     );
-    const installed = join(consumer, "node_modules", "@convex-dev", "embedded");
+    const installed = join(consumer, "node_modules", "@estifanos-sh", "convex-embedded");
     mkdirSync(dirname(installed), { recursive: true });
     execFileSync("tar", ["-xzf", join(destination, tarball), "-C", consumer], { stdio: "pipe" });
     renameSync(join(consumer, "package"), installed);
@@ -524,29 +524,29 @@ describe("package entrypoint contract", () => {
     );
     writeFileSync(
       join(consumer, "index.ts"),
-      `import type { LocalBuilders } from "@convex-dev/embedded/local";
+      `import type { LocalBuilders } from "@estifanos-sh/convex-embedded/local";
 
 export type LocalContract = LocalBuilders<any>;
 
 // @ts-expect-error Generated modules, not app code, own the builder factory.
-import { defineLocal } from "@convex-dev/embedded/local";
+import { defineLocal } from "@estifanos-sh/convex-embedded/local";
 // @ts-expect-error Generated modules export the schema-bound local value.
-import { local } from "@convex-dev/embedded/local";
+import { local } from "@estifanos-sh/convex-embedded/local";
 // @ts-expect-error Local stamping stays package-private.
-import { stampLocal } from "@convex-dev/embedded/local";
+import { stampLocal } from "@estifanos-sh/convex-embedded/local";
 // @ts-expect-error Local references stay package-private.
-import { localReferenceName } from "@convex-dev/embedded/local";
+import { localReferenceName } from "@estifanos-sh/convex-embedded/local";
 // @ts-expect-error The marker is package-private.
-import { EMBEDDED_LOCAL_REFERENCE } from "@convex-dev/embedded/local";
+import { EMBEDDED_LOCAL_REFERENCE } from "@estifanos-sh/convex-embedded/local";
 // @ts-expect-error Ambient registration was removed.
-import type { Register } from "@convex-dev/embedded/local";
+import type { Register } from "@estifanos-sh/convex-embedded/local";
 
 void [defineLocal, local, stampLocal, localReferenceName, EMBEDDED_LOCAL_REFERENCE];
 `,
     );
     writeFileSync(
       join(consumer, "runtime.mjs"),
-      `import * as local from "@convex-dev/embedded/local";
+      `import * as local from "@estifanos-sh/convex-embedded/local";
 if (Object.keys(local).length !== 0) throw new Error("public local runtime exports must be empty");
 `,
     );

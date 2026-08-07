@@ -431,7 +431,7 @@ function runScaleCase(
   const out = `tests/bench/.out/${mode}-${entry.clients}clients-${entry.revs}${volumeNoun}${skipSuffix}-${timestamp()}.json`;
   const args = [
     "run",
-    "@convex-dev/embedded#bench",
+    "@estifanos-sh/convex-embedded#bench",
     `--${mode}`,
     "--clients",
     String(entry.clients),

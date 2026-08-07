@@ -8,9 +8,9 @@ Pod::Spec.new do |s|
   s.summary = package["description"]
   s.description = package["description"]
   s.license = package["license"] || "MIT"
-  s.author = package["author"] || "Convex"
-  s.homepage = package["homepage"] || "https://github.com/get-convex/embedded"
-  s.source = { :git => "https://github.com/get-convex/embedded.git", :tag => s.version.to_s }
+  s.author = package["author"] || "estifanos-sh"
+  s.homepage = package["homepage"] || "https://github.com/estifanos-sh/convex-embedded"
+  s.source = { :git => "https://github.com/estifanos-sh/convex-embedded.git", :tag => s.version.to_s }
   s.platforms = { :ios => "15.1" }
   s.swift_version = "5.9"
   s.static_framework = true

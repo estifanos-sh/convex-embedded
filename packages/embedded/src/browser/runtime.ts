@@ -4,7 +4,7 @@
  * @remarks
  * This module is used by the package-owned worker runtime. Applications should
  * construct `ConvexEmbeddedClient` from
- * `@convex-dev/embedded/browser` instead.
+ * `@estifanos-sh/convex-embedded/browser` instead.
  *
  * @packageDocumentation
  */
@@ -313,7 +313,7 @@ async function importEmbeddedBundle(): Promise<typeof import("virtual:convex-emb
   } catch (cause) {
     throw Object.assign(
       new Error(
-        "ConvexEmbeddedClient requires the @convex-dev/embedded Vite or unplugin adapter so the browser worker can load your Convex schema and functions.",
+        "ConvexEmbeddedClient requires the @estifanos-sh/convex-embedded Vite or unplugin adapter so the browser worker can load your Convex schema and functions.",
       ),
       { cause },
     );

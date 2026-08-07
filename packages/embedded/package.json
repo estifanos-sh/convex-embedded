@@ -1,5 +1,5 @@
 {
-  "name": "@convex-dev/embedded",
+  "name": "@estifanos-sh/convex-embedded",
   "version": "0.0.1",
   "description": "Embedded runtime and Convex server wrapper for local-first Convex apps.",
   "files": [

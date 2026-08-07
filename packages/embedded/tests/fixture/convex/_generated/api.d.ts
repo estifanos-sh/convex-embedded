@@ -71,6 +71,6 @@ export declare const api: FilterApi<typeof fullApi, FunctionReference<any, "publ
 export declare const internal: FilterApi<typeof fullApi, FunctionReference<any, "internal">>;
 
 export declare const components: {
-  embedded: import("@convex-dev/embedded/_generated/component.js").ComponentApi<"embedded">;
+  embedded: import("@estifanos-sh/convex-embedded/_generated/component.js").ComponentApi<"embedded">;
   migrations: import("@convex-dev/migrations/_generated/component.js").ComponentApi<"migrations">;
 };

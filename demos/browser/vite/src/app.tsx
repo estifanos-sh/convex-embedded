@@ -34,9 +34,9 @@ import {
 import {
   createConvexEmbeddedUploadFetch,
   type EmbeddedConnectionState,
-} from "@convex-dev/embedded/browser";
-import { createTextField } from "@convex-dev/embedded/internal/text";
-import type { TextFieldWriter } from "@convex-dev/embedded/internal/text";
+} from "@estifanos-sh/convex-embedded/browser";
+import { createTextField } from "@estifanos-sh/convex-embedded/internal/text";
+import type { TextFieldWriter } from "@estifanos-sh/convex-embedded/internal/text";
 
 import { api } from "~convex/_generated/api";
 import type { Id } from "~convex/_generated/dataModel";

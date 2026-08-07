@@ -22,7 +22,7 @@ try {
     version: "0.0.0",
     packageManager: "pnpm@11.5.2",
     dependencies: {
-      "@convex-dev/embedded": `link:${packageDir}`,
+      "@estifanos-sh/convex-embedded": `link:${packageDir}`,
       expo: "~54.0.34",
       "expo-crypto": "~15.0.9",
       react: "19.1.0",

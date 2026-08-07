@@ -17,7 +17,7 @@ void clientReady.catch((error) => {
 });
 
 if (import.meta.env.DEV) {
-  void import("@convex-dev/embedded/devtools").then(({ mountEmbeddedDevtools }) => {
+  void import("@estifanos-sh/convex-embedded/devtools").then(({ mountEmbeddedDevtools }) => {
     mountEmbeddedDevtools(client, { defaultOpen: false });
   });
 }

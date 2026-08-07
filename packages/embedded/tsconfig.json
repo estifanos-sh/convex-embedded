@@ -6,8 +6,8 @@
     "module": "preserve",
     "moduleResolution": "bundler",
     "paths": {
-      "@convex-dev/embedded/convex.config": ["./src/component/convex.config.ts"],
-      "@convex-dev/embedded/server": ["./src/server/index.ts"]
+      "@estifanos-sh/convex-embedded/convex.config": ["./src/component/convex.config.ts"],
+      "@estifanos-sh/convex-embedded/server": ["./src/server/index.ts"]
     },
     "jsx": "preserve",
     "jsxImportSource": "solid-js",

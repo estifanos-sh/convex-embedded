@@ -1,10 +1,10 @@
 {
-  "name": "@convex-dev/embedded-demo-browser-vite",
+  "name": "@estifanos-sh/convex-embedded-demo-browser-vite",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build:package": "vp run @convex-dev/embedded#build:ts",
+    "build:package": "vp run @estifanos-sh/convex-embedded#build:ts",
     "dev": "vp run build:package && vp dev",
     "build": "tsc && vp build",
     "preview": "vp preview",
@@ -14,7 +14,7 @@
     "@blocknote/ariakit": "^0.47.2",
     "@blocknote/core": "^0.47.2",
     "@blocknote/react": "^0.47.2",
-    "@convex-dev/embedded": "workspace:*",
+    "@estifanos-sh/convex-embedded": "workspace:*",
     "@fontsource-variable/inter": "catalog:",
     "@tailwindcss/forms": "catalog:",
     "@tailwindcss/vite": "catalog:",

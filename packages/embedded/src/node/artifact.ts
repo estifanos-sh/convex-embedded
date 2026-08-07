@@ -172,7 +172,7 @@ function hasGlibc(): boolean {
 function nativeArtifactError(candidates: string[], failures: string[]): string {
   const lines = [
     "ConvexEmbeddedClient could not load the native storage artifact.",
-    "Set CONVEX_EMBEDDED_NATIVE to an absolute .node artifact path, or run `vp run @convex-dev/embedded#build` to package the Node artifact.",
+    "Set CONVEX_EMBEDDED_NATIVE to an absolute .node artifact path, or run `vp run @estifanos-sh/convex-embedded#build` to package the Node artifact.",
     "Checked:",
     ...candidates.map((candidate) => `  - ${candidate}`),
   ];

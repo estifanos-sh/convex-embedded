@@ -10,7 +10,7 @@
  * @example
  * ```ts
  * import { getDefaultConfig } from "expo/metro-config";
- * import { withConvexEmbedded } from "@convex-dev/embedded/metro";
+ * import { withConvexEmbedded } from "@estifanos-sh/convex-embedded/metro";
  * import schema from "./convex/schema";
  *
  * export default withConvexEmbedded(getDefaultConfig(__dirname), { schema });

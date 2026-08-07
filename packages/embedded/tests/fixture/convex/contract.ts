@@ -6,11 +6,11 @@ import { remote } from "./embedded";
 export const read = remote.query({
   args: {},
   returns: v.object({
-    fixture: v.literal("@convex-dev/embedded/remote-test-fixture"),
+    fixture: v.literal("@estifanos-sh/convex-embedded/remote-test-fixture"),
     version: v.literal(1),
   }),
   handler: () => ({
-    fixture: "@convex-dev/embedded/remote-test-fixture" as const,
+    fixture: "@estifanos-sh/convex-embedded/remote-test-fixture" as const,
     version: 1 as const,
   }),
 });

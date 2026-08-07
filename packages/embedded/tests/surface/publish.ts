@@ -6,8 +6,8 @@ import { describe, expect, test } from "vite-plus/test";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
 
-describe("Robelest publishing workflow", () => {
-  test("assembles every runtime before publishing the guarded package", () => {
+describe("Embedded publishing workflow", () => {
+  test("assembles every runtime before publishing the independently verified package", () => {
     const workflow = readFileSync(join(root, ".github/workflows/publish.yml"), "utf8");
 
     for (const target of [
@@ -21,7 +21,9 @@ describe("Robelest publishing workflow", () => {
     }
     expect(workflow).toContain("Build every Apple slice through the Expo hook");
     expect(workflow).toContain("Build every Android ABI through the Expo hook");
-    expect(workflow).toContain("runs-on: large-runner");
+    expect(workflow).toContain("options: [blacksmith, depot]");
+    expect(workflow).toContain("blacksmith-16vcpu-ubuntu-2404");
+    expect(workflow).toContain("depot-ubuntu-24.04-16");
     expect(workflow).toContain("needs: [gate, javascript]");
     expect(workflow).toContain("Download JavaScript bundle for the Node smoke test");
     expect(workflow).toContain("Enable pnpm for the Expo compile fixture");
@@ -29,26 +31,25 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain("node packages/embedded/scripts/publish.ts prepare-build");
     expect(workflow).toContain("node packages/embedded/scripts/publish.ts qualify-tarball");
     expect(workflow).toMatch(
-      /name: Prepare and pack the guarded Robelest package[\s\S]*?name: Qualify exact packed artifact[\s\S]*?qualify-tarball artifacts\/convex-embedded\.tgz/,
+      /name: Prepare and pack the verified Embedded package[\s\S]*?name: Qualify exact packed artifact[\s\S]*?qualify-tarball artifacts\/convex-embedded\.tgz/,
     );
     expect(workflow).toContain(
       "npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public",
     );
-    expect(workflow).toContain('NPM_CONFIG_PROVENANCE: "false"');
+    expect(workflow).toContain('NPM_CONFIG_PROVENANCE: "true"');
     expect(workflow).toContain("Publish package preview prerelease");
     expect(workflow).toContain("gh release create");
     expect(workflow).toContain("artifacts/convex-embedded.tgz");
     expect(workflow).toContain("tar -xOzf artifacts/convex-embedded.tgz package/package.json");
     expect(workflow).not.toContain("pkg-pr-new");
-    expect(workflow).toContain("Prerelease and release modes require a robelest-v* tag");
+    expect(workflow).toContain("Prerelease and release modes require a v* tag");
     expect(workflow).toContain("options: [preview, prerelease, release]");
     expect(workflow).toContain("dist_tag=latest");
     expect(workflow).not.toContain("dist_tag=preview");
     expect(workflow).toContain("CONVEX_EMBEDDED_PUBLISH_VERSION");
-    expect(workflow).toContain("@robelest/convex-embedded");
-    expect(workflow).toContain("github.repository == 'get-convex/embedded'");
-    expect(workflow).toContain('REPOSITORY" != "get-convex/embedded"');
-    expect(workflow).not.toContain("github.repository == 'robelest/convex-embedded'");
+    expect(workflow).toContain("@estifanos-sh/convex-embedded");
+    expect(workflow).not.toContain("get-convex/embedded");
+    expect(workflow).not.toContain("github.repository ==");
     expect(workflow).toContain("Refusing to publish unexpected package");
     expect(workflow).toContain("Verify packaged Linux Node durability");
     expect(workflow).toContain(
@@ -59,15 +60,19 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain("cargo test -p storage --features testkit --test migration");
     expect(workflow).toContain("cargo test -p mobile");
     expect(workflow).toContain("vp test run packages/embedded/tests/unit/expo.ts");
-    expect(workflow).not.toContain('tags: ["robelest-v*"]');
+    expect(workflow).not.toContain('tags: ["v*"]');
     expect(workflow).not.toContain('[[ "$EVENT" == "push" ]]');
     expect(workflow).not.toContain("pull_request_target:");
     expect(workflow).not.toContain("labels.*.name, 'npm package'");
     expect(workflow).toContain('PACKAGE_PREVIEW" == "true"');
     expect(workflow).toContain('INPUT_MODE" == "prerelease"');
-    expect(workflow).toContain('"self-hosted", "linux", "arm64", "xlarge"');
-    expect(workflow).toContain('"self-hosted", "linux", "arm64", "large"');
-    expect(workflow).toContain("Preview PR code stays on GitHub-hosted hardware");
+    expect(workflow).toContain(
+      'npm dist-tag add "${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}" preview',
+    );
+    expect(workflow).toContain("blacksmith-8vcpu-ubuntu-2404-arm");
+    expect(workflow).toContain("depot-ubuntu-24.04-arm-8");
+    expect(workflow).toContain("This job is deliberately credential-free");
+    expect(workflow).toContain("Package releases must dispatch the reviewed workflow from main.");
     expect(workflow).toContain("Download exact JavaScript and WASM artifact");
     expect(workflow).not.toContain("Build production Node and WASM artifacts");
     expect(workflow).toMatch(
@@ -82,7 +87,7 @@ describe("Robelest publishing workflow", () => {
     expect(workflow).toContain(
       "ASSEMBLED_TARBALL_SHA256: ${{ needs.assemble.outputs.tarball_sha256 }}",
     );
-    expect(workflow).toContain("Robelest package SHA-256: $ASSEMBLED_TARBALL_SHA256");
+    expect(workflow).toContain("Embedded package SHA-256: $ASSEMBLED_TARBALL_SHA256");
     expect(workflow).toContain(
       "EXPECTED_TARBALL_SHA256: ${{ needs.release-tag.outputs.tarball_sha256 }}",
     );

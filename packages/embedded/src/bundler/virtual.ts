@@ -92,7 +92,7 @@ export function renderLocalShim(
     .map((name) => `export const ${name} = embeddedLocal[${JSON.stringify(name)}];`)
     .join("\n");
   return `import * as source from ${source};
-import { createLocalFacade } from "@convex-dev/embedded/internal/local";
+import { createLocalFacade } from "@estifanos-sh/convex-embedded/internal/local";
 
 const embeddedLocal = createLocalFacade(${JSON.stringify(moduleId)}, ${JSON.stringify(
     graphHash,

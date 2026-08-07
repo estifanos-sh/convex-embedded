@@ -79,7 +79,7 @@ describe("webkit runtime smoke", () => {
     const url = __CONVEX_EMBEDDED_HOSTED_URL__?.trim();
     if (!url) throw new Error("Set VITE_CONVEX_URL before running the webkit smoke.");
     isolate("webkit-smoke");
-    const { ConvexEmbeddedClient } = await import("@convex-dev/embedded/browser");
+    const { ConvexEmbeddedClient } = await import("@estifanos-sh/convex-embedded/browser");
     const convex = new ConvexEmbeddedClient({ url }) as unknown as SmokeClient;
     clients.add(convex);
 
@@ -120,7 +120,7 @@ describe("webkit runtime smoke", () => {
     });
     try {
       isolate("webkit-pull");
-      const { ConvexEmbeddedClient } = await import("@convex-dev/embedded/browser");
+      const { ConvexEmbeddedClient } = await import("@estifanos-sh/convex-embedded/browser");
       const convex = new ConvexEmbeddedClient({ url }) as unknown as SmokeClient;
       clients.add(convex);
 

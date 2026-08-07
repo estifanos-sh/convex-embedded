@@ -1,11 +1,11 @@
 {
-  "name": "@convex-dev/embedded-demo-expo",
+  "name": "@estifanos-sh/convex-embedded-demo-expo",
   "version": "0.0.0",
   "private": true,
   "main": "expo-router/entry",
   "scripts": {
     "android": "vp run build:package && vp run native:android && expo run:android --no-bundler",
-    "build:package": "vp run @convex-dev/embedded#build:ts",
+    "build:package": "vp run @estifanos-sh/convex-embedded#build:ts",
     "eas-build-post-install": "vp run build:package",
     "eas-build-pre-install": "node scripts/native.ts eas",
     "export": "vp run build:package && expo export",
@@ -24,7 +24,7 @@
     "@blocknote/ariakit": "^0.47.2",
     "@blocknote/core": "^0.47.2",
     "@blocknote/react": "^0.47.2",
-    "@convex-dev/embedded": "workspace:*",
+    "@estifanos-sh/convex-embedded": "workspace:*",
     "convex": "catalog:",
     "expo": "catalog:",
     "expo-crypto": "catalog:",

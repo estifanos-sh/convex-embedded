@@ -1,6 +1,10 @@
-import { defineEmbeddedSchema, localTable, replicatedTable } from "@convex-dev/embedded/schema";
+import {
+  defineEmbeddedSchema,
+  localTable,
+  replicatedTable,
+} from "@estifanos-sh/convex-embedded/schema";
 import { v } from "convex/values";
-import { e } from "@convex-dev/embedded/values";
+import { e } from "@estifanos-sh/convex-embedded/values";
 
 const schema = defineEmbeddedSchema({
   attachments: replicatedTable({

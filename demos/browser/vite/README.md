@@ -1,6 +1,6 @@
-# @convex-dev/embedded · browser · vite demo
+# @estifanos-sh/convex-embedded · browser · vite demo
 
-A document editor demonstrating `@convex-dev/embedded/browser`: local-first Convex execution in the browser with BlockNote editing, OPFS persistence, optional remote sync, and a Notion-style revision history panel.
+A document editor demonstrating `@estifanos-sh/convex-embedded/browser`: local-first Convex execution in the browser with BlockNote editing, OPFS persistence, optional remote sync, and a Notion-style revision history panel.
 
 ## Run
 

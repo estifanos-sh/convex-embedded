@@ -3,7 +3,7 @@
  *
  * @remarks
  * These exports support tests and the browser runtime. Applications normally
- * use `@convex-dev/embedded/browser` and let the package load its bundled WASM
+ * use `@estifanos-sh/convex-embedded/browser` and let the package load its bundled WASM
  * artifact.
  *
  * @packageDocumentation

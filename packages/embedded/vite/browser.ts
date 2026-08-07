@@ -69,9 +69,9 @@ export const browserProject = {
   resolve: {
     dedupe: ["solid-js"],
     alias: [
-      { find: "@convex-dev/embedded/browser", replacement: browserDistPath },
-      { find: "@convex-dev/embedded/internal/local", replacement: localInternalEntryPath },
-      { find: "@convex-dev/embedded/local", replacement: localEntryPath },
+      { find: "@estifanos-sh/convex-embedded/browser", replacement: browserDistPath },
+      { find: "@estifanos-sh/convex-embedded/internal/local", replacement: localInternalEntryPath },
+      { find: "@estifanos-sh/convex-embedded/local", replacement: localEntryPath },
       { find: "convex/browser", replacement: convexBrowserPath },
       { find: "convex/server", replacement: convexServerPath },
       { find: "convex/values", replacement: convexValuesPath },

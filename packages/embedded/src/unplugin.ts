@@ -3,12 +3,12 @@
  *
  * @remarks
  * Use this entrypoint when integrating with bundlers through unplugin directly.
- * Vite/Vite+ users should prefer `@convex-dev/embedded/vite`, which also
+ * Vite/Vite+ users should prefer `@estifanos-sh/convex-embedded/vite`, which also
  * installs the headers required by the browser WASM storage backend.
  *
  * @example
  * ```ts
- * import { convexEmbeddedUnplugin } from "@convex-dev/embedded/unplugin";
+ * import { convexEmbeddedUnplugin } from "@estifanos-sh/convex-embedded/unplugin";
  * import schema from "./convex/schema";
  *
  * export default {

@@ -2,14 +2,14 @@
  * Browser client entrypoint for embedded Convex.
  *
  * @remarks
- * Import from `@convex-dev/embedded/browser` when running Convex functions in
+ * Import from `@estifanos-sh/convex-embedded/browser` when running Convex functions in
  * the browser with worker-owned Rust/WASM storage. Browser applications should
  * also install the Vite or unplugin adapter so the worker can load the local
  * Convex schema and function modules.
  *
  * @example
  * ```ts
- * import { ConvexEmbeddedClient } from "@convex-dev/embedded/browser";
+ * import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/browser";
  *
  * const client = new ConvexEmbeddedClient();
  * await client.open();

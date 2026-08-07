@@ -4,7 +4,7 @@
  * @remarks
  * Framework adapters use this entrypoint to build the virtual module consumed
  * by the browser runtime. Application code usually uses
- * `@convex-dev/embedded/vite` or `@convex-dev/embedded/unplugin` instead.
+ * `@estifanos-sh/convex-embedded/vite` or `@estifanos-sh/convex-embedded/unplugin` instead.
  *
  * @packageDocumentation
  */
@@ -212,7 +212,7 @@ const DEFAULT_CONVEX_DIR = "convex";
 const DEFAULT_SCHEMA_PATH = "schema.ts";
 const EMBEDDED_ENTRYPOINT_PATH = "embedded.ts";
 const DEFAULT_GENERATED_PATH = "_generated/embedded.ts";
-const LOCAL_ENTRYPOINT = "@convex-dev/embedded/local";
+const LOCAL_ENTRYPOINT = "@estifanos-sh/convex-embedded/local";
 const SOURCE_EXTENSIONS = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const SYSTEM_MODULE_RE =
   /^(?:convex\.config|auth\.config|crons|http)\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
@@ -228,7 +228,7 @@ const PROJECT_SOURCE_EXTENSIONS = [
   ".cjs",
   ".json",
 ] as const;
-const GENERATED_IDENTITY_PREFIX = "// @convex-dev/embedded-generated ";
+const GENERATED_IDENTITY_PREFIX = "// @estifanos-sh/convex-embedded-generated ";
 
 /**
  * Discovers Convex schema and function module files for embedded bundler adapters.
@@ -897,13 +897,13 @@ async function assertGeneratedFile(
     source = await readFile(file, "utf8");
   } catch {
     throw new Error(
-      `Could not find generated Embedded contract at ${file}. Regenerate it with your configured @convex-dev/embedded bundler adapter before building.`,
+      `Could not find generated Embedded contract at ${file}. Regenerate it with your configured @estifanos-sh/convex-embedded bundler adapter before building.`,
     );
   }
   const firstLine = source.split(/\r?\n/, 1)[0] ?? "";
   if (!firstLine.startsWith(GENERATED_IDENTITY_PREFIX)) {
     throw new Error(
-      `Generated Embedded contract at ${file} has no verifiable identity; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+      `Generated Embedded contract at ${file} has no verifiable identity; regenerate it with your configured @estifanos-sh/convex-embedded bundler adapter.`,
     );
   }
   let identity: unknown;
@@ -911,27 +911,27 @@ async function assertGeneratedFile(
     identity = JSON.parse(firstLine.slice(GENERATED_IDENTITY_PREFIX.length));
   } catch {
     throw new Error(
-      `Generated Embedded contract at ${file} has an invalid identity; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+      `Generated Embedded contract at ${file} has an invalid identity; regenerate it with your configured @estifanos-sh/convex-embedded bundler adapter.`,
     );
   }
   if (!isGeneratedIdentity(identity)) {
     throw new Error(
-      `Generated Embedded contract at ${file} has an invalid identity; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+      `Generated Embedded contract at ${file} has an invalid identity; regenerate it with your configured @estifanos-sh/convex-embedded bundler adapter.`,
     );
   }
   if (identity.formatVersion !== EMBEDDED_GENERATED_FORMAT_VERSION) {
     throw new Error(
-      `Generated Embedded contract format ${identity.formatVersion} is unsupported; regenerate it with your configured @convex-dev/embedded bundler adapter: ${file}`,
+      `Generated Embedded contract format ${identity.formatVersion} is unsupported; regenerate it with your configured @estifanos-sh/convex-embedded bundler adapter: ${file}`,
     );
   }
   if (identity.schemaSourceHash !== expected.schemaSourceHash) {
     throw new Error(
-      `Generated Embedded contract at ${file} is stale for the current schema source; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+      `Generated Embedded contract at ${file} is stale for the current schema source; regenerate it with your configured @estifanos-sh/convex-embedded bundler adapter.`,
     );
   }
   if (identity.manifestHash !== expected.manifestHash) {
     throw new Error(
-      `Generated Embedded contract at ${file} is stale for the current function manifest; regenerate it with your configured @convex-dev/embedded bundler adapter.`,
+      `Generated Embedded contract at ${file} is stale for the current function manifest; regenerate it with your configured @estifanos-sh/convex-embedded bundler adapter.`,
     );
   }
 }

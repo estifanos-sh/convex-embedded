@@ -8,7 +8,7 @@
  * @example
  * ```ts
  * import { defineConfig } from "vite";
- * import convexEmbedded from "@convex-dev/embedded/vite";
+ * import convexEmbedded from "@estifanos-sh/convex-embedded/vite";
  * import schema from "./convex/schema";
  *
  * export default defineConfig({
@@ -69,7 +69,7 @@ function convexEmbeddedViteConfig(options: ConvexEmbeddedPluginOptions): VitePlu
     config() {
       return {
         optimizeDeps: {
-          exclude: ["@convex-dev/embedded", "@convex-dev/embedded/browser"],
+          exclude: ["@estifanos-sh/convex-embedded", "@estifanos-sh/convex-embedded/browser"],
           include: ["@napi-rs/wasm-runtime", "convex", "convex/server", "convex/values"],
         },
         worker: {

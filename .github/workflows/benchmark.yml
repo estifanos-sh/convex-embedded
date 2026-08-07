@@ -1,0 +1,130 @@
+name: Runner benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Run Blacksmith, Depot, or both providers
+        required: true
+        default: both
+        type: choice
+        options: [blacksmith, depot, both]
+      ref:
+        description: Git ref or commit to benchmark
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_TERM_COLOR: always
+
+jobs:
+  runtime:
+    name: Runtime ${{ matrix.provider }}
+    if: inputs.provider == matrix.provider || inputs.provider == 'both'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: blacksmith
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - provider: depot
+            runner: depot-ubuntu-24.04-8
+
+    steps:
+      - name: Checkout exact benchmark source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: embedded-benchmark-${{ matrix.provider }}
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+
+      - name: Build and exercise the runtime
+        run: |
+          vp run '@estifanos-sh/convex-embedded#build:ts'
+          vp run '@estifanos-sh/convex-embedded#native'
+          vp run '@estifanos-sh/convex-embedded#wasm'
+          vp run '@estifanos-sh/convex-embedded#test:node'
+          vp run '@estifanos-sh/convex-embedded#test:fixture:node'
+          vp run '@estifanos-sh/convex-embedded#test:stress:node'
+          vp run '@estifanos-sh/convex-embedded#test:kill:node'
+          cargo test -p storage --features testkit --test fixture
+          cargo test -p storage --features testkit --test migration
+
+  android:
+    name: Android ${{ matrix.provider }}
+    if: inputs.provider == matrix.provider || inputs.provider == 'both'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: blacksmith
+            runner: blacksmith-16vcpu-ubuntu-2404
+          - provider: depot
+            runner: depot-ubuntu-24.04-16
+
+    steps:
+      - name: Checkout exact benchmark source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: 24.18.0
+          cache: true
+          run-install: |
+            args: ['--frozen-lockfile']
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: embedded-benchmark-${{ matrix.provider }}-android
+          key: ${{ hashFiles('rust-toolchain.toml') }}
+          cache-on-failure: true
+
+      - name: Enable pnpm for the Expo compile fixture
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.2 --activate
+
+      - name: Build and compile all Android ABIs
+        env:
+          EAS_BUILD_PLATFORM: android
+        run: |
+          node demos/expo/scripts/native.ts eas
+          node packages/embedded/scripts/mobilecompile.ts android

@@ -1,4 +1,4 @@
-import { ConvexEmbeddedClient } from "@convex-dev/embedded/browser";
+import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/browser";
 
 declare const __CONVEX_EMBEDDED_CONVEX_URL__: string;
 

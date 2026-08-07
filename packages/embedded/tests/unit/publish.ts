@@ -10,16 +10,14 @@ import {
   prepareBuildVersion,
   qualifyTarball,
   packPackage,
+  packageName,
+  packageRepository,
   preview2Tag,
   preview2Version,
-  publishedPackageName,
-  publishedRepository,
   requiredPackageFiles,
-  sourcePackageName,
   verifyManifest,
   verifyPackageTree,
   verifyFixtureFiles,
-  verifyPreview2PendingVersion,
   verifyPackedFiles,
 } from "../../scripts/publish.js";
 
@@ -29,8 +27,8 @@ afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { force: true, recursive: true });
 });
 
-describe("Robelest package publication", () => {
-  test("binds Preview2 to its named prerelease and rejects fixture-directory debris", () => {
+describe("Embedded package publication", () => {
+  test("keeps the historical Preview2 name and rejects fixture-directory debris", () => {
     expect(preview2Tag).toBe("robelest-v0.0.1-preview-2");
     expect(preview2Version).toBe("0.0.1-preview-2");
 
@@ -42,18 +40,15 @@ describe("Robelest package publication", () => {
 
     writeFileSync(join(directory, "store.sqlite3-wal"), "");
     expect(() => verifyFixtureFiles(directory)).toThrow("must contain only");
-
-    expect(() => verifyPreview2PendingVersion(preview2Version)).not.toThrow();
-    expect(() => verifyPreview2PendingVersion("0.0.1")).toThrow("must first publish");
   });
 
-  test("rewrites only the ephemeral package identity and strips lifecycle builds", () => {
+  test("preserves the package identity and strips lifecycle builds", () => {
     const directory = mkdtempSync(join(tmpdir(), "convex-embedded-publish-"));
     temporary.push(directory);
     writeFileSync(
       join(directory, "package.json"),
       JSON.stringify({
-        name: sourcePackageName,
+        name: packageName,
         publishConfig: { access: "restricted" },
         scripts: { build: "vp pack", postinstall: "false", prepack: "false" },
         version: "0.0.1",
@@ -68,40 +63,40 @@ describe("Robelest package publication", () => {
       repository: { url: string };
       scripts: Record<string, string>;
     };
-    expect(manifest.name).toBe(publishedPackageName);
-    expect(manifest.repository.url).toContain(publishedRepository);
+    expect(manifest.name).toBe(packageName);
+    expect(manifest.repository.url).toContain(packageRepository);
     expect(manifest.publishConfig.access).toBe("public");
     expect(manifest.scripts).toEqual({ build: "vp pack" });
   });
 
-  test("stamps the release version before build without changing the source package identity", () => {
+  test("stamps the release version before build without changing package identity", () => {
     const directory = mkdtempSync(join(tmpdir(), "convex-embedded-build-version-"));
     temporary.push(directory);
     writeFileSync(
       join(directory, "package.json"),
-      JSON.stringify({ name: sourcePackageName, version: "0.0.1" }),
+      JSON.stringify({ name: packageName, version: "0.0.1" }),
     );
 
     prepareBuildVersion(directory, "0.0.1-preview-3");
 
     expect(JSON.parse(readFileSync(join(directory, "package.json"), "utf8"))).toMatchObject({
-      name: sourcePackageName,
+      name: packageName,
       version: "0.0.1-preview-3",
     });
     expect(() => prepareBuildVersion(directory, "not-a-version")).toThrow("must be semver");
   });
 
-  test("cannot verify the official package identity for publication", () => {
+  test("rejects a package identity other than the independent release package", () => {
     expect(() =>
       verifyManifest(
         {
-          name: sourcePackageName,
-          repository: { type: "git", url: `git+${publishedRepository}.git` },
+          name: "@convex-dev/embedded",
+          repository: { type: "git", url: `git+${packageRepository}.git` },
           version: "0.0.1",
         },
         "release",
       ),
-    ).toThrow(`only ${publishedPackageName} is allowed`);
+    ).toThrow(`only ${packageName} is allowed`);
   });
 
   test("requires every runtime artifact in the packed payload", () => {
@@ -142,7 +137,7 @@ describe("Robelest package publication", () => {
           "ios",
           "native",
         ],
-        name: sourcePackageName,
+        name: packageName,
         scripts: { prepack: "false" },
         version: "0.0.0",
       }),
@@ -169,13 +164,13 @@ describe("Robelest package publication", () => {
       join(consumer, "package.json"),
       JSON.stringify({ name: "consumer", private: true }),
     );
-    execFileSync("pnpm", ["add", `${sourcePackageName}@file:${tarball}`], {
+    execFileSync("pnpm", ["add", `${packageName}@file:${tarball}`], {
       cwd: consumer,
       stdio: "pipe",
     });
-    const aliased = join(consumer, "node_modules/@convex-dev/embedded/package.json");
+    const aliased = join(consumer, "node_modules/@estifanos-sh/convex-embedded/package.json");
     expect(existsSync(aliased)).toBe(true);
-    expect(JSON.parse(readFileSync(aliased, "utf8")).name).toBe(publishedPackageName);
+    expect(JSON.parse(readFileSync(aliased, "utf8")).name).toBe(packageName);
   });
 
   test("requires release metadata, documentation, and runtime artifacts to agree", () => {
@@ -184,7 +179,7 @@ describe("Robelest package publication", () => {
     writeFileSync(
       join(directory, "package.json"),
       JSON.stringify({
-        name: sourcePackageName,
+        name: packageName,
         version: "0.0.1-preview-3",
       }),
     );
@@ -207,8 +202,8 @@ describe("Robelest package publication", () => {
 
   test("rejects placeholder and prerelease versions", () => {
     const manifest = {
-      name: publishedPackageName,
-      repository: { type: "git", url: `git+${publishedRepository}.git` },
+      name: packageName,
+      repository: { type: "git", url: `git+${packageRepository}.git` },
     };
     expect(() => verifyManifest({ ...manifest, version: "0.0.0" }, "release")).toThrow(
       "nonzero stable",
@@ -225,12 +220,12 @@ describe("Robelest package publication", () => {
     expect(() => verifyManifest({ ...manifest, version: "0.0.0" }, "preview")).not.toThrow();
   });
 
-  test("assigns a prerelease version only in the ephemeral package tree", () => {
+  test("assigns a prerelease version in the assembled package tree", () => {
     const directory = mkdtempSync(join(tmpdir(), "convex-embedded-prerelease-"));
     temporary.push(directory);
     writeFileSync(
       join(directory, "package.json"),
-      JSON.stringify({ name: sourcePackageName, version: "0.0.0" }),
+      JSON.stringify({ name: packageName, version: "0.0.0" }),
     );
 
     preparePackage(directory, "0.0.1-preview-0");
@@ -239,6 +234,6 @@ describe("Robelest package publication", () => {
       name: string;
       version: string;
     };
-    expect(manifest).toMatchObject({ name: publishedPackageName, version: "0.0.1-preview-0" });
+    expect(manifest).toMatchObject({ name: packageName, version: "0.0.1-preview-0" });
   });
 });

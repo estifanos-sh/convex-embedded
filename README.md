@@ -13,18 +13,16 @@ local SQLite runtime owns the device projection and all Loro computation.
 Install the package alongside Convex:
 
 ```sh
-pnpm add @convex-dev/embedded convex
+pnpm add @estifanos-sh/convex-embedded convex
 ```
 
-### Robelest test releases
+### Independent test releases
 
-Until the package is approved for an official Convex release, this repository publishes complete
-test builds as `@robelest/convex-embedded`. Install one under the eventual official dependency key
-so application imports, generated modules, and bundler configuration exercise the real
-`@convex-dev/embedded/*` paths:
+This independent package is published directly as `@estifanos-sh/convex-embedded`. Its import
+paths, generated modules, and bundler configuration all use that same identity:
 
 ```sh
-pnpm add @convex-dev/embedded@npm:@robelest/convex-embedded@<version> convex
+pnpm add @estifanos-sh/convex-embedded@<version> convex
 ```
 
 The `package preview` pull-request label publishes an ephemeral package assembled from JavaScript,
@@ -32,11 +30,10 @@ WASM, five Node targets, both Apple XCFramework slices, and all four Android ABI
 release asset, not an npm publication.
 
 Every npm publication is an explicit `publish.yml` workflow dispatch. Select `prerelease` or
-`release`, provide the exact source commit, and provide a matching `robelest-v<version>` tag; for
-example, `robelest-v0.0.1-preview-3`. The workflow qualifies and assembles that one commit before it
-creates the tag and publishes the rewritten `@robelest/convex-embedded` tarball. The source manifest
-remains `@convex-dev/embedded@0.0.1`; only the assembled Robelest copy receives the release version.
-Neither path has credentials or a package identity capable of publishing `@convex-dev/embedded`.
+`release`, provide the exact source commit, and provide a matching `v<version>` tag—for example,
+`v0.0.1-preview.0`. The workflow qualifies and assembles that one commit before creating the tag
+and publishing the package. npm trusted publishing binds release authority to this repository and
+this package identity; no other repository can publish it.
 
 ## 1. Configure Convex
 
@@ -45,7 +42,7 @@ Install the component once:
 ```ts
 // convex/convex.config.ts
 import { defineApp } from "convex/server";
-import embedded from "@convex-dev/embedded/convex.config";
+import embedded from "@estifanos-sh/convex-embedded/convex.config";
 
 const app = defineApp();
 app.use(embedded);
@@ -56,7 +53,7 @@ Create one Embedded server definition and export its protocol functions:
 
 ```ts
 // convex/embedded.ts
-import { defineEmbedded } from "@convex-dev/embedded/server";
+import { defineEmbedded } from "@estifanos-sh/convex-embedded/server";
 
 import { components } from "./_generated/api";
 import { embeddedManifest } from "./_generated/embedded";
@@ -117,7 +114,7 @@ returned value with one device commit timestamp:
 // convex/schema.ts
 import { v } from "convex/values";
 
-import { defineEmbeddedSchema, replicatedTable } from "@convex-dev/embedded/schema";
+import { defineEmbeddedSchema, replicatedTable } from "@estifanos-sh/convex-embedded/schema";
 
 export default defineEmbeddedSchema({
   events: replicatedTable({
@@ -337,7 +334,7 @@ pnpm add @convex-dev/migrations
 
 ```ts
 // convex/convex.config.ts
-import embedded from "@convex-dev/embedded/convex.config";
+import embedded from "@estifanos-sh/convex-embedded/convex.config";
 import migrations from "@convex-dev/migrations/convex.config.js";
 import { defineApp } from "convex/server";
 
@@ -525,7 +522,7 @@ Vite configuration:
 
 ```ts
 // vite.config.ts
-import { convexEmbedded } from "@convex-dev/embedded/vite";
+import { convexEmbedded } from "@estifanos-sh/convex-embedded/vite";
 import { defineConfig } from "vite";
 import schema from "./convex/schema";
 
@@ -569,7 +566,7 @@ directive are hosted-only and are intentionally excluded from the local registry
 The package exposes Unplugin adapters for projects that do not use Vite:
 
 ```ts
-import { convexEmbeddedUnplugin } from "@convex-dev/embedded/unplugin";
+import { convexEmbeddedUnplugin } from "@estifanos-sh/convex-embedded/unplugin";
 import schema from "./convex/schema";
 
 // Rollup
@@ -619,14 +616,14 @@ production-build smoke test that starts the client and runs one local query.
 | Metro              | Expo native adapter; restart after schema or device-function changes                  |
 | Turbopack / Parcel | No adapter currently provided                                                         |
 
-`@convex-dev/embedded/bundler` is the lower-level registry generator used by these adapters. Most
+`@estifanos-sh/convex-embedded/bundler` is the lower-level registry generator used by these adapters. Most
 applications should use `vite` or `unplugin` instead.
 
 ### Expo and Metro
 
 Expo development and release builds can use the package-owned native store through
-`@convex-dev/embedded/expo`; Expo Go cannot load the required native module. Wrap the Expo Metro
-configuration with `withConvexEmbedded` from `@convex-dev/embedded/metro`. Use
+`@estifanos-sh/convex-embedded/expo`; Expo Go cannot load the required native module. Wrap the Expo Metro
+configuration with `withConvexEmbedded` from `@estifanos-sh/convex-embedded/metro`. Use
 [Expo's supported `tsx` hook](https://docs.expo.dev/guides/typescript/#typescript-for-projects-config-files)
 so the configuration can import the TypeScript Convex schema. Install it with
 `pnpm exec expo install tsx -- --dev`, then split the configuration into this JavaScript shim and
@@ -640,7 +637,7 @@ module.exports = require("./metro.config.ts");
 
 ```ts
 // metro.config.ts
-import { withConvexEmbedded } from "@convex-dev/embedded/metro";
+import { withConvexEmbedded } from "@estifanos-sh/convex-embedded/metro";
 import { getDefaultConfig } from "expo/metro-config";
 import schema from "./convex/schema";
 
@@ -659,7 +656,7 @@ protocol driver as Node. Omit `url` for local-only execution.
 
 ### Frameworks and server rendering
 
-Import `@convex-dev/embedded/browser` only from client-side code. The browser entry creates a Web
+Import `@estifanos-sh/convex-embedded/browser` only from client-side code. The browser entry creates a Web
 Worker and reads browser storage; it cannot run during SSR. In frameworks with server and client
 module graphs, put client creation behind the framework's client-only boundary or a guarded dynamic
 import.
@@ -687,7 +684,7 @@ that its worker and storage runtime started.
 Use the browser entry from client-side application code:
 
 ```ts
-import { ConvexEmbeddedClient } from "@convex-dev/embedded/browser";
+import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/browser";
 
 import { api } from "../convex/_generated/api";
 
@@ -742,7 +739,7 @@ outcome. `applied` means the authoritative replay committed; `conflict` carries 
 `EMBEDDED_REJECTED` or `EMBEDDED_DIVERGENCE` code and any retained revisions. Internal rebase
 attempts and raw server rejection reasons are never exposed.
 
-Node applications import `ConvexEmbeddedClient` from `@convex-dev/embedded/node`. The Node entry
+Node applications import `ConvexEmbeddedClient` from `@estifanos-sh/convex-embedded/node`. The Node entry
 does not need a browser bundler plugin or cross-origin isolation, but it does require a native binary
 for the current operating system and architecture. Device-only modules are passed programmatically:
 the constructor's `local` option takes a record of import thunks keyed by module path relative to
@@ -851,8 +848,8 @@ materialized values.
 
 ```ts
 // convex/schema.ts
-import { defineEmbeddedSchema, replicatedTable } from "@convex-dev/embedded/schema";
-import { e } from "@convex-dev/embedded/values";
+import { defineEmbeddedSchema, replicatedTable } from "@estifanos-sh/convex-embedded/schema";
+import { e } from "@estifanos-sh/convex-embedded/values";
 import { v } from "convex/values";
 
 export default defineEmbeddedSchema({

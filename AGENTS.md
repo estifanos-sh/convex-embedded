@@ -20,7 +20,7 @@ Docs are local at `node_modules/vite-plus/docs` or online at https://viteplus.de
 
 <!--VITE PLUS END-->
 
-## Lexicon — minimal verb/noun dictionary for @convex-dev/embedded
+## Lexicon — minimal verb/noun dictionary for @estifanos-sh/convex-embedded
 
 Authored code uses one small vocabulary, shared identically across the Rust and
 TypeScript layers, in `noun.[noun.]verb` shape. Keep it small on purpose: reach

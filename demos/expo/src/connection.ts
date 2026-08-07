@@ -1,4 +1,4 @@
-import type { EmbeddedConnectionState } from "@convex-dev/embedded/expo";
+import type { EmbeddedConnectionState } from "@estifanos-sh/convex-embedded/expo";
 import { useEffect, useState } from "react";
 
 import { client, clientReady } from "./client";

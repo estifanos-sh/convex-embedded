@@ -49,14 +49,14 @@ export interface ConvexEmbeddedClientOptions {
  * This entry requires an Expo development or release build. Expo Go cannot
  * load custom native modules. Install `expo-crypto` with Expo's version-aware
  * installer, then configure Metro with
- * `@convex-dev/embedded/metro` so the generated placement contract and local
+ * `@estifanos-sh/convex-embedded/metro` so the generated placement contract and local
  * Convex modules are included in the application bundle. Pass `url` to enable
  * native remote replication over the same Rust driver used by Node.
  *
  * @example
  * ```ts
  * // Run once: npx expo install expo-crypto
- * import { ConvexEmbeddedClient } from "@convex-dev/embedded/expo";
+ * import { ConvexEmbeddedClient } from "@estifanos-sh/convex-embedded/expo";
  *
  * const client = new ConvexEmbeddedClient();
  * await client.open();

@@ -1,4 +1,4 @@
-import { defineEmbedded } from "@convex-dev/embedded/server";
+import { defineEmbedded } from "@estifanos-sh/convex-embedded/server";
 
 import { components } from "./_generated/api";
 import { embeddedManifest } from "./_generated/embedded";

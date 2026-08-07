@@ -2,7 +2,7 @@ import { makeFunctionReference } from "convex/server";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import { commands } from "vitest/browser";
 
-import { createEmbeddedDevtoolsSource } from "@convex-dev/embedded/devtools";
+import { createEmbeddedDevtoolsSource } from "@estifanos-sh/convex-embedded/devtools";
 
 import type {
   DiagnosticEvent as EmbeddedEvent,
@@ -175,7 +175,7 @@ describe("browser runtime", () => {
   test("opens through a typed setup action and keeps failed candidate writes unpublished", async () => {
     useIsolatedBrowserStorage("setup-success");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const client = track(new ConvexEmbeddedClient());
@@ -207,7 +207,7 @@ describe("browser runtime", () => {
     installDebugLogHook();
     await mark("capability start");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = await openClient(new ConvexEmbeddedClient());
@@ -222,7 +222,7 @@ describe("browser runtime", () => {
   test("resolves commit timestamps through packaged WASM and preserves the floor across reopen", async () => {
     useIsolatedBrowserStorage("commit-timestamp");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const client = await openClient(new ConvexEmbeddedClient());
@@ -247,7 +247,7 @@ describe("browser runtime", () => {
     installDebugLogHook();
     await mark("start");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const prefix = `runtime-${getTimerTime()}-${Math.random().toString(36).slice(2)}:`;
@@ -314,7 +314,7 @@ describe("browser runtime", () => {
   test("reports packaged browser mutation phase timing", async () => {
     useIsolatedBrowserStorage("timing");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = await openClient(new ConvexEmbeddedClient());
@@ -388,7 +388,7 @@ describe("browser runtime", () => {
     installDebugLogHook();
     const importStartedAt = getTimerTime();
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const importMs = getTimerTime() - importStartedAt;
@@ -448,7 +448,7 @@ describe("browser runtime", () => {
   test("reports ready local state after the browser runtime opens", async () => {
     useIsolatedBrowserStorage("runtime-events");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = await openClient(new ConvexEmbeddedClient());
@@ -460,7 +460,7 @@ describe("browser runtime", () => {
   test("leaves the runtime event channel inert when a boot is unobserved", async () => {
     useIsolatedBrowserStorage("runtime-events-inert");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = await openClient(new ConvexEmbeddedClient());
@@ -472,8 +472,8 @@ describe("browser runtime", () => {
   test("reports demo-shaped mutation timing with devtools activity open", async () => {
     useIsolatedBrowserStorage("timing-devtools");
     const [{ ConvexEmbeddedClient }, { mountEmbeddedDevtools }] = await Promise.all([
-      withTimeout(import("@convex-dev/embedded/browser"), "browser package import"),
-      withTimeout(import("@convex-dev/embedded/devtools"), "devtools package import"),
+      withTimeout(import("@estifanos-sh/convex-embedded/browser"), "browser package import"),
+      withTimeout(import("@estifanos-sh/convex-embedded/devtools"), "devtools package import"),
     ]);
     const convex = await openClient(new ConvexEmbeddedClient());
     const mounted = mountEmbeddedDevtools(convex, { defaultOpen: true });
@@ -521,7 +521,7 @@ describe("browser runtime", () => {
   test("reports cold reopen mutation timing on the same browser storage", async () => {
     useIsolatedBrowserStorage("timing-reopen");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const prefix = `timing-reopen-${getTimerTime()}-${Math.random().toString(36).slice(2)}:`;
@@ -566,7 +566,7 @@ describe("browser runtime", () => {
   test("reports local mutation timing with unreachable browser remote configured", async () => {
     useIsolatedBrowserStorage("timing-dead-remote");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = track(
@@ -718,7 +718,7 @@ describe("browser runtime", () => {
   test("uploads files through explicit local embedded upload fetch", async () => {
     useIsolatedBrowserStorage("upload");
     const { ConvexEmbeddedClient, createConvexEmbeddedUploadFetch } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = await openClient(new ConvexEmbeddedClient());
@@ -758,7 +758,7 @@ describe("browser runtime", () => {
     expect(localReferenceName(documentCount)).toBe("local/insights:documentCount");
     expect(localReferenceName(documentTitles)).toBe("local/mixed:documentTitles");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = (await openClient(new ConvexEmbeddedClient())) as unknown as LocalInsightsClient;
@@ -847,7 +847,7 @@ describe("browser runtime", () => {
     const remoteUrl = hostedRemoteUrl();
     useIsolatedBrowserStorage("action");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const convex = await openClient(new ConvexEmbeddedClient({ url: remoteUrl }));
@@ -860,7 +860,7 @@ describe("browser runtime", () => {
     installDebugLogHook();
     useIsolatedBrowserStorage("remote");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const text = `browser-remote-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
@@ -932,7 +932,7 @@ describe("browser runtime", () => {
     const remoteUrl = hostedRemoteUrl();
     useIsolatedBrowserStorage("remote-first-edit");
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const text = `browser-remote-first-edit-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
@@ -979,7 +979,7 @@ describe("browser runtime", () => {
     const runId = `browser-crdt-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
     const storageIds = [`${runId}-a`, `${runId}-b`];
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const open = async (storageId: string) => {
@@ -1111,7 +1111,7 @@ describe("browser runtime", () => {
     const remoteUrl = hostedRemoteUrl();
     const runId = `browser-delete-${getTimerTime()}-${Math.random().toString(36).slice(2)}`;
     const { ConvexEmbeddedClient } = await withTimeout(
-      import("@convex-dev/embedded/browser"),
+      import("@estifanos-sh/convex-embedded/browser"),
       "browser package import",
     );
     const open = async (suffix: string) => {

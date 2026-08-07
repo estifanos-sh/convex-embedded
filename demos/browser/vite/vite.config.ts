@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { embeddedDevtools } from "@convex-dev/embedded/devtools/vite";
+import { embeddedDevtools } from "@estifanos-sh/convex-embedded/devtools/vite";
 import schema from "../../../convex/schema";
 import { embeddedGeneratedPath, embeddedLocalPath, requireDeploymentUrl } from "../../../config";
 
@@ -131,7 +131,7 @@ export default defineConfig(async () => {
   embeddedViteUrl.searchParams.set("build", String(statSync(embeddedViteEntry).mtimeMs));
   const { convexEmbedded } = (await import(
     embeddedViteUrl.href
-  )) as typeof import("@convex-dev/embedded/vite");
+  )) as typeof import("@estifanos-sh/convex-embedded/vite");
 
   return {
     define: {
@@ -139,10 +139,10 @@ export default defineConfig(async () => {
     },
     optimizeDeps: {
       exclude: [
-        "@convex-dev/embedded/browser",
-        "@convex-dev/embedded/devtools",
-        "@convex-dev/embedded/devtools/vite",
-        "@convex-dev/embedded/vite",
+        "@estifanos-sh/convex-embedded/browser",
+        "@estifanos-sh/convex-embedded/devtools",
+        "@estifanos-sh/convex-embedded/devtools/vite",
+        "@estifanos-sh/convex-embedded/vite",
       ],
     },
     resolve: {

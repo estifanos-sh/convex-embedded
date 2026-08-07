@@ -41,7 +41,7 @@ export function setEmbeddedIdentity(identity: {
 export function createRuntimeIdentity(storageId = browserStorageId()): RuntimeIdentity {
   if (!embeddedIdentity) {
     throw new Error(
-      "ConvexEmbeddedClient requires the @convex-dev/embedded Vite or unplugin adapter to provide runtime identity.",
+      "ConvexEmbeddedClient requires the @estifanos-sh/convex-embedded Vite or unplugin adapter to provide runtime identity.",
     );
   }
   return {

@@ -52,11 +52,13 @@ test("generated contract exports schema-bound local builders without carrying th
   expect(source).toContain(
     'embeddedManifest = {"documents":{"list":{"kind":"query","placement":"replicated","visibility":"public"}}}',
   );
-  expect(source).toContain('import { defineLocal } from "@convex-dev/embedded/internal/local";');
+  expect(source).toContain(
+    'import { defineLocal } from "@estifanos-sh/convex-embedded/internal/local";',
+  );
   expect(source).toContain('import schema from "../schema.js";');
   expect(source).toContain("export const local = defineLocal(schema);");
   expect(source).not.toContain("Register");
-  expect(source).not.toContain('"@convex-dev/embedded/local"');
+  expect(source).not.toContain('"@estifanos-sh/convex-embedded/local"');
   expect(source).not.toContain("embeddedSchema");
   expect(source).not.toContain("runtimeStoreSchema");
   expect(source).not.toContain("localApi");
@@ -113,7 +115,7 @@ test("generator atomically creates the contract needed by bundler builds", async
     expect(result.source).not.toContain("localApi");
     expect(result.source).not.toContain("makeFunctionReference");
     expect(result.source).not.toContain("type LocalReference");
-    expect(result.source).toContain('from "@convex-dev/embedded/internal/local"');
+    expect(result.source).toContain('from "@estifanos-sh/convex-embedded/internal/local"');
   } finally {
     await rm(root, { force: true, recursive: true });
   }
