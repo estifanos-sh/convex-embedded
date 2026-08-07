@@ -1055,24 +1055,9 @@ export class StoreAdapter implements StorageBackend {
     const docWrite = commit.docWrite;
     // The shortcut can only carry fully encoded physical columns. A timestamp marker is resolved
     // together with its document/result in the generic transaction, never by the one-row path.
-    if (
-      docWrite.pendingCommitTs === true ||
-      hasPendingCommitTs(docWrite.data) ||
-      options?.commitTs === true
-    ) {
-      const row = { table: docWrite.table, id: docWrite.id };
-      return await this.commit(
-        {
-          docWrites: [docWrite],
-          deletes: [],
-          freshIds: commit.fresh ? [row] : [],
-          dataOnlyIds: commit.dataOnly ? [row] : [],
-          ...(docWrite.pendingCommitTs === true || hasPendingCommitTs(docWrite.data)
-            ? { pendingCommitTs: true }
-            : {}),
-        },
-        options,
-      );
+    const pendingCommitTs = docWrite.pendingCommitTs === true || hasPendingCommitTs(docWrite.data);
+    if (pendingCommitTs || options?.commitTs === true) {
+      return await this.commitOneDocWriteBatch(commit, options, pendingCommitTs);
     }
     const hasFastPath =
       options?.changes === "omit"
@@ -1080,16 +1065,7 @@ export class StoreAdapter implements StorageBackend {
           hasMethod(this.inner, "commitOneDocWriteEncoded")
         : hasMethod(this.inner, "commitOneDocWrite");
     if (!hasFastPath) {
-      const row = { table: docWrite.table, id: docWrite.id };
-      return await this.commit(
-        {
-          docWrites: [docWrite],
-          deletes: [],
-          freshIds: commit.fresh ? [row] : [],
-          dataOnlyIds: commit.dataOnly ? [row] : [],
-        },
-        options,
-      );
+      return await this.commitOneDocWriteBatch(commit, options);
     }
     const data = encodeDocData(docWrite.data);
     const mutation = bindingCommitMutation(options);
@@ -1156,6 +1132,26 @@ export class StoreAdapter implements StorageBackend {
     const resultCommit = fromBindingCommitResult(result);
     this.applyOneDocWriteCommitCaches(resultCommit, commit);
     return resultCommit;
+  }
+
+  /** Routes one-document commits through the generic transaction when its shortcut is unavailable. */
+  private async commitOneDocWriteBatch(
+    commit: OneDocWriteCommit,
+    options: CommitOptions | undefined,
+    pendingCommitTs = false,
+  ): Promise<CommitResult> {
+    const { docWrite } = commit;
+    const row = { table: docWrite.table, id: docWrite.id };
+    return await this.commit(
+      {
+        docWrites: [docWrite],
+        deletes: [],
+        freshIds: commit.fresh ? [row] : [],
+        dataOnlyIds: commit.dataOnly ? [row] : [],
+        ...(pendingCommitTs ? { pendingCommitTs: true } : {}),
+      },
+      options,
+    );
   }
 
   async clear(): Promise<void> {
