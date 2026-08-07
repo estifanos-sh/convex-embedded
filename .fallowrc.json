@@ -35,17 +35,34 @@
     "packages/embedded/tests/surface/**/*.ts",
     "packages/embedded/tests/browser/**/*.ts",
     "packages/embedded/tests/bench/**/*.ts",
-    "packages/embedded/tests/metal/**/*.ts",
-    "packages/embedded/tests/fixture/convex/**/*.ts"
+    "packages/embedded/tests/metal/**/*.ts"
   ],
-  "dynamicallyLoaded": ["packages/embedded/src/browser/worker.ts"],
+  "dynamicallyLoaded": [
+    "packages/embedded/src/browser/worker.ts",
+    "packages/embedded/src/component/_generated/api.ts",
+    "packages/embedded/src/component/_generated/dataModel.ts",
+    "packages/embedded/src/component/_generated/server.ts",
+    "packages/embedded/tests/browser/convex/**/*.ts",
+    "packages/embedded/tests/fixture/convex/**/*.ts",
+    "packages/embedded/tests/metal/convex/**/*.ts"
+  ],
   "workspaces": {
     "patterns": ["packages/*", "demos/*", "demos/browser/*"]
   },
   "ignoreExportsUsedInFile": true,
+  "publicPackages": ["@estifanos-sh/convex-embedded"],
+  "typeAware": {
+    "enabled": true,
+    "projects": ["config/tsconfig.fallow.json"],
+    "require": "complete"
+  },
   "ignoreDependencies": ["@napi-rs/cli", "binaryen", "~convex"],
   "ignoreDependencyOverrides": [{ "package": "@voidzero-dev/vite-plus" }],
-  "ignorePatterns": ["vendor/**", "dist/**", "**/_generated/**", "tests/bench/.out/**"],
+  "ignorePatterns": [
+    "vendor/**",
+    "packages/embedded/dist/**",
+    "packages/embedded/tests/bench/.out/**"
+  ],
   "ignoreUnresolvedImports": [
     "**/wasm/index.wasm",
     "**/thread/browser-worker.mjs",
