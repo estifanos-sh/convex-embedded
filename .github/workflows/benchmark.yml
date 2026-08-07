@@ -19,7 +19,7 @@ env:
 jobs:
   runtime:
     name: Runtime
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
 
     steps:
@@ -62,7 +62,7 @@ jobs:
 
   android:
     name: Android
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 120
 
     steps:
