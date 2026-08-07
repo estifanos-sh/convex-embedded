@@ -819,6 +819,7 @@ class FakeStorage implements RuntimeStorage {
     commit: OneDocWriteCommit,
     options?: CommitOptions,
   ) => ReturnType<FakeStorage["commit"]>;
+  readonly commitOptions: Array<CommitOptions | undefined> = [];
   mutationWriteCalls = 0;
   readonly pushEnvelopes: Array<{
     afterImages: unknown[];
@@ -968,6 +969,7 @@ class FakeStorage implements RuntimeStorage {
   }
 
   commit(batch: WriteBatch, options?: CommitOptions) {
+    this.commitOptions.push(options);
     if (this.commitFailures > 0) {
       this.commitFailures -= 1;
       return Promise.reject(new Error("transient commit failure"));
@@ -2431,6 +2433,78 @@ describe("runtime", () => {
 
     expect(paths).toContain("messages:list");
     expect(paths).not.toContain("convex.config");
+  });
+
+  test("direct devtools commits retain replicated and device commit options", async () => {
+    const replicatedStore = new FakeStorage();
+    const replicated = createRunner({ messages }, replicatedStore, storeSchema);
+    const events: EmbeddedEvent[] = [];
+    const unsubscribe = replicated.subscribeEvents?.((event) => events.push(event));
+    const id = (await replicated.runMutation("messages:send", {
+      body: "before",
+      channel: "devtools",
+    })) as string;
+    replicatedStore.commitOptions.length = 0;
+    const eventsBeforePatch = events.length;
+
+    await replicated.devtools({
+      fields: { body: "after" },
+      id,
+      kind: "patchDocument",
+      table: "messages",
+    });
+    expect(replicatedStore.commitOptions).toEqual([
+      { changes: "omit", mutation: "none", source: "local" },
+    ]);
+    expect(events.slice(eventsBeforePatch)).toContainEqual(
+      expect.objectContaining({ source: "local", type: "data" }),
+    );
+
+    await replicated.devtools({
+      id: "messages|000000000000400080000000000000ff",
+      kind: "deleteDocument",
+      table: "messages",
+    });
+    expect(replicatedStore.commitOptions).toHaveLength(1);
+
+    await replicated.devtools({ id, kind: "deleteDocument", table: "messages" });
+    expect(replicatedStore.commitOptions).toEqual([
+      { changes: "omit", mutation: "none", source: "local" },
+      { changes: "omit", mutation: "none", source: "local" },
+    ]);
+    unsubscribe?.();
+
+    const deviceSchema: StoreSchema = {
+      hash: "device-devtools",
+      tables: [{ columns: [], indexes: [], name: "preferences", placement: "device" }],
+    };
+    const deviceStore = new FakeStorage();
+    const deviceId = "preferences|00000000000040008000000000000001";
+    await deviceStore.commit(
+      {
+        deletes: [],
+        docWrites: [
+          {
+            cols: [],
+            creationTime: 1,
+            data: { compact: true },
+            id: deviceId,
+            table: "preferences",
+          },
+        ],
+      },
+      { changes: "omit", source: "device" },
+    );
+    const device = createRunner({}, deviceStore, deviceSchema);
+    deviceStore.commitOptions.length = 0;
+
+    await device.devtools({
+      fields: { compact: false },
+      id: deviceId,
+      kind: "patchDocument",
+      table: "preferences",
+    });
+    expect(deviceStore.commitOptions).toEqual([{ changes: "omit", source: "device" }]);
   });
 
   test("table/id overload rejects ids from another table", async () => {

@@ -2604,17 +2604,7 @@ export function createRunner(
       rootScope.schema.get(table)?.placement === "device" ? "device" : "replicated",
     );
     await root.db.patch(table as never, id as never, normalizeCopy(fields) as never);
-    const batch = root.toBatch();
-    const commit = await runSpan("storage.commit", () =>
-      store.commit(
-        batch,
-        rootScope.schema.get(table)?.placement === "device"
-          ? { changes: "omit", source: "device" }
-          : { changes: "omit", mutation: "none", source: "local" },
-      ),
-    );
-    if (hasEventListeners()) emitCommit(emit, commit, batch, "local");
-    scheduleNotify({ dataOnlyDocIds: new Map(), tables: new Set(commit.changedTables) });
+    await commitDirectDocumentWriter(root, table);
   }
 
   async function devtoolsDelete(table: string, id: string): Promise<void> {
@@ -2637,6 +2627,14 @@ export function createRunner(
     );
     if ((await root.db.get(table as never, id as never)) === null) return;
     await root.db.delete(table as never, id as never);
+    await commitDirectDocumentWriter(root, table);
+  }
+
+  /** Commits an already-staged direct document write without mutation bookkeeping or push effects. */
+  async function commitDirectDocumentWriter(
+    root: ReturnType<typeof createWriter<GenericDataModel>>,
+    table: string,
+  ): Promise<void> {
     const batch = root.toBatch();
     const commit = await runSpan("storage.commit", () =>
       store.commit(
