@@ -43,7 +43,7 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toContain("tar -xOzf artifacts/convex-embedded.tgz package/package.json");
     expect(workflow).not.toContain("pkg-pr-new");
     expect(workflow).toContain("Prerelease and release modes require a v* tag");
-    expect(workflow).toContain("options: [preview, prerelease, release]");
+    expect(workflow).toContain("options: [verify, preview, prerelease, release]");
     expect(workflow).toContain("dist_tag=latest");
     expect(workflow).not.toContain("dist_tag=preview");
     expect(workflow).toContain("CONVEX_EMBEDDED_PUBLISH_VERSION");

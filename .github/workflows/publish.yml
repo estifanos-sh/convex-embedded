@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Publish a package preview, npm prerelease, or stable npm release
+        description: Verify only, publish a package preview, npm prerelease, or stable npm release
         required: true
         default: preview
         type: choice
-        options: [preview, prerelease, release]
+        options: [verify, preview, prerelease, release]
       ref:
         description: Git ref or commit to validate and build
         required: false
@@ -70,6 +70,8 @@ jobs:
               exit 1
             fi
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+            # `verify` deliberately takes the complete build, qualification, and assembly path;
+            # the release-tag, preview, and npm-publish jobs below only admit publishing modes.
             echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
             if [[ "$INPUT_MODE" == "release" || "$INPUT_MODE" == "prerelease" ]]; then
               if [[ -z "$INPUT_TAG" ]]; then

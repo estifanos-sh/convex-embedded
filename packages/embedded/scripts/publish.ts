@@ -50,7 +50,7 @@ interface PackageJson {
   [key: string]: unknown;
 }
 
-export type PublishMode = "preview" | "prerelease" | "release";
+export type PublishMode = "verify" | "preview" | "prerelease" | "release";
 
 /**
  * Stamp the version consumed by tsdown before it emits package artifacts.
@@ -408,8 +408,10 @@ function argument(index: number, description: string): string {
 
 function mode(index: number): PublishMode {
   const value = argument(index, "publish mode");
-  if (value !== "preview" && value !== "prerelease" && value !== "release") {
-    throw new Error(`Publish mode must be preview, prerelease, or release; received ${value}.`);
+  if (value !== "verify" && value !== "preview" && value !== "prerelease" && value !== "release") {
+    throw new Error(
+      `Publish mode must be verify, preview, prerelease, or release; received ${value}.`,
+    );
   }
   return value;
 }
