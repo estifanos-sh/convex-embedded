@@ -165,8 +165,8 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Type-aware Fallow reports support Markdown, not GitHub workflow annotations. Keep
-          # the typed analysis and surface its deterministic report in the run summary instead.
+          # Fallow's syntactic report supports Markdown, not GitHub workflow annotations. Surface
+          # its deterministic changed-code report in the run summary instead.
           report="$RUNNER_TEMP/fallow-audit.md"
           # GitHub limits each job summary to 1 MiB. Reserve half for surrounding CI output,
           # while retaining enough detail for a useful changed-code report.
