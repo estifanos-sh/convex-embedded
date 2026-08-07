@@ -52,9 +52,12 @@
   "ignoreExportsUsedInFile": true,
   "publicPackages": ["@estifanos-sh/convex-embedded"],
   "typeAware": {
-    "enabled": true,
+    "enabled": false,
     "projects": ["config/tsconfig.fallow.json"],
     "require": "complete"
+  },
+  "audit": {
+    "typeAware": false
   },
   "ignoreDependencies": ["@napi-rs/cli", "binaryen", "~convex"],
   "ignoreDependencyOverrides": [{ "package": "@voidzero-dev/vite-plus" }],
