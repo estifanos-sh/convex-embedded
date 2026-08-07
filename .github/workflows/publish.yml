@@ -35,7 +35,7 @@ env:
 jobs:
   gate:
     name: Gate
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       enabled: ${{ steps.gate.outputs.enabled }}
       mode: ${{ steps.gate.outputs.mode }}
@@ -134,11 +134,11 @@ jobs:
 
   qualification:
     name: Qualify
-    # This job is deliberately credential-free. Depot runs the native build and qualification
-    # workload; release authority stays in GitHub-hosted tag and npm OIDC jobs below.
+    # This job is deliberately credential-free. It runs the native build and qualification
+    # workload; release authority stays in the GitHub token and npm OIDC jobs below.
     needs: [gate, javascript]
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
 
     steps:
@@ -206,7 +206,7 @@ jobs:
     name: JavaScript
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: depot-ubuntu-24.04-8
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
 
     steps:
@@ -264,13 +264,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: depot-ubuntu-24.04-8
+          - runner: blacksmith-8vcpu-ubuntu-2404
             target: linux-x64-gnu
-          - runner: depot-ubuntu-24.04-arm-8
+          - runner: blacksmith-8vcpu-ubuntu-2404-arm
             target: linux-arm64-gnu
-          - runner: depot-macos-15
+          - runner: blacksmith-6vcpu-macos-15
             target: darwin-arm64
-          - runner: depot-windows-2025-8
+          - runner: blacksmith-8vcpu-windows-2025
             target: win32-x64
 
     steps:
@@ -329,7 +329,7 @@ jobs:
     name: Apple
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: depot-macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 90
 
     steps:
@@ -382,8 +382,8 @@ jobs:
     name: Android
     needs: gate
     if: needs.gate.outputs.enabled == 'true'
-    # The complete four-ABI cargo-ndk build needs Depot's largest Linux allocation.
-    runs-on: depot-ubuntu-24.04-16
+    # The complete four-ABI cargo-ndk build needs the 16-vCPU Linux allocation.
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 120
 
     steps:
@@ -445,7 +445,7 @@ jobs:
     name: Assemble
     needs: [gate, qualification, javascript, node, apple, android]
     if: needs.gate.outputs.enabled == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 30
     outputs:
       sha: ${{ steps.source.outputs.sha }}
@@ -549,7 +549,7 @@ jobs:
     name: Tag
     needs: [gate, qualification, assemble]
     if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       contents: write
@@ -615,7 +615,7 @@ jobs:
     name: Preview
     needs: [gate, assemble]
     if: needs.gate.outputs.mode == 'preview'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 20
     permissions:
       contents: write
@@ -720,7 +720,7 @@ jobs:
     name: Publish
     needs: [gate, qualification, assemble, release-tag]
     if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 20
     environment: npm
     permissions:
