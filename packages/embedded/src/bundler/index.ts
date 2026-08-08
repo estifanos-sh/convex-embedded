@@ -15,6 +15,7 @@ import path from "node:path";
 
 import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
 import type { EmbeddedSchemaAnalysis } from "../schema";
+import { maskCommentsAndStrings, readModuleEdges } from "./scanner";
 import {
   EMBEDDED_GENERATED_FORMAT_VERSION,
   toEmbeddedGeneratedSchema,
@@ -275,119 +276,318 @@ function isMissingFile(error: unknown): boolean {
   );
 }
 
+interface BundlePaths {
+  convexDir: string;
+  embeddedPath: string;
+  generatedPath: string;
+  localDirs: string[];
+  root: string;
+  schemaPath: string;
+}
+
+interface ProjectSources {
+  convexFiles: string[];
+  functionFiles: string[];
+  sources: Map<string, string>;
+}
+
+interface FunctionModules {
+  manifest: EmbeddedFunctionManifest;
+  modules: Record<string, string>;
+}
+
+interface FunctionModuleState extends FunctionModules {
+  seen: Map<string, string>;
+}
+
+interface ArtifactState {
+  artifact: AppArtifactV1;
+  executionHash: string;
+  localExports: Record<string, string[]>;
+}
+
 async function createEmbeddedBundleInner(
   input: EmbeddedBundleInput,
   requireGenerated: boolean,
 ): Promise<EmbeddedBundleResult> {
+  const paths = resolveBundlePaths(input);
+  assertLocalDirectories(paths);
+  await assertSchemaFile(paths.schemaPath);
+  await assertEmbeddedEntrypoint(paths.embeddedPath);
+  const project = await readProjectSources(paths);
+  const placementByFile = new Map<string, FunctionPlacement | "local" | "node">();
+  const localModules = await readLocalModules(paths.localDirs, project.sources, placementByFile);
+  const resolver = await createProjectResolver(paths.root);
+  await assertProjectBoundaries(paths, project, resolver);
+  const { manifest, modules } = readFunctionModules(paths, project, placementByFile);
+  const graph = await readDeviceSources(
+    paths,
+    project.sources,
+    placementByFile,
+    resolver,
+    modules,
+    localModules,
+  );
+  const schemaSourceHash = hashBytes(
+    project.sources.get(paths.schemaPath) ?? (await readFile(paths.schemaPath, "utf8")),
+  );
+  const manifestHash = hashJson(manifest);
+  if (requireGenerated) {
+    await assertGeneratedFile(paths.generatedPath, { manifestHash, schemaSourceHash });
+  }
+  const { artifact, executionHash, localExports } = createArtifactState(
+    input,
+    paths,
+    project.sources,
+    graph,
+    manifest,
+    manifestHash,
+    localModules,
+  );
+  return {
+    embeddedSchema: toEmbeddedGeneratedSchema(input.analysis),
+    generatedPath: paths.generatedPath,
+    localModules,
+    manifest,
+    manifestHash,
+    artifact,
+    localExports,
+    moduleGraphHash: executionHash,
+    modules,
+    schemaPath: paths.schemaPath,
+    schemaSourceHash,
+    sourceFiles: graph,
+  };
+}
+
+function resolveBundlePaths(input: EmbeddedBundleInput): BundlePaths {
   const root = path.resolve(input.root ?? process.cwd());
-  const convexDir = resolveInputPath(root, input.convexDir ?? DEFAULT_CONVEX_DIR);
-  const schemaPath = resolveInputPath(convexDir, input.schemaPath ?? DEFAULT_SCHEMA_PATH);
-  const embeddedPath = resolveInputPath(convexDir, EMBEDDED_ENTRYPOINT_PATH);
-  const generatedPath = resolveInputPath(convexDir, input.generatedPath ?? DEFAULT_GENERATED_PATH);
-  const localDirs =
-    input.local === undefined
-      ? []
-      : (Array.isArray(input.local) ? input.local : [input.local]).map((dir) =>
-          resolveInputPath(root, dir),
-        );
-  for (const [index, localDir] of localDirs.entries()) {
-    if (isInside(localDir, convexDir) || isInside(convexDir, localDir)) {
-      throw new Error(
-        `local function directory ${localDir} must live outside the Convex directory ${convexDir}`,
-      );
-    }
-    for (const other of localDirs.slice(index + 1)) {
-      if (isInside(localDir, other) || isInside(other, localDir)) {
-        throw new Error(`local function directories ${localDir} and ${other} must not overlap`);
-      }
+  const convexDir = resolveDefaultPath(root, input.convexDir, DEFAULT_CONVEX_DIR);
+  const schemaPath = resolveDefaultPath(convexDir, input.schemaPath, DEFAULT_SCHEMA_PATH);
+  const embeddedPath = resolveDefaultPath(convexDir, undefined, EMBEDDED_ENTRYPOINT_PATH);
+  const generatedPath = resolveDefaultPath(convexDir, input.generatedPath, DEFAULT_GENERATED_PATH);
+  const localDirs = resolveLocalDirectories(root, input.local);
+  return {
+    convexDir,
+    embeddedPath,
+    generatedPath,
+    localDirs,
+    root,
+    schemaPath,
+  };
+}
+
+function resolveDefaultPath(root: string, value: string | undefined, fallback: string): string {
+  return resolveInputPath(root, value ?? fallback);
+}
+
+function resolveLocalDirectories(root: string, local: string | string[] | undefined): string[] {
+  if (local === undefined) return [];
+  const directories = Array.isArray(local) ? local : [local];
+  return directories.map((directory) => resolveInputPath(root, directory));
+}
+
+function assertLocalDirectories(paths: BundlePaths): void {
+  for (const [index, localDir] of paths.localDirs.entries()) {
+    assertLocalDirectoryOutsideConvex(localDir, paths.convexDir);
+    for (const other of paths.localDirs.slice(index + 1)) {
+      assertLocalDirectoriesDoNotOverlap(localDir, other);
     }
   }
-  await assertSchemaFile(schemaPath);
-  await assertEmbeddedEntrypoint(embeddedPath);
-  const convexFiles = await listSourceFiles(convexDir);
+}
+
+function assertLocalDirectoryOutsideConvex(localDir: string, convexDir: string): void {
+  if (!isInside(localDir, convexDir) && !isInside(convexDir, localDir)) return;
+  throw new Error(
+    `local function directory ${localDir} must live outside the Convex directory ${convexDir}`,
+  );
+}
+
+function assertLocalDirectoriesDoNotOverlap(left: string, right: string): void {
+  if (!isInside(left, right) && !isInside(right, left)) return;
+  throw new Error(`local function directories ${left} and ${right} must not overlap`);
+}
+
+async function readProjectSources(paths: BundlePaths): Promise<ProjectSources> {
+  const convexFiles = await listSourceFiles(paths.convexDir);
   const sources = new Map(
     await Promise.all(
       convexFiles.map(async (file) => [path.resolve(file), await readFile(file, "utf8")] as const),
     ),
   );
-  const files = convexFiles.filter((file) => {
+  const functionFiles = convexFiles.filter((file) => {
     const name = path.basename(file);
     return (
-      path.resolve(file) !== generatedPath &&
+      path.resolve(file) !== paths.generatedPath &&
       !SYSTEM_MODULE_RE.test(name) &&
       !GENERATED_MODULE_RE.test(name)
     );
   });
-  const modules: Record<string, string> = {};
-  const manifest: EmbeddedFunctionManifest = {};
-  const seen = new Map<string, string>();
-  const placementByFile = new Map<string, FunctionPlacement | "local" | "node">();
-  const localModules = await readLocalModules(localDirs, sources, placementByFile);
+  return { convexFiles, functionFiles, sources };
+}
 
-  const resolver = await createProjectResolver(root);
-  for (const file of convexFiles) {
-    const resolved = path.resolve(file);
-    const source = sources.get(resolved)!;
-    for (const match of source.matchAll(STATIC_IMPORT)) {
-      const specifier = match[2]!;
-      if (/^(?:import|export)\s+type\b/.test(match[0]!)) continue;
-      if (specifier === LOCAL_ENTRYPOINT) {
-        throw new Error(
-          `Convex module ${file} must not import ${LOCAL_ENTRYPOINT}; device-only functions live under the bundler local directories`,
-        );
-      }
-      if (localDirs.length === 0) continue;
-      let target: string | undefined;
-      try {
-        target = await resolveProjectImport(resolved, specifier, resolver);
-      } catch {
-        continue;
-      }
-      const normalized = target === undefined ? undefined : path.normalize(target);
-      if (normalized !== undefined && localDirs.some((dir) => isInside(normalized, dir))) {
-        throw new Error(
-          `Convex module ${file} must not import device-only module ${target}; device-only code never deploys`,
-        );
-      }
-    }
+async function assertProjectBoundaries(
+  paths: BundlePaths,
+  project: ProjectSources,
+  resolver: ProjectResolver,
+): Promise<void> {
+  for (const file of project.convexFiles) {
+    await assertProjectFileBoundaries(paths, project, resolver, file);
   }
+}
 
-  for (const file of files) {
-    const resolved = path.resolve(file);
-    if (resolved === schemaPath || resolved === embeddedPath) continue;
-    const source = sources.get(resolved)!;
-    if (hasUseNodeDirective(source)) {
-      placementByFile.set(resolved, "node");
-      continue;
-    }
-    const moduleId = toModuleId(convexDir, file);
-    const existing = seen.get(moduleId);
-    if (existing !== undefined) {
-      throw new Error(`Duplicate Convex module id "${moduleId}" from "${existing}" and "${file}".`);
-    }
-    const registrations = readCanonicalRegistrations(moduleId, file, source);
-    if (Object.keys(registrations).length === 0) continue;
-    if (moduleId === "local" || moduleId.startsWith("local/")) {
-      throw new Error(
-        `Convex module ${moduleId} uses the reserved local/ function namespace; move it outside convex/local`,
-      );
-    }
-    if ((path.basename(file).match(/\./g) ?? []).length > 1) {
-      throw new Error(
-        `Convex module ${moduleId} in ${file} contains multiple dots, which the Convex CLI silently skips; rename the module`,
-      );
-    }
-    const placements = new Set(Object.values(registrations).map((entry) => entry.placement));
-    if (placements.size !== 1) {
-      throw new Error(`Convex module ${moduleId} mixes embedded function placements`);
-    }
-    const [placement] = placements;
-    placementByFile.set(resolved, placement!);
-    seen.set(moduleId, file);
-    manifest[moduleId] = registrations;
-    if (placement !== "remote") modules[moduleId] = file;
+async function assertProjectFileBoundaries(
+  paths: BundlePaths,
+  project: ProjectSources,
+  resolver: ProjectResolver,
+  file: string,
+): Promise<void> {
+  const resolved = path.resolve(file);
+  const source = project.sources.get(resolved)!;
+  for (const edge of readModuleEdges(source)) {
+    if (edge.typeOnly) continue;
+    assertNoLocalEntrypointImport(file, edge.specifier);
+    await assertNoLocalModuleImport(paths.localDirs, resolver, resolved, file, edge.specifier);
   }
+}
 
+function assertNoLocalEntrypointImport(file: string, specifier: string): void {
+  if (specifier !== LOCAL_ENTRYPOINT) return;
+  throw new Error(
+    `Convex module ${file} must not import ${LOCAL_ENTRYPOINT}; device-only functions live under the bundler local directories`,
+  );
+}
+
+async function assertNoLocalModuleImport(
+  localDirs: string[],
+  resolver: ProjectResolver,
+  importer: string,
+  file: string,
+  specifier: string,
+): Promise<void> {
+  if (localDirs.length === 0) return;
+  const target = await resolveProjectTarget(importer, specifier, resolver);
+  if (target === undefined || !localDirs.some((dir) => isInside(path.normalize(target), dir)))
+    return;
+  throw new Error(
+    `Convex module ${file} must not import device-only module ${target}; device-only code never deploys`,
+  );
+}
+
+async function resolveProjectTarget(
+  importer: string,
+  specifier: string,
+  resolver: ProjectResolver,
+): Promise<string | undefined> {
+  try {
+    return await resolveProjectImport(importer, specifier, resolver);
+  } catch {
+    return undefined;
+  }
+}
+
+function readFunctionModules(
+  paths: BundlePaths,
+  project: ProjectSources,
+  placementByFile: Map<string, FunctionPlacement | "local" | "node">,
+): FunctionModules {
+  const state: FunctionModuleState = { manifest: {}, modules: {}, seen: new Map() };
+  for (const file of project.functionFiles) {
+    readFunctionModule(paths, project, placementByFile, state, file);
+  }
+  return { manifest: state.manifest, modules: state.modules };
+}
+
+function readFunctionModule(
+  paths: BundlePaths,
+  project: ProjectSources,
+  placementByFile: Map<string, FunctionPlacement | "local" | "node">,
+  state: FunctionModuleState,
+  file: string,
+): void {
+  const resolved = path.resolve(file);
+  if (isBundleEntrypoint(paths, resolved)) return;
+  const source = project.sources.get(resolved)!;
+  if (hasUseNodeDirective(source)) {
+    placementByFile.set(resolved, "node");
+    return;
+  }
+  const moduleId = toModuleId(paths.convexDir, file);
+  assertUniqueFunctionModule(moduleId, file, state.seen);
+  const registrations = readCanonicalRegistrations(moduleId, file, source);
+  if (Object.keys(registrations).length === 0) return;
+  writeFunctionModule(placementByFile, state, resolved, file, moduleId, registrations);
+}
+
+function isBundleEntrypoint(paths: BundlePaths, file: string): boolean {
+  return file === paths.schemaPath || file === paths.embeddedPath;
+}
+
+function writeFunctionModule(
+  placementByFile: Map<string, FunctionPlacement | "local" | "node">,
+  state: FunctionModuleState,
+  resolved: string,
+  file: string,
+  moduleId: string,
+  registrations: Record<string, EmbeddedFunctionManifestEntry>,
+): void {
+  assertFunctionModuleName(moduleId, file);
+  const placement = readFunctionPlacement(moduleId, registrations);
+  placementByFile.set(resolved, placement);
+  state.seen.set(moduleId, file);
+  state.manifest[moduleId] = registrations;
+  if (placement !== "remote") state.modules[moduleId] = file;
+}
+
+function assertUniqueFunctionModule(
+  moduleId: string,
+  file: string,
+  seen: ReadonlyMap<string, string>,
+): void {
+  const existing = seen.get(moduleId);
+  if (existing === undefined) return;
+  throw new Error(`Duplicate Convex module id "${moduleId}" from "${existing}" and "${file}".`);
+}
+
+function assertFunctionModuleName(moduleId: string, file: string): void {
+  if (isReservedLocalModuleId(moduleId)) {
+    throw new Error(
+      `Convex module ${moduleId} uses the reserved local/ function namespace; move it outside convex/local`,
+    );
+  }
+  if (!hasMultipleModuleDots(file)) return;
+  throw new Error(
+    `Convex module ${moduleId} in ${file} contains multiple dots, which the Convex CLI silently skips; rename the module`,
+  );
+}
+
+function isReservedLocalModuleId(moduleId: string): boolean {
+  return moduleId === "local" || moduleId.startsWith("local/");
+}
+
+function hasMultipleModuleDots(file: string): boolean {
+  return (path.basename(file).match(/\./g) ?? []).length > 1;
+}
+
+function readFunctionPlacement(
+  moduleId: string,
+  registrations: Record<string, EmbeddedFunctionManifestEntry>,
+): FunctionPlacement {
+  const placements = new Set(Object.values(registrations).map((entry) => entry.placement));
+  if (placements.size !== 1) {
+    throw new Error(`Convex module ${moduleId} mixes embedded function placements`);
+  }
+  return [...placements][0]!;
+}
+
+async function readDeviceSources(
+  paths: BundlePaths,
+  sources: Map<string, string>,
+  placementByFile: Map<string, FunctionPlacement | "local" | "node">,
+  resolver: ProjectResolver,
+  modules: Record<string, string>,
+  localModules: EmbeddedBundleResult["localModules"],
+): Promise<string[]> {
   const sourceFiles = new Set<string>();
   const entrypoints = [
     ...Object.values(modules),
@@ -395,32 +595,24 @@ async function createEmbeddedBundleInner(
   ];
   for (const file of entrypoints) {
     await readDeviceImportGraph({
-      convexDir,
+      convexDir: paths.convexDir,
       entry: path.resolve(file),
-      generatedPath,
+      generatedPath: paths.generatedPath,
       placementByFile,
       resolver,
-      root,
+      root: paths.root,
       sources,
       visited: sourceFiles,
     });
   }
+  return [...sourceFiles].sort();
+}
 
-  const schemaSourceHash = hashBytes(
-    sources.get(schemaPath) ?? (await readFile(schemaPath, "utf8")),
-  );
-  const manifestHash = hashJson(manifest);
-  if (requireGenerated) {
-    await assertGeneratedFile(generatedPath, { manifestHash, schemaSourceHash });
-  }
-  const graph = [...sourceFiles].sort();
-  const localModuleByFile = new Map(
-    Object.entries(localModules).map(([moduleId, module]) => [
-      path.normalize(module.file),
-      moduleId,
-    ]),
-  );
-  const localExports: Record<string, string[]> = Object.fromEntries(
+function readLocalExports(
+  localModules: EmbeddedBundleResult["localModules"],
+  sources: ReadonlyMap<string, string>,
+): Record<string, string[]> {
+  return Object.fromEntries(
     Object.entries(localModules)
       .map(([moduleId, module]) => [
         moduleId,
@@ -428,8 +620,22 @@ async function createEmbeddedBundleInner(
       ])
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
   ) as Record<string, string[]>;
-  const localSetups = readLocalSetupDescriptors(localModules, sources);
-  const artifactModules = graph.map((file) => {
+}
+
+function readArtifactModules(
+  root: string,
+  graph: string[],
+  localModules: EmbeddedBundleResult["localModules"],
+  localExports: Readonly<Record<string, string[]>>,
+  sources: ReadonlyMap<string, string>,
+): AppArtifactModule[] {
+  const localModuleByFile = new Map(
+    Object.entries(localModules).map(([moduleId, module]) => [
+      path.normalize(module.file),
+      moduleId,
+    ]),
+  );
+  return graph.map((file) => {
     const normalized = path.normalize(file);
     const localModuleId = localModuleByFile.get(normalized);
     const id =
@@ -441,12 +647,13 @@ async function createEmbeddedBundleInner(
     );
     return { contentHash: hashBytes(sources.get(normalized)!), exports, id };
   });
-  const executionHash = hashJson({ manifest, modules: artifactModules });
-  const schemaHash = toEmbeddedGeneratedSchema(input.analysis).runtimeStoreSchema.hash;
-  if (schemaHash === undefined) {
-    throw new Error("Embedded application artifact requires a generated runtime schema hash");
-  }
-  const setups = [...localSetups]
+}
+
+function createArtifactSetups(
+  localSetups: ReadonlyMap<string, ReadonlySet<string>>,
+  executionHash: string,
+): LocalSetupDescriptor[] {
+  return [...localSetups]
     .flatMap(([moduleId, exports]) =>
       [...exports].map((name) => ({
         closureHash: executionHash,
@@ -457,6 +664,31 @@ async function createEmbeddedBundleInner(
     .sort((left, right) =>
       left.reference < right.reference ? -1 : left.reference > right.reference ? 1 : 0,
     );
+}
+
+function createArtifactState(
+  input: EmbeddedBundleInput,
+  paths: BundlePaths,
+  sources: ReadonlyMap<string, string>,
+  graph: string[],
+  manifest: EmbeddedFunctionManifest,
+  manifestHash: string,
+  localModules: EmbeddedBundleResult["localModules"],
+): ArtifactState {
+  const localExports = readLocalExports(localModules, sources);
+  const localSetups = readLocalSetupDescriptors(localModules, sources);
+  const artifactModules = readArtifactModules(
+    paths.root,
+    graph,
+    localModules,
+    localExports,
+    sources,
+  );
+  const executionHash = hashJson({ manifest, modules: artifactModules });
+  const schemaHash = toEmbeddedGeneratedSchema(input.analysis).runtimeStoreSchema.hash;
+  if (schemaHash === undefined) {
+    throw new Error("Embedded application artifact requires a generated runtime schema hash");
+  }
   const artifactWithoutHash = {
     executionHash,
     expectedBinding: {
@@ -469,26 +701,12 @@ async function createEmbeddedBundleInner(
     modules: artifactModules,
     replicationHash: manifestHash,
     schemaHash,
-    setups,
+    setups: createArtifactSetups(localSetups, executionHash),
   };
-  const artifact: AppArtifactV1 = {
-    ...artifactWithoutHash,
-    artifactHash: hashJson(artifactWithoutHash),
-  };
-
   return {
-    embeddedSchema: toEmbeddedGeneratedSchema(input.analysis),
-    generatedPath,
-    localModules,
-    manifest,
-    manifestHash,
-    artifact,
+    artifact: { ...artifactWithoutHash, artifactHash: hashJson(artifactWithoutHash) },
+    executionHash,
     localExports,
-    moduleGraphHash: executionHash,
-    modules,
-    schemaPath,
-    schemaSourceHash,
-    sourceFiles: graph,
   };
 }
 
@@ -796,9 +1014,6 @@ function maskAmbientDeclarations(code: string): string {
   return output;
 }
 
-const STATIC_IMPORT =
-  /(?:\b(?:import|export)\s+(?:[^"']*?\s+from\s+)?|\bimport\s*\()(["'])([^"']+)\1/g;
-
 interface ProjectResolver {
   baseUrl?: string;
   paths: Array<{ pattern: string; targets: string[] }>;
@@ -822,9 +1037,7 @@ async function readDeviceImportGraph(options: {
     if (visited.has(file)) return;
     visited.add(file);
     const source = await readProjectSource(file, sources);
-    for (const match of source.matchAll(STATIC_IMPORT)) {
-      const specifier = match[2];
-      if (!specifier) continue;
+    for (const { specifier } of readModuleEdges(source)) {
       if (isGeneratedImport(file, specifier, generatedPath)) continue;
       const target = await resolveProjectImport(file, specifier, resolver);
       if (target === undefined) continue;
@@ -994,124 +1207,6 @@ function readPlacementImports(source: string, code: string): Set<string> {
     }
   }
   return placements;
-}
-
-const REGEX_PRECEDING_OPERATORS = "(,=:[!&|?{;+-*%~^>";
-const REGEX_PRECEDING_KEYWORDS = new Set([
-  "await",
-  "case",
-  "delete",
-  "do",
-  "else",
-  "in",
-  "instanceof",
-  "new",
-  "of",
-  "return",
-  "throw",
-  "typeof",
-  "void",
-  "yield",
-]);
-
-function maskCommentsAndStrings(source: string): string {
-  let output = "";
-  let state: "code" | "line" | "block" | "string" | "regex" = "code";
-  let quote = "";
-  let previous = "";
-  let word = "";
-  let characterClass = false;
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index]!;
-    const next = source[index + 1];
-    if (state === "code") {
-      if (character === "/" && next === "/") {
-        output += "  ";
-        index += 1;
-        state = "line";
-      } else if (character === "/" && next === "*") {
-        output += "  ";
-        index += 1;
-        state = "block";
-      } else if (character === "/" && startsRegexLiteral(previous, word)) {
-        output += " ";
-        characterClass = false;
-        state = "regex";
-      } else if (character === '"' || character === "'" || character === "`") {
-        output += " ";
-        quote = character;
-        state = "string";
-      } else {
-        output += character;
-        if (!/\s/.test(character)) {
-          word = /[$\w]/.test(character) ? `${word}${character}` : "";
-          previous = character;
-        }
-      }
-      continue;
-    }
-    if (state === "line") {
-      output += character === "\n" || character === "\r" ? character : " ";
-      if (character === "\n" || character === "\r") state = "code";
-      continue;
-    }
-    if (state === "block") {
-      if (character === "*" && next === "/") {
-        output += "  ";
-        index += 1;
-        state = "code";
-      } else {
-        output += character === "\n" || character === "\r" ? character : " ";
-      }
-      continue;
-    }
-    if (state === "regex") {
-      output += character === "\n" || character === "\r" ? character : " ";
-      if (character === "\\") {
-        if (next !== undefined) {
-          output += next === "\n" || next === "\r" ? next : " ";
-          index += 1;
-        }
-      } else if (character === "[") {
-        characterClass = true;
-      } else if (character === "]") {
-        characterClass = false;
-      } else if (
-        (character === "/" && !characterClass) ||
-        character === "\n" ||
-        character === "\r"
-      ) {
-        previous = "/";
-        word = "";
-        state = "code";
-      }
-      continue;
-    }
-    if (character === "\\") {
-      output += " ";
-      if (next !== undefined) {
-        output += next === "\n" || next === "\r" ? next : " ";
-        index += 1;
-      }
-    } else if (character === quote) {
-      output += " ";
-      previous = quote;
-      word = "";
-      state = "code";
-    } else {
-      output += character === "\n" || character === "\r" ? character : " ";
-    }
-  }
-  return output;
-}
-
-/**
- * Whether a `/` opens a regex literal rather than a division, from the last significant token.
- * JSX closes (`</`, `/>`) keep `<` and `}` out of the operand-position set.
- */
-function startsRegexLiteral(previous: string, word: string): boolean {
-  if (word !== "") return REGEX_PRECEDING_KEYWORDS.has(word);
-  return previous === "" || REGEX_PRECEDING_OPERATORS.includes(previous);
 }
 
 function hasUseNodeDirective(source: string): boolean {

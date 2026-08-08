@@ -20,9 +20,12 @@ import { LeaderRuntime, type LeaderClient, type RemoteFollower } from "./coordin
 import { Mailbox } from "./coordinator/mailbox";
 import {
   controlChannelName,
+  compareFence,
   ControlOp,
   CoordinatorProtocol,
+  isCanonicalFence,
   isControlMessage,
+  isLegacyLeaderBroadcast,
   isPeerMessage,
   PeerOp,
   RejectCode,
@@ -67,6 +70,7 @@ type RuntimeOwnership =
   | { ownership: "seeking" }
   | {
       epoch: string;
+      fence: string;
       leaderId: string;
       mailbox: Mailbox<PeerMessage>;
       ownership: "attaching";
@@ -74,13 +78,26 @@ type RuntimeOwnership =
     }
   | {
       epoch: string;
+      fence: string;
       leaderId: string;
       mailbox: Mailbox<PeerMessage>;
       ownership: "follower";
     }
   | { ownership: "promoting" }
-  | { epoch: string; leader: LeaderRuntime; ownership: "leader" }
+  | { epoch: string; fence: string; leader: LeaderRuntime; ownership: "leader" }
   | { ownership: "closed" };
+
+function isFollowerOwnership(
+  ownership: RuntimeOwnership,
+  leaderEpoch: string,
+  leaderFence: string,
+): ownership is Extract<RuntimeOwnership, { ownership: "follower" }> {
+  return (
+    ownership.ownership === "follower" &&
+    ownership.epoch === leaderEpoch &&
+    ownership.fence === leaderFence
+  );
+}
 
 interface RuntimeAddress {
   clientId: string;
@@ -104,6 +121,8 @@ interface LeaderDiscovery {
   /** Backoff timer scheduled after a retryable attach rejection, tracked so it can be cancelled. */
   attachBackoff?: Timer;
   leaderBeacon?: Timer;
+  /** One compatibility probe per discovery round; never participates in an attach. */
+  legacyProbeSent?: true;
   recoveryTimer?: Timer;
 }
 
@@ -111,6 +130,10 @@ const MAX_ATTACH_BACKOFF_EXPONENT = 16;
 interface RuntimeResources {
   control?: Mailbox<ControlMessage>;
   localClient: LeaderClient;
+  /** Highest durable term observed for this physical browser store. */
+  leaderFence?: string;
+  /** Random session paired with the highest durable term. */
+  leaderEpoch?: string;
   ownership: RuntimeOwnership;
   storageLease?: { release: Deferred; released: Deferred };
   workerLease: Deferred;
@@ -338,16 +361,18 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   async start(): Promise<void> {
     try {
       await this.env.assertCapabilities();
-      this.state.resources.control = this.openMailbox(
+      this.state.resources.control = this.openMailbox<ControlMessage>(
         this.state.address.controlName,
         this.onControlMessage,
       );
-      this.state.resources.workerMailbox = this.openMailbox(
+      this.state.resources.workerMailbox = this.openMailbox<PeerMessage>(
         this.state.address.workerChannelName,
         this.onPeerMessage,
       );
       await this.holdWorkerLock();
-      if (this.init.storageOwner !== false) void this.acceptStorageOwnership();
+      if (this.init.storageOwner !== false) {
+        void this.acceptStorageOwnership().catch(() => undefined);
+      }
       this.ensureConnected();
       const lifecycle = this.state.lifecycle;
       if (lifecycle.lifecycle === "starting") {
@@ -420,6 +445,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.state.resources.control?.send({
       identity: ownership.leader.identity,
       leaderEpoch: ownership.epoch,
+      leaderFence: ownership.fence,
       leaderId: this.state.address.workerId,
       op: ControlOp.BroadcastLeader,
       protocol: CoordinatorProtocol,
@@ -431,19 +457,40 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     message: Extract<ControlMessage, { op: typeof ControlOp.BroadcastLeader }>,
   ): void {
     if (message.leaderId === this.state.address.workerId) return;
-    const ownership = this.state.resources.ownership;
-    if (ownership.ownership === "leader" || ownership.ownership === "promoting") return;
-    if (ownership.ownership === "follower" && ownership.epoch === message.leaderEpoch) {
+    const fence = this.adoptLeaderFence(message.leaderFence, message.leaderEpoch);
+    if (fence === "stale") return;
+    if (fence === "conflict") {
+      this.fail(new Error("Conflicting browser leader sessions advertised the same durable term."));
       return;
     }
-    if (ownership.ownership === "attaching" && ownership.epoch === message.leaderEpoch) return;
-    this.attachToLeader(message.leaderId, message.leaderEpoch, message.scope);
+    const ownership = this.state.resources.ownership;
+    if (ownership.ownership === "leader" || ownership.ownership === "promoting") {
+      this.fail(new Error("A newer browser leader term superseded this runtime."));
+      return;
+    }
+    if (
+      ownership.ownership === "follower" &&
+      ownership.epoch === message.leaderEpoch &&
+      ownership.fence === message.leaderFence
+    ) {
+      return;
+    }
+    if (
+      ownership.ownership === "attaching" &&
+      ownership.epoch === message.leaderEpoch &&
+      ownership.fence === message.leaderFence
+    ) {
+      return;
+    }
+    this.attachToLeader(message.leaderId, message.leaderEpoch, message.leaderFence, message.scope);
   }
 
   handleAttach(message: Extract<PeerMessage, { op: typeof PeerOp.Attach }>): void {
     const ownership = this.state.resources.ownership;
     if (message.workerId === this.state.address.workerId || ownership.ownership !== "leader")
       return;
+    if (!this.acceptPeerFence(message.leaderFence, message.leaderEpoch)) return;
+    if (message.leaderEpoch !== ownership.epoch || message.leaderFence !== ownership.fence) return;
     ownership.leader.attachFollower(
       message,
       (name) => this.env.channels.open(name),
@@ -463,20 +510,27 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     if (message.fromWorkerId === this.state.address.workerId || ownership.ownership !== "leader") {
       return;
     }
-    if (message.leaderEpoch !== ownership.epoch) return;
+    if (!this.acceptPeerFence(message.leaderFence, message.leaderEpoch)) return;
+    if (message.leaderEpoch !== ownership.epoch || message.leaderFence !== ownership.fence) return;
     void ownership.leader.handlePeerRequest(message);
   }
 
   handleRequestAck(message: Extract<PeerMessage, { op: typeof PeerOp.RequestAck }>): void {
-    const ownership = this.state.resources.ownership;
-    if (ownership.ownership !== "follower" || ownership.epoch !== message.leaderEpoch) return;
+    if (!this.isCurrentFollower(message.leaderFence, message.leaderEpoch)) return;
     this.state.outbox.confirm(message.requestId);
     this.postDebug("worker:coordination:request-ack", { requestId: message.requestId });
   }
 
   handleAttached(message: Extract<PeerMessage, { op: typeof PeerOp.Attached }>): void {
     const ownership = this.state.resources.ownership;
-    if (ownership.ownership !== "attaching" || ownership.epoch !== message.leaderEpoch) return;
+    if (!this.acceptPeerFence(message.leaderFence, message.leaderEpoch)) return;
+    if (
+      ownership.ownership !== "attaching" ||
+      ownership.epoch !== message.leaderEpoch ||
+      ownership.fence !== message.leaderFence
+    ) {
+      return;
+    }
     this.env.clearTimer(ownership.timer);
     this.state.discovery.attachRejections = undefined;
     this.clearAttachBackoff();
@@ -484,6 +538,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.clearRecoveryTimer();
     this.state.resources.ownership = {
       epoch: message.leaderEpoch,
+      fence: message.leaderFence,
       leaderId: message.leaderId,
       mailbox: ownership.mailbox,
       ownership: "follower",
@@ -501,7 +556,14 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     const attach = this.state.resources.ownership;
     // Ignore a late rejection from a previous attach target — only the current attempt's leader
     // epoch may cancel the current pending attach (mirrors `handleAttached`).
-    if (attach.ownership !== "attaching" || attach.epoch !== message.leaderEpoch) return;
+    if (!this.acceptPeerFence(message.leaderFence, message.leaderEpoch)) return;
+    if (
+      attach.ownership !== "attaching" ||
+      attach.epoch !== message.leaderEpoch ||
+      attach.fence !== message.leaderFence
+    ) {
+      return;
+    }
     this.env.clearTimer(attach.timer);
     attach.mailbox.close();
     this.state.resources.ownership = { ownership: "seeking" };
@@ -552,8 +614,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   handlePeerResponse(message: Extract<PeerMessage, { op: typeof PeerOp.Response }>): void {
-    const ownership = this.state.resources.ownership;
-    if (ownership.ownership !== "follower" || ownership.epoch !== message.leaderEpoch) return;
+    if (!this.isCurrentFollower(message.leaderFence, message.leaderEpoch)) return;
     this.postRuntimeResponse(message.response);
   }
 
@@ -581,14 +642,15 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     ownership.mailbox.send({
       fromWorkerId: this.state.address.workerId,
       leaderEpoch: ownership.epoch,
+      leaderFence: ownership.fence,
       op: PeerOp.Request,
       protocol: CoordinatorProtocol,
       request,
     });
-    const epoch = ownership.epoch;
+    const { epoch, fence } = ownership;
     this.state.outbox.armAckTimer(request.id, this.env.timeouts.forwardAckTimeoutMs, () => {
       const current = this.state.resources.ownership;
-      if (current.ownership !== "follower" || current.epoch !== epoch) return;
+      if (!isFollowerOwnership(current, epoch, fence)) return;
       this.postDebug("worker:coordination:request-ack-timeout", {
         leaderEpoch: epoch,
         requestId: request.id,
@@ -621,14 +683,25 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.startLeaderBeacon();
   }
 
-  private attachToLeader(leaderId: string, leaderEpoch: string, leaderScope: string): void {
+  private attachToLeader(
+    leaderId: string,
+    leaderEpoch: string,
+    leaderFence: string,
+    leaderScope: string,
+  ): void {
     this.stopLeaderBeacon();
     this.clearPendingAttach();
     this.clearFollowerTransport();
     const mailbox = this.openSendOnlyMailbox<PeerMessage>(workerChannelName(leaderScope, leaderId));
     const timer = this.env.setTimer(() => {
       const current = this.state.resources.ownership;
-      if (current.ownership !== "attaching" || current.epoch !== leaderEpoch) return;
+      if (
+        current.ownership !== "attaching" ||
+        current.epoch !== leaderEpoch ||
+        current.fence !== leaderFence
+      ) {
+        return;
+      }
       mailbox.close();
       this.state.resources.ownership = { ownership: "seeking" };
       this.postDebug("worker:coordination:attach-timeout", { leaderEpoch, leaderId });
@@ -636,6 +709,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     }, this.env.timeouts.attachTimeoutMs);
     this.state.resources.ownership = {
       epoch: leaderEpoch,
+      fence: leaderFence,
       leaderId,
       mailbox,
       ownership: "attaching",
@@ -645,6 +719,8 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     mailbox.send({
       clientId: this.state.address.clientId,
       identity: this.state.address.identity,
+      leaderEpoch,
+      leaderFence,
       op: PeerOp.Attach,
       protocol: CoordinatorProtocol,
       remote: this.init.remote,
@@ -685,55 +761,167 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     this.state.resources.ownership = { ownership: "promoting" };
     this.postDebug("worker:coordination:promoting", { workerId: this.state.address.workerId });
     const runtime = await this.env.openRuntime(this.init, (response) => this.postLocal(response));
-    const leader = new LeaderRuntime({
-      epoch: this.env.randomId("leader"),
-      identity: this.state.address.identity,
-      runtime,
-      scope: this.state.address.scope,
-      storagePath: this.state.address.storagePath,
-    });
-    if (this.isClosedOrClosing()) return leader;
-    leader.addLocalClient(this.state.resources.localClient);
-    const { closeWorkerRemoteSocket, ensureWorkerRemoteStarted } = await import("./runtime");
-    const startRemote = () => {
-      if (this.init.remote === undefined) return;
-      runtime.remoteReady = ensureWorkerRemoteStarted(
+    let leader: LeaderRuntime | undefined;
+    try {
+      // The term is durable store state. Allocate it only after this worker owns the page lock and
+      // has physically opened the candidate, but before any leader object can publish or run remote
+      // work. A random epoch remains an opaque session token only.
+      const leaderFence = await this.writeLeaderFence(runtime);
+      const leaderEpoch = this.env.randomId("leader");
+      const adopted = this.adoptLeaderFence(leaderFence, leaderEpoch);
+      if (adopted === "stale" || adopted === "conflict") {
+        throw new Error("The browser store allocated a non-monotonic leader fence.");
+      }
+      leader = new LeaderRuntime({
+        epoch: leaderEpoch,
+        fence: leaderFence,
+        identity: this.state.address.identity,
         runtime,
-        this.init.remote,
-        this.init.debug,
-        (response) => this.postLocal(response),
-      );
-    };
-    if (this.init.remote !== undefined) startRemote();
-    leader.enableRecovery({
-      closeRemoteSocket: () => {
-        if (this.init.remote !== undefined) closeWorkerRemoteSocket(runtime);
-      },
-      onDeadInstance: (error) => this.releaseDeadInstance(error),
-    });
-    this.state.discovery.attachRejections = undefined;
-    this.state.resources.ownership = { epoch: leader.epoch, leader, ownership: "leader" };
-    this.state.resources.control?.send({
-      identity: leader.identity,
-      leaderEpoch: leader.epoch,
-      leaderId: this.state.address.workerId,
-      op: ControlOp.BroadcastLeader,
-      protocol: CoordinatorProtocol,
-      scope: this.state.address.scope,
-    });
-    this.clearRecoveryTimer();
-    this.postDebug("worker:coordination:leader", {
-      leaderEpoch: leader.epoch,
-      workerId: this.state.address.workerId,
-    });
-    this.postDebug("worker:coordination:reconnect-success", {
-      leaderEpoch: leader.epoch,
-      leaderId: this.state.address.workerId,
-      role: "leader",
-    });
-    this.replayLedger();
-    this.postInitSuccess(runtime.runner.localConfigured);
-    return leader;
+        scope: this.state.address.scope,
+        storagePath: this.state.address.storagePath,
+      });
+      if (this.isClosedOrClosing()) return leader;
+      // This control broadcast is an ownership barrier, deliberately free of remote settlements.
+      // Followers record the higher durable term before this leader can replay remote work.
+      this.state.resources.ownership = {
+        epoch: leader.epoch,
+        fence: leader.fence,
+        leader,
+        ownership: "leader",
+      };
+      this.state.resources.control?.send({
+        identity: leader.identity,
+        leaderEpoch: leader.epoch,
+        leaderFence: leader.fence,
+        leaderId: this.state.address.workerId,
+        op: ControlOp.BroadcastLeader,
+        protocol: CoordinatorProtocol,
+        scope: this.state.address.scope,
+      });
+      leader.addLocalClient(this.state.resources.localClient);
+      const { closeWorkerRemoteSocket, ensureWorkerRemoteStarted } = await import("./runtime");
+      leader.enableRecovery({
+        closeRemoteSocket: () => {
+          if (this.init.remote !== undefined) closeWorkerRemoteSocket(runtime);
+        },
+        onDeadInstance: (error) => this.releaseDeadInstance(error),
+      });
+      this.state.discovery.attachRejections = undefined;
+      this.clearRecoveryTimer();
+      this.postDebug("worker:coordination:leader", {
+        leaderEpoch: leader.epoch,
+        leaderFence: leader.fence,
+        workerId: this.state.address.workerId,
+      });
+      this.postDebug("worker:coordination:reconnect-success", {
+        leaderEpoch: leader.epoch,
+        leaderId: this.state.address.workerId,
+        role: "leader",
+      });
+      this.postInitSuccess(runtime.runner.localConfigured);
+      if (this.init.remote !== undefined) {
+        runtime.remoteReady = ensureWorkerRemoteStarted(
+          runtime,
+          this.init.remote,
+          this.init.debug,
+          (response) => this.postLocal(response),
+        );
+      }
+      this.replayLedger();
+      return leader;
+    } catch (error) {
+      if (leader) {
+        await leader.close().catch(() => undefined);
+      } else {
+        await this.closeUnownedRuntime(runtime);
+      }
+      if (
+        this.state.resources.ownership.ownership === "leader" &&
+        this.state.resources.ownership.leader === leader
+      ) {
+        this.state.resources.ownership = { ownership: "seeking" };
+      }
+      throw error;
+    }
+  }
+
+  /** Release a physical runtime that failed before a LeaderRuntime could take responsibility. */
+  private async closeUnownedRuntime(runtime: import("./runtime").WorkerState): Promise<void> {
+    runtime.closed = true;
+    runtime.remoteStop?.();
+    runtime.remoteStop = undefined;
+    for (const stop of runtime.stops.values()) stop();
+    runtime.stops.clear();
+    try {
+      await runtime.store.remote?.close().catch(() => undefined);
+      await runtime.store.close().catch(() => undefined);
+    } finally {
+      runtime.pthreads?.terminateAll();
+      runtime.opfs.closeAll();
+    }
+  }
+
+  /** Allocate and validate one durable store term without widening the public storage surface. */
+  private async writeLeaderFence(runtime: import("./runtime").WorkerState): Promise<string> {
+    const allocator = (
+      runtime.store as unknown as {
+        leader?: { fence?: { write?: () => Promise<string> } };
+      }
+    ).leader?.fence;
+    if (!allocator?.write) {
+      throw new Error("This browser storage binding does not support durable leader fencing.");
+    }
+    const fence = await allocator.write();
+    if (!isCanonicalFence(fence)) {
+      throw new Error("Browser storage returned a non-canonical durable leader fence.");
+    }
+    return fence;
+  }
+
+  /**
+   * Record the highest durable term seen on the control/peer channels. Equal terms must name the
+   * same random session; otherwise accepting either side could reattach a split brain.
+   */
+  private adoptLeaderFence(
+    leaderFence: string,
+    leaderEpoch: string,
+  ): "first" | "higher" | "same" | "stale" | "conflict" {
+    const known = this.state.resources.leaderFence;
+    if (known === undefined) {
+      this.state.resources.leaderFence = leaderFence;
+      this.state.resources.leaderEpoch = leaderEpoch;
+      return "first";
+    }
+    const comparison = compareFence(leaderFence, known);
+    if (comparison < 0) return "stale";
+    if (comparison > 0) {
+      this.state.resources.leaderFence = leaderFence;
+      this.state.resources.leaderEpoch = leaderEpoch;
+      return "higher";
+    }
+    return this.state.resources.leaderEpoch === leaderEpoch ? "same" : "conflict";
+  }
+
+  /** Drop lower-term traffic; terminate instead of accepting two sessions at one durable term. */
+  private acceptPeerFence(leaderFence: string, leaderEpoch: string): boolean {
+    const result = this.adoptLeaderFence(leaderFence, leaderEpoch);
+    if (result === "conflict") {
+      this.fail(new Error("Conflicting browser leader sessions used the same durable term."));
+      return false;
+    }
+    if (result === "higher") {
+      this.fail(new Error("A newer browser leader term superseded this runtime."));
+      return false;
+    }
+    return result !== "stale";
+  }
+
+  /** Admit a peer message only from the leader that owns this follower transport. */
+  private isCurrentFollower(leaderFence: string, leaderEpoch: string): boolean {
+    return (
+      this.acceptPeerFence(leaderFence, leaderEpoch) &&
+      isFollowerOwnership(this.state.resources.ownership, leaderEpoch, leaderFence)
+    );
   }
 
   private async holdWorkerLock(): Promise<void> {
@@ -840,6 +1028,18 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
         storagePath: this.state.address.storagePath,
         workerId: this.state.address.workerId,
       });
+      if (this.state.discovery.legacyProbeSent !== true) {
+        this.state.discovery.legacyProbeSent = true;
+        (this.state.resources.control as Mailbox<unknown> | undefined)?.send({
+          clientId: this.state.address.clientId,
+          identity: this.state.address.identity,
+          op: ControlOp.SeekLeader,
+          protocol: 2,
+          scope: this.state.address.scope,
+          storagePath: this.state.address.storagePath,
+          workerId: this.state.address.workerId,
+        });
+      }
       this.state.discovery.leaderBeacon = this.env.setTimer(
         send,
         this.env.timeouts.helloIntervalMs,
@@ -854,6 +1054,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     if (beacon === undefined) return;
     this.env.clearTimer(beacon);
     this.state.discovery.leaderBeacon = undefined;
+    this.state.discovery.legacyProbeSent = undefined;
   }
 
   private clearPendingAttach(): void {
@@ -961,13 +1162,36 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     );
   }
 
-  private readonly onControlMessage = (message: ControlMessage): void => {
-    if (!isControlMessage(message) || this.isClosedOrClosing()) return;
+  private readonly onControlMessage = (message: unknown): void => {
+    if (this.isClosedOrClosing()) return;
+    if (!isControlMessage(message)) {
+      if (isLegacyLeaderBroadcast(message)) {
+        const ownership = this.state.resources.ownership;
+        // A v2 SeekLeader is ignored by active v3 owners. Only a candidate that sees a real
+        // legacy leader advertisement fails, before it can attach or touch physical storage.
+        if (ownership.ownership === "seeking" || ownership.ownership === "attaching") {
+          this.postLocal({
+            event: {
+              at: getTimerTime(),
+              degradation: "deployment-mismatch",
+              error: "ConvexEmbeddedClient cannot coordinate with a legacy browser protocol.",
+              type: "runtime",
+            },
+            op: WorkerEvent.Event,
+          });
+          this.fail(
+            new Error("ConvexEmbeddedClient cannot coordinate with a different browser protocol."),
+          );
+        }
+      }
+      return;
+    }
     controlHandlers.get(message.op)?.(this, message as never);
   };
 
-  private readonly onPeerMessage = (message: PeerMessage): void => {
-    if (!isPeerMessage(message) || this.isClosedOrClosing()) return;
+  private readonly onPeerMessage = (message: unknown): void => {
+    if (this.isClosedOrClosing()) return;
+    if (!isPeerMessage(message)) return;
     peerHandlers.get(message.op)?.(this, message as never);
   };
 }
@@ -997,7 +1221,7 @@ function mergeEnv(overrides: CoordinatorEnvOverrides): CoordinatorEnv {
       overrides.openRuntime ??
       ((request, post) =>
         import("./runtime").then(({ initFromMessage }) =>
-          initFromMessage(request, post, { events: false }),
+          initFromMessage(request, post, { events: false, remote: false }),
         )),
     postLocal: overrides.postLocal ?? ((response) => workerGlobal().postMessage?.(response)),
     randomId: overrides.randomId ?? randomId,

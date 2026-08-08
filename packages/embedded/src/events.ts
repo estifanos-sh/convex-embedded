@@ -134,6 +134,11 @@ export interface EmbeddedStorageEvent {
 export interface EmbeddedRemoteEvent {
   at: number;
   attempt: number;
+  /**
+   * Canonical decimal ownership term for browser-coordinated remotes. Native/direct runtimes do
+   * not frame events with a leader fence.
+   */
+  leaderFence?: string;
   /** Browser leader incarnation; a change resets the per-runtime generation and sequence fence. */
   incarnation?: string;
   /** Remote actor incarnation; higher generations supersede every earlier event. */

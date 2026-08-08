@@ -60,7 +60,7 @@ use storage::{
     TableDef, TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch,
 };
 
-const API_VERSION: u32 = 32;
+const API_VERSION: u32 = 33;
 
 #[napi(js_name = "apiVersion")]
 #[must_use]
@@ -750,6 +750,11 @@ impl Store {
     #[napi]
     pub fn clock_read(&self) -> napi::Result<f64> {
         self.store()?.clock_read().map_err(map_err)
+    }
+
+    #[napi]
+    pub async fn leader_fence_write(&self) -> napi::Result<String> {
+        self.run(storage::EmbeddedStore::leader_fence_write).await
     }
 
     #[napi]
@@ -1679,6 +1684,11 @@ impl Store {
     #[napi]
     pub fn clock_read(&self) -> napi::Result<f64> {
         self.store()?.clock_read().map_err(map_err)
+    }
+
+    #[napi]
+    pub fn leader_fence_write(&self) -> napi::Result<String> {
+        self.run(storage::EmbeddedStore::leader_fence_write)
     }
 
     #[napi]

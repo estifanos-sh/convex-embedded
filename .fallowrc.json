@@ -24,6 +24,7 @@
     "packages/embedded/src/node/index.ts",
     "packages/embedded/src/tables.ts",
     "packages/embedded/src/server/index.ts",
+    "packages/embedded/src/text/field.ts",
     "packages/embedded/src/unplugin.ts",
     "packages/embedded/src/values.ts",
     "packages/embedded/src/vite.ts",
@@ -56,10 +57,96 @@
     "projects": ["config/tsconfig.fallow.json"],
     "require": "complete"
   },
-  "audit": {
-    "typeAware": false
+  "health": {
+    "thresholdOverrides": [
+      {
+        "files": ["packages/embedded/src/client.ts"],
+        "functions": ["updateRemoteConnection"],
+        "maxCyclomatic": 26,
+        "maxCognitive": 24,
+        "maxCrap": 172.1,
+        "maxUnitSize": 60,
+        "reason": "Connection reconciliation is a single ordered state transition; its measured ceiling is retained so any further branching must be decomposed."
+      },
+      {
+        "files": ["packages/embedded/src/client.ts"],
+        "functions": ["admitRemoteDiagnostic"],
+        "maxCyclomatic": 18,
+        "maxCognitive": 29,
+        "maxCrap": 88.1,
+        "maxUnitSize": 57,
+        "reason": "Diagnostic admission deliberately enumerates protocol validity cases; the exact ceiling makes future cases visible to review."
+      },
+      {
+        "files": ["packages/embedded/src/storage/binding.ts"],
+        "functions": ["commitOneDocWrite"],
+        "maxCyclomatic": 17,
+        "maxCognitive": 14,
+        "maxCrap": 79.5,
+        "maxUnitSize": 85,
+        "reason": "The one-document commit preserves transactional ordering across binding boundaries; its measured ceiling remains a regression guard."
+      },
+      {
+        "files": ["packages/embedded/src/browser/runtime.ts"],
+        "functions": ["decideWorkerRemoteTurn"],
+        "maxCyclomatic": 16,
+        "maxCognitive": 21,
+        "maxUnitSize": 54,
+        "reason": "Remote-turn selection is an exhaustive worker state-machine decision; additional branches must be reviewed explicitly."
+      },
+      {
+        "files": ["packages/embedded/src/runtime/runner.ts"],
+        "functions": ["preparePushEnvelope"],
+        "maxCyclomatic": 12,
+        "maxCognitive": 10,
+        "maxCrap": 43.2,
+        "maxUnitSize": 63,
+        "reason": "Push-envelope preparation validates a fixed protocol shape before transport; the ceiling prevents silent expansion."
+      },
+      {
+        "files": ["packages/embedded/src/browser/coordinator.ts"],
+        "functions": ["handleBroadcastLeader"],
+        "maxCyclomatic": 12,
+        "maxCognitive": 9,
+        "maxCrap": 43.2,
+        "maxUnitSize": 31,
+        "reason": "Leader broadcast handling is a fenced ownership transition; its exact ceiling protects the protocol path from accretion."
+      },
+      {
+        "files": ["packages/embedded/src/client.ts"],
+        "functions": ["init"],
+        "maxCyclomatic": 11,
+        "maxCognitive": 11,
+        "maxCrap": 37.2,
+        "maxUnitSize": 160,
+        "reason": "Client initialization intentionally sequences lifecycle, subscription, and cleanup boundaries; any added branch or line exceeds the reviewed budget."
+      },
+      {
+        "files": ["packages/embedded/src/client.ts"],
+        "functions": ["initPrebuilt"],
+        "maxCyclomatic": 11,
+        "maxCognitive": 5,
+        "maxCrap": 37.2,
+        "maxUnitSize": 46,
+        "reason": "The prebuilt initializer mirrors the public initialization lifecycle while preserving its own runner boundary; the budget cannot grow silently."
+      }
+    ]
   },
-  "ignoreDependencies": ["@napi-rs/cli", "binaryen", "~convex"],
+  "audit": {
+    "gate": "new-only",
+    "typeAware": false,
+    "cssDeep": false,
+    "dupesBaseline": "config/fallow/dupes.json"
+  },
+  "ignoreDependencies": [
+    "@napi-rs/cli",
+    "binaryen",
+    "expo-crypto",
+    "expo-dev-client",
+    "react-native-web",
+    "react-native-webview",
+    "~convex"
+  ],
   "ignoreDependencyOverrides": [{ "package": "@voidzero-dev/vite-plus" }],
   "ignorePatterns": [
     "vendor/**",

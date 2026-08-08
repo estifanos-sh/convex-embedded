@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ReactElement } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent, ReactElement } from "react";
 import type { Block, PartialBlock } from "@blocknote/core";
 import { filterSuggestionItems } from "@blocknote/core/extensions";
 import { BlockNoteView } from "@blocknote/ariakit";
@@ -35,8 +35,8 @@ import {
   createConvexEmbeddedUploadFetch,
   type EmbeddedConnectionState,
 } from "@estifanos-sh/convex-embedded/browser";
-import { createTextField } from "@estifanos-sh/convex-embedded/internal/text";
-import type { TextFieldWriter } from "@estifanos-sh/convex-embedded/internal/text";
+import { createTextField } from "@estifanos-sh/convex-embedded/text";
+import type { TextFieldWriter } from "@estifanos-sh/convex-embedded/text";
 
 import { api } from "~convex/_generated/api";
 import type { Id } from "~convex/_generated/dataModel";
@@ -48,7 +48,6 @@ import {
 import { client, subscribeBrowserDebug } from "./lib/client";
 import { readQuery, type QueryState } from "./lib/query";
 
-const diffDelayMs = 90;
 const createDocumentMutation = api.documents.write;
 const getDocument = api.documents.read;
 const listDocuments = api.documents.read;
@@ -167,6 +166,12 @@ type PendingUploadBlock = {
 };
 
 const uploadAccept = "image/*,audio/*,video/*,application/pdf,text/plain";
+const documentTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  month: "short",
+});
 const mediaUploadAccept: Record<MediaBlockType, string> = {
   audio: "audio/*",
   file: "*/*",
@@ -190,6 +195,7 @@ export function App(): ReactElement {
   const [appError, setAppError] = useState<string | null>(null);
   const [uploadNotice, setUploadNotice] = useState<UploadNotice | null>(null);
   const uploadNoticeRef = useRef<UploadNotice | null>(null);
+  const uploadBusyRef = useRef(false);
   const uploadVerifyRef = useRef<string | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const pendingUploadBlockRef = useRef<PendingUploadBlock | null>(null);
@@ -197,6 +203,7 @@ export function App(): ReactElement {
   const slashFrameRef = useRef<number | undefined>(undefined);
   const writeUploadNotice = useCallback((notice: UploadNotice | null) => {
     uploadNoticeRef.current = notice;
+    uploadBusyRef.current = notice?.phase === "saving";
     setUploadNotice(notice);
   }, []);
   const uploadFile = useCallback(
@@ -302,6 +309,7 @@ export function App(): ReactElement {
   const [createdFallback, setCreatedFallback] = useState<DocumentDoc | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const historyOpenRef = useRef(historyOpen);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [revs, setRevs] = useState<EmbeddedRev[]>([]);
@@ -309,8 +317,8 @@ export function App(): ReactElement {
   const [selectedHistoryRevId, setSelectedHistoryRevId] = useState<string | null>(null);
   const [currentBody, setCurrentBody] = useState(JSON.stringify(emptyBlocks));
   const [currentDelta, setCurrentDelta] = useState<DiffResult | null>(null);
+  const currentBodyRef = useRef(currentBody);
   const [historyBusy, setHistoryBusy] = useState(false);
-  const diffTimerRef = useRef<number | undefined>(undefined);
   const fieldRef = useRef<TextFieldWriter | null>(null);
   const settlingRef = useRef(false);
   const queryDocsRef = useRef(new Map<Id<"documents">, { body: string; title: string }>());
@@ -394,12 +402,36 @@ export function App(): ReactElement {
   const historyGroups = useMemo(() => groupSavedRevs(revs), [revs]);
   const historyConnected = connection.replication.status === "online";
 
+  useEffect(() => {
+    historyOpenRef.current = historyOpen;
+  }, [historyOpen]);
+
+  const writeCurrentDelta = useCallback((next: DiffResult | null) => {
+    if (historyOpenRef.current) setCurrentDelta(next);
+  }, []);
+
+  const readCurrentDelta = useCallback((body: string): DiffResult | null => {
+    const current = baselineRef.current;
+    if (!current || current.docId !== lastAppliedDocIdRef.current) return null;
+    return nonEmptyDelta(diffBodies(current.body, body));
+  }, []);
+
+  const writeHistoryLiveBody = useCallback(
+    (body: string) => {
+      currentBodyRef.current = body;
+      if (!historyOpenRef.current) return;
+      setCurrentBody(body);
+      setCurrentDelta(readCurrentDelta(body));
+    },
+    [readCurrentDelta],
+  );
+
   const setBaseline = useCallback(
     (next: Baseline | null, bodyForDiff = JSON.stringify(editor.document)) => {
       baselineRef.current = next;
-      setCurrentDelta(next ? nonEmptyDelta(diffBodies(next.body, bodyForDiff)) : null);
+      writeCurrentDelta(next ? nonEmptyDelta(diffBodies(next.body, bodyForDiff)) : null);
     },
-    [editor],
+    [editor, writeCurrentDelta],
   );
 
   useEffect(() => {
@@ -430,13 +462,12 @@ export function App(): ReactElement {
     });
     const switchingDocuments = lastAppliedDocIdRef.current !== selectedDocument._id;
     if (!switchingDocuments && selectedDocument.body === lastAppliedBodyRef.current) return;
-    if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
     applyingRemoteRef.current = true;
     editor.replaceBlocks(editor.document, parseBlocks(selectedDocument.body));
     lastAppliedBodyRef.current = selectedDocument.body;
     if (!switchingDocuments) fieldRef.current?.adopt(selectedDocument.body);
     lastAppliedDocIdRef.current = selectedDocument._id;
-    setCurrentBody(selectedDocument.body);
+    writeHistoryLiveBody(selectedDocument.body);
     if (switchingDocuments) {
       setPreview(null);
       setSelectedHistoryRevId(null);
@@ -444,12 +475,11 @@ export function App(): ReactElement {
       previewCacheRef.current.clear();
       setRevs([]);
       setBaseline(null, selectedDocument.body);
-      setCurrentDelta(null);
     }
     queueMicrotask(() => {
       applyingRemoteRef.current = false;
     });
-  }, [editor, selectedDocument, setBaseline]);
+  }, [editor, selectedDocument, setBaseline, writeHistoryLiveBody]);
 
   const refreshHistory = useCallback(
     async (resetBaseline = false) => {
@@ -518,13 +548,16 @@ export function App(): ReactElement {
     return unsubscribe;
   }, [historyConnected, historyOpen, selectedDocument]);
 
-  const updateCurrentDelta = useCallback((body: string) => {
-    const current = baselineRef.current;
-    if (!current || current.docId !== lastAppliedDocIdRef.current) {
-      setCurrentDelta(null);
-      return;
-    }
-    setCurrentDelta(nonEmptyDelta(diffBodies(current.body, body)));
+  const openHistory = useCallback(() => {
+    if (!selectedDocument) return;
+    historyOpenRef.current = true;
+    writeHistoryLiveBody(currentBodyRef.current);
+    setHistoryOpen(true);
+  }, [selectedDocument, writeHistoryLiveBody]);
+
+  const closeHistory = useCallback(() => {
+    historyOpenRef.current = false;
+    setHistoryOpen(false);
   }, []);
 
   useLayoutEffect(() => {
@@ -672,9 +705,7 @@ export function App(): ReactElement {
     if (!selectedDocument || applyingRemoteRef.current) return;
     updateSlashPalette(currentEditor);
     const body = JSON.stringify(currentEditor.document);
-    setCurrentBody(body);
-    if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
-    diffTimerRef.current = window.setTimeout(() => updateCurrentDelta(body), diffDelayMs);
+    writeHistoryLiveBody(body);
     if (body === lastAppliedBodyRef.current) return;
     desiredBodyRef.current = body;
     fieldRef.current?.queue(body);
@@ -683,7 +714,6 @@ export function App(): ReactElement {
 
   useEffect(() => {
     return () => {
-      if (diffTimerRef.current !== undefined) window.clearTimeout(diffTimerRef.current);
       if (slashFrameRef.current !== undefined) window.cancelAnimationFrame(slashFrameRef.current);
     };
   }, []);
@@ -716,6 +746,12 @@ export function App(): ReactElement {
       setAppError(errorMessage(error));
     }
   }, [documentsQuery.query]);
+
+  const selectDocument = useCallback((documentId: Id<"documents">) => {
+    if (uploadBusyRef.current) return;
+    setSelectedDocumentId(documentId);
+    setMobilePane("editor");
+  }, []);
 
   const insertUploadedFile = useCallback(
     async (file: File) => {
@@ -778,14 +814,14 @@ export function App(): ReactElement {
       setSelectedDocumentId(nextDocument?._id ?? null);
       setMobilePane(nextDocument ? "editor" : "documents");
       if (createdFallback?._id === selectedDocument._id) setCreatedFallback(null);
-      setHistoryOpen(false);
+      closeHistory();
       setDeleteOpen(false);
     } catch (error) {
       setAppError(errorMessage(error));
     } finally {
       setDeleteBusy(false);
     }
-  }, [createdFallback, documents, selectedDocument, settleDraftDocument]);
+  }, [closeHistory, createdFallback, documents, selectedDocument, settleDraftDocument]);
 
   const createSnapshot = useCallback(async () => {
     if (!selectedDocument || snapshotPendingRef.current) return;
@@ -794,7 +830,7 @@ export function App(): ReactElement {
     setAppError(null);
     try {
       const body = JSON.stringify(editor.document);
-      setCurrentBody(body);
+      writeHistoryLiveBody(body);
       desiredBodyRef.current = body;
       fieldRef.current?.queue(body);
       await settleDraftDocument();
@@ -825,7 +861,14 @@ export function App(): ReactElement {
       snapshotPendingRef.current = false;
       setHistoryBusy(false);
     }
-  }, [editor, refreshHistory, selectedDocument, setBaseline, settleDraftDocument]);
+  }, [
+    editor,
+    refreshHistory,
+    selectedDocument,
+    setBaseline,
+    settleDraftDocument,
+    writeHistoryLiveBody,
+  ]);
 
   const selectRev = useCallback(
     async (rev: EmbeddedRev) => {
@@ -871,10 +914,6 @@ export function App(): ReactElement {
     let queuedRemoteReset = false;
     try {
       await settleDraftDocument();
-      if (diffTimerRef.current !== undefined) {
-        window.clearTimeout(diffTimerRef.current);
-        diffTimerRef.current = undefined;
-      }
       applyingRemoteRef.current = true;
       const restored = (await client.mutation(restoreDocumentMutation, {
         id: selectedDocument._id,
@@ -883,7 +922,7 @@ export function App(): ReactElement {
       const body = documentBody(restored.document) ?? preview.body;
       editor.replaceBlocks(editor.document, parseBlocks(body));
       lastAppliedBodyRef.current = body;
-      setCurrentBody(body);
+      writeHistoryLiveBody(body);
       queueMicrotask(() => {
         applyingRemoteRef.current = false;
       });
@@ -907,7 +946,15 @@ export function App(): ReactElement {
     } finally {
       setHistoryBusy(false);
     }
-  }, [editor, preview, refreshHistory, selectedDocument, setBaseline, settleDraftDocument]);
+  }, [
+    editor,
+    preview,
+    refreshHistory,
+    selectedDocument,
+    setBaseline,
+    settleDraftDocument,
+    writeHistoryLiveBody,
+  ]);
 
   const filteredDocuments = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -977,16 +1024,15 @@ export function App(): ReactElement {
                   <DocumentRow
                     key={document._id}
                     active={document._id === selectedDocumentId}
-                    document={document}
+                    documentId={document._id}
                     expanded={expandedIds.has(document._id)}
                     pinned={pinnedIds.has(document._id)}
-                    onSelect={() => {
-                      if (uploadBusy) return;
-                      setSelectedDocumentId(document._id);
-                      setMobilePane("editor");
-                    }}
-                    onToggleExpanded={() => void toggleExpanded(document._id)}
-                    onTogglePin={() => void togglePin(document._id)}
+                    slug={document.slug}
+                    title={document.title}
+                    updatedAt={document.updatedAt}
+                    onSelect={selectDocument}
+                    onToggleExpanded={toggleExpanded}
+                    onTogglePin={togglePin}
                   />
                 ))
               )}
@@ -1088,7 +1134,7 @@ export function App(): ReactElement {
                   aria-label="Open snapshot history"
                   disabled={!selectedDocument}
                   onClick={() => {
-                    if (selectedDocument) setHistoryOpen(true);
+                    openHistory();
                   }}
                   title="Snapshot history"
                 >
@@ -1191,7 +1237,7 @@ export function App(): ReactElement {
             preview={preview}
             groups={historyGroups}
             selectedRevId={selectedHistoryRevId}
-            onClose={() => setHistoryOpen(false)}
+            onClose={closeHistory}
             onRefresh={() => {
               if (historyConnected) void refreshHistory(true);
             }}
@@ -1405,33 +1451,34 @@ function RemoteStatus(props: { connection: EmbeddedConnectionState }): ReactElem
   );
 }
 
-function DocumentRow(props: {
+const DocumentRow = memo(function DocumentRow(props: {
   active: boolean;
-  document: DocumentSummary;
+  documentId: Id<"documents">;
   expanded: boolean;
   pinned: boolean;
-  onSelect: () => void;
-  onToggleExpanded: () => void;
-  onTogglePin: () => void;
+  slug: string;
+  title: string;
+  updatedAt: number;
+  onSelect: (documentId: Id<"documents">) => void;
+  onToggleExpanded: (documentId: Id<"documents">) => void;
+  onTogglePin: (documentId: Id<"documents">) => void;
 }): ReactElement {
   return (
     <div className={["documentRow", props.active ? "active" : ""].join(" ")}>
       <button
         className="documentRowSelect"
         type="button"
-        onClick={props.onSelect}
-        title={props.document.title}
+        onClick={() => props.onSelect(props.documentId)}
+        title={props.title}
       >
         <FileText className="shrink-0 text-content-tertiary" size={15} />
         <span className="min-w-0 flex-1">
-          <span className="block truncate">{props.document.title}</span>
+          <span className="block truncate">{props.title}</span>
           <span className="block truncate text-xs text-content-tertiary">
-            {formatTime(props.document.updatedAt)}
+            {formatTime(props.updatedAt)}
           </span>
           {props.expanded ? (
-            <span className="block truncate text-xs text-content-tertiary">
-              /{props.document.slug}
-            </span>
+            <span className="block truncate text-xs text-content-tertiary">/{props.slug}</span>
           ) : null}
         </span>
       </button>
@@ -1441,7 +1488,7 @@ function DocumentRow(props: {
         aria-label={props.expanded ? "Collapse document details" : "Expand document details"}
         aria-expanded={props.expanded}
         title={props.expanded ? "Hide details on this device" : "Show details on this device"}
-        onClick={props.onToggleExpanded}
+        onClick={() => props.onToggleExpanded(props.documentId)}
       >
         {props.expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
       </button>
@@ -1451,13 +1498,13 @@ function DocumentRow(props: {
         aria-label={props.pinned ? "Unpin document" : "Pin document"}
         aria-pressed={props.pinned}
         title={props.pinned ? "Unpin from this device" : "Pin to this device"}
-        onClick={props.onTogglePin}
+        onClick={() => props.onTogglePin(props.documentId)}
       >
         <Pin size={14} />
       </button>
     </div>
   );
-}
+});
 
 function DeleteDialog(props: {
   busy: boolean;
@@ -1559,7 +1606,7 @@ function EmptyDocumentState(props: {
   );
 }
 
-function HistoryModal(props: {
+type HistoryModalProps = {
   busy: boolean;
   currentBody: string;
   currentDelta: DiffResult | null;
@@ -1575,30 +1622,16 @@ function HistoryModal(props: {
   preview: HistoryPreview | null;
   groups: HistoryGroup[];
   selectedRevId: string | null;
-}): ReactElement {
-  const viewingDraft = props.selectedRevId === null;
-  const loadingSelectedVersion =
-    props.selectedRevId !== null && props.preview === null && props.busy;
-  const canRestore = props.preview !== null && props.preview.rev.status !== "current";
-  const detailTitle = props.preview?.title ?? props.currentTitle;
-  const detailBody = props.preview?.body ?? props.currentBody;
-  const detailTime = props.preview
-    ? `Snapshot from ${formatTime(props.preview.createdAt)}`
-    : loadingSelectedVersion
-      ? "Loading snapshot"
-      : props.currentDelta
-        ? "Live local document with snapshot changes"
-        : "Live local document";
+};
 
-  useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent): void => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      props.onClose();
-    };
-    document.addEventListener("keydown", closeOnEscape, true);
-    return () => document.removeEventListener("keydown", closeOnEscape, true);
-  }, [props.onClose]);
+function HistoryModal(props: HistoryModalProps): ReactElement {
+  const loadingSelectedVersion = isHistoryPreviewLoading(
+    props.selectedRevId,
+    props.preview,
+    props.busy,
+  );
+  const canRestore = canHistoryRestore(props.preview);
+  useCloseHistoryOnEscape(props.onClose);
 
   return (
     <div
@@ -1606,165 +1639,386 @@ function HistoryModal(props: {
       role="dialog"
       aria-modal="true"
       aria-label="Snapshot history"
-      onPointerDown={(event) => {
-        if (!(event.target instanceof Element)) return;
-        if (!event.target.closest(".historyModalShell")) props.onClose();
-      }}
+      onPointerDown={(event) => closeHistoryOnPointer(event, props.onClose)}
     >
       <div className="historyModalBackdrop" aria-hidden="true" onClick={props.onClose} />
       <div
         className="historyModalShell panel"
         data-mobile-view={props.selectedRevId === null ? "list" : "preview"}
       >
-        <div className="historyPreview">
-          <div className="panelHeader">
-            <button
-              className="iconButton mobileHistoryPreviewBack"
-              type="button"
-              aria-label="Back to snapshot history"
-              onClick={props.onSelectCurrent}
-            >
-              <ArrowLeft size={18} />
-            </button>
-            <div className="historyPreviewTitle">
-              <h2>{detailTitle}</h2>
-              <p>{detailTime}</p>
-            </div>
-            {canRestore ? (
-              <button
-                className="iconButton mobileHistoryRestore"
-                type="button"
-                disabled={props.busy}
-                aria-label="Restore snapshot"
-                onClick={props.onRestore}
-              >
-                <RotateCcw size={17} />
-              </button>
-            ) : null}
-          </div>
-          <div className="historyPreviewBody">
-            {loadingSelectedVersion ? (
-              <div className="historyLoading">
-                <Loader2 className="animate-spin" size={16} />
-                Loading snapshot
-              </div>
-            ) : (
-              <SnapshotDocument body={detailBody} delta={null} />
-            )}
-          </div>
-        </div>
-
-        <aside className="historySidebar">
-          <div className="panelHeader">
-            <div>
-              <h2>Snapshot history</h2>
-              <p>
-                {props.groups.length} {props.groups.length === 1 ? "entry" : "entries"}
-              </p>
-            </div>
-            <button
-              className="iconButton"
-              type="button"
-              aria-label="Close snapshot history"
-              onClick={props.onClose}
-            >
-              <X size={16} />
-            </button>
-          </div>
-
-          <div className="historyToolbar">
-            <button
-              className="primaryCommand"
-              type="button"
-              disabled={props.busy}
-              onClick={props.onCreateSnapshot}
-            >
-              {props.busy ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}
-              Create snapshot
-            </button>
-            <button
-              className="iconButton"
-              type="button"
-              onClick={props.onRefresh}
-              aria-label="Refresh history"
-              title="Refresh"
-            >
-              <History size={15} />
-            </button>
-          </div>
-
-          <div className="historyRows">
-            {props.error ? <div className="historyError">{props.error}</div> : null}
-            <p className="historyGroupLabel">Live</p>
-            <button
-              className={["historyRow", viewingDraft ? "active" : ""].join(" ")}
-              type="button"
-              onClick={props.onSelectCurrent}
-            >
-              <FileText size={15} />
-              <span>
-                <strong>{props.currentDelta ? "Local edits" : "Current document"}</strong>
-                <small>
-                  {props.currentDelta
-                    ? diffSummary(props.currentDelta)
-                    : props.currentRev
-                      ? `Updated ${formatTime(props.currentRev.updatedTime)}`
-                      : "No snapshot baseline yet"}
-                </small>
-              </span>
-            </button>
-
-            <p className="historyGroupLabel">Snapshots</p>
-            <div>
-              {props.groups.map((group) => (
-                <button
-                  key={group.rev.revId}
-                  type="button"
-                  className={[
-                    "historyRow",
-                    props.selectedRevId === group.rev.revId ? "active" : "",
-                  ].join(" ")}
-                  onClick={() => props.onSelect(group.rev)}
-                >
-                  {group.kind === "activity" ? <Clock3 size={15} /> : <Save size={15} />}
-                  <span>
-                    <strong>{historyGroupTitle(group)}</strong>
-                    <small>{historyGroupSubtitle(group)}</small>
-                  </span>
-                </button>
-              ))}
-              {props.groups.length === 0 ? <p className="historyEmpty">No snapshots yet.</p> : null}
-            </div>
-          </div>
-
-          <div className="historyActions">
-            {canRestore ? (
-              <button
-                className="primaryCommand"
-                type="button"
-                disabled={props.busy}
-                onClick={props.onRestore}
-              >
-                <RotateCcw size={15} />
-                Restore snapshot
-              </button>
-            ) : (
-              <p>
-                {props.selectedRevId === null
-                  ? "Select a snapshot to preview or restore it."
-                  : loadingSelectedVersion
-                    ? "Loading selected snapshot."
-                    : "Selected snapshot could not be restored."}
-              </p>
-            )}
-          </div>
-        </aside>
+        <HistoryPreviewPanel
+          body={props.preview?.body ?? props.currentBody}
+          busy={props.busy}
+          canRestore={canRestore}
+          loading={loadingSelectedVersion}
+          onRestore={props.onRestore}
+          onSelectCurrent={props.onSelectCurrent}
+          preview={props.preview}
+          currentDelta={props.currentDelta}
+          currentTitle={props.currentTitle}
+        />
+        <HistorySidebar
+          busy={props.busy}
+          canRestore={canRestore}
+          currentDelta={props.currentDelta}
+          currentRev={props.currentRev}
+          error={props.error}
+          groups={props.groups}
+          loading={loadingSelectedVersion}
+          onClose={props.onClose}
+          onCreateSnapshot={props.onCreateSnapshot}
+          onRefresh={props.onRefresh}
+          onRestore={props.onRestore}
+          onSelect={props.onSelect}
+          onSelectCurrent={props.onSelectCurrent}
+          selectedRevId={props.selectedRevId}
+        />
       </div>
     </div>
   );
 }
 
-function SnapshotDocument(props: { body: string; delta: DiffResult | null }): ReactElement {
+function isHistoryPreviewLoading(
+  selectedRevId: string | null,
+  preview: HistoryPreview | null,
+  busy: boolean,
+): boolean {
+  return selectedRevId !== null && preview === null && busy;
+}
+
+function canHistoryRestore(preview: HistoryPreview | null): boolean {
+  return preview !== null && preview.rev.status !== "current";
+}
+
+function useCloseHistoryOnEscape(onClose: () => void): void {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape, true);
+    return () => document.removeEventListener("keydown", closeOnEscape, true);
+  }, [onClose]);
+}
+
+function closeHistoryOnPointer(event: ReactPointerEvent, onClose: () => void): void {
+  if (!(event.target instanceof Element)) return;
+  if (!event.target.closest(".historyModalShell")) onClose();
+}
+
+function HistoryPreviewPanel(props: {
+  body: string;
+  busy: boolean;
+  canRestore: boolean;
+  currentDelta: DiffResult | null;
+  currentTitle: string;
+  loading: boolean;
+  onRestore: () => void;
+  onSelectCurrent: () => void;
+  preview: HistoryPreview | null;
+}): ReactElement {
+  const detail = historyPreviewDetail(
+    props.preview,
+    props.currentDelta,
+    props.currentTitle,
+    props.loading,
+  );
+  return (
+    <div className="historyPreview">
+      <HistoryPreviewHeader
+        busy={props.busy}
+        canRestore={props.canRestore}
+        onRestore={props.onRestore}
+        onSelectCurrent={props.onSelectCurrent}
+        title={detail.title}
+        time={detail.time}
+      />
+      <HistoryPreviewBody body={props.body} loading={props.loading} />
+    </div>
+  );
+}
+
+function historyPreviewDetail(
+  preview: HistoryPreview | null,
+  currentDelta: DiffResult | null,
+  currentTitle: string,
+  loading: boolean,
+): { time: string; title: string } {
+  if (preview)
+    return { title: preview.title, time: `Snapshot from ${formatTime(preview.createdAt)}` };
+  if (loading) return { title: currentTitle, time: "Loading snapshot" };
+  return {
+    title: currentTitle,
+    time: currentDelta ? "Live local document with snapshot changes" : "Live local document",
+  };
+}
+
+function HistoryPreviewHeader(props: {
+  busy: boolean;
+  canRestore: boolean;
+  onRestore: () => void;
+  onSelectCurrent: () => void;
+  time: string;
+  title: string;
+}): ReactElement {
+  return (
+    <div className="panelHeader">
+      <button
+        className="iconButton mobileHistoryPreviewBack"
+        type="button"
+        aria-label="Back to snapshot history"
+        onClick={props.onSelectCurrent}
+      >
+        <ArrowLeft size={18} />
+      </button>
+      <div className="historyPreviewTitle">
+        <h2>{props.title}</h2>
+        <p>{props.time}</p>
+      </div>
+      <HistoryRestoreButton
+        busy={props.busy}
+        enabled={props.canRestore}
+        onRestore={props.onRestore}
+      />
+    </div>
+  );
+}
+
+function HistoryRestoreButton(props: {
+  busy: boolean;
+  enabled: boolean;
+  onRestore: () => void;
+}): ReactElement | null {
+  if (!props.enabled) return null;
+  return (
+    <button
+      className="iconButton mobileHistoryRestore"
+      type="button"
+      disabled={props.busy}
+      aria-label="Restore snapshot"
+      onClick={props.onRestore}
+    >
+      <RotateCcw size={17} />
+    </button>
+  );
+}
+
+function HistoryPreviewBody(props: { body: string; loading: boolean }): ReactElement {
+  return (
+    <div className="historyPreviewBody">
+      {props.loading ? (
+        <div className="historyLoading">
+          <Loader2 className="animate-spin" size={16} />
+          Loading snapshot
+        </div>
+      ) : (
+        <SnapshotDocument body={props.body} delta={null} />
+      )}
+    </div>
+  );
+}
+
+function HistorySidebar(props: {
+  busy: boolean;
+  canRestore: boolean;
+  currentDelta: DiffResult | null;
+  currentRev: EmbeddedRev | null;
+  error: string | null;
+  groups: HistoryGroup[];
+  loading: boolean;
+  onClose: () => void;
+  onCreateSnapshot: () => void;
+  onRefresh: () => void;
+  onRestore: () => void;
+  onSelect: (rev: EmbeddedRev) => void;
+  onSelectCurrent: () => void;
+  selectedRevId: string | null;
+}): ReactElement {
+  return (
+    <aside className="historySidebar">
+      <HistorySidebarHeader count={props.groups.length} onClose={props.onClose} />
+      <HistoryToolbar
+        busy={props.busy}
+        onCreateSnapshot={props.onCreateSnapshot}
+        onRefresh={props.onRefresh}
+      />
+      <div className="historyRows">
+        {props.error ? <div className="historyError">{props.error}</div> : null}
+        <p className="historyGroupLabel">Live</p>
+        <HistoryLiveRow
+          currentDelta={props.currentDelta}
+          currentRev={props.currentRev}
+          onSelectCurrent={props.onSelectCurrent}
+          selected={props.selectedRevId === null}
+        />
+        <p className="historyGroupLabel">Snapshots</p>
+        <HistorySnapshotRows
+          groups={props.groups}
+          onSelect={props.onSelect}
+          selectedRevId={props.selectedRevId}
+        />
+      </div>
+      <HistoryRestoreAction
+        busy={props.busy}
+        canRestore={props.canRestore}
+        loading={props.loading}
+        onRestore={props.onRestore}
+        selectedRevId={props.selectedRevId}
+      />
+    </aside>
+  );
+}
+
+function HistorySidebarHeader(props: { count: number; onClose: () => void }): ReactElement {
+  return (
+    <div className="panelHeader">
+      <div>
+        <h2>Snapshot history</h2>
+        <p>
+          {props.count} {props.count === 1 ? "entry" : "entries"}
+        </p>
+      </div>
+      <button
+        className="iconButton"
+        type="button"
+        aria-label="Close snapshot history"
+        onClick={props.onClose}
+      >
+        <X size={16} />
+      </button>
+    </div>
+  );
+}
+
+function HistoryToolbar(props: {
+  busy: boolean;
+  onCreateSnapshot: () => void;
+  onRefresh: () => void;
+}): ReactElement {
+  return (
+    <div className="historyToolbar">
+      <button
+        className="primaryCommand"
+        type="button"
+        disabled={props.busy}
+        onClick={props.onCreateSnapshot}
+      >
+        {props.busy ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}
+        Create snapshot
+      </button>
+      <button
+        className="iconButton"
+        type="button"
+        onClick={props.onRefresh}
+        aria-label="Refresh history"
+        title="Refresh"
+      >
+        <History size={15} />
+      </button>
+    </div>
+  );
+}
+
+function HistoryLiveRow(props: {
+  currentDelta: DiffResult | null;
+  currentRev: EmbeddedRev | null;
+  onSelectCurrent: () => void;
+  selected: boolean;
+}): ReactElement {
+  return (
+    <button
+      className={["historyRow", props.selected ? "active" : ""].join(" ")}
+      type="button"
+      onClick={props.onSelectCurrent}
+    >
+      <FileText size={15} />
+      <span>
+        <strong>{props.currentDelta ? "Local edits" : "Current document"}</strong>
+        <small>{historyLiveSubtitle(props.currentDelta, props.currentRev)}</small>
+      </span>
+    </button>
+  );
+}
+
+function historyLiveSubtitle(
+  currentDelta: DiffResult | null,
+  currentRev: EmbeddedRev | null,
+): string {
+  if (currentDelta) return diffSummary(currentDelta);
+  return currentRev ? `Updated ${formatTime(currentRev.updatedTime)}` : "No snapshot baseline yet";
+}
+
+function HistorySnapshotRows(props: {
+  groups: HistoryGroup[];
+  onSelect: (rev: EmbeddedRev) => void;
+  selectedRevId: string | null;
+}): ReactElement {
+  return (
+    <div>
+      {props.groups.map((group) => (
+        <button
+          key={group.rev.revId}
+          type="button"
+          className={["historyRow", props.selectedRevId === group.rev.revId ? "active" : ""].join(
+            " ",
+          )}
+          onClick={() => props.onSelect(group.rev)}
+        >
+          {group.kind === "activity" ? <Clock3 size={15} /> : <Save size={15} />}
+          <span>
+            <strong>{historyGroupTitle(group)}</strong>
+            <small>{historyGroupSubtitle(group)}</small>
+          </span>
+        </button>
+      ))}
+      {props.groups.length === 0 ? <p className="historyEmpty">No snapshots yet.</p> : null}
+    </div>
+  );
+}
+
+function HistoryRestoreAction(props: {
+  busy: boolean;
+  canRestore: boolean;
+  loading: boolean;
+  onRestore: () => void;
+  selectedRevId: string | null;
+}): ReactElement {
+  if (!props.canRestore) {
+    return (
+      <div className="historyActions">
+        <p>{historyRestoreHint(props.selectedRevId, props.loading)}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="historyActions">
+      <button
+        className="primaryCommand"
+        type="button"
+        disabled={props.busy}
+        onClick={props.onRestore}
+      >
+        <RotateCcw size={15} />
+        Restore snapshot
+      </button>
+    </div>
+  );
+}
+
+function historyRestoreHint(selectedRevId: string | null, loading: boolean): string {
+  if (selectedRevId === null) return "Select a snapshot to preview or restore it.";
+  return loading ? "Loading selected snapshot." : "Selected snapshot could not be restored.";
+}
+
+const SnapshotDocument = memo(function SnapshotDocument(props: {
+  body: string;
+  delta: DiffResult | null;
+}): ReactElement {
+  const blocks = useMemo(
+    () => (props.delta ? null : parseBlocks(props.body)),
+    [props.body, props.delta],
+  );
   if (props.delta) {
     return (
       <article className="mx-auto max-w-3xl px-8 py-12 md:px-12">
@@ -1777,12 +2031,12 @@ function SnapshotDocument(props: { body: string; delta: DiffResult | null }): Re
 
   return (
     <article className="mx-auto max-w-3xl px-8 py-12 md:px-12">
-      {parseBlocks(props.body).map((block, index) => (
+      {blocks?.map((block, index) => (
         <SnapshotBlock key={snapshotKey(block, index)} block={block} depth={0} />
       ))}
     </article>
   );
-}
+});
 
 function SnapshotDiffRow(props: { row: SnapshotRow }): ReactElement {
   if (props.row.kind === "changed") {
@@ -2153,12 +2407,7 @@ function slashQueryFromEditor(editor: {
 }
 
 function formatTime(value: number): string {
-  return new Intl.DateTimeFormat(undefined, {
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    month: "short",
-  }).format(value);
+  return documentTimeFormatter.format(value);
 }
 
 function embeddedFileToken(url: string): string | null {

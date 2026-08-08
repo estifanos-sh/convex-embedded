@@ -47,7 +47,12 @@ import {
 } from "../protocol";
 import { withEntropy } from "../entropy";
 import { read as readTime } from "../component/time";
-import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../component/model";
+import {
+  pullChangeValidator,
+  pullCrdtValidator,
+  resultRowValidator,
+  settlementFields,
+} from "../component/model";
 import {
   analyzeEmbeddedSchema,
   embeddedSchemaMeta,
@@ -62,6 +67,7 @@ import {
 import { normalizeMutationResult } from "../result";
 import {
   assertReplicatedReference,
+  assertReplicatedIndex,
   assertReplicatedTarget,
   buildQueryBuilder,
   completeQueryRows,
@@ -723,47 +729,6 @@ const replayValidator = v.object({
     }),
   ),
 });
-
-const settlementFields = {
-  mutationId: v.string(),
-  inserts: v.array(v.object({ ordinal: v.number(), table: v.string(), id: v.string() })),
-  schedules: v.array(v.object({ ordinal: v.number(), id: v.string() })),
-  uploads: v.array(v.object({ ordinal: v.number(), url: v.string() })),
-  revisions: v.array(
-    v.object({
-      table: v.string(),
-      rowId: v.string(),
-      revId: v.string(),
-    }),
-  ),
-  crdt: v.array(
-    v.object({
-      table: v.string(),
-      rowId: v.string(),
-      field: v.string(),
-      kind: v.union(v.literal("text"), v.literal("count"), v.literal("set")),
-      headSeq: v.number(),
-      projectionHash: v.string(),
-    }),
-  ),
-  authoritative: v.array(
-    v.union(
-      v.object({
-        op: v.literal("put"),
-        table: v.string(),
-        rowId: v.string(),
-        fields: v.any(),
-        plainHash: v.string(),
-      }),
-      v.object({
-        op: v.literal("del"),
-        table: v.string(),
-        rowId: v.string(),
-        plainHash: v.string(),
-      }),
-    ),
-  ),
-};
 
 const conflictSettlementErrorValidator = v.object({ code: v.literal("EMBEDDED_CONFLICT") });
 const rejectedSettlementErrorValidator = v.object({
@@ -1912,15 +1877,6 @@ class WriteCapture {
     }
   }
 
-  private assertReplicatedIndex(table: string, index: unknown): void {
-    if (
-      typeof index === "string" &&
-      this.placements.indexes[table]?.remote.includes(index) === true
-    ) {
-      throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
-    }
-  }
-
   private project(table: string, value: unknown): unknown {
     if (typeof value !== "object" || value === null) return value;
     return projectWireDoc(this.placements, table, value as Record<string, unknown>);
@@ -1938,7 +1894,7 @@ class WriteCapture {
         const value = Reflect.get(target, property, receiver);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
-          if (property === "withIndex") this.assertReplicatedIndex(table, args[0]);
+          if (property === "withIndex") assertReplicatedIndex(this.placements, table, args[0]);
           const next = value.apply(target, args);
           if (property === "collect" || property === "take") {
             return Promise.resolve(next).then((rows: unknown[]) =>

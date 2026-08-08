@@ -6,7 +6,7 @@ import {
   isSpliceRangeError,
   isStaleTextBaseError,
 } from "../../src/crdt/intent";
-import { base, diff } from "../../src/text";
+import { base, diff } from "../../src/text/base";
 import { createTextField } from "../../src/text/field";
 
 type Splice = { index: number; delete: number; insert: string };

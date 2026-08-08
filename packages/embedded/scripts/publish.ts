@@ -28,6 +28,20 @@ const lifecycleScripts = ["install", "postinstall", "prepack", "prepare", "prepu
 const nodeTargets = ["darwin-arm64", "linux-arm64-gnu", "linux-x64-gnu", "win32-x64"] as const;
 const androidAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] as const;
 const appleSlices = ["ios-arm64", "ios-arm64-simulator"] as const;
+const readmeContract = [
+  "# Convex Embedded",
+  `\`${packageName}\``,
+  `pnpm add ${packageName} convex`,
+  "## Quick start",
+  "## Functions",
+  "## Client lifecycle and API",
+  "## User data migrations",
+  "## Platform setup",
+  "## Errors and troubleshooting",
+  "## Release and compatibility policy",
+  "await client.open()",
+] as const;
+const retiredPackageIdentities = ["@convex-dev/embedded", "@robelest/convex-embedded"] as const;
 
 interface PackageJson {
   author?: string;
@@ -212,6 +226,7 @@ export function verifyPackageTree(directory: string, mode: PublishMode): void {
       throw new Error(`Embedded package is missing required artifact: ${path}`);
     }
   }
+  verifyReadme(readFileSync(resolve(directory, "README.md"), "utf8"));
   verifyArtifactVersion(readArtifact(directory), manifest.version);
 }
 
@@ -259,12 +274,35 @@ export function verifyTarball(path: string, mode: PublishMode): void {
   ) as PackageJson;
   verifyPackedFiles(files, manifest);
   verifyManifest(manifest, mode);
+  verifyReadme(execFileSync("tar", ["-xOzf", path, "package/README.md"], { encoding: "utf8" }));
   const artifact = JSON.parse(
     execFileSync("tar", ["-xOzf", path, "package/dist/artifact.json"], { encoding: "utf8" }),
   ) as unknown;
   verifyArtifactVersion(artifact, manifest.version);
   if (JSON.stringify(manifest).includes('"catalog:"')) {
     throw new Error("Embedded tarball contains unresolved pnpm catalog dependency ranges.");
+  }
+}
+
+/**
+ * npm renders this file as the package's primary documentation, so its release contract is part
+ * of the payload rather than a best-effort repository extra. Keep the markers semantic instead
+ * of freezing prose: documentation can improve without changing this verifier, but a skeletal
+ * README or the old package identity cannot ship accidentally.
+ */
+export function verifyReadme(readme: string): void {
+  if (readme.trim().length === 0) {
+    throw new Error("Embedded package README must not be empty.");
+  }
+  for (const marker of readmeContract) {
+    if (!readme.includes(marker)) {
+      throw new Error(`Embedded package README is missing required documentation: ${marker}.`);
+    }
+  }
+  for (const identity of retiredPackageIdentities) {
+    if (readme.includes(identity)) {
+      throw new Error(`Embedded package README must not refer to retired package ${identity}.`);
+    }
   }
 }
 

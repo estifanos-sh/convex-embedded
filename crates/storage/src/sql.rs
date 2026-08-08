@@ -84,6 +84,9 @@ pub(crate) const PAYLOAD_CLEANUP_CURSOR_KEY: &str = "payload_cleanup_cursor";
 /// Store-global durable floor for device-domain commit timestamps. It intentionally lives in the
 /// frozen bootstrap table so identity rotations and candidate generations share one sequence.
 pub(crate) const COMMIT_TS_FLOOR_KEY: &str = "commit_ts_floor_ns";
+/// Private monotonic browser-coordinator leadership fence. The V2-to-V3 bridge seeds this once;
+/// ordinary fence claims only increment the already-published counter.
+pub(crate) const LEADER_FENCE_KEY: &str = "leader_fence";
 
 pub(crate) const CREATE_BOOTSTRAP: &str = "\
 CREATE TABLE IF NOT EXISTS __embedded_bootstrap (\
@@ -210,6 +213,14 @@ WHERE reachable.hash IS NULL LIMIT 1";
 /// Epoch-47 locating plane. These tables and bootstrap meanings are frozen and append-only: a
 /// candidate may rebuild generation tables, but it never repairs or replaces this kernel.
 pub(crate) fn kernel_layout_manifest() -> Vec<String> {
+    let mut manifest = kernel_layout_manifest_v2();
+    manifest.push("bootstrap:v3:leader_fence=browser-coordinator-monotonic-fence".to_owned());
+    manifest
+}
+
+/// The exact V2 manifest retained solely for controlled V2-to-V3 admission. Do not add new
+/// entries here: doing so would widen the set of legacy stores accepted by the bridge.
+pub(crate) fn kernel_layout_manifest_v2() -> Vec<String> {
     vec![
         CREATE_BOOTSTRAP.to_owned(),
         CREATE_ORIGIN.to_owned(),

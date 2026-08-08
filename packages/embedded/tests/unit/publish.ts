@@ -19,9 +19,34 @@ import {
   verifyPackageTree,
   verifyFixtureFiles,
   verifyPackedFiles,
+  verifyReadme,
 } from "../../scripts/publish.js";
 
 const temporary: string[] = [];
+const readmeFixture = `# Convex Embedded
+
+\`@estifanos-sh/convex-embedded\`
+
+\`\`\`sh
+pnpm add @estifanos-sh/convex-embedded convex
+\`\`\`
+
+## Quick start
+
+## Functions
+
+## Client lifecycle and API
+
+await client.open()
+
+## User data migrations
+
+## Platform setup
+
+## Errors and troubleshooting
+
+## Release and compatibility policy
+`;
 
 afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { force: true, recursive: true });
@@ -99,6 +124,19 @@ describe("Embedded package publication", () => {
     ).toThrow(`only ${packageName} is allowed`);
   });
 
+  test("requires comprehensive npm documentation with the current package identity", () => {
+    expect(() => verifyReadme(readmeFixture)).not.toThrow();
+    expect(() => verifyReadme("")).toThrow("README must not be empty");
+    expect(() =>
+      verifyReadme(
+        "# Convex Embedded\n\n`@estifanos-sh/convex-embedded`\n\npnpm add @estifanos-sh/convex-embedded convex",
+      ),
+    ).toThrow("Quick start");
+    expect(() => verifyReadme(`${readmeFixture}\n@robelest/convex-embedded`)).toThrow(
+      "retired package",
+    );
+  });
+
   test("requires every runtime artifact in the packed payload", () => {
     const complete = new Set(requiredPackageFiles().map((path) => `package/${path}`));
     expect(() => verifyPackedFiles(complete)).not.toThrow();
@@ -149,9 +187,11 @@ describe("Embedded package publication", () => {
         absolute,
         path === "dist/artifact.json"
           ? JSON.stringify({ format: 1, packageVersion: "0.0.0" })
-          : path === "dist/node.mjs"
-            ? "export {};\n"
-            : "fixture",
+          : path === "README.md"
+            ? readmeFixture
+            : path === "dist/node.mjs"
+              ? "export {};\n"
+              : "fixture",
       );
     }
 
@@ -190,7 +230,9 @@ describe("Embedded package publication", () => {
         absolute,
         path === "dist/artifact.json"
           ? JSON.stringify({ format: 1, packageVersion: "wrong" })
-          : "fixture",
+          : path === "README.md"
+            ? readmeFixture
+            : "fixture",
       );
     }
     preparePackage(directory, "0.0.1-preview-3");

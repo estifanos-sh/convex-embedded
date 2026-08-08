@@ -49,14 +49,9 @@ function checkFields(
   fields: PropertyValidators,
   path: string,
 ): string | undefined {
-  for (const key of Object.keys(value)) {
-    if (!Object.hasOwn(fields, key)) return `${path}.${key} is not a declared field`;
-  }
-  for (const [key, validator] of Object.entries(fields)) {
-    const error = checkValue(value[key], validator as GenericValidator, `${path}.${key}`);
-    if (error !== undefined) return error;
-  }
-  return undefined;
+  return checkObjectFields(value, fields, path, (entry, validator, fieldPath) =>
+    checkValue(entry, validator as GenericValidator, fieldPath),
+  );
 }
 
 function checkValue(value: unknown, validator: GenericValidator, path: string): string | undefined {
@@ -78,45 +73,34 @@ const checkValueByKind = {
     return checkAnyValue(value, path);
   },
   id(value, validator, path) {
-    if (typeof value !== "string") return `${path} must be an id`;
-    if (validator.tableName && tableFromId(value) !== validator.tableName) {
-      return formatIdTableError(path, validator.tableName, value);
-    }
-    return undefined;
+    return checkId(value, validator.tableName, path, Boolean(validator.tableName));
   },
   string(value, _validator, path) {
-    return typeof value === "string" ? undefined : `${path} must be a string`;
+    return checkType(value, "string", "string", path);
   },
   float64(value, _validator, path) {
-    return typeof value === "number" ? undefined : `${path} must be a number`;
+    return checkType(value, "number", "number", path);
   },
   int64(value, _validator, path) {
-    return typeof value === "bigint" ? undefined : `${path} must be an int64`;
+    return checkType(value, "bigint", "int64", path);
   },
   commitTs(value, _validator, path) {
-    return typeof value === "bigint" || isPendingCommitTs(value)
-      ? undefined
-      : `${path} must be a commit timestamp`;
+    return checkCommitTs(value, path);
   },
   boolean(value, _validator, path) {
-    return typeof value === "boolean" ? undefined : `${path} must be a boolean`;
+    return checkType(value, "boolean", "boolean", path);
   },
   bytes(value, _validator, path) {
-    return value instanceof ArrayBuffer ? undefined : `${path} must be bytes`;
+    return checkBytes(value, path);
   },
   null(value, _validator, path) {
-    return value === null ? undefined : `${path} must be null`;
+    return checkNull(value, path);
   },
   literal(value, validator, path) {
-    return equals(value, validator.value) ? undefined : `${path} must be the literal value`;
+    return checkLiteral(value, validator.value, path);
   },
   array(value, validator, path) {
-    if (!Array.isArray(value)) return `${path} must be an array`;
-    for (const [i, entry] of value.entries()) {
-      const error = checkValue(entry, validator.element, `${path}[${i}]`);
-      if (error !== undefined) return error;
-    }
-    return undefined;
+    return checkArray(value, validator.element, path, checkValue);
   },
   object(value, validator, path) {
     const shape = checkRecordObject(value, path);
@@ -124,23 +108,10 @@ const checkValueByKind = {
     return checkFields(value as Record<string, unknown>, validator.fields, path);
   },
   record(value, validator, path) {
-    const shape = checkRecordObject(value, path);
-    if (shape !== undefined) return shape;
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      const nameError = recordKeyError(key, path);
-      if (nameError !== undefined) return nameError;
-      const keyError = checkValue(key, validator.key, `${path}.${key} key`);
-      if (keyError !== undefined) return keyError;
-      const error = checkValue(entry, validator.value, `${path}.${key}`);
-      if (error !== undefined) return error;
-    }
-    return undefined;
+    return checkRecord(value, validator.key, validator.value, path, checkValue);
   },
   union(value, validator, path) {
-    for (const member of validator.members) {
-      if (checkValue(value, member, path) === undefined) return undefined;
-    }
-    return `${path} does not match any union member`;
+    return checkUnion(value, validator.members, path, checkValue);
   },
 } satisfies RuntimeValidatorHandlers;
 
@@ -161,47 +132,34 @@ const checkJsonByType = {
     return checkAnyValue(value, path);
   },
   id(value, validator, path) {
-    if (typeof value !== "string") return `${path} must be an id`;
-    if (tableFromId(value) !== validator.tableName) {
-      return formatIdTableError(path, validator.tableName, value);
-    }
-    return undefined;
+    return checkId(value, validator.tableName, path, true);
   },
   string(value, _validator, path) {
-    return typeof value === "string" ? undefined : `${path} must be a string`;
+    return checkType(value, "string", "string", path);
   },
   number(value, _validator, path) {
-    return typeof value === "number" ? undefined : `${path} must be a number`;
+    return checkType(value, "number", "number", path);
   },
   bigint(value, _validator, path) {
-    return typeof value === "bigint" ? undefined : `${path} must be an int64`;
+    return checkType(value, "bigint", "int64", path);
   },
   commitTs(value, _validator, path) {
-    return typeof value === "bigint" || isPendingCommitTs(value)
-      ? undefined
-      : `${path} must be a commit timestamp`;
+    return checkCommitTs(value, path);
   },
   boolean(value, _validator, path) {
-    return typeof value === "boolean" ? undefined : `${path} must be a boolean`;
+    return checkType(value, "boolean", "boolean", path);
   },
   bytes(value, _validator, path) {
-    return value instanceof ArrayBuffer ? undefined : `${path} must be bytes`;
+    return checkBytes(value, path);
   },
   null(value, _validator, path) {
-    return value === null ? undefined : `${path} must be null`;
+    return checkNull(value, path);
   },
   literal(value, validator, path) {
-    return equals(value, fromJson(validator.value))
-      ? undefined
-      : `${path} must be the literal value`;
+    return checkLiteral(value, fromJson(validator.value), path);
   },
   array(value, validator, path) {
-    if (!Array.isArray(value)) return `${path} must be an array`;
-    for (const [i, entry] of value.entries()) {
-      const error = checkJson(entry, validator.value, `${path}[${i}]`);
-      if (error !== undefined) return error;
-    }
-    return undefined;
+    return checkArray(value, validator.value, path, checkJson);
   },
   object(value, validator, path) {
     const shape = checkRecordObject(value, path);
@@ -209,23 +167,10 @@ const checkJsonByType = {
     return checkJsonFields(value as Record<string, unknown>, validator.value, path);
   },
   record(value, validator, path) {
-    const shape = checkRecordObject(value, path);
-    if (shape !== undefined) return shape;
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      const nameError = recordKeyError(key, path);
-      if (nameError !== undefined) return nameError;
-      const keyError = checkJson(key, validator.keys, `${path}.${key} key`);
-      if (keyError !== undefined) return keyError;
-      const error = checkJson(entry, validator.values.fieldType, `${path}.${key}`);
-      if (error !== undefined) return error;
-    }
-    return undefined;
+    return checkRecord(value, validator.keys, validator.values.fieldType, path, checkJson);
   },
   union(value, validator, path) {
-    for (const member of validator.value) {
-      if (checkJson(value, member, path) === undefined) return undefined;
-    }
-    return `${path} does not match any union member`;
+    return checkUnion(value, validator.value, path, checkJson);
   },
 } satisfies JsonValidatorHandlers;
 
@@ -238,15 +183,114 @@ function checkJsonFields(
   fields: Extract<ValidatorJSON, { type: "object" }>["value"],
   path: string,
 ): string | undefined {
+  return checkObjectFields(value, fields, path, (entry, field, fieldPath) => {
+    if (entry === undefined && field.optional) return undefined;
+    return checkJson(entry, field.fieldType, fieldPath);
+  });
+}
+
+type Check<Validator> = (value: unknown, validator: Validator, path: string) => string | undefined;
+
+function checkObjectFields<Field>(
+  value: Record<string, unknown>,
+  fields: Record<string, Field>,
+  path: string,
+  check: (value: unknown, field: Field, path: string) => string | undefined,
+): string | undefined {
   for (const key of Object.keys(value)) {
     if (!Object.hasOwn(fields, key)) return `${path}.${key} is not a declared field`;
   }
   for (const [key, field] of Object.entries(fields)) {
-    if (value[key] === undefined && field.optional) continue;
-    const error = checkJson(value[key], field.fieldType, `${path}.${key}`);
+    const error = check(value[key], field, `${path}.${key}`);
     if (error !== undefined) return error;
   }
   return undefined;
+}
+
+function checkArray<Validator>(
+  value: unknown,
+  validator: Validator,
+  path: string,
+  check: Check<Validator>,
+): string | undefined {
+  if (!Array.isArray(value)) return `${path} must be an array`;
+  for (const [index, entry] of value.entries()) {
+    const error = check(entry, validator, `${path}[${index}]`);
+    if (error !== undefined) return error;
+  }
+  return undefined;
+}
+
+function checkRecord<KeyValidator, ValueValidator>(
+  value: unknown,
+  keyValidator: KeyValidator,
+  valueValidator: ValueValidator,
+  path: string,
+  check: Check<KeyValidator | ValueValidator>,
+): string | undefined {
+  const shape = checkRecordObject(value, path);
+  if (shape !== undefined) return shape;
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    const nameError = recordKeyError(key, path);
+    if (nameError !== undefined) return nameError;
+    const keyError = check(key, keyValidator, `${path}.${key} key`);
+    if (keyError !== undefined) return keyError;
+    const valueError = check(entry, valueValidator, `${path}.${key}`);
+    if (valueError !== undefined) return valueError;
+  }
+  return undefined;
+}
+
+function checkUnion<Validator>(
+  value: unknown,
+  validators: readonly Validator[],
+  path: string,
+  check: Check<Validator>,
+): string | undefined {
+  for (const validator of validators) {
+    if (check(value, validator, path) === undefined) return undefined;
+  }
+  return `${path} does not match any union member`;
+}
+
+function checkId(
+  value: unknown,
+  tableName: string,
+  path: string,
+  checkTable: boolean,
+): string | undefined {
+  if (typeof value !== "string") return `${path} must be an id`;
+  if (checkTable && tableFromId(value) !== tableName) {
+    return formatIdTableError(path, tableName, value);
+  }
+  return undefined;
+}
+
+function checkType(
+  value: unknown,
+  type: "string" | "number" | "bigint" | "boolean",
+  name: string,
+  path: string,
+): string | undefined {
+  return typeof value === type ? undefined : `${path} must be a ${name}`;
+}
+
+function checkCommitTs(value: unknown, path: string): string | undefined {
+  return typeof value === "bigint" || isPendingCommitTs(value)
+    ? undefined
+    : `${path} must be a commit timestamp`;
+}
+
+function checkBytes(value: unknown, path: string): string | undefined {
+  return value instanceof ArrayBuffer ? undefined : `${path} must be bytes`;
+}
+
+function checkNull(value: unknown, path: string): string | undefined {
+  return value === null ? undefined : `${path} must be null`;
+}
+
+function checkLiteral(value: unknown, literal: unknown, path: string): string | undefined {
+  return equals(value, literal) ? undefined : `${path} must be the literal value`;
 }
 
 /** `v.any()` only requires a representable Convex value; branded values short-circuit. */

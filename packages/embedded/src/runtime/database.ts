@@ -633,14 +633,15 @@ export function createWriter<DM extends GenericDataModel>(
             : undefined;
         stage(def, id, mergedData, current._creationTime, {
           cols: previousCols,
-          dataOnly: !fresh && !previousCols,
+          dataOnly: def.placement === "replicated" && !fresh && !previousCols,
         });
         return;
       }
       const mergedCols = extractColEntries(def, mergedData);
       stage(def, id, mergedData, current._creationTime, {
         cols: mergedCols,
-        dataOnly: colsEqual(extractColEntries(def, current), mergedCols),
+        dataOnly:
+          def.placement === "replicated" && colsEqual(extractColEntries(def, current), mergedCols),
       });
     },
     async replace<T extends TableNamesInDataModel<DM>>(

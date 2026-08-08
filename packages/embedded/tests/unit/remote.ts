@@ -4,6 +4,7 @@ import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import {
   assembleTransitionChunk,
   createRemoteTransport,
+  decideWorkerRemoteTurn,
   rotateRetiredClient,
   startWorkerRemoteLoop,
   writeWorkerRemoteConnection,
@@ -298,6 +299,101 @@ describe("remote transport input limits", () => {
 });
 
 describe("remote tick activity", () => {
+  test("derives post-turn response fences, idle state, status, and scheduling", () => {
+    const empty = tick({}).pending!;
+    const pending = { ...empty, scope: 1 };
+    const cases: Array<{
+      name: string;
+      input: Parameters<typeof decideWorkerRemoteTurn>[0];
+      expected: ReturnType<typeof decideWorkerRemoteTurn>;
+    }> = [
+      {
+        name: "sleeps after a connected, drained turn",
+        input: {
+          active: false,
+          awaitingResponse: false,
+          connected: true,
+          networkOnline: true,
+          pending: empty,
+          pullAttempted: 0,
+          pushPending: false,
+          pushUnblocked: false,
+          sent: 0,
+          wakePending: false,
+        },
+        expected: { awaitingResponse: false, idle: true, nextDelay: undefined, status: "idle" },
+      },
+      {
+        name: "keeps a sent response alive while work remains",
+        input: {
+          active: false,
+          awaitingResponse: false,
+          connected: true,
+          networkOnline: true,
+          pending,
+          pullAttempted: 0,
+          pushPending: false,
+          pushUnblocked: false,
+          sent: 1,
+          wakePending: false,
+        },
+        expected: { awaitingResponse: true, idle: false, nextDelay: 500, status: "tick" },
+      },
+      {
+        name: "clears the response fence when an authoritative pull completes",
+        input: {
+          active: true,
+          awaitingResponse: true,
+          connected: true,
+          networkOnline: true,
+          pending,
+          pullAttempted: 1,
+          pushPending: false,
+          pushUnblocked: false,
+          sent: 1,
+          wakePending: false,
+        },
+        expected: { awaitingResponse: false, idle: false, nextDelay: undefined, status: "tick" },
+      },
+      {
+        name: "runs immediately for a queued wake",
+        input: {
+          active: false,
+          awaitingResponse: false,
+          connected: true,
+          networkOnline: true,
+          pending,
+          pullAttempted: 0,
+          pushPending: true,
+          pushUnblocked: false,
+          sent: 0,
+          wakePending: true,
+        },
+        expected: { awaitingResponse: false, idle: false, nextDelay: 0, status: "tick" },
+      },
+      {
+        name: "runs an unblocked retained push immediately",
+        input: {
+          active: false,
+          awaitingResponse: false,
+          connected: false,
+          networkOnline: true,
+          pending,
+          pullAttempted: 0,
+          pushPending: true,
+          pushUnblocked: true,
+          sent: 0,
+          wakePending: false,
+        },
+        expected: { awaitingResponse: false, idle: false, nextDelay: 0, status: "starting" },
+      },
+    ];
+
+    for (const { name, input, expected } of cases) {
+      expect(decideWorkerRemoteTurn(input), name).toEqual(expected);
+    }
+  });
+
   test("every authoritative pending lane blocks convergence", () => {
     const empty = tick({}).pending!;
     expect(remotePendingIsEmpty(empty)).toBe(true);

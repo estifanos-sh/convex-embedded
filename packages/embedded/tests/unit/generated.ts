@@ -19,7 +19,7 @@ test("generated contract exports schema-bound local builders without carrying th
     artifact: {
       artifactHash: "artifact-hash",
       executionHash: "graph-hash",
-      expectedBinding: { mobileAbi: 10, storageAbi: 32 },
+      expectedBinding: { mobileAbi: 10, storageAbi: 33 },
       format: 1,
       modules: [],
       replicationHash: "manifest-hash",

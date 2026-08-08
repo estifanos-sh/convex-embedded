@@ -7,8 +7,12 @@ use std::fmt::Write;
 pub const STORE_CONTRACT_V1_EPOCH: i64 = 47;
 /// The first contract whose setup identity is stored independently from durable layout identity.
 pub const STORE_CONTRACT_V2_EPOCH: i64 = 48;
+/// The durable coordinator fence lives in the frozen bootstrap plane. V3 is admitted only after
+/// the explicit V2-to-V3 kernel bridge has seeded that counter.
+pub const STORE_CONTRACT_V3_EPOCH: i64 = 49;
 pub const STORE_CONTRACT_V1_FORMAT: i64 = 1;
 pub const STORE_CONTRACT_V2_FORMAT: i64 = 2;
+pub const STORE_CONTRACT_V3_FORMAT: i64 = 3;
 
 /// Permanent numeric identities for originated semantic records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +118,7 @@ pub struct StoreContract {
     /// capability, never a durable migration trigger.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin_reader_hash: String,
-    /// V1 setup identity. V2 deliberately omits it and uses the bootstrap setup-plan record.
+    /// V1 setup identity. V2+ deliberately omit it and use the bootstrap setup-plan record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_hash: Option<String>,
 }
@@ -123,9 +127,9 @@ impl StoreContract {
     #[must_use]
     pub fn for_schema(schema: &super::StoreSchema) -> Self {
         Self {
-            format: STORE_CONTRACT_V2_FORMAT,
+            format: STORE_CONTRACT_V3_FORMAT,
             bootstrap_version: crate::sql::BOOTSTRAP_VERSION,
-            package_epoch: STORE_CONTRACT_V2_EPOCH,
+            package_epoch: STORE_CONTRACT_V3_EPOCH,
             app_schema_hash: schema.hash.clone(),
             kernel_layout_hash: manifest_hash(&crate::sql::kernel_layout_manifest()),
             generation_layout_hash: manifest_hash(&crate::sql::generation_contract_manifest()),
@@ -147,6 +151,43 @@ impl StoreContract {
     #[must_use]
     pub(crate) fn is_v2(&self) -> bool {
         self.format == STORE_CONTRACT_V2_FORMAT
+    }
+
+    #[must_use]
+    pub(crate) fn is_v3(&self) -> bool {
+        self.format == STORE_CONTRACT_V3_FORMAT
+    }
+
+    /// The exact V2 kernel layout is retained only to admit the one controlled V2-to-V3 bridge.
+    /// It must not silently follow later V3 kernel changes.
+    #[must_use]
+    pub(crate) fn baseline_kernel_layout_hash() -> String {
+        manifest_hash(&crate::sql::kernel_layout_manifest_v2())
+    }
+
+    #[must_use]
+    pub(crate) fn has_exact_v2_layout(&self) -> bool {
+        self.is_v2()
+            && self.bootstrap_version == crate::sql::BOOTSTRAP_VERSION
+            && self.package_epoch == STORE_CONTRACT_V2_EPOCH
+            && self.kernel_layout_hash == Self::baseline_kernel_layout_hash()
+            && self.generation_layout_hash
+                == manifest_hash(&crate::sql::generation_contract_manifest())
+            && self.origin_writer_hash == manifest_hash(&origin_writer_manifest())
+            && self.origin_reader_hash.is_empty()
+            && self.setup_hash.is_none()
+    }
+
+    #[must_use]
+    pub(crate) fn has_exact_v3_layout(&self) -> bool {
+        self.is_v3()
+            && self.bootstrap_version == crate::sql::BOOTSTRAP_VERSION
+            && self.package_epoch == STORE_CONTRACT_V3_EPOCH
+            && self.kernel_layout_hash == manifest_hash(&crate::sql::kernel_layout_manifest())
+            && self.generation_layout_hash
+                == manifest_hash(&crate::sql::generation_contract_manifest())
+            && self.origin_writer_hash == manifest_hash(&origin_writer_manifest())
+            && self.setup_hash.is_none()
     }
 
     /// Reader coverage is a runtime capability, not a reason to rewrite a store. Everything else

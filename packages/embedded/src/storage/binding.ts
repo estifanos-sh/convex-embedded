@@ -414,6 +414,8 @@ export interface StoreBinding {
   mutationCacheWrite?(call: BindingMutationCall): Promise<BindingMutationRecord>;
   mutationFail(mutationId: string, error: string): Promise<void>;
   clockRead(): number;
+  // Expo's independently versioned bridge does not participate in browser coordination.
+  leaderFenceWrite?(): Promise<string>;
   commit(batch: BindingWriteBatch, options?: BindingCommitOptions): Promise<BindingCommitResult>;
   commitOneDocWrite?(
     table: string,
@@ -679,6 +681,17 @@ export class StoreAdapter implements StorageBackend {
   private readonly inner: StoreBinding;
   private readonly readCache = new ReadCache();
   readonly capabilities = { hasExactBounds: true };
+  /** Private browser-coordinator ownership term allocator. */
+  readonly leader = {
+    fence: {
+      write: async (): Promise<string> => {
+        if (!this.inner.leaderFenceWrite) {
+          throw new Error("This storage binding does not support durable leader fencing.");
+        }
+        return await this.inner.leaderFenceWrite();
+      },
+    },
+  };
   readonly remote: RemoteSurface | undefined;
   readonly identity: StorageBackend["identity"];
 
@@ -1042,24 +1055,9 @@ export class StoreAdapter implements StorageBackend {
     const docWrite = commit.docWrite;
     // The shortcut can only carry fully encoded physical columns. A timestamp marker is resolved
     // together with its document/result in the generic transaction, never by the one-row path.
-    if (
-      docWrite.pendingCommitTs === true ||
-      hasPendingCommitTs(docWrite.data) ||
-      options?.commitTs === true
-    ) {
-      const row = { table: docWrite.table, id: docWrite.id };
-      return await this.commit(
-        {
-          docWrites: [docWrite],
-          deletes: [],
-          freshIds: commit.fresh ? [row] : [],
-          dataOnlyIds: commit.dataOnly ? [row] : [],
-          ...(docWrite.pendingCommitTs === true || hasPendingCommitTs(docWrite.data)
-            ? { pendingCommitTs: true }
-            : {}),
-        },
-        options,
-      );
+    const pendingCommitTs = docWrite.pendingCommitTs === true || hasPendingCommitTs(docWrite.data);
+    if (pendingCommitTs || options?.commitTs === true) {
+      return await this.commitOneDocWriteBatch(commit, options, pendingCommitTs);
     }
     const hasFastPath =
       options?.changes === "omit"
@@ -1067,16 +1065,7 @@ export class StoreAdapter implements StorageBackend {
           hasMethod(this.inner, "commitOneDocWriteEncoded")
         : hasMethod(this.inner, "commitOneDocWrite");
     if (!hasFastPath) {
-      const row = { table: docWrite.table, id: docWrite.id };
-      return await this.commit(
-        {
-          docWrites: [docWrite],
-          deletes: [],
-          freshIds: commit.fresh ? [row] : [],
-          dataOnlyIds: commit.dataOnly ? [row] : [],
-        },
-        options,
-      );
+      return await this.commitOneDocWriteBatch(commit, options);
     }
     const data = encodeDocData(docWrite.data);
     const mutation = bindingCommitMutation(options);
@@ -1143,6 +1132,26 @@ export class StoreAdapter implements StorageBackend {
     const resultCommit = fromBindingCommitResult(result);
     this.applyOneDocWriteCommitCaches(resultCommit, commit);
     return resultCommit;
+  }
+
+  /** Routes one-document commits through the generic transaction when its shortcut is unavailable. */
+  private async commitOneDocWriteBatch(
+    commit: OneDocWriteCommit,
+    options: CommitOptions | undefined,
+    pendingCommitTs = false,
+  ): Promise<CommitResult> {
+    const { docWrite } = commit;
+    const row = { table: docWrite.table, id: docWrite.id };
+    return await this.commit(
+      {
+        docWrites: [docWrite],
+        deletes: [],
+        freshIds: commit.fresh ? [row] : [],
+        dataOnlyIds: commit.dataOnly ? [row] : [],
+        ...(pendingCommitTs ? { pendingCommitTs: true } : {}),
+      },
+      options,
+    );
   }
 
   async clear(): Promise<void> {

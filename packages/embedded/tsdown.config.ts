@@ -45,7 +45,7 @@ const main = defineConfig({
     node: "src/node/index.ts",
     schema: "src/tables.ts",
     server: "src/server/index.ts",
-    "internal/text": "src/text/field.ts",
+    text: "src/text.ts",
     unplugin: "src/unplugin.ts",
     values: "src/values.ts",
     vite: "src/vite.ts",

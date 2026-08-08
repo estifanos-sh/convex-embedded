@@ -358,6 +358,8 @@
   }
 
   .documentRow {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 52px;
     display: flex;
     width: 100%;
     align-items: center;
