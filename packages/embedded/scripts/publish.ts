@@ -61,6 +61,12 @@ interface PackageJson {
   [key: string]: unknown;
 }
 
+type DependencySection =
+  | "dependencies"
+  | "devDependencies"
+  | "optionalDependencies"
+  | "peerDependencies";
+
 interface BaselineFixtureManifest {
   releaseIdentity?: string;
   releasePackage?: string;
@@ -79,6 +85,13 @@ interface BaselineFixtureManifest {
 }
 
 export type PublishMode = "verify" | "preview" | "prerelease" | "release";
+
+const dependencySections: DependencySection[] = [
+  "dependencies",
+  "devDependencies",
+  "optionalDependencies",
+  "peerDependencies",
+];
 
 /**
  * Stamp the version consumed by tsdown before it emits package artifacts.
@@ -202,12 +215,67 @@ export function preparePackage(directory: string, version?: string): PackageJson
   manifest.homepage = `${packageRepository}#readme`;
   manifest.bugs = { url: `${packageRepository}/issues` };
   manifest.publishConfig = { ...manifest.publishConfig, access: "public" };
+  resolveCatalogRanges(manifest);
   if (manifest.scripts) {
     for (const script of lifecycleScripts) delete manifest.scripts[script];
   }
 
   writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
   return manifest;
+}
+
+/** Resolve workspace-only pnpm catalog ranges before npm creates the release payload. */
+function resolveCatalogRanges(manifest: PackageJson): void {
+  const catalog = readDefaultCatalog();
+  for (const section of dependencySections) {
+    const dependencies = manifest[section];
+    if (dependencies === undefined) continue;
+    if (!isStringRecord(dependencies)) {
+      throw new Error(`Embedded package ${section} must be a dependency map.`);
+    }
+    for (const [name, range] of Object.entries(dependencies)) {
+      if (range === "catalog:") {
+        const resolved = catalog.get(name);
+        if (resolved === undefined) {
+          throw new Error(`Embedded package ${section}.${name} has no default catalog range.`);
+        }
+        dependencies[name] = resolved;
+      } else if (range.startsWith("catalog:")) {
+        throw new Error(
+          `Embedded package ${section}.${name} uses an unsupported named pnpm catalog range.`,
+        );
+      }
+    }
+  }
+}
+
+/** Read the small, flat default pnpm catalog without adding a YAML parser to the release path. */
+function readDefaultCatalog(): Map<string, string> {
+  const workspace = readFileSync(resolve(repositoryDir, "pnpm-workspace.yaml"), "utf8");
+  const catalog = new Map<string, string>();
+  let active = false;
+  for (const line of workspace.split("\n")) {
+    if (line === "catalog:") {
+      active = true;
+      continue;
+    }
+    if (!active) continue;
+    if (/^\S/.test(line)) break;
+    const entry = line.match(/^  (?:("[^"]+")|([^:#][^:]*)):\s*(\S.*?)\s*$/);
+    if (entry === null) continue;
+    const name = entry[1] === undefined ? entry[2]!.trim() : entry[1].slice(1, -1);
+    const range = entry[3]!.replace(/\s+#.*$/, "").trim();
+    if (range.length > 0) catalog.set(name, range);
+  }
+  return catalog;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Object.values(value).every((entry) => typeof entry === "string")
+  );
 }
 
 /** Every prebuilt that must be present in the npm tarball. */
