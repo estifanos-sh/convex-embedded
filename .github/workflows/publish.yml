@@ -720,7 +720,10 @@ jobs:
     name: Publish
     needs: [gate, qualification, assemble, release-tag]
     if: needs.gate.outputs.mode == 'release' || needs.gate.outputs.mode == 'prerelease'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # npm trusted publishing and provenance attestations require a GitHub-hosted runner.
+    # Native qualification remains on Blacksmith; this job only verifies and publishes the
+    # already-qualified, digest-bound archive.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: npm
     permissions:
@@ -805,11 +808,23 @@ jobs:
 
       # Trusted publishing is bound by npm to this repository's workflow and emits provenance
       # for the public package. A copied workflow has no authority to obtain this credential.
-      - name: Publish package with trusted publishing
+      # Before the npm trusted publisher exists, NPM_BOOTSTRAP_TOKEN can publish the inaugural
+      # package through this same qualified path. Remove that secret immediately after the first
+      # successful publish: its absence selects OIDC, and it is never needed for later releases.
+      - name: Publish qualified package
         if: steps.release.outputs.published != 'true'
         env:
           NPM_CONFIG_PROVENANCE: "true"
-        run: npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public --tag "${{ steps.release.outputs.dist_tag }}"
+          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+        run: |
+          if [[ -n "${NPM_BOOTSTRAP_TOKEN:-}" ]]; then
+            echo "::notice::Using the one-time npm bootstrap token fallback. Remove NPM_BOOTSTRAP_TOKEN after this inaugural publish."
+            export NODE_AUTH_TOKEN="$NPM_BOOTSTRAP_TOKEN"
+          else
+            echo "Publishing with npm trusted publishing (OIDC)."
+            unset NODE_AUTH_TOKEN
+          fi
+          npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public --tag "${{ steps.release.outputs.dist_tag }}"
 
       - name: Move prerelease channel
         if: needs.gate.outputs.mode == 'prerelease'

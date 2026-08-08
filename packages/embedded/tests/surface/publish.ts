@@ -17,13 +17,14 @@ function jobBody(workflow: string, name: string) {
 }
 
 describe("Embedded publishing workflow", () => {
-  test("every production workflow uses a declared Blacksmith runner", () => {
-    const workflows = [
+  test("production work stays on Blacksmith except the OIDC publish boundary", () => {
+    const workflowPaths = [
       ".github/workflows/benchmark.yml",
       ".github/workflows/preview.yml",
       ".github/workflows/publish.yml",
       ".github/workflows/release-native.yml",
-    ].map((path) => readFileSync(join(root, path), "utf8"));
+    ];
+    const workflows = workflowPaths.map((path) => readFileSync(join(root, path), "utf8"));
     const labels = readFileSync(join(root, ".github/actionlint.yaml"), "utf8");
     const declared = [
       "blacksmith-2vcpu-ubuntu-2404",
@@ -37,17 +38,25 @@ describe("Embedded publishing workflow", () => {
     for (const runner of declared) {
       expect(labels).toContain(runner);
     }
-    for (const workflow of workflows) {
+    for (const [index, workflow] of workflows.entries()) {
       expect(workflow).not.toContain("depot");
       for (const [, runner] of workflow.matchAll(/^\s*runs-on:\s+([^\s#]+).*$/gm)) {
         if (runner !== "${{") {
-          expect(declared).toContain(runner);
+          const isNpmTrustedPublish =
+            workflowPaths[index] === ".github/workflows/publish.yml" && runner === "ubuntu-24.04";
+          expect(isNpmTrustedPublish || declared.includes(runner)).toBe(true);
         }
       }
       for (const [, runner] of workflow.matchAll(/^\s*- runner:\s+([^\s#]+).*$/gm)) {
         expect(declared).toContain(runner);
       }
     }
+
+    const publish = workflows[workflowPaths.indexOf(".github/workflows/publish.yml")];
+    const publishJob = jobBody(publish, "publish");
+    expect(publishJob).toContain("runs-on: ubuntu-24.04");
+    expect(publishJob).toContain("id-token: write");
+    expect(publish.match(/^\s*runs-on:\s+ubuntu-24\.04\s*$/gm) ?? []).toHaveLength(1);
   });
 
   test("assembles every runtime before publishing the independently verified package", () => {
