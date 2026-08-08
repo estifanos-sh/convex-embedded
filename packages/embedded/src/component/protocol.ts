@@ -36,9 +36,8 @@ import { write as retentionWrite } from "./crdt/retention";
 import { bytesHash, hashDocument, hashValue } from "../hash";
 import {
   EMBEDDED_CLIENT_RETIRED,
-  EMBEDDED_PROTOCOL_LEGACY_VERSION,
   EMBEDDED_PROTOCOL_MISMATCH,
-  EMBEDDED_PROTOCOL_VERSION,
+  EMBEDDED_PROTOCOL_VERSIONS,
   isEmbeddedProtocolVersion,
 } from "../protocol";
 
@@ -1471,7 +1470,7 @@ function assertRuntime(runtime: {
   if (!isEmbeddedProtocolVersion(runtime.protocolVersion)) {
     throw new ConvexError({
       code: EMBEDDED_PROTOCOL_MISMATCH,
-      expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
+      expected: [...EMBEDDED_PROTOCOL_VERSIONS],
       message: `Embedded protocol ${runtime.protocolVersion} is not supported.`,
       received: runtime.protocolVersion,
     });

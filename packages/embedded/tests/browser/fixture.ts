@@ -1,12 +1,12 @@
 import { describe, expect, test } from "vite-plus/test";
 
-import fixtureManifest from "../../../../crates/storage/tests/fixtures/preview2/manifest.json";
+import fixtureManifest from "../../../../crates/storage/tests/fixtures/baseline/manifest.json";
 
 type WorkerMessage = { error: string; ok: false } | { ok: true; result: unknown };
 
-describe("Preview2 production fixture", () => {
+describe("public baseline fixture", () => {
   test("opens, migrates, and warm-reopens exact bytes through WASM and OPFS", async () => {
-    const storageId = `preview2-packed-${crypto.randomUUID()}`;
+    const storageId = `baseline-packed-${crypto.randomUUID()}`;
     const worker = new Worker(new URL("./boot.ts", import.meta.url), { type: "module" });
     try {
       await request(worker, { op: "fixtureInstall", storageId });
@@ -24,7 +24,7 @@ describe("Preview2 production fixture", () => {
   }, 130_000);
 
   test("resumes after the candidate worker is terminated during target materialization", async () => {
-    const storageId = `preview2-kill-${crypto.randomUUID()}`;
+    const storageId = `baseline-kill-${crypto.randomUUID()}`;
     const wounded = new Worker(new URL("./boot.ts", import.meta.url), { type: "module" });
     try {
       const prepared = await request<{ phase: "materialize"; wounding: true }>(wounded, {
@@ -63,7 +63,7 @@ async function openPackedClient(): Promise<void> {
 async function request<T>(worker: Worker, message: unknown): Promise<T> {
   return await new Promise<T>((resolve, reject) => {
     const timeout = setTimeout(
-      () => reject(new Error("Preview2 fixture worker timed out")),
+      () => reject(new Error("baseline fixture worker timed out")),
       120_000,
     );
     worker.onmessage = (event: MessageEvent<WorkerMessage & { result?: T }>) => {
@@ -73,7 +73,7 @@ async function request<T>(worker: Worker, message: unknown): Promise<T> {
     };
     worker.onerror = (event) => {
       clearTimeout(timeout);
-      reject(new Error(event.message || "Preview2 fixture worker failed"));
+      reject(new Error(event.message || "baseline fixture worker failed"));
     };
     worker.postMessage(message);
   });

@@ -121,7 +121,7 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toContain("Download exact JavaScript and WASM artifact");
     expect(workflow).not.toContain("Build production Node and WASM artifacts");
     expect(workflow).toMatch(
-      /name: Checkout exact source[\s\S]*?fetch-depth: 0[\s\S]*?name: Verify Preview2 baseline/,
+      /name: Checkout exact source[\s\S]*?fetch-depth: 0[\s\S]*?name: Verify public baseline/,
     );
     expect(workflow).toMatch(/name: Assemble[\s\S]*?name: Checkout[\s\S]*?fetch-depth: 0/);
     expect(workflow).toContain("name: Qualify");

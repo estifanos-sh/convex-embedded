@@ -310,7 +310,7 @@ fn identity_args(protocol_versions: Option<&[i64]>) -> ConvexArgs {
     ConvexArgs::from([("request".to_owned(), Value::Object(request))])
 }
 
-/// Preview 2's frozen identity validator rejects the otherwise additive
+/// The public baseline identity validator rejects the otherwise additive
 /// `protocolVersions` field. Only that precise validation failure permits the
 /// one legacy-shaped retry; transport, authentication, and application errors
 /// must remain visible to the caller.

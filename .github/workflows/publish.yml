@@ -179,7 +179,7 @@ jobs:
           vp run style
           vp run clippy
 
-      - name: Verify Preview2 baseline and release stress
+      - name: Verify public baseline and release stress
         env:
           CONVEX_EMBEDDED_PUBLISH_VERSION: ${{ needs.gate.outputs.version }}
         run: |

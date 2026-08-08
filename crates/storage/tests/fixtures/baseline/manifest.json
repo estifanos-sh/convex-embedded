@@ -3,16 +3,15 @@
   "contract": {
     "appSchemaHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "bootstrapVersion": 1,
+    "format": 3,
     "generationLayoutHash": "4f377db32f9cd4433a83778401c1270a7b71d56b970b7b44badfd4f252df1a0b",
-    "kernelLayoutHash": "5fa387957ed045e0e1c6e6f4357034af63a102c8180d7fd9f0f8437d41fe72fa",
-    "originReaderHash": "a9eb50f732b915e2ea7605efb6e9d02504e225ef22361db0dd185ce19309592f",
+    "kernelLayoutHash": "cabffadfc144dbf05566b3a200167cc6fc46b4bf4e70254232c5210163dc4d01",
     "originWriterHash": "4ba46d92f6760cca0422b6381e2a6ee5c813477e3e9852af14e976b0c343c7a1",
-    "packageEpoch": 47,
-    "setupHash": ""
+    "packageEpoch": 49
   },
-  "epoch": 47,
-  "fixtureContractVersion": 1,
-  "name": "preview2",
+  "epoch": 49,
+  "fixtureContractVersion": 3,
+  "name": "baseline",
   "oracle": {
     "cursor": "fixture:cursor",
     "identityKey": "unauthenticated",
@@ -122,7 +121,7 @@
     "crdt": [
       {
         "field": "body",
-        "hash": "11a5ae9e46bad1db0eaa39d3d126d2976c28a565bcc39fe2cc9ee6397de8fd54",
+        "hash": "d4b71425b9234d96d3d3fa4bb6caceb16523368586fa3e9b6f566f017970e3c3",
         "headSeq": 0,
         "kind": "text",
         "projectionHash": "c866b7bf3478c1248961bc693bdbca181c516f5651f58d53ebb4a842a56b65e7"
@@ -208,7 +207,7 @@
       "clock": 7.0,
       "function": "issues:list",
       "key": "fixture:result",
-      "moduleHash": "module:preview2",
+      "moduleHash": "module:baseline",
       "paths": "[{\"path\":\"/items/0\",\"rowId\":\"j575pnjjhzf95ze91djp5v26b188xreb\",\"table\":\"issues\"}]",
       "schemaHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "skeleton": "{\"items\":[null]}",
@@ -253,18 +252,18 @@
     ]
   },
   "referencedPayloadCount": 4,
-  "releaseIdentity": "robelest-v0.0.1-preview-2",
-  "releasePackage": "@robelest/convex-embedded",
-  "releaseVersion": "0.0.1-preview-2",
-  "semanticDigest": "62b2cbd459bfb79987d917be07aa7244133c9ef11c1010e586b027bdf401daf6",
+  "releaseIdentity": "v0.0.1-preview.0",
+  "releasePackage": "@estifanos-sh/convex-embedded",
+  "releaseVersion": "0.0.1-preview.0",
+  "semanticDigest": "d83b031b0cf11a941d236f57a2046f6a62a1439e10e79796c1dc099ca47ee080",
   "semanticSnapshot": {
     "crdt": {
-      "originHashes": ["ZIbq8LJCIUtJRRUHJ2k1imjqmij+f9phKwa8GlBERmg="],
+      "originHashes": ["6Le+YD08pTgBPFK7xEJgBpxu45XpsRd3NTjsPjtot5g="],
       "states": "[CrdtReadState { field: \"body\", epoch: 0, head_seq: 0, projection_hash: \"\" }]"
     },
     "deviceDocument": "{\"_id\":\"preferences:fixture\",\"_creationTime\":1,\"theme\":\"dark\"}",
     "envelopes": [
-      "{\"afterImages\":[{\"content\":\"value\",\"creationTime\":2,\"rowId\":\"issues|11111111111111111111111111111111\",\"table\":\"issues\",\"value\":{\"body\":\"\",\"title\":\"fixture\"}}],\"commitSeq\":2,\"crdt\":[{\"checkpoint\":{\"bytes\":{\"$bytes\":\"bG9ybwAAAAAAAAAAAAAAANbDHj4AA8IAAABMT1JPAAHDleC1yvHPoKwBDgACAHZ2AcOV4LXK8c+grAEQAAwArEE/jKa4CsMAAAAAAAgACAEQAcMKuKaMP0GsAQEAAAAAAAUBAAABAAsCBAEAAAIEAQIABBIBdgNyb3cL8J+knTokcm93PnYAEQEEAwMAAgIEAAMDCwUDAwEHABIGCABMTQECpKz2B29mZmxpbmUAAAwAHQADAAVceekBAAAABQAAAAIAZnIADACsQT+MprgKwwAAAAAdgPmnnwAAAIwAAABMT1JPAAABAAEBdggIAExNAQKkrPYAAcMKuKaMP0GsAAAADQCCC/CfpJ06JHJvdz52AgIBAANyb3cBB29mZmxpbmUBwwq4pow/QawDBAIBAAIBAgIBAAIBDgAAAAAcAAIAIwS26QEAAAAFAAAABQCAA3JvdwANAIIL8J+knTokcm93PnYhD9KkZQAAAAAAAAA=\"},\"hash\":\"11a5ae9e46bad1db0eaa39d3d126d2976c28a565bcc39fe2cc9ee6397de8fd54\",\"throughSeq\":1},\"field\":\"body\",\"kind\":\"text\",\"payload\":{\"$bytes\":\"bG9ybwAAAAAAAAAAAAAAAEykcCAABGIACAAIARABwwq4pow/QawBAQAAAAAABQEAAAEACwIEAQAAAgQBAgAEEgF2A3Jvdwvwn6SdOiRyb3c+dgARAQQDAwACAgQAAwMLBQMDAQcAEgYIAExNAQKkrPYHb2ZmbGluZQ==\"},\"rowId\":\"issues|11111111111111111111111111111111\",\"table\":\"issues\"}],\"localInserts\":[\"issues|11111111111111111111111111111111\"],\"localSchedules\":[\"fixture:schedule\"],\"mutationId\":\"fixture:retained\",\"mutationTime\":3}"
+      "{\"afterImages\":[{\"content\":\"value\",\"creationTime\":2,\"rowId\":\"issues|11111111111111111111111111111111\",\"table\":\"issues\",\"value\":{\"body\":\"\",\"title\":\"fixture\"}}],\"commitSeq\":2,\"crdt\":[{\"checkpoint\":{\"bytes\":{\"$bytes\":\"bG9ybwAAAAAAAAAAAAAAAPNPzBcAA8IAAABMT1JPAAGo+tSFxdON55MBDgACAHZ2Aaj61IXF043nkwEQAAwAk842nFC1PSgAAAAAAAgACAEQASg9tVCcNs6TAQEAAAAAAAUBAAABAAsCBAEAAAIEAQIABBIBdgNyb3cL8J+knTokcm93PnYAEQEEAwMAAgIEAAMDCwUDAwEHABIGCABMTQECpKz2B29mZmxpbmUAAAwAHQADANBHUX8BAAAABQAAAAIAZnIADACTzjacULU9KAAAAAAnUU3knwAAAIwAAABMT1JPAAABAAEBdggIAExNAQKkrPYAASg9tVCcNs6TAAAADQCCC/CfpJ06JHJvdz52AgIBAANyb3cBB29mZmxpbmUBKD21UJw2zpMDBAIBAAIBAgIBAAIBDgAAAAAcAAIAbq0XNAEAAAAFAAAABQCAA3JvdwANAIIL8J+knTokcm93PnYhD9KkZQAAAAAAAAA=\"},\"hash\":\"d4b71425b9234d96d3d3fa4bb6caceb16523368586fa3e9b6f566f017970e3c3\",\"throughSeq\":1},\"field\":\"body\",\"kind\":\"text\",\"payload\":{\"$bytes\":\"bG9ybwAAAAAAAAAAAAAAAHu1B8cABGIACAAIARABKD21UJw2zpMBAQAAAAAABQEAAAEACwIEAQAAAgQBAgAEEgF2A3Jvdwvwn6SdOiRyb3c+dgARAQQDAwACAgQAAwMLBQMDAQcAEgYIAExNAQKkrPYHb2ZmbGluZQ==\"},\"rowId\":\"issues|11111111111111111111111111111111\",\"table\":\"issues\"}],\"localInserts\":[\"issues|11111111111111111111111111111111\"],\"localSchedules\":[\"fixture:schedule\"],\"mutationId\":\"fixture:retained\",\"mutationTime\":3}"
     ],
     "file": "Some(FileMetadata { storage_id: \"fixture:file\", sha256: \"sha256:fixture-file\", size: 3, content_type: Some(\"application/octet-stream\"), source: Some(\"fixture\"), created_time: 4, updated_time: 4 })",
     "fileBytes": [1, 2, 3],
@@ -279,12 +278,12 @@
     "remoteDocument": "{\"_id\":\"issues|22222222222222222222222222222222\",\"_creationTime\":1,\"body\":\"\",\"title\":\"remote\"}",
     "remoteMembership": "[RemoteMember { table: \"issues\", server_document_id: \"j575pnjjhzf95ze91djp5v26b188xreb\" }]",
     "remoteProjection": "Some(RowHead { table: \"issues\", local_document_id: \"issues|22222222222222222222222222222222\", current_rev_id: \"main\", server_document_id: \"j575pnjjhzf95ze91djp5v26b188xreb\", projection_hash: \"fixture:projection\", current_root_id: None, current_node_id: None, server_base: Some(\"fixture:plain\"), server_row: Some(\"{\\\"_id\\\":\\\"j575pnjjhzf95ze91djp5v26b188xreb\\\",\\\"_creationTime\\\":1,\\\"body\\\":\\\"\\\",\\\"title\\\":\\\"remote\\\"}\"), logical_clock: 7.0, updated_time: 7 })",
-    "remoteResult": "Some(ResultEntry { key: \"fixture:result\", function: \"issues:list\", args: \"{}\", schema_hash: \"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\", module_hash: \"module:preview2\", skeleton: [123, 34, 105, 116, 101, 109, 115, 34, 58, 91, 110, 117, 108, 108, 93, 125], paths: [91, 123, 34, 112, 97, 116, 104, 34, 58, 34, 47, 105, 116, 101, 109, 115, 47, 48, 34, 44, 34, 114, 111, 119, 73, 100, 34, 58, 34, 106, 53, 55, 53, 112, 110, 106, 106, 104, 122, 102, 57, 53, 122, 101, 57, 49, 100, 106, 112, 53, 118, 50, 54, 98, 49, 56, 56, 120, 114, 101, 98, 34, 44, 34, 116, 97, 98, 108, 101, 34, 58, 34, 105, 115, 115, 117, 101, 115, 34, 125, 93], skeleton_hash: \"fixture:skeleton\", clock: 7.0 })",
+    "remoteResult": "Some(ResultEntry { key: \"fixture:result\", function: \"issues:list\", args: \"{}\", schema_hash: \"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\", module_hash: \"module:baseline\", skeleton: [123, 34, 105, 116, 101, 109, 115, 34, 58, 91, 110, 117, 108, 108, 93, 125], paths: [91, 123, 34, 112, 97, 116, 104, 34, 58, 34, 47, 105, 116, 101, 109, 115, 47, 48, 34, 44, 34, 114, 111, 119, 73, 100, 34, 58, 34, 106, 53, 55, 53, 112, 110, 106, 106, 104, 122, 102, 57, 53, 122, 101, 57, 49, 100, 106, 112, 53, 118, 50, 54, 98, 49, 56, 56, 120, 114, 101, 98, 34, 44, 34, 116, 97, 98, 108, 101, 34, 58, 34, 105, 115, 115, 117, 101, 115, 34, 125, 93], skeleton_hash: \"fixture:skeleton\", clock: 7.0 })",
     "revisions": ["Cp6/1Tz7Upz0fNRWhh+8gpa8ekI0Hazli2JEp8EVjuM="],
     "schedules": "[ScheduledJob { job_id: \"fixture:schedule\", kind: Mutation, name: \"issues:followup\", args: \"{}\", due_time: 4102444800000, state: Pending, created_time: 3, updated_time: 3 }]",
     "settlements": ["fixture:settled"],
     "uploads": "[PendingUpload { local_storage_id: \"_storage|fixture\", sha256: \"sha256:fixture-upload\", size: 3, content_type: Some(\"text/plain\"), lease: Pending, created_time: 4, updated_time: 4 }, PendingUpload { local_storage_id: \"fixture:file\", sha256: \"sha256:fixture-file\", size: 3, content_type: Some(\"application/octet-stream\"), lease: Pending, created_time: 4, updated_time: 4 }]"
   },
-  "sha256": "bd7e42b1af9227c31576c6fdcb08e87cf8a9136b4065e73184e1daf9003be980",
-  "writer": "storage epoch 47 release candidate"
+  "sha256": "70ad1b676dc86e701f8fd9f0bc3499206c6f630c48097c4bfb085439add62b41",
+  "writer": "public Preview 0 release contract"
 }

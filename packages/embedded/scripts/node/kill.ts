@@ -33,9 +33,9 @@ if (process.argv[2] === "child") {
 }
 
 const repositoryDir = new URL("../../../..", import.meta.url).pathname;
-const fixture = join(repositoryDir, "crates/storage/tests/fixtures/preview2/store.sqlite3");
+const fixture = join(repositoryDir, "crates/storage/tests/fixtures/baseline/store.sqlite3");
 const manifest = JSON.parse(
-  readFileSync(join(repositoryDir, "crates/storage/tests/fixtures/preview2/manifest.json"), "utf8"),
+  readFileSync(join(repositoryDir, "crates/storage/tests/fixtures/baseline/manifest.json"), "utf8"),
 ) as { portableOracle: unknown };
 const temporary = mkdtempSync(join(tmpdir(), "embedded-candidate-kill-"));
 const path = join(temporary, "store.sqlite3");

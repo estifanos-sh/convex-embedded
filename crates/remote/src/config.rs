@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::{RemoteError, RemoteResult};
 
-/// v27 requires structured, sanitized terminal replay failure codes.
+/// The current wire requires structured, sanitized terminal replay failure codes.
 pub const EMBEDDED_PROTOCOL_VERSION: i64 = 27;
 
 /// Reserved local partition key for unauthenticated data; non-hex so it never collides with a `hashValue` digest.

@@ -37,7 +37,7 @@ export async function portableOracle(store: StorageBackend): Promise<unknown> {
     cursor === undefined ||
     membership === undefined
   ) {
-    throw new Error("Preview2 portable oracle is missing required fixture state.");
+    throw new Error("baseline portable oracle is missing required fixture state.");
   }
   return {
     identityKey: identity.identityKey,
@@ -141,7 +141,7 @@ function sort(value: unknown): unknown {
   );
 }
 
-/** Exact target contract with a real schema/index evolution from the Preview2 fixture. */
+/** Exact target contract with a real schema/index evolution from the public baseline fixture. */
 export const fixtureTargetSchema: StoreSchema = {
   hash: "e".repeat(64),
   setupHash: "",

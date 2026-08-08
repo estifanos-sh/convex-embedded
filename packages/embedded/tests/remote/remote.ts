@@ -11,7 +11,7 @@ import schema from "../../../../convex/schema";
 import { hashDocument, hashValue } from "../../src/hash";
 import { ConvexEmbeddedClient } from "../../src/node/client";
 import { readDevtoolsBridge } from "../../src/devtools/bridge";
-import { EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
 import { fixtureRemoteUrl } from "../testkit/remote";
 import { read as readTime } from "../testkit/time";
@@ -174,10 +174,10 @@ describe("v5 real Convex vertical slice", () => {
         args: { limit: 1 },
         runtime: {
           ...testRuntime,
-          protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION - 1,
+          protocolVersion: EMBEDDED_PROTOCOL_VERSION - 1,
         },
       }),
-    ).rejects.toThrow(`Embedded protocol ${EMBEDDED_PROTOCOL_LEGACY_VERSION - 1} is not supported`);
+    ).rejects.toThrow(`Embedded protocol ${EMBEDDED_PROTOCOL_VERSION - 1} is not supported`);
   });
 
   test("routes actions and hosted-only functions through Convex", async () => {

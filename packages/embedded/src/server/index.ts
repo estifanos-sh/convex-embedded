@@ -24,7 +24,13 @@ import {
   queryGeneric,
 } from "convex/server";
 import { asObjectValidator, ConvexError, v } from "convex/values";
-import type { GenericValidator, PropertyValidators, Validator, VObject } from "convex/values";
+import type {
+  GenericValidator,
+  Infer,
+  PropertyValidators,
+  Validator,
+  VObject,
+} from "convex/values";
 
 import { embeddedFieldMeta } from "../meta";
 import {
@@ -38,9 +44,8 @@ import {
 import { canonicalJson, hashDocument, hashValue } from "../hash";
 import { validatorIdReferences, validatorIdValues } from "../id/path";
 import {
-  EMBEDDED_PROTOCOL_LEGACY_VERSION,
   EMBEDDED_PROTOCOL_MISMATCH,
-  EMBEDDED_PROTOCOL_VERSION,
+  EMBEDDED_PROTOCOL_VERSIONS,
   isEmbeddedProtocolVersion,
   selectEmbeddedProtocolVersion,
   type EmbeddedProtocolVersion,
@@ -224,17 +229,8 @@ type Settlement = SettlementInput & {
   >;
 };
 
-type WireSettlementBase = SettlementBase & {
-  crdt: Settlement["crdt"];
-  authoritative: Settlement["authoritative"];
-};
-
 /** A settlement after selecting the caller's response adapter. */
-type WireSettlement =
-  | (WireSettlementBase & { outcome: "applied"; result: unknown })
-  | (WireSettlementBase & { outcome: "conflict"; error: unknown })
-  | (WireSettlementBase & { outcome: "rejected"; error: unknown })
-  | (WireSettlementBase & { outcome: "rebase"; error: unknown });
+type WireSettlement = Infer<typeof wireSettlementValidator>;
 
 type CrdtIntentWriter = {
   text: {
@@ -755,16 +751,7 @@ const settlementValidator = v.union(
   }),
 );
 
-// Wire 26 treated a failed settlement's `error` field as opaque. Its Rust decoder checks only the
-// terminal outcome, while v27 requires the closed code above. Keep this adapter-only validator at
-// the public response boundary; component records remain canonicalized before they are returned.
-const legacySettlementValidator = v.union(
-  v.object({ ...settlementFields, outcome: v.literal("conflict"), error: v.any() }),
-  v.object({ ...settlementFields, outcome: v.literal("rejected"), error: v.any() }),
-  v.object({ ...settlementFields, outcome: v.literal("rebase"), error: v.any() }),
-);
-
-const wireSettlementValidator = v.union(settlementValidator, legacySettlementValidator);
+const wireSettlementValidator = settlementValidator;
 
 type RevisionRunMutation = (
   ref: FunctionReference<
@@ -1056,8 +1043,7 @@ const runtimeRequestValidator = v.object({
 const pullRequestValidator = v.union(
   v.object({
     kind: v.literal("identity"),
-    // Omission is the frozen Preview 2 identity request shape and selects wire 26. Current
-    // clients advertise their complete discrete set so this deployment can select wire 27.
+    // Clients advertise their complete discrete set before the server returns identity state.
     protocolVersions: v.optional(v.array(v.number())),
   }),
   v.object({
@@ -1190,7 +1176,7 @@ function buildPull(component: EmbeddedComponent, manifest?: FunctionManifest) {
         if (protocolVersion === undefined) {
           throw new ConvexError({
             code: EMBEDDED_PROTOCOL_MISMATCH,
-            expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
+            expected: [...EMBEDDED_PROTOCOL_VERSIONS],
             message: "Embedded identity request has no supported protocol version.",
             received: args.protocolVersions,
           });
@@ -1509,11 +1495,11 @@ function buildPush(
 }
 
 /**
- * Normalize a cached v26 failure at the v27 server response boundary.
+ * Normalize a cached failure at the current server response boundary.
  *
  * Historic component rows may contain an arbitrary `error` object and reason text. Their exact
  * payload is never forwarded: the outcome determines conflict/rebase, while rejected preserves
- * only the one safe legacy distinction (`EMBEDDED_DIVERGENCE`). New records already use this
+ * only the one safe stored distinction (`EMBEDDED_DIVERGENCE`). New records already use this
  * shape, so the same boundary guarantees every Rust client receives the closed form.
  */
 function normalizeSettlement(settlement: Settlement): Settlement {
@@ -1537,16 +1523,10 @@ function normalizeSettlement(settlement: Settlement): Settlement {
 }
 
 /**
- * Encode a canonical settlement at the only v26/v27 response seam.
- *
- * Preview 2's decoder required an `error` field but deliberately treated it as opaque. Sending
- * `null` preserves its terminal outcome without making the v27 closed failure-code contract part
- * of the old wire. Wire 27 receives the normalized structured error above.
+ * Encode the canonical settlement for the selected package wire.
  */
-function encodeSettlement(wire: EmbeddedProtocolVersion, settlement: Settlement): WireSettlement {
-  if (wire === EMBEDDED_PROTOCOL_VERSION) return settlement;
-  if (settlement.outcome === "applied") return settlement;
-  return { ...settlement, error: null };
+function encodeSettlement(_wire: EmbeddedProtocolVersion, settlement: Settlement): WireSettlement {
+  return settlement;
 }
 
 function failureSettlement(mutationId: string, code: ReplayFailureCode): FailureSettlementInput {
@@ -2509,7 +2489,7 @@ function assertRuntimeVersion(runtime: { protocolVersion: number }): EmbeddedPro
   if (isEmbeddedProtocolVersion(runtime.protocolVersion)) return runtime.protocolVersion;
   throw new ConvexError({
     code: EMBEDDED_PROTOCOL_MISMATCH,
-    expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
+    expected: [...EMBEDDED_PROTOCOL_VERSIONS],
     message: `Embedded protocol ${runtime.protocolVersion} is not supported.`,
     received: runtime.protocolVersion,
   });

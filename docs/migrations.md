@@ -177,7 +177,7 @@ ordinary local functions but fails closed as a setup identity.
 An active store contract includes:
 
 - the application storage schema hash;
-- the frozen epoch-47 kernel fingerprint;
+- the frozen public-baseline kernel fingerprint;
 - a separate rebuildable generation-layout fingerprint;
 - the current origin-record writer fingerprint;
 - the retained origin-record reader-coverage fingerprint;
@@ -195,10 +195,11 @@ the package epoch fails closed.
 The application schema hash must include validators as well as table, placement, field, column,
 CRDT, and index definitions. A same-schema backfill is detected through the setup graph hash.
 
-Epoch 47 is the Preview-2 compatibility baseline. Any nonempty library store below epoch 47 raises
-the named `PreBaselineStore` error and is left logically untouched by migration code; there is no
-flat-layout reader, extractor, seeder, active-ledger repair, or automatic deletion path. A newer
-unsupported epoch and a missing active contract also fail closed. Future package adapters are selected by the interval
+The first public package baseline is `@estifanos-sh/convex-embedded@0.0.1-preview.0` (epoch 49).
+Any nonempty library store below that epoch raises the named `PreBaselineStore` error and is left
+logically untouched by migration code; there is no flat-layout reader, extractor, seeder,
+active-ledger repair, or automatic deletion path. A newer unsupported epoch and a missing active
+contract also fail closed. Future package adapters are selected by the interval
 `source_epoch < introduced_epoch <= target_epoch`, so a device may skip releases without depending
 on an exact adjacent epoch pair.
 
@@ -208,15 +209,15 @@ including system projections, before replaying from the beginning. Resetting onl
 is invalid because insert-only projections such as the mutation table may already contain a partial
 prefix.
 
-The current package epoch is 47. The commit-timestamp floor remains a lazy key in the frozen kernel,
+The current package epoch is 49. The commit-timestamp floor remains a lazy key in the frozen kernel,
 so stores that never use `ctx.db.vars.commitTs` pay no setup write.
 
 The release baseline is the checked-in
-`crates/storage/tests/fixtures/preview2/{store.sqlite3,manifest.json}`, emitted by the exact epoch-47
-writer, checkpointed and closed before capture. Those are the only two permitted directory entries;
+`crates/storage/tests/fixtures/baseline/{store.sqlite3,manifest.json}`, emitted by the exact public
+baseline writer, checkpointed and closed before capture. Those are the only two permitted directory entries;
 WAL, shared-memory, owner, or unrelated files fail the publication verifier and the capture command
 removes its known auxiliary files after closing the final reader. The manifest binds the baseline to
-`@robelest/convex-embedded@0.0.1-preview-2` / `robelest-v0.0.1-preview-2`, the SQLite SHA-256,
+`@estifanos-sh/convex-embedded@0.0.1-preview.0` / `v0.0.1-preview.0`, the SQLite SHA-256,
 complete store-contract fingerprints, `(kind, codec, flags, count)` origin inventory, referenced
 payload validation, and a canonical semantic snapshot. The Rust gate runs the normal candidate
 engine when a future package requires an upgrade.
@@ -225,9 +226,9 @@ The checked-in manifest cannot contain the hash of the commit that contains that
 Instead, every release job resolves the requested ref once, and every qualification and assembly job
 checks out that exact SHA. Only after the common native, WASM, fixture, crash, stress, and memory gates
 and complete package assembly succeed may the workflow create the requested release tag at that SHA.
-Publication depends on a tag-target equality check against the validated SHA. Once the Preview2 tag
+Publication depends on a tag-target equality check against the validated SHA. Once the baseline tag
 exists, the verifier compares both fixture files byte-for-byte with that commit; later releases may
-add sibling fixture directories but cannot rewrite the Preview2 pair.
+add sibling fixture directories but cannot rewrite the baseline pair.
 
 The same bytes and portable oracle gate all production adapters before a release tag is created.
 The packaged Node addon and the real browser worker/WASM/OPFS runtime each run the shared candidate
@@ -280,7 +281,7 @@ The store treats data by semantic ownership rather than by physical table.
 | Pull cursor                             | Carry last, with a digest of its membership and projection dependencies; reject materialization on any mismatch                                                      |
 | SQL indexes, query cache, commit cache  | Recreate from the target contract                                                                                                                                    |
 
-Preview 2's compatibility promise includes the exact offline-visible authoritative view. Projection,
+The public baseline's compatibility promise includes the exact offline-visible authoritative view. Projection,
 membership, result, and cursor origins are maintained in the same transaction as their generation
 tables. Materialization order is projection, membership, result, then cursor. The cursor record
 contains a dependency digest recomputed in the candidate, so an old cursor can never publish over

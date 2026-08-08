@@ -12,14 +12,14 @@ import {
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const repositoryDir = resolve(packageDir, "../..");
-const fixture = resolve(repositoryDir, "crates/storage/tests/fixtures/preview2/store.sqlite3");
+const fixture = resolve(repositoryDir, "crates/storage/tests/fixtures/baseline/store.sqlite3");
 const manifest = JSON.parse(
   readFileSync(
-    resolve(repositoryDir, "crates/storage/tests/fixtures/preview2/manifest.json"),
+    resolve(repositoryDir, "crates/storage/tests/fixtures/baseline/manifest.json"),
     "utf8",
   ),
 ) as { portableOracle: unknown };
-const temporary = mkdtempSync(join(tmpdir(), "embedded-preview2-node-"));
+const temporary = mkdtempSync(join(tmpdir(), "embedded-baseline-node-"));
 const path = join(temporary, "store.sqlite3");
 cpSync(fixture, path);
 

@@ -23,8 +23,8 @@ import type { StoreSchema } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { fixtureTargetSchema, portableOracle, portableOracleJson } from "../fixture/oracle";
 
-import fixtureManifest from "../../../../crates/storage/tests/fixtures/preview2/manifest.json";
-import fixtureUrl from "../../../../crates/storage/tests/fixtures/preview2/store.sqlite3?url";
+import fixtureManifest from "../../../../crates/storage/tests/fixtures/baseline/manifest.json";
+import fixtureUrl from "../../../../crates/storage/tests/fixtures/baseline/store.sqlite3?url";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
 import wasmUrl from "../../dist/wasm/index.wasm?url";
@@ -212,7 +212,7 @@ async function fixtureInstall(
   const path =
     typeof requestOrPath === "string" ? requestOrPath : storagePath(requestOrPath.storageId);
   const response = await fetch(fixtureUrl);
-  if (!response.ok) throw new Error(`failed to load Preview2 fixture: ${response.status}`);
+  if (!response.ok) throw new Error(`failed to load baseline fixture: ${response.status}`);
   const bytes = new Uint8Array(await response.arrayBuffer());
   const opfs = new OpfsDirectory();
   try {

@@ -3,16 +3,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-/// The immutable Preview 2 durable contract. It remains readable but is never written again.
-pub const STORE_CONTRACT_V1_EPOCH: i64 = 47;
-/// The first contract whose setup identity is stored independently from durable layout identity.
-pub const STORE_CONTRACT_V2_EPOCH: i64 = 48;
-/// The durable coordinator fence lives in the frozen bootstrap plane. V3 is admitted only after
-/// the explicit V2-to-V3 kernel bridge has seeded that counter.
-pub const STORE_CONTRACT_V3_EPOCH: i64 = 49;
-pub const STORE_CONTRACT_V1_FORMAT: i64 = 1;
-pub const STORE_CONTRACT_V2_FORMAT: i64 = 2;
-pub const STORE_CONTRACT_V3_FORMAT: i64 = 3;
+/// The first public `@estifanos-sh/convex-embedded` store contract. Its byte identity is frozen:
+/// every later runtime must either keep accepting it or add one explicit forward adapter.
+pub const BASELINE_STORE_EPOCH: i64 = 49;
+pub const BASELINE_STORE_FORMAT: i64 = 3;
 
 /// Permanent numeric identities for originated semantic records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,11 +96,7 @@ pub struct OriginPage {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreContract {
-    /// Encoding discriminator. Missing means the frozen Preview 2 V1 shape.
-    #[serde(
-        default = "legacy_store_contract_format",
-        skip_serializing_if = "is_legacy_format"
-    )]
+    /// Encoding discriminator for the public baseline contract.
     pub format: i64,
     pub bootstrap_version: i64,
     pub package_epoch: i64,
@@ -114,11 +104,11 @@ pub struct StoreContract {
     pub kernel_layout_hash: String,
     pub generation_layout_hash: String,
     pub origin_writer_hash: String,
-    /// V1 retained-reader metadata. V2 deliberately omits it: reader coverage is a runtime
-    /// capability, never a durable migration trigger.
+    /// Retained reader metadata is deliberately outside candidate identity: reader coverage is a
+    /// runtime capability, not a durable migration trigger.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin_reader_hash: String,
-    /// V1 setup identity. V2+ deliberately omit it and use the bootstrap setup-plan record.
+    /// Setup identity lives in the bootstrap setup-plan record, rather than in this contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_hash: Option<String>,
 }
@@ -127,9 +117,9 @@ impl StoreContract {
     #[must_use]
     pub fn for_schema(schema: &super::StoreSchema) -> Self {
         Self {
-            format: STORE_CONTRACT_V3_FORMAT,
+            format: BASELINE_STORE_FORMAT,
             bootstrap_version: crate::sql::BOOTSTRAP_VERSION,
-            package_epoch: STORE_CONTRACT_V3_EPOCH,
+            package_epoch: BASELINE_STORE_EPOCH,
             app_schema_hash: schema.hash.clone(),
             kernel_layout_hash: manifest_hash(&crate::sql::kernel_layout_manifest()),
             generation_layout_hash: manifest_hash(&crate::sql::generation_contract_manifest()),
@@ -144,45 +134,10 @@ impl StoreContract {
     }
 
     #[must_use]
-    pub(crate) fn is_v1(&self) -> bool {
-        self.format == STORE_CONTRACT_V1_FORMAT
-    }
-
-    #[must_use]
-    pub(crate) fn is_v2(&self) -> bool {
-        self.format == STORE_CONTRACT_V2_FORMAT
-    }
-
-    #[must_use]
-    pub(crate) fn is_v3(&self) -> bool {
-        self.format == STORE_CONTRACT_V3_FORMAT
-    }
-
-    /// The exact V2 kernel layout is retained only to admit the one controlled V2-to-V3 bridge.
-    /// It must not silently follow later V3 kernel changes.
-    #[must_use]
-    pub(crate) fn baseline_kernel_layout_hash() -> String {
-        manifest_hash(&crate::sql::kernel_layout_manifest_v2())
-    }
-
-    #[must_use]
-    pub(crate) fn has_exact_v2_layout(&self) -> bool {
-        self.is_v2()
+    pub(crate) fn has_exact_baseline_layout(&self) -> bool {
+        self.format == BASELINE_STORE_FORMAT
             && self.bootstrap_version == crate::sql::BOOTSTRAP_VERSION
-            && self.package_epoch == STORE_CONTRACT_V2_EPOCH
-            && self.kernel_layout_hash == Self::baseline_kernel_layout_hash()
-            && self.generation_layout_hash
-                == manifest_hash(&crate::sql::generation_contract_manifest())
-            && self.origin_writer_hash == manifest_hash(&origin_writer_manifest())
-            && self.origin_reader_hash.is_empty()
-            && self.setup_hash.is_none()
-    }
-
-    #[must_use]
-    pub(crate) fn has_exact_v3_layout(&self) -> bool {
-        self.is_v3()
-            && self.bootstrap_version == crate::sql::BOOTSTRAP_VERSION
-            && self.package_epoch == STORE_CONTRACT_V3_EPOCH
+            && self.package_epoch == BASELINE_STORE_EPOCH
             && self.kernel_layout_hash == manifest_hash(&crate::sql::kernel_layout_manifest())
             && self.generation_layout_hash
                 == manifest_hash(&crate::sql::generation_contract_manifest())
@@ -202,15 +157,6 @@ impl StoreContract {
             && self.generation_layout_hash == other.generation_layout_hash
             && self.origin_writer_hash == other.origin_writer_hash
     }
-}
-
-fn legacy_store_contract_format() -> i64 {
-    STORE_CONTRACT_V1_FORMAT
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` callback receives `&T`.
-fn is_legacy_format(format: &i64) -> bool {
-    *format == STORE_CONTRACT_V1_FORMAT
 }
 
 #[derive(Debug, Clone)]

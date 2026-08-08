@@ -19,9 +19,8 @@ import {
 import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../component/model";
 import { canonicalJson, hashDocument } from "../hash";
 import {
-  EMBEDDED_PROTOCOL_LEGACY_VERSION,
   EMBEDDED_PROTOCOL_MISMATCH,
-  EMBEDDED_PROTOCOL_VERSION,
+  EMBEDDED_PROTOCOL_VERSIONS,
   isEmbeddedProtocolVersion,
 } from "../protocol";
 import { pointerPart } from "../id/path";
@@ -763,7 +762,7 @@ function assertRuntimeVersion(runtime: { protocolVersion: number }): void {
   if (isEmbeddedProtocolVersion(runtime.protocolVersion)) return;
   throw new ConvexError({
     code: EMBEDDED_PROTOCOL_MISMATCH,
-    expected: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
+    expected: [...EMBEDDED_PROTOCOL_VERSIONS],
     received: runtime.protocolVersion,
   });
 }

@@ -9,7 +9,7 @@ import { api } from "../../../../convex/_generated/api";
 import schema from "../../../../convex/schema";
 import { ConvexEmbeddedClient } from "../../src/node/client";
 import { readDevtoolsBridge } from "../../src/devtools/bridge";
-import { EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
 import { fixtureAdminKey, fixtureRemoteUrl } from "../testkit/remote";
@@ -75,7 +75,7 @@ describe("v5 production pull contract", () => {
       pull(client, {
         functionName: "documents:read",
         args: { limit: 1 },
-        runtime: { ...runtime, protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION - 1 },
+        runtime: { ...runtime, protocolVersion: EMBEDDED_PROTOCOL_VERSION - 1 },
       }),
     ).rejects.toThrow();
   });

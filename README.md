@@ -314,10 +314,10 @@ Applications never author migrations for Embedded's private SQLite tables or rec
 `client.open()` performs package-owned compatibility work automatically and fails without deleting
 the existing store when that work cannot be proven safe.
 
-Preview 2 establishes the first library-store compatibility baseline. Stores created by earlier
-unreleased previews are left intact but cannot be opened by Preview 2; clear that preview-only app
-storage once, or choose a new storage id. Starting with Preview 2, released compatibility is tested
-against immutable store fixtures.
+`@estifanos-sh/convex-embedded@0.0.1-preview.0` is the first supported library-store baseline.
+Each later release must either read that contract unchanged or carry it forward through an explicit,
+tested adapter. Stores outside the published compatibility set are preserved and reported as
+unsupported; Embedded never clears app storage to make an upgrade succeed.
 
 ### Hosted Convex data
 
