@@ -440,14 +440,10 @@ export function qualifyTarball(path: string, mode: PublishMode): void {
         2,
       )}\n`,
     );
-    execFileSync(
-      "pnpm",
-      ["install", "--ignore-scripts", "--config.audit=false", "--config.fund=false"],
-      {
-        cwd: temporary,
-        stdio: "inherit",
-      },
-    );
+    execFileSync("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], {
+      cwd: temporary,
+      stdio: "inherit",
+    });
     execFileSync(
       process.execPath,
       ["--input-type=module", "--eval", `await import(${JSON.stringify(`${packageName}/node`)});`],
