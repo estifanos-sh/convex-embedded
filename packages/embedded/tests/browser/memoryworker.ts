@@ -2,6 +2,7 @@
 import type { WasmSource } from "../../src/browser/artifact";
 import { initRuntime, type WorkerState } from "../../src/browser/runtime";
 import type { StoreSchema } from "../../src/storage/types";
+import { workerRun } from "./harness/worker";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
 import wasmUrl from "../../dist/wasm/index.wasm?url";
@@ -33,14 +34,7 @@ self.onmessage = (event: MessageEvent<CandidateRequest | MemoryRequest | SeedReq
       : request.op === "candidate"
         ? measureCandidate(request)
         : measure(request);
-  void handler
-    .then((result) => self.postMessage({ ok: true, result }))
-    .catch((error: unknown) =>
-      self.postMessage({
-        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-        ok: false,
-      }),
-    );
+  workerRun(() => handler);
 };
 
 async function measureCandidate(request: CandidateRequest): Promise<{

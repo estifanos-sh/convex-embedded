@@ -22,6 +22,7 @@ import { initRuntime, openStoreInstance, type WorkerState } from "../../src/brow
 import type { StoreSchema } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { fixtureTargetSchema, portableOracle, portableOracleJson } from "../fixture/oracle";
+import { workerRun } from "./harness/worker";
 
 import fixtureManifest from "../../../../crates/storage/tests/fixtures/baseline/manifest.json";
 import fixtureUrl from "../../../../crates/storage/tests/fixtures/baseline/store.sqlite3?url";
@@ -179,14 +180,7 @@ self.onmessage = (
                         : request.op === "woundStage"
                           ? woundStage(request)
                           : wound(request);
-  void handler
-    .then((result) => self.postMessage({ ok: true, result }))
-    .catch((error: unknown) =>
-      self.postMessage({
-        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-        ok: false,
-      }),
-    );
+  workerRun(() => handler);
 };
 
 async function fixture(request: FixtureRequest): Promise<{

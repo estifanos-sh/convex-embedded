@@ -21,6 +21,10 @@ export const baselineVersion = "0.0.1-preview.0";
 export const baselineTag = `v${baselineVersion}`;
 const baselinePackageName = packageName;
 const baselineFixtureSha256 = "70ad1b676dc86e701f8fd9f0bc3499206c6f630c48097c4bfb085439add62b41";
+const baselineFixtureEpoch = 49;
+const baselineFixtureBootstrapVersion = 1;
+const baselineFixtureContractVersion = 3;
+const baselineOriginKinds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17];
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryDir = resolve(packageDir, "../..");
@@ -55,6 +59,23 @@ interface PackageJson {
   scripts?: Record<string, string>;
   version?: string;
   [key: string]: unknown;
+}
+
+interface BaselineFixtureManifest {
+  releaseIdentity?: string;
+  releasePackage?: string;
+  releaseVersion?: string;
+  fixtureContractVersion?: number;
+  epoch?: number;
+  bootstrapVersion?: number;
+  sha256?: string;
+  permanentOriginKinds?: number[];
+  semanticDigest?: string;
+  semanticSnapshot?: unknown;
+  portableOracle?: unknown;
+  originInventory?: unknown[];
+  referencedPayloadCount?: number;
+  contract?: Record<string, unknown>;
 }
 
 export type PublishMode = "verify" | "preview" | "prerelease" | "release";
@@ -96,32 +117,12 @@ export function verifyFixtureFiles(directory: string): void {
   }
 }
 
-/** Require the exact public baseline writer artifact before release qualification. */
-export function verifyBaselineFixture(): void {
-  const directory = resolve(repositoryDir, "crates/storage/tests/fixtures/baseline");
-  if (!existsSync(directory) || !statSync(directory).isDirectory()) {
-    throw new Error("baseline SQLite fixture and semantic manifest are required for publication.");
-  }
-  verifyFixtureFiles(directory);
-  const fixture = resolve(directory, "store.sqlite3");
-  const manifestPath = resolve(directory, "manifest.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-    releaseIdentity?: string;
-    releasePackage?: string;
-    releaseVersion?: string;
-    fixtureContractVersion?: number;
-    epoch?: number;
-    bootstrapVersion?: number;
-    sha256?: string;
-    permanentOriginKinds?: number[];
-    semanticDigest?: string;
-    semanticSnapshot?: unknown;
-    portableOracle?: unknown;
-    originInventory?: unknown[];
-    referencedPayloadCount?: number;
-    contract?: Record<string, unknown>;
-  };
-  const checksum = createHash("sha256").update(readFileSync(fixture)).digest("hex");
+function readBaselineFixtureManifest(path: string): BaselineFixtureManifest {
+  return JSON.parse(readFileSync(path, "utf8")) as BaselineFixtureManifest;
+}
+
+function verifyBaselineFixtureChecksum(path: string, manifest: BaselineFixtureManifest): void {
+  const checksum = createHash("sha256").update(readFileSync(path)).digest("hex");
   if (manifest.sha256 !== checksum) {
     throw new Error(
       `baseline fixture checksum mismatch: expected ${manifest.sha256}, got ${checksum}.`,
@@ -132,21 +133,31 @@ export function verifyBaselineFixture(): void {
       `baseline fixture changed from its recorded checksum ${baselineFixtureSha256}.`,
     );
   }
-  if (manifest.epoch !== 49 || manifest.bootstrapVersion !== 1) {
+}
+
+function hasBaselineFixtureContract(manifest: BaselineFixtureManifest): boolean {
+  return [
+    manifest.releaseIdentity === baselineTag &&
+      manifest.releasePackage === baselinePackageName &&
+      manifest.releaseVersion === baselineVersion &&
+      manifest.fixtureContractVersion === baselineFixtureContractVersion,
+    Boolean(manifest.contract?.kernelLayoutHash),
+    Boolean(manifest.contract?.generationLayoutHash),
+    Boolean(manifest.contract?.originWriterHash),
+    Array.isArray(manifest.originInventory),
+    manifest.portableOracle !== undefined,
+    typeof manifest.referencedPayloadCount === "number",
+  ].every(Boolean);
+}
+
+function verifyBaselineFixtureSemantics(manifest: BaselineFixtureManifest): void {
+  if (
+    manifest.epoch !== baselineFixtureEpoch ||
+    manifest.bootstrapVersion !== baselineFixtureBootstrapVersion
+  ) {
     throw new Error("baseline fixture semantic version oracle is invalid.");
   }
-  if (
-    manifest.releaseIdentity !== baselineTag ||
-    manifest.releasePackage !== baselinePackageName ||
-    manifest.releaseVersion !== baselineVersion ||
-    manifest.fixtureContractVersion !== 3 ||
-    !manifest.contract?.kernelLayoutHash ||
-    !manifest.contract?.generationLayoutHash ||
-    !manifest.contract?.originWriterHash ||
-    !Array.isArray(manifest.originInventory) ||
-    manifest.portableOracle === undefined ||
-    typeof manifest.referencedPayloadCount !== "number"
-  ) {
+  if (!hasBaselineFixtureContract(manifest)) {
     throw new Error("baseline fixture release identity or semantic contract is incomplete.");
   }
   const semanticDigest = createHash("sha256")
@@ -155,10 +166,23 @@ export function verifyBaselineFixture(): void {
   if (semanticDigest !== manifest.semanticDigest) {
     throw new Error("baseline fixture semantic snapshot digest does not match its manifest.");
   }
-  const expectedKinds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17];
-  if (JSON.stringify(manifest.permanentOriginKinds) !== JSON.stringify(expectedKinds)) {
+  if (JSON.stringify(manifest.permanentOriginKinds) !== JSON.stringify(baselineOriginKinds)) {
     throw new Error("baseline fixture does not enumerate every permanent originated record kind.");
   }
+}
+
+/** Require the exact public baseline writer artifact before release qualification. */
+export function verifyBaselineFixture(): void {
+  const directory = resolve(repositoryDir, "crates/storage/tests/fixtures/baseline");
+  if (!existsSync(directory) || !statSync(directory).isDirectory()) {
+    throw new Error("baseline SQLite fixture and semantic manifest are required for publication.");
+  }
+  verifyFixtureFiles(directory);
+  const fixture = resolve(directory, "store.sqlite3");
+  const manifestPath = resolve(directory, "manifest.json");
+  const manifest = readBaselineFixtureManifest(manifestPath);
+  verifyBaselineFixtureChecksum(fixture, manifest);
+  verifyBaselineFixtureSemantics(manifest);
 }
 
 /** Prepare the assembled package copy without changing its public identity. */
