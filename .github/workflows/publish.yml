@@ -327,8 +327,8 @@ jobs:
           set CXX=cl.exe
           where cl.exe
           where link.exe
-          vp run '@estifanos-sh/convex-embedded#native'
-          vp run '@estifanos-sh/convex-embedded#test:node'
+          vp run "@estifanos-sh/convex-embedded#native"
+          vp run "@estifanos-sh/convex-embedded#test:node"
 
       - name: Verify packaged Linux Node durability
         if: matrix.target == 'linux-x64-gnu'
