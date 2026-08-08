@@ -39,8 +39,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # An unresolved filter leaves the output empty, which the mobile jobs read as "no native
-      # change". Pushes to main and manual runs build the mobile smoke slices regardless.
+      # This identifies source changes that can affect the native artifacts. Workflow-only edits
+      # deliberately do not select the costly mobile smoke jobs: add the `native` PR label when
+      # a workflow change itself needs pre-merge mobile qualification. Pushes to main and manual
+      # runs build the mobile smoke slices regardless.
       - name: Filter native paths
         id: filter
         continue-on-error: true
@@ -49,7 +51,6 @@ jobs:
           filters: |
             mobile:
               - '.cargo/**'
-              - '.github/workflows/**'
               - 'Cargo.lock'
               - 'Cargo.toml'
               - 'config/**'
@@ -257,6 +258,7 @@ jobs:
     if: >-
       !cancelled()
       && (needs.changes.outputs.mobile == 'true'
+      || contains(github.event.pull_request.labels.*.name, 'native')
       || github.event_name != 'pull_request')
 
     steps:
@@ -316,6 +318,7 @@ jobs:
     if: >-
       !cancelled()
       && (needs.changes.outputs.mobile == 'true'
+      || contains(github.event.pull_request.labels.*.name, 'native')
       || github.event_name != 'pull_request')
 
     # `assembleDebug` packages whatever ABI directories exist and never runs the result, so the

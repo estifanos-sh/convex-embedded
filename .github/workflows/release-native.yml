@@ -11,13 +11,9 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  # Package publishing already builds and verifies the full shipping matrix. This independent
-  # nightly run catches ABI-specific breakage — a triple or ABI the per-push smoke never
-  # compiles — before the next release. 07:27 UTC is off the hour and outside working hours,
-  # and because a scheduled run reports `refs/heads/main` it also refreshes the shared `apple`
-  # and `android` caches for every slice.
-  schedule:
-    - cron: "27 7 * * *"
+  # Package publishing already builds and verifies the full shipping matrix. Run this separate,
+  # full-target qualification explicitly when changing native build infrastructure or preparing
+  # a release; ordinary CI covers the shipping Apple and Android smoke slices on main.
   workflow_dispatch:
 
 permissions:

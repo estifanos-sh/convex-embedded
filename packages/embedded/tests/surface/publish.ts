@@ -160,10 +160,18 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toContain("blacksmith-8vcpu-ubuntu-2404");
     expect(workflow).toContain("blacksmith-16vcpu-ubuntu-2404");
     expect(workflow).toContain("blacksmith-6vcpu-macos-15");
+    expect(workflow).not.toContain("- '.github/workflows/**'");
+    for (const name of ["mobile-apple", "mobile-android"]) {
+      const job = jobBody(workflow, name);
+
+      expect(job).toContain("needs.changes.outputs.mobile == 'true'");
+      expect(job).toContain("github.event.pull_request.labels.*.name, 'native'");
+      expect(job).toContain("github.event_name != 'pull_request'");
+    }
     expect(native).not.toContain("large-runner");
     expect(native).not.toContain("depot");
     expect(native).not.toContain('tags: ["v*"]');
-    expect(native).toContain('cron: "27 7 * * *"');
+    expect(native).not.toContain("schedule:");
     expect(native).toContain("workflow_dispatch:");
     expect(native).toContain("blacksmith-16vcpu-ubuntu-2404");
     expect(native).toContain("blacksmith-6vcpu-macos-15");
