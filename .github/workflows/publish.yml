@@ -306,7 +306,27 @@ jobs:
           path: packages/embedded/dist
 
       - name: Build and load Node addon
+        if: matrix.target != 'win32-x64'
         run: |
+          vp run '@estifanos-sh/convex-embedded#native'
+          vp run '@estifanos-sh/convex-embedded#test:node'
+
+      # Blacksmith's Windows image exposes Visual Studio but sets CC to clang-cl,
+      # which is not installed on that image. Keep this setup adjacent to the
+      # build so the Visual Studio environment and explicit MSVC compiler choice
+      # apply only to the Windows native target.
+      - name: Build and load Windows Node addon
+        if: matrix.target == 'win32-x64'
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL exit /b 1
+          call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          set CC=cl.exe
+          set CXX=cl.exe
+          where cl.exe
+          where link.exe
           vp run '@estifanos-sh/convex-embedded#native'
           vp run '@estifanos-sh/convex-embedded#test:node'
 
