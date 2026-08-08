@@ -24,6 +24,7 @@
     "packages/embedded/src/node/index.ts",
     "packages/embedded/src/tables.ts",
     "packages/embedded/src/server/index.ts",
+    "packages/embedded/src/text/field.ts",
     "packages/embedded/src/unplugin.ts",
     "packages/embedded/src/values.ts",
     "packages/embedded/src/vite.ts",
@@ -137,7 +138,15 @@
     "cssDeep": false,
     "dupesBaseline": "config/fallow/dupes.json"
   },
-  "ignoreDependencies": ["@napi-rs/cli", "binaryen", "~convex"],
+  "ignoreDependencies": [
+    "@napi-rs/cli",
+    "binaryen",
+    "expo-crypto",
+    "expo-dev-client",
+    "react-native-web",
+    "react-native-webview",
+    "~convex"
+  ],
   "ignoreDependencyOverrides": [{ "package": "@voidzero-dev/vite-plus" }],
   "ignorePatterns": [
     "vendor/**",
