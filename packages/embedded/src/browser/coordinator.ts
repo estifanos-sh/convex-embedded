@@ -87,6 +87,18 @@ type RuntimeOwnership =
   | { epoch: string; fence: string; leader: LeaderRuntime; ownership: "leader" }
   | { ownership: "closed" };
 
+function isFollowerOwnership(
+  ownership: RuntimeOwnership,
+  leaderEpoch: string,
+  leaderFence: string,
+): ownership is Extract<RuntimeOwnership, { ownership: "follower" }> {
+  return (
+    ownership.ownership === "follower" &&
+    ownership.epoch === leaderEpoch &&
+    ownership.fence === leaderFence
+  );
+}
+
 interface RuntimeAddress {
   clientId: string;
   controlName: string;
@@ -504,15 +516,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   handleRequestAck(message: Extract<PeerMessage, { op: typeof PeerOp.RequestAck }>): void {
-    const ownership = this.state.resources.ownership;
-    if (!this.acceptPeerFence(message.leaderFence, message.leaderEpoch)) return;
-    if (
-      ownership.ownership !== "follower" ||
-      ownership.epoch !== message.leaderEpoch ||
-      ownership.fence !== message.leaderFence
-    ) {
-      return;
-    }
+    if (!this.isCurrentFollower(message.leaderFence, message.leaderEpoch)) return;
     this.state.outbox.confirm(message.requestId);
     this.postDebug("worker:coordination:request-ack", { requestId: message.requestId });
   }
@@ -610,15 +614,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   }
 
   handlePeerResponse(message: Extract<PeerMessage, { op: typeof PeerOp.Response }>): void {
-    const ownership = this.state.resources.ownership;
-    if (!this.acceptPeerFence(message.leaderFence, message.leaderEpoch)) return;
-    if (
-      ownership.ownership !== "follower" ||
-      ownership.epoch !== message.leaderEpoch ||
-      ownership.fence !== message.leaderFence
-    ) {
-      return;
-    }
+    if (!this.isCurrentFollower(message.leaderFence, message.leaderEpoch)) return;
     this.postRuntimeResponse(message.response);
   }
 
@@ -654,9 +650,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     const { epoch, fence } = ownership;
     this.state.outbox.armAckTimer(request.id, this.env.timeouts.forwardAckTimeoutMs, () => {
       const current = this.state.resources.ownership;
-      if (current.ownership !== "follower" || current.epoch !== epoch || current.fence !== fence) {
-        return;
-      }
+      if (!isFollowerOwnership(current, epoch, fence)) return;
       this.postDebug("worker:coordination:request-ack-timeout", {
         leaderEpoch: epoch,
         requestId: request.id,
@@ -920,6 +914,14 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       return false;
     }
     return result !== "stale";
+  }
+
+  /** Admit a peer message only from the leader that owns this follower transport. */
+  private isCurrentFollower(leaderFence: string, leaderEpoch: string): boolean {
+    return (
+      this.acceptPeerFence(leaderFence, leaderEpoch) &&
+      isFollowerOwnership(this.state.resources.ownership, leaderEpoch, leaderFence)
+    );
   }
 
   private async holdWorkerLock(): Promise<void> {

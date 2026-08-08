@@ -111,6 +111,74 @@ const template = \`text import("./template.js") \${import("./expression.js")}\`;
     ]);
   });
 
+  test("masks TSX text while retaining imports in JSX expression containers", () => {
+    const source = `import { Static } from "./static-live.js";\r
+const view = <section>\r
+  It's documented at https://example.dev; don't import("./prose-decoy.js")\r
+  import { Decoy } from "./static-decoy.js";\r
+  import("./dynamic-decoy.js")\r
+  {import("./expression-live.js")}\r
+  <aside>{condition ? <strong>import("./nested-decoy.js")</strong> : import("./nested-live.js")}</aside>\r
+  <Panel\r
+    slot={<strong>import("./property-decoy.js")</strong>}\r
+    fragment={<>Don't import("./fragment-decoy.js"){import("./property-live.js")}</>}\r
+  />\r
+</section>;\r
+void Static;\r
+`;
+    const masked = maskCommentsAndStrings(source);
+
+    expect(masked).toHaveLength(source.length);
+    expect(masked.indexOf("import(", source.indexOf('import("./expression-live.js")'))).toBe(
+      source.indexOf('import("./expression-live.js")'),
+    );
+    expect(masked.indexOf("import(", source.indexOf('import("./nested-live.js")'))).toBe(
+      source.indexOf('import("./nested-live.js")'),
+    );
+    expect(masked).not.toContain("static-decoy");
+    expect(masked).not.toContain("dynamic-decoy");
+    expect(masked).not.toContain("nested-decoy");
+    expect(masked).not.toContain("prose-decoy");
+    expect(masked).not.toContain("property-decoy");
+    expect(masked).not.toContain("fragment-decoy");
+    for (let index = 0; index < source.length; index += 1) {
+      if (source[index] === "\r" || source[index] === "\n") {
+        expect(masked[index]).toBe(source[index]);
+      }
+    }
+    expect(readModuleEdges(source)).toEqual([
+      { specifier: "./static-live.js", typeOnly: false },
+      { specifier: "./expression-live.js", typeOnly: false },
+      { specifier: "./nested-live.js", typeOnly: false },
+      { specifier: "./property-live.js", typeOnly: false },
+    ]);
+  });
+
+  test("keeps TypeScript operators and nested JSX lexical contexts distinct", () => {
+    const source = `
+const generic = <T extends object>(value: T) => import("./generic-live.js");
+const comparison = left < right > import("./comparison-live.js");
+const unary = void <span>import("./unary-decoy.js")</span>;
+const quotient = value / <span>import("./operator-decoy.js")</span>;
+const nested = <section>{
+  /import\\(".\\/regex-decoy.js"\\)/.test("value")
+    ? \`import("./template-decoy.js") \${import("./template-live.js")}\`
+    : null
+}{/* import("./comment-decoy.js") */}</section>;
+void generic;
+void comparison;
+void unary;
+void quotient;
+void nested;
+`;
+
+    expect(readModuleEdges(source)).toEqual([
+      { specifier: "./generic-live.js", typeOnly: false },
+      { specifier: "./comparison-live.js", typeOnly: false },
+      { specifier: "./template-live.js", typeOnly: false },
+    ]);
+  });
+
   test("discovers Convex modules and renders a lazy virtual registry", async () => {
     await withFixture(async ({ convexDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
@@ -460,6 +528,27 @@ export const replicated = null;
     });
   });
 
+  test("does not preflight static or dynamic imports written as TSX text", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.tsx",
+        `const preview = <section>
+  import { local } from "@estifanos-sh/convex-embedded/local";
+  import("@estifanos-sh/convex-embedded/local")
+</section>;
+void preview;
+${canonical("replicated", "query", "list")}`,
+      );
+
+      await expect(createFixtureBundle(root)).resolves.toMatchObject({
+        modules: { feed: path.join(convexDir, "feed.tsx") },
+      });
+    });
+  });
+
   test.each([
     ["comments", '// import "@estifanos-sh/convex-embedded/local";'],
     ["strings", "const decoy = 'import \"@estifanos-sh/convex-embedded/local\";';"],
@@ -561,6 +650,29 @@ export const replicated = null;
     });
   });
 
+  test("does not follow NodeNext imports written as TSX text", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.tsx",
+        `const preview = <section>
+  import "./admin.js";
+  import("./admin.js")
+</section>;
+void preview;
+${canonical("replicated", "query", "list")}`,
+      );
+      await file(convexDir, "admin.ts", canonical("remote", "query", "audit"));
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.modules).toEqual({ feed: path.join(convexDir, "feed.tsx") });
+      expect(bundle.sourceFiles).not.toContain(path.join(convexDir, "admin.ts"));
+    });
+  });
+
   test.each([
     ["static imports", 'import { helper } from "./helper.js";\nvoid helper;'],
     ["named re-exports", 'export { helper } from "./helper.js";'],
@@ -573,6 +685,25 @@ export const replicated = null;
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
       await file(convexDir, "feed.ts", `${edge}\n${canonical("replicated", "query", "list")}`);
+      await file(convexDir, "helper.ts", "export const helper = 1;\n");
+
+      const bundle = await createFixtureBundle(root);
+
+      expect(bundle.sourceFiles).toContain(path.join(convexDir, "helper.ts"));
+    });
+  });
+
+  test("follows live dynamic NodeNext imports in TSX expression containers", async () => {
+    await withFixture(async ({ convexDir, root }) => {
+      await file(convexDir, "schema.ts", "export default {};\n");
+      await embeddedEntrypoint(convexDir);
+      await file(
+        convexDir,
+        "feed.tsx",
+        `const preview = <section>{import("./helper.js")}</section>;
+void preview;
+${canonical("replicated", "query", "list")}`,
+      );
       await file(convexDir, "helper.ts", "export const helper = 1;\n");
 
       const bundle = await createFixtureBundle(root);
