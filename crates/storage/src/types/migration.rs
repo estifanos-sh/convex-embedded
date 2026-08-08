@@ -338,7 +338,7 @@ struct OriginAdapter {
     adapt: OriginAdapterFn,
 }
 
-// Epoch 47 is the baseline, so it has no predecessor adapter. Future adapters are appended here
+// The public baseline has no predecessor adapter. Future adapters are appended here
 // and retained while a released source epoch can still reach the current package.
 const ORIGIN_ADAPTERS: [OriginAdapter; 0] = [];
 
