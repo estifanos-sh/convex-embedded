@@ -350,7 +350,7 @@ fn make_exact_v2_bridge_source(store: &EmbeddedStore) {
     let mut contract = store.active_contract_debug_read().unwrap();
     contract.format = 2;
     contract.package_epoch = 48;
-    contract.kernel_layout_hash = store.v2_kernel_layout_hash_debug_read();
+    contract.kernel_layout_hash = store.baseline_kernel_layout_hash_debug_read();
     store.leader_fence_debug_delete().unwrap();
     store.active_contract_debug_write(&contract, 48).unwrap();
 }
@@ -395,7 +395,7 @@ fn exact_v2_to_v3_kernel_bridge_seeds_fence_and_skips_unchanged_setup() {
 }
 
 #[test]
-fn v2_to_v3_bridge_composes_with_app_schema_and_setup_migration() {
+fn baseline_kernel_bridge_composes_with_app_schema_and_setup_migration() {
     let path = tmp_path("migration_v2_v3_app_change.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     let mut active = schema('0');
@@ -437,7 +437,7 @@ fn v2_to_v3_bridge_composes_with_app_schema_and_setup_migration() {
 }
 
 #[test]
-fn v2_to_v3_bridge_rejects_unknown_contract_before_candidate_writes() {
+fn baseline_kernel_bridge_rejects_unknown_contract_before_candidate_writes() {
     let path = tmp_path("migration_v2_v3_unknown_contract.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     let active = schema('0');

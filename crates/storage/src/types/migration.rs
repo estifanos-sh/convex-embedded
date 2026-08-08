@@ -161,7 +161,7 @@ impl StoreContract {
     /// The exact V2 kernel layout is retained only to admit the one controlled V2-to-V3 bridge.
     /// It must not silently follow later V3 kernel changes.
     #[must_use]
-    pub(crate) fn v2_kernel_layout_hash() -> String {
+    pub(crate) fn baseline_kernel_layout_hash() -> String {
         manifest_hash(&crate::sql::kernel_layout_manifest_v2())
     }
 
@@ -170,7 +170,7 @@ impl StoreContract {
         self.is_v2()
             && self.bootstrap_version == crate::sql::BOOTSTRAP_VERSION
             && self.package_epoch == STORE_CONTRACT_V2_EPOCH
-            && self.kernel_layout_hash == Self::v2_kernel_layout_hash()
+            && self.kernel_layout_hash == Self::baseline_kernel_layout_hash()
             && self.generation_layout_hash
                 == manifest_hash(&crate::sql::generation_contract_manifest())
             && self.origin_writer_hash == manifest_hash(&origin_writer_manifest())

@@ -91,7 +91,7 @@ fn contract_matches_store_epoch(contract: &StoreContract, stored_epoch: i64) -> 
     }
 }
 
-fn is_v2_to_v3_kernel_bridge(active: &StoreContract, target: &StoreContract) -> bool {
+fn is_baseline_kernel_bridge(active: &StoreContract, target: &StoreContract) -> bool {
     // App schema and setup identity are candidate-owned concerns. Restrict this bridge only to
     // the exact durable engine layouts so an ordinary app migration can compose with the engine
     // upgrade in one candidate lifecycle.
@@ -101,7 +101,7 @@ fn is_v2_to_v3_kernel_bridge(active: &StoreContract, target: &StoreContract) -> 
 // Preview 2 stores predate both the V2 setup-plan split and the coordinator fence. Retain this
 // one exact legacy reader so the already-shipped V1 fixture can reach the current contract; it is
 // deliberately separate from V2 admission, which remains the only normal no-fence bridge source.
-fn is_v1_to_v3_legacy_bridge(active: &StoreContract, target: &StoreContract) -> bool {
+fn is_legacy_kernel_bridge(active: &StoreContract, target: &StoreContract) -> bool {
     active.is_v1() && target.has_exact_v3_layout()
 }
 
@@ -1451,11 +1451,11 @@ impl EmbeddedStore {
         let source_contract_hash = active
             .hash()
             .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-        let v2_to_v3_bridge = is_v2_to_v3_kernel_bridge(&active, &target);
-        let legacy_v1_to_v3_bridge = is_v1_to_v3_legacy_bridge(&active, &target);
+        let kernel_bridge = is_baseline_kernel_bridge(&active, &target);
+        let legacy_kernel_bridge = is_legacy_kernel_bridge(&active, &target);
         if active.kernel_layout_hash != target.kernel_layout_hash
-            && !v2_to_v3_bridge
-            && !legacy_v1_to_v3_bridge
+            && !kernel_bridge
+            && !legacy_kernel_bridge
         {
             return Err(StorageError::IncompatibleStore(
                 "the kernel layout fingerprint changed without a supported store-contract upgrade; the store was preserved"
@@ -1624,7 +1624,7 @@ impl EmbeddedStore {
             self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_STATE_KEY, b"pending")?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"pending")?;
             let setup_skipped = target_setup_hash.is_empty()
-                || (v2_to_v3_bridge && target_setup_hash == active_setup_hash);
+                || (kernel_bridge && target_setup_hash == active_setup_hash);
             self.write_bootstrap_unlocked(
                 sql::CANDIDATE_SETUP_STATE_KEY,
                 if setup_skipped {
@@ -1676,7 +1676,7 @@ impl EmbeddedStore {
             cleanup_generation: None,
             source_schema,
             setup_complete: target_setup_hash.is_empty()
-                || (v2_to_v3_bridge && target_setup_hash == active_setup_hash),
+                || (kernel_bridge && target_setup_hash == active_setup_hash),
             source_contract_hash,
             target_contract_hash,
             retired_generations,
@@ -2759,8 +2759,8 @@ impl EmbeddedStore {
             self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY, Some(&active))?;
         let target_setup = Self::target_setup_hash(&active_setup, schema);
         let candidate_setup = self.setup_hash_read_unlocked(sql::CANDIDATE_SETUP_HASH_KEY, None)?;
-        let v2_to_v3_bridge = is_v2_to_v3_kernel_bridge(&active, &target);
-        let seed_leader_fence = v2_to_v3_bridge || is_v1_to_v3_legacy_bridge(&active, &target);
+        let kernel_bridge = is_baseline_kernel_bridge(&active, &target);
+        let seed_leader_fence = kernel_bridge || is_legacy_kernel_bridge(&active, &target);
         if candidate_target != target {
             return Err(StorageError::IncompatibleStore(
                 "candidate contract no longer matches the target".to_owned(),
@@ -8817,8 +8817,8 @@ impl EmbeddedStore {
     }
 
     #[cfg(any(test, feature = "testkit"))]
-    pub fn v2_kernel_layout_hash_debug_read(&self) -> String {
-        StoreContract::v2_kernel_layout_hash()
+    pub fn baseline_kernel_layout_hash_debug_read(&self) -> String {
+        StoreContract::baseline_kernel_layout_hash()
     }
 
     /// Replaces the active contract and header epoch together for bridge-admission tests.
