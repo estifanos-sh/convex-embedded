@@ -521,6 +521,89 @@ interface MutationCommitMaterial {
   timingCommitStartedAt: number;
 }
 
+interface ResolvedMutationInvocation {
+  componentRevision: string | undefined;
+  fn: RunnableFunction;
+  readSetCollector: ReturnType<typeof createReadSetCollector> | undefined;
+  resolved: { name: string; scope: RuntimeScope };
+  resolvedWriter: ReturnType<ScopedMutationTransaction["writer"]>;
+  root: ScopedMutationTransaction;
+  snapshot: ScopedMutationSnapshot | undefined;
+}
+
+interface MutationReplaySnapshot {
+  checkpointCount: number;
+  nextCheckpointOrdinal: number;
+  nextOrdinal: number;
+}
+
+interface MutationAdmissionState {
+  encodedMutationArgs: ReturnType<typeof encode> | undefined;
+  recordsMutation: boolean;
+}
+
+interface MutationAdmissionResult extends MutationAdmissionState {
+  handled: boolean;
+  result: unknown;
+}
+
+interface ExistingMutationAdmission {
+  result: unknown;
+}
+
+interface MutationTimingState {
+  phaseStartedAt: number;
+  startedAt: number;
+  timing: RunMutationTiming | undefined;
+}
+
+interface MutationHandlerInput {
+  checked: Record<string, unknown>;
+  componentRevision: string | undefined;
+  fn: RunnableFunction;
+  generatedUploadUrls: string[];
+  options: RunMutationOptions;
+  pendingScheduleRows: ScheduledJob[];
+  pendingSchedules: Array<() => Promise<void>> | undefined;
+  pushEnvelopeTimeHlc: number | undefined;
+  resolved: { name: string; scope: RuntimeScope };
+  resolvedWriter: ReturnType<ScopedMutationTransaction["writer"]>;
+  revisionReplay: RevisionReplay | undefined;
+  root: ScopedMutationTransaction;
+  scheduledJobs: string[];
+}
+
+interface MutationRevisionInput {
+  args: Record<string, unknown>;
+  argsAreNormalized: boolean;
+  invocation: ResolvedMutationInvocation;
+  options: RunMutationOptions;
+  replaySnapshot: MutationReplaySnapshot | undefined;
+  tx: ScopedMutationTransaction | undefined;
+}
+
+interface MutationRevisionResult {
+  checked: Record<string, unknown> | undefined;
+  handled: boolean;
+  result: unknown;
+}
+
+interface MutationExecutionInput {
+  admission: MutationAdmissionResult;
+  checked: Record<string, unknown>;
+  invocation: ResolvedMutationInvocation;
+  options: RunMutationOptions;
+  replaySnapshot: MutationReplaySnapshot | undefined;
+  timingState: MutationTimingState;
+  tx: ScopedMutationTransaction | undefined;
+}
+
+interface MutationHandlerPhase {
+  input: MutationHandlerInput;
+  pendingSchedules: Array<() => Promise<void>>;
+  revisionReplay: RevisionReplay | undefined;
+}
+
 interface ScopedMutationSnapshot {
   revisionRestores: number;
   writers: Map<ComponentInstancePath, ReturnType<ReturnType<typeof createWriter>["snapshot"]>>;
@@ -767,15 +850,11 @@ export function createRunner(
 
   const emit = (event: DiagnosticEvent): void => {
     if (!hasEventListeners()) return;
-    options.emit?.(event);
+    // Event consumers are independent observers. A primary diagnostic sink must not prevent
+    // subscribed consumers from seeing the same committed transition.
+    callPostCommit(() => options.emit?.(event));
     for (const listener of Array.from(eventListeners)) {
-      try {
-        listener(event);
-      } catch (error) {
-        queueMicrotask(() => {
-          throw error;
-        });
-      }
+      callPostCommit(() => listener(event));
     }
   };
   const runSpan = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
@@ -807,6 +886,46 @@ export function createRunner(
         phase: "finish",
         type: "span",
       } satisfies EmbeddedSpanEvent);
+      throw error;
+    }
+  };
+
+  /**
+   * A storage write has two distinct boundaries: the span start is ordinary pre-write diagnostics,
+   * while the finish observes an already durable result. Never let the latter reject a successful
+   * mutation or conceal the original storage error.
+   */
+  const runDurableSpan = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+    if (!hasEventListeners()) return await run();
+    const id = `runner:${nextSpanId}`;
+    nextSpanId += 1;
+    const startedAt = getTimerTime();
+    emit({ at: startedAt, id, name, phase: "start", type: "span" });
+    try {
+      const result = await run();
+      callPostCommit(() =>
+        emit({
+          at: getTimerTime(),
+          durationMs: getElapsedTime(startedAt),
+          id,
+          name,
+          phase: "finish",
+          type: "span",
+        } satisfies EmbeddedSpanEvent),
+      );
+      return result;
+    } catch (error) {
+      callPostCommit(() =>
+        emit({
+          at: getTimerTime(),
+          durationMs: getElapsedTime(startedAt),
+          error: error instanceof Error ? error.message : String(error),
+          id,
+          name,
+          phase: "finish",
+          type: "span",
+        } satisfies EmbeddedSpanEvent),
+      );
       throw error;
     }
   };
@@ -1057,21 +1176,7 @@ export function createRunner(
     revisionReplay,
     root,
     scheduledJobs,
-  }: {
-    checked: Record<string, unknown>;
-    componentRevision: string | undefined;
-    fn: RunnableFunction;
-    generatedUploadUrls: string[];
-    options: RunMutationOptions;
-    pendingScheduleRows: ScheduledJob[];
-    pendingSchedules: Array<() => Promise<void>> | undefined;
-    resolved: { name: string; scope: RuntimeScope };
-    resolvedWriter: ReturnType<ScopedMutationTransaction["writer"]>;
-    revisionReplay: RevisionReplay | undefined;
-    root: ScopedMutationTransaction;
-    scheduledJobs: string[];
-    pushEnvelopeTimeHlc: number | undefined;
-  }): Promise<unknown> => {
+  }: MutationHandlerInput): Promise<unknown> => {
     let schedulerService: SchedulerService | undefined;
     let storageService: StorageWriterService | undefined;
     const run = () =>
@@ -1152,6 +1257,7 @@ export function createRunner(
               pendingSchedules,
               scheduledJobs,
               remoteEnabled ? undefined : pendingScheduleRows,
+              callPostCommit,
             ));
           },
           get storage(): StorageWriterService {
@@ -1482,9 +1588,10 @@ export function createRunner(
     commit: Awaited<ReturnType<RuntimeStorageWriter["commit"]>>,
   ): void => {
     const batch = plan.kind === "batch" ? plan.batch : undefined;
-    if (hasEventListeners()) emitCommit(emit, commit, batch!.batch, "local");
+    // Storage is already durable. Observer failures must not make callers replay it.
+    if (hasEventListeners()) callPostCommit(() => emitCommit(emit, commit, batch!.batch, "local"));
     if (plan.pushEnvelopeJson !== undefined) {
-      for (const listener of Array.from(remoteWakeListeners)) listener();
+      for (const listener of Array.from(remoteWakeListeners)) callPostCommit(listener);
     }
     if (plan.kind === "batch" && plan.watching) {
       scheduleNotify({
@@ -1498,10 +1605,11 @@ export function createRunner(
     input: MutationCommitInput,
     phaseStartedAt: number,
   ): void => {
-    if (input.timing) {
-      input.timing.notifyMs = getTimerTime() - phaseStartedAt;
-      input.timing.totalMs = getTimerTime() - input.timingStartedAt;
-      input.options.onTiming?.(input.timing);
+    const timing = input.timing;
+    if (timing) {
+      timing.notifyMs = getTimerTime() - phaseStartedAt;
+      timing.totalMs = getTimerTime() - input.timingStartedAt;
+      callPostCommit(() => input.options.onTiming?.(timing));
     }
   };
 
@@ -1526,24 +1634,27 @@ export function createRunner(
     return resolvedResult;
   };
 
-  const commitMutation = async (input: MutationCommitInput): Promise<unknown> => {
-    await input.root.validateRevisionRestores();
+  const commitMutation = async (
+    input: MutationCommitInput,
+    onCommitted: (() => void) | undefined,
+  ): Promise<unknown> => {
     const plan = await prepareMutationCommit(input);
     const commit =
       plan.kind === "oneDoc"
         ? await store.commitOneDocWrite!(plan.oneDocWrite, plan.commitOptions)
-        : await runSpan("storage.commit", () => store.commit(plan.batch.batch, plan.commitOptions));
+        : await runDurableSpan("storage.commit", async () => {
+            const committed = await store.commit(plan.batch.batch, plan.commitOptions);
+            onCommitted?.();
+            return committed;
+          });
+    if (plan.kind === "oneDoc") onCommitted?.();
     return await finishMutationCommit(input, plan, commit);
   };
 
-  const runMutationDirect = async (
-    ref: FunctionReference,
-    args: Record<string, unknown>,
-    scope = rootScope,
-    options: RunMutationOptions = {},
-    tx?: ScopedMutationTransaction,
-    argsAreNormalized = false,
-  ): Promise<unknown> => {
+  const createMutationTiming = (
+    tx: ScopedMutationTransaction | undefined,
+    options: RunMutationOptions,
+  ): MutationTimingState => {
     const timing =
       !tx && options.onTiming
         ? {
@@ -1559,10 +1670,15 @@ export function createRunner(
             totalMs: 0,
           }
         : undefined;
-    const timingStartedAt = timing ? getTimerTime() : 0;
-    let timingPhaseStartedAt = timingStartedAt;
-    const resolved = resolveFunctionAddress(ref, scope);
-    const fn = await resolveFunction(resolved.scope, resolved.name);
+    const startedAt = timing ? getTimerTime() : 0;
+    return { phaseStartedAt: startedAt, startedAt, timing };
+  };
+
+  const assertLocalMutationInvocation = (
+    fn: RunnableFunction,
+    ref: FunctionReference,
+    options: RunMutationOptions,
+  ): void => {
     if (fn.kind !== "mutation") throw kindMismatch(fn, ref, "mutation");
     ensureVisible(fn, ref, options);
     ensureSamePlacement(fn, ref, options.callerPlacement);
@@ -1571,81 +1687,155 @@ export function createRunner(
         `${describeRef(ref)} is remote-only and cannot execute in the local runtime.`,
       );
     }
-    const readSetCollector = !tx && options.pushCall ? createReadSetCollector() : undefined;
-    const root =
-      tx ??
-      createMutationTransaction(
-        fn.placement === "local" ? "local" : "replicated",
-        readSetCollector?.tracker,
-      );
-    const snapshot = tx?.snapshot();
-    const revisionReplaySnapshot = options.revisionReplay
-      ? {
-          checkpointCount: options.revisionReplay.checkpoints.length,
-          nextCheckpointOrdinal: options.revisionReplay.nextCheckpointOrdinal,
-          nextOrdinal: options.revisionReplay.nextOrdinal,
-        }
+  };
+
+  const mutationPlacement = (fn: RunnableFunction): "local" | "replicated" =>
+    fn.placement === "local" ? "local" : "replicated";
+
+  const componentRevisionName = (resolved: {
+    name: string;
+    scope: RuntimeScope;
+  }): string | undefined =>
+    resolved.scope.instancePath === "embedded" && resolved.name.startsWith("rev:")
+      ? resolved.name.slice(4)
       : undefined;
-    const resolvedWriter = root.writer(resolved.scope);
-    const componentRevision =
-      resolved.scope.instancePath === "embedded" && resolved.name.startsWith("rev:")
-        ? resolved.name.slice(4)
-        : undefined;
-    const captureRevisionSnapshots = async (
-      revision: Record<string, unknown>,
-    ): Promise<CrdtSnapshot[]> => {
-      const table = String(revision.table);
-      const rowId = String(revision.rowId);
-      const batch = root.toBatch().rootBatch;
-      return await store.doc.crdt.snapshot.read(table, rowId, batch.crdtOps ?? []);
+
+  const resolveMutationInvocation = async (
+    ref: FunctionReference,
+    scope: RuntimeScope,
+    options: RunMutationOptions,
+    tx: ScopedMutationTransaction | undefined,
+  ): Promise<ResolvedMutationInvocation> => {
+    const resolved = resolveFunctionAddress(ref, scope);
+    const fn = await resolveFunction(resolved.scope, resolved.name);
+    assertLocalMutationInvocation(fn, ref, options);
+    const readSetCollector = !tx && options.pushCall ? createReadSetCollector() : undefined;
+    const root = tx ?? createMutationTransaction(mutationPlacement(fn), readSetCollector?.tracker);
+    // Nested calls must snapshot before their scope writer is allocated so a caught component
+    // failure restores the exact writer set (including one-document eligibility).
+    const snapshot = tx?.snapshot();
+    return {
+      componentRevision: componentRevisionName(resolved),
+      fn,
+      readSetCollector,
+      resolved,
+      resolvedWriter: root.writer(resolved.scope),
+      root,
+      snapshot,
     };
-    if (componentRevision === "create" && options.revisionReplay) {
+  };
+
+  const mutationReplaySnapshot = (
+    replay: RevisionReplay | undefined,
+  ): MutationReplaySnapshot | undefined =>
+    replay && {
+      checkpointCount: replay.checkpoints.length,
+      nextCheckpointOrdinal: replay.nextCheckpointOrdinal,
+      nextOrdinal: replay.nextOrdinal,
+    };
+
+  const restoreMutationReplay = (
+    replay: RevisionReplay | undefined,
+    snapshot: MutationReplaySnapshot | undefined,
+  ): void => {
+    if (!replay || !snapshot) return;
+    replay.nextCheckpointOrdinal = snapshot.nextCheckpointOrdinal;
+    replay.nextOrdinal = snapshot.nextOrdinal;
+    replay.checkpoints.length = snapshot.checkpointCount;
+  };
+
+  const restoreMutationAttempt = (
+    root: ScopedMutationTransaction,
+    snapshot: ScopedMutationSnapshot | undefined,
+    replay: RevisionReplay | undefined,
+    replaySnapshot: MutationReplaySnapshot | undefined,
+  ): void => {
+    if (snapshot) root.restore(snapshot);
+    restoreMutationReplay(replay, replaySnapshot);
+  };
+
+  const captureRevisionSnapshots = async (
+    root: ScopedMutationTransaction,
+    revision: Record<string, unknown>,
+  ): Promise<CrdtSnapshot[]> => {
+    const table = String(revision.table);
+    const rowId = String(revision.rowId);
+    const batch = root.toBatch().rootBatch;
+    return await store.doc.crdt.snapshot.read(table, rowId, batch.crdtOps ?? []);
+  };
+
+  const redirectRevisionCreateReplay = async (
+    args: Record<string, unknown>,
+    argsAreNormalized: boolean,
+    options: RunMutationOptions,
+    root: ScopedMutationTransaction,
+    snapshot: ScopedMutationSnapshot | undefined,
+    replaySnapshot: MutationReplaySnapshot | undefined,
+    tx: ScopedMutationTransaction | undefined,
+  ): Promise<{ handled: boolean; result: unknown }> => {
+    const replay = options.revisionReplay;
+    if (!replay) return { handled: false, result: undefined };
+    try {
       await validateRevisionCreate(root.writer(rootScope).db, args);
-      const ordinal = options.revisionReplay.nextOrdinal;
-      const checkpointOrdinal = options.revisionReplay.nextCheckpointOrdinal;
-      const snapshots = await captureRevisionSnapshots(args);
-      options.revisionReplay.checkpoints.push({
-        ordinal: checkpointOrdinal,
+      const ordinal = replay.nextOrdinal;
+      const snapshots = await captureRevisionSnapshots(root, args);
+      replay.checkpoints.push({
+        ordinal: replay.nextCheckpointOrdinal,
         operation: "create",
         rowId: String(args.rowId),
         table: String(args.table),
         snapshots,
       });
-      options.revisionReplay.nextCheckpointOrdinal += 1;
-      const replay = {
-        createdAt: options.revisionReplay.createdAt,
-        mutationId: options.revisionReplay.mutationId,
-        ordinal,
+      replay.nextCheckpointOrdinal += 1;
+      replay.nextOrdinal += 1;
+      return {
+        handled: true,
+        result: await runMutationDirect(
+          embeddedComponentReference("rev/createReplay"),
+          {
+            ...args,
+            replay: { createdAt: replay.createdAt, mutationId: replay.mutationId, ordinal },
+            snapshots,
+          },
+          rootScope,
+          { ...options, allowInternal: true },
+          tx,
+          argsAreNormalized,
+        ),
       };
-      options.revisionReplay.nextOrdinal += 1;
-      return await runMutationDirect(
-        embeddedComponentReference("rev/createReplay"),
-        { ...args, replay, snapshots },
-        rootScope,
-        { ...options, allowInternal: true },
-        tx,
-        argsAreNormalized,
-      );
+    } catch (error) {
+      restoreMutationAttempt(root, snapshot, replay, replaySnapshot);
+      throw error;
     }
-    const checked = await resolveMutationArgs(
-      namespaceStore(store, resolved.scope.instancePath),
-      fn,
-      args,
-      argsAreNormalized,
-      tx !== undefined,
+  };
+
+  const redirectRevisionCreateLocal = async (
+    checked: Record<string, unknown>,
+    options: RunMutationOptions,
+    root: ScopedMutationTransaction,
+    tx: ScopedMutationTransaction | undefined,
+  ): Promise<unknown> => {
+    await validateRevisionCreate(root.writer(rootScope).db, checked);
+    const snapshots = await captureRevisionSnapshots(root, checked);
+    return await runMutationDirect(
+      embeddedComponentReference("rev/createLocal"),
+      { ...checked, snapshots },
+      rootScope,
+      { ...options, allowInternal: true },
+      tx,
     );
-    if (componentRevision === "create") {
-      await validateRevisionCreate(root.writer(rootScope).db, checked);
-      const snapshots = await captureRevisionSnapshots(checked);
-      return await runMutationDirect(
-        embeddedComponentReference("rev/createLocal"),
-        { ...checked, snapshots },
-        rootScope,
-        { ...options, allowInternal: true },
-        tx,
-      );
-    } else if (componentRevision === "retain") {
-      const snapshots = await captureRevisionSnapshots(checked);
+  };
+
+  const redirectRevisionRetain = async (
+    checked: Record<string, unknown>,
+    options: RunMutationOptions,
+    root: ScopedMutationTransaction,
+    snapshot: ScopedMutationSnapshot | undefined,
+    replaySnapshot: MutationReplaySnapshot | undefined,
+    tx: ScopedMutationTransaction | undefined,
+  ): Promise<unknown> => {
+    try {
+      const snapshots = await captureRevisionSnapshots(root, checked);
       if (options.revisionReplay) {
         options.revisionReplay.checkpoints.push({
           ordinal: options.revisionReplay.nextCheckpointOrdinal,
@@ -1663,72 +1853,244 @@ export function createRunner(
         { ...options, allowInternal: true },
         tx,
       );
+    } catch (error) {
+      restoreMutationAttempt(root, snapshot, options.revisionReplay, replaySnapshot);
+      throw error;
     }
-    const displaced =
-      componentRevision === "restore"
-        ? await revisionCurrent(root.writer(rootScope).db, checked)
-        : undefined;
-    if (componentRevision === "restore" && displaced !== undefined) {
-      const target = (await runQuery(
-        embeddedComponentReference("rev/get"),
-        checked,
+  };
+
+  const retainDisplacedRevision = async (
+    checked: Record<string, unknown>,
+    options: RunMutationOptions,
+    root: ScopedMutationTransaction,
+  ): Promise<void> => {
+    const displaced = await revisionCurrent(root.writer(rootScope).db, checked);
+    const target = (await runQuery(
+      embeddedComponentReference("rev/get"),
+      checked,
+      rootScope,
+      undefined,
+      undefined,
+      root,
+      { ...options, allowInternal: true },
+    )) as RevisionRestoreExpectation | null;
+    if (
+      target &&
+      (target.deleted !== displaced.deleted || !equals(target.value, displaced.value))
+    ) {
+      await runMutationDirect(
+        embeddedComponentReference("rev/retain"),
+        { ...displaced, origin: "displaced" },
         rootScope,
-        undefined,
-        undefined,
-        root,
         { ...options, allowInternal: true },
-      )) as RevisionRestoreExpectation | null;
-      if (
-        target &&
-        (target.deleted !== displaced.deleted || !equals(target.value, displaced.value))
-      ) {
-        await runMutationDirect(
-          embeddedComponentReference("rev/retain"),
-          { ...displaced, origin: "displaced" },
-          rootScope,
-          { ...options, allowInternal: true },
-          root,
-        );
-      }
+        root,
+      );
     }
-    if (timing) timing.prepareMs = getTimerTime() - timingPhaseStartedAt;
-    timingPhaseStartedAt = timing ? getTimerTime() : 0;
+  };
+
+  const prepareRevisionMutation = async ({
+    args,
+    argsAreNormalized,
+    invocation,
+    options,
+    replaySnapshot,
+    tx,
+  }: MutationRevisionInput): Promise<MutationRevisionResult> => {
+    if (invocation.componentRevision === "create" && options.revisionReplay) {
+      const redirect = await redirectRevisionCreateReplay(
+        args,
+        argsAreNormalized,
+        options,
+        invocation.root,
+        invocation.snapshot,
+        replaySnapshot,
+        tx,
+      );
+      return { checked: undefined, ...redirect };
+    }
+    const checked = await resolveMutationArgs(
+      namespaceStore(store, invocation.resolved.scope.instancePath),
+      invocation.fn,
+      args,
+      argsAreNormalized,
+      tx !== undefined,
+    );
+    if (invocation.componentRevision === "create") {
+      return {
+        checked: undefined,
+        handled: true,
+        result: await redirectRevisionCreateLocal(checked, options, invocation.root, tx),
+      };
+    }
+    if (invocation.componentRevision === "retain") {
+      return {
+        checked: undefined,
+        handled: true,
+        result: await redirectRevisionRetain(
+          checked,
+          options,
+          invocation.root,
+          invocation.snapshot,
+          replaySnapshot,
+          tx,
+        ),
+      };
+    }
+    if (invocation.componentRevision === "restore") {
+      await retainDisplacedRevision(checked, options, invocation.root);
+    }
+    return { checked, handled: false, result: undefined };
+  };
+
+  const prepareMutationAdmission = (
+    checked: Record<string, unknown>,
+    options: RunMutationOptions,
+    timingState: MutationTimingState,
+  ): MutationAdmissionState => {
     const recordsMutation =
       options.mutationId !== undefined &&
       !(options.mutationIsFresh && options.pushCall !== undefined);
     const encodedMutationArgs = recordsMutation ? encode(checked) : undefined;
+    const timing = timingState.timing;
     if (timing) {
-      timing.argsEncodeMs = getTimerTime() - timingPhaseStartedAt;
-      timingPhaseStartedAt = getTimerTime();
+      timing.argsEncodeMs = getTimerTime() - timingState.phaseStartedAt;
+      timingState.phaseStartedAt = getTimerTime();
     }
-    if (!tx && options.mutationId && store.mutation && !options.mutationIsFresh) {
-      const existing = await store.mutation.write({
-        args: encodedMutationArgs!,
-        mutationId: options.mutationId,
-        name: resolved.name,
+    return { encodedMutationArgs, recordsMutation };
+  };
+
+  const completeExistingMutation = (
+    result: ReturnType<typeof encode> | undefined,
+    options: RunMutationOptions,
+    timingState: MutationTimingState,
+  ): unknown => {
+    const timing = timingState.timing;
+    if (timing) {
+      timing.totalMs = getTimerTime() - timingState.startedAt;
+      callPostCommit(() => options.onTiming?.(timing));
+    }
+    return result === undefined ? null : decode(result);
+  };
+
+  const writeMutationAdmission = async (
+    encodedMutationArgs: ReturnType<typeof encode>,
+    options: RunMutationOptions,
+    resolved: { name: string; scope: RuntimeScope },
+    timingState: MutationTimingState,
+  ): Promise<ExistingMutationAdmission | undefined> => {
+    const existing = await store.mutation!.write({
+      args: encodedMutationArgs,
+      mutationId: options.mutationId!,
+      name: resolved.name,
+    });
+    const timing = timingState.timing;
+    if (timing) {
+      timing.beginMs = getTimerTime() - timingState.phaseStartedAt;
+      timingState.phaseStartedAt = getTimerTime();
+    }
+    options.onAccepted?.(options.mutationId!);
+    if (existing.status === "committed") {
+      return { result: completeExistingMutation(existing.result, options, timingState) };
+    }
+    if (existing.status === "failed") {
+      throw decodeError(existing.error ?? `mutation failed: ${options.mutationId}`);
+    }
+    return undefined;
+  };
+
+  const hasDurableMutationAdmission = (
+    options: RunMutationOptions,
+    tx: ScopedMutationTransaction | undefined,
+  ): boolean =>
+    !tx &&
+    options.mutationId !== undefined &&
+    store.mutation !== undefined &&
+    !options.mutationIsFresh;
+
+  const acceptUnstoredMutation = (
+    options: RunMutationOptions,
+    tx: ScopedMutationTransaction | undefined,
+  ): void => {
+    if (!tx && options.mutationId) options.onAccepted?.(options.mutationId);
+  };
+
+  const finishMutationAdmissionTiming = (timingState: MutationTimingState): void => {
+    const timing = timingState.timing;
+    if (timing && timing.beginMs === 0) timingState.phaseStartedAt = getTimerTime();
+  };
+
+  const admitMutation = async (
+    checked: Record<string, unknown>,
+    resolved: { name: string; scope: RuntimeScope },
+    options: RunMutationOptions,
+    tx: ScopedMutationTransaction | undefined,
+    timingState: MutationTimingState,
+  ): Promise<MutationAdmissionResult> => {
+    const admission = prepareMutationAdmission(checked, options, timingState);
+    if (hasDurableMutationAdmission(options, tx)) {
+      const result = await writeMutationAdmission(
+        admission.encodedMutationArgs!,
+        options,
+        resolved,
+        timingState,
+      );
+      if (result) return { ...admission, handled: true, result: result.result };
+    } else acceptUnstoredMutation(options, tx);
+    finishMutationAdmissionTiming(timingState);
+    return { ...admission, handled: false, result: undefined };
+  };
+
+  const failMutationHandler = async (
+    error: unknown,
+    encodedMutationArgs: ReturnType<typeof encode> | undefined,
+    options: RunMutationOptions,
+    recordsMutation: boolean,
+    resolved: { name: string; scope: RuntimeScope },
+    root: ScopedMutationTransaction,
+    snapshot: ScopedMutationSnapshot | undefined,
+    tx: ScopedMutationTransaction | undefined,
+  ): Promise<never> => {
+    if (snapshot) root.restore(snapshot);
+    if (!tx && options.mutationId && store.mutation && recordsMutation) {
+      if (options.mutationIsFresh) {
+        await store.mutation
+          .write(
+            { args: encodedMutationArgs!, mutationId: options.mutationId, name: resolved.name },
+            { fresh: true },
+          )
+          .catch(() => undefined);
+      }
+      await store.mutation.fail(options.mutationId, encodeError(error)).catch(() => undefined);
+    }
+    throw error;
+  };
+
+  const commitMutationWithRecovery = async (
+    input: MutationCommitInput,
+    root: ScopedMutationTransaction,
+    snapshot: ScopedMutationSnapshot | undefined,
+    replay: RevisionReplay | undefined,
+    replaySnapshot: MutationReplaySnapshot | undefined,
+  ): Promise<unknown> => {
+    let committed = false;
+    try {
+      return await commitMutation(input, () => {
+        committed = true;
       });
-      if (timing) {
-        timing.beginMs = getTimerTime() - timingPhaseStartedAt;
-        timingPhaseStartedAt = getTimerTime();
-      }
-      options.onAccepted?.(options.mutationId);
-      if (existing.status === "committed") {
-        // The result was already validated when first committed; returning the committed value
-        // keeps local mutation retries idempotent without re-running the handler.
-        if (timing) {
-          timing.totalMs = getTimerTime() - timingStartedAt;
-          options.onTiming?.(timing);
-        }
-        return existing.result === undefined ? null : decode(existing.result);
-      }
-      if (existing.status === "failed") {
-        throw decodeError(existing.error ?? `mutation failed: ${options.mutationId}`);
-      }
-    } else if (!tx && options.mutationId) {
-      options.onAccepted?.(options.mutationId);
+    } catch (error) {
+      // Before commit, a storage failure is retryable. Once commit resolves, even a result,
+      // observer, or scheduling failure must not roll the accepted mutation back to replayable.
+      if (!committed) restoreMutationAttempt(root, snapshot, replay, replaySnapshot);
+      throw error;
     }
-    if (timing && timing.beginMs === 0) timingPhaseStartedAt = getTimerTime();
-    let validated: unknown;
+  };
+
+  const prepareMutationHandlerPhase = (
+    checked: Record<string, unknown>,
+    invocation: ResolvedMutationInvocation,
+    options: RunMutationOptions,
+    tx: ScopedMutationTransaction | undefined,
+  ): MutationHandlerPhase => {
     const pendingSchedules: Array<() => Promise<void>> = [];
     const pendingScheduleRows: ScheduledJob[] = [];
     const scheduledJobs: string[] = [];
@@ -1745,80 +2107,160 @@ export function createRunner(
             checkpoints: [],
           }
         : undefined);
-    try {
-      validated = await runMutationHandler({
+    return {
+      input: {
         checked,
-        componentRevision,
-        fn,
+        componentRevision: invocation.componentRevision,
+        fn: invocation.fn,
         generatedUploadUrls,
         options,
         pendingScheduleRows,
         pendingSchedules: tx ? undefined : pendingSchedules,
         pushEnvelopeTimeHlc: tx ? undefined : pushEnvelopeTimeHlc,
-        resolved,
-        resolvedWriter,
+        resolved: invocation.resolved,
+        resolvedWriter: invocation.resolvedWriter,
         revisionReplay,
-        root,
+        root: invocation.root,
         scheduledJobs,
-      });
-      if (timing) {
-        timing.handlerMs = getTimerTime() - timingPhaseStartedAt;
-        timingPhaseStartedAt = getTimerTime();
-      }
-    } catch (error) {
-      // Deterministic failure (handler threw or the return validator rejected): it reproduces on
-      // replay, so record it as the mutation's terminal `failed` outcome (preserving ConvexError).
-      if (snapshot) root.restore(snapshot);
-      if (!tx && options.mutationId && store.mutation && recordsMutation) {
-        if (options.mutationIsFresh) {
-          await store.mutation
-            .write(
-              {
-                args: encodedMutationArgs!,
-                mutationId: options.mutationId,
-                name: resolved.name,
-              },
-              { fresh: true },
-            )
-            .catch(() => undefined);
-        }
-        await store.mutation.fail(options.mutationId, encodeError(error)).catch(() => undefined);
-      }
-      throw error;
+      },
+      pendingSchedules,
+      revisionReplay,
+    };
+  };
+
+  const runMutationHandlerPhase = async (
+    input: MutationHandlerInput,
+    root: ScopedMutationTransaction,
+    timingState: MutationTimingState,
+    tx: ScopedMutationTransaction | undefined,
+  ): Promise<unknown> => {
+    const validated = await runMutationHandler(input);
+    // A rev.restore has a required matching replace/delete, but only the top-level handler can
+    // establish it after a nested component call returns. Validate before the durable boundary
+    // so violating it becomes this mutation's deterministic terminal result.
+    if (!tx) await root.validateRevisionRestores();
+    const timing = timingState.timing;
+    if (timing) {
+      timing.handlerMs = getTimerTime() - timingState.phaseStartedAt;
+      timingState.phaseStartedAt = getTimerTime();
     }
-    if (tx) return validated;
+    return validated;
+  };
+
+  const prepareMutationCommitInput = (
+    admission: MutationAdmissionResult,
+    phase: MutationHandlerPhase,
+    invocation: ResolvedMutationInvocation,
+    timingState: MutationTimingState,
+    validated: unknown,
+  ): MutationCommitInput => ({
+    checked: phase.input.checked,
+    encodedMutationArgs: admission.encodedMutationArgs,
+    fn: invocation.fn,
+    generatedUploadUrls: phase.input.generatedUploadUrls,
+    options: phase.input.options,
+    pendingScheduleRows: phase.input.pendingScheduleRows,
+    pendingSchedules: phase.pendingSchedules,
+    pushEnvelopeTimeHlc: phase.input.pushEnvelopeTimeHlc,
+    readSetCollector: invocation.readSetCollector,
+    recordsMutation: admission.recordsMutation,
+    resolved: invocation.resolved,
+    revisionReplay: phase.revisionReplay,
+    root: invocation.root,
+    scheduledJobs: phase.input.scheduledJobs,
+    timing: timingState.timing,
+    timingPhaseStartedAt: timingState.phaseStartedAt,
+    timingStartedAt: timingState.startedAt,
+    validated,
+  });
+
+  const runMutationHandlerWithRecovery = async (
+    admission: MutationAdmissionResult,
+    phase: MutationHandlerPhase,
+    invocation: ResolvedMutationInvocation,
+    options: RunMutationOptions,
+    timingState: MutationTimingState,
+    tx: ScopedMutationTransaction | undefined,
+  ): Promise<unknown> => {
     try {
-      return await commitMutation({
-        checked,
-        encodedMutationArgs,
-        fn,
-        generatedUploadUrls,
-        options,
-        pendingScheduleRows,
-        pendingSchedules,
-        pushEnvelopeTimeHlc,
-        readSetCollector,
-        recordsMutation,
-        resolved,
-        revisionReplay,
-        root,
-        scheduledJobs,
-        timing,
-        timingPhaseStartedAt,
-        timingStartedAt,
-        validated,
-      });
+      return await runMutationHandlerPhase(phase.input, invocation.root, timingState, tx);
     } catch (error) {
-      // Transient storage failure: NOT recorded as `failed`, so the mutation can be retried. The
-      // ledger entry stays pending and a later replay re-runs the handler.
-      if (snapshot) root.restore(snapshot);
-      if (revisionReplaySnapshot && options.revisionReplay) {
-        options.revisionReplay.nextCheckpointOrdinal = revisionReplaySnapshot.nextCheckpointOrdinal;
-        options.revisionReplay.nextOrdinal = revisionReplaySnapshot.nextOrdinal;
-        options.revisionReplay.checkpoints.length = revisionReplaySnapshot.checkpointCount;
-      }
-      throw error;
+      return await failMutationHandler(
+        error,
+        admission.encodedMutationArgs,
+        options,
+        admission.recordsMutation,
+        invocation.resolved,
+        invocation.root,
+        invocation.snapshot,
+        tx,
+      );
     }
+  };
+
+  const executeMutation = async ({
+    admission,
+    checked,
+    invocation,
+    options,
+    replaySnapshot,
+    timingState,
+    tx,
+  }: MutationExecutionInput): Promise<unknown> => {
+    const phase = prepareMutationHandlerPhase(checked, invocation, options, tx);
+    const validated = await runMutationHandlerWithRecovery(
+      admission,
+      phase,
+      invocation,
+      options,
+      timingState,
+      tx,
+    );
+    if (tx) return validated;
+    return await commitMutationWithRecovery(
+      prepareMutationCommitInput(admission, phase, invocation, timingState, validated),
+      invocation.root,
+      invocation.snapshot,
+      options.revisionReplay,
+      replaySnapshot,
+    );
+  };
+
+  const runMutationDirect = async (
+    ref: FunctionReference,
+    args: Record<string, unknown>,
+    scope = rootScope,
+    options: RunMutationOptions = {},
+    tx?: ScopedMutationTransaction,
+    argsAreNormalized = false,
+  ): Promise<unknown> => {
+    const timingState = createMutationTiming(tx, options);
+    const invocation = await resolveMutationInvocation(ref, scope, options, tx);
+    const replaySnapshot = mutationReplaySnapshot(options.revisionReplay);
+    const revision = await prepareRevisionMutation({
+      args,
+      argsAreNormalized,
+      invocation,
+      options,
+      replaySnapshot,
+      tx,
+    });
+    if (revision.handled) return revision.result;
+    const checked = revision.checked!;
+    if (timingState.timing)
+      timingState.timing.prepareMs = getTimerTime() - timingState.phaseStartedAt;
+    timingState.phaseStartedAt = timingState.timing ? getTimerTime() : 0;
+    const admission = await admitMutation(checked, invocation.resolved, options, tx, timingState);
+    if (admission.handled) return admission.result;
+    return await executeMutation({
+      admission,
+      checked,
+      invocation,
+      options,
+      replaySnapshot,
+      timingState,
+      tx,
+    });
   };
 
   const runAction = async (
@@ -2024,7 +2466,15 @@ export function createRunner(
     mergePendingNotification(pendingNotify, notification);
     if (notifyQueued) return;
     notifyQueued = true;
-    deferNotify(flushNotify);
+    callPostCommit(() => {
+      try {
+        deferNotify(flushNotify);
+      } catch {
+        // A host deferral hook is an observer boundary. Keep the merged notification for the next
+        // successful deferral, and most importantly do not strand the queue in its queued state.
+        notifyQueued = false;
+      }
+    });
   };
 
   // Cut 7 §1/§14: the ONE site the retained-result cache key is computed. Both the published scope
@@ -2636,7 +3086,7 @@ export function createRunner(
     table: string,
   ): Promise<void> {
     const batch = root.toBatch();
-    const commit = await runSpan("storage.commit", () =>
+    const commit = await runDurableSpan("storage.commit", () =>
       store.commit(
         batch,
         rootScope.schema.get(table)?.placement === "device"
@@ -2644,7 +3094,7 @@ export function createRunner(
           : { changes: "omit", mutation: "none", source: "local" },
       ),
     );
-    if (hasEventListeners()) emitCommit(emit, commit, batch, "local");
+    if (hasEventListeners()) callPostCommit(() => emitCommit(emit, commit, batch, "local"));
     scheduleNotify({ dataOnlyDocIds: new Map(), tables: new Set(commit.changedTables) });
   }
 
@@ -3245,6 +3695,15 @@ function callSafely(call: () => void): void {
     queueMicrotask(() => {
       throw error;
     });
+  }
+}
+
+/** A durable commit remains successful even when its optional observers fail. */
+function callPostCommit(call: () => void): void {
+  try {
+    call();
+  } catch {
+    // Diagnostics, timing, and wake hooks run after storage commits. They cannot reopen it.
   }
 }
 

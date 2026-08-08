@@ -25,6 +25,7 @@ import type {
 import type {
   CommitOptions,
   CountSpec,
+  CrdtSnapshot,
   KeyPage,
   IdMapping,
   MutationCall,
@@ -824,6 +825,7 @@ class FakeStorage implements RuntimeStorage {
   readonly pushEnvelopes: Array<{
     afterImages: unknown[];
     crdt: unknown[];
+    revisionCheckpoints?: Array<{ operation: "create" | "retain"; ordinal: number }>;
     reads?: Array<{
       kind: string;
       equality?: Array<{ field: string; value: unknown; commitTs?: true }>;
@@ -849,7 +851,9 @@ class FakeStorage implements RuntimeStorage {
     crdt: {
       read: (_table: string, _id: string, _field: string): Promise<number | undefined> =>
         Promise.resolve(undefined),
-      snapshot: { read: (_table: string, _id: string) => Promise.resolve([]) },
+      snapshot: {
+        read: (_table: string, _id: string): Promise<CrdtSnapshot[]> => Promise.resolve([]),
+      },
     },
     page: {
       read: (spec: ReadSpec): Promise<DocPage> =>
@@ -2236,6 +2240,7 @@ describe("runtime", () => {
         };
       };
     };
+    let restoreAttempts = 0;
     const bridge = {
       savepoint: mutation({
         args: { id: v.id("messages"), fail: v.boolean() },
@@ -2269,6 +2274,7 @@ describe("runtime", () => {
       restore: mutation({
         args: { id: v.id("messages"), revId: v.string(), write: v.boolean() },
         handler: async (ctx, args) => {
+          restoreAttempts += 1;
           const revision = (await ctx.runMutation(components.embedded.rev.restore as never, {
             table: "messages",
             rowId: args.id,
@@ -2303,8 +2309,20 @@ describe("runtime", () => {
 
     await r.runMutation("bridge:edit", { id, body: "changed" });
     await expect(
-      r.runMutation("bridge:restore", { id, revId: revision.revId, write: false }),
+      r.runMutation(
+        "bridge:restore",
+        { id, revId: revision.revId, write: false },
+        { mutationId: "mutation:restore-postcondition" },
+      ),
     ).rejects.toThrow("matching document replace");
+    await expect(
+      r.runMutation(
+        "bridge:restore",
+        { id, revId: revision.revId, write: false },
+        { mutationId: "mutation:restore-postcondition" },
+      ),
+    ).rejects.toThrow("matching document replace");
+    expect(restoreAttempts).toBe(1);
     await r.runMutation("bridge:restore", { id, revId: revision.revId, write: true });
     const restored = (await r.runQuery("messages:get", { id })) as { body: string };
     expect(restored.body).toBe("draft");
@@ -2411,6 +2429,91 @@ describe("runtime", () => {
     expect(await r.runQuery("docs:get", { id })).toMatchObject({ body: "fresh now" });
     await store.close();
   });
+
+  for (const operation of ["create", "retain"] as const) {
+    test(`a caught nested revision ${operation} failure restores replay checkpoints`, async () => {
+      const components = componentsGeneric() as unknown as {
+        embedded: { rev: { create: unknown; retain: unknown } };
+      };
+      const store = new FakeStorage();
+      let snapshotReads = 0;
+      const overfullSnapshots: CrdtSnapshot[] = Array.from({ length: 65 }, (_, index) => ({
+        bytes: new ArrayBuffer(0),
+        field: `body.${index}`,
+        hash: "not-read-after-limit-check",
+        headSeq: 0,
+        kind: "text",
+        projectionHash: "",
+      }));
+      store.doc.crdt.snapshot.read = async () => (snapshotReads++ === 0 ? overfullSnapshots : []);
+      const bridge = {
+        saveAfterCaughtRevisionFailure: mutation({
+          args: { id: v.id("messages") },
+          handler: async (ctx, args) => {
+            const document = await ctx.db.get(args.id);
+            if (!document) throw new Error("Document not found.");
+            const { _creationTime, _id, ...value } = document;
+            const revision = {
+              deleted: false,
+              rowId: args.id,
+              table: "messages",
+              value,
+            };
+            const reference =
+              operation === "create"
+                ? components.embedded.rev.create
+                : components.embedded.rev.retain;
+            const revisionArgs =
+              operation === "create" ? revision : { ...revision, origin: "displaced" as const };
+            let caught = false;
+            try {
+              await ctx.runMutation(reference as never, revisionArgs);
+            } catch {
+              caught = true;
+            }
+            const saved = await ctx.runMutation(reference as never, revisionArgs);
+            return { caught, saved };
+          },
+        }),
+      };
+      const r = createRunner({ bridge, messages }, store, storeSchema);
+      const id = (await r.runMutation("messages:send", {
+        body: operation,
+        channel: "revision-replay",
+      })) as string;
+      const mutationId = `mutation:revision-${operation}-caught`;
+      await store.mutation.write({
+        args: "{}",
+        mutationId,
+        name: "bridge:saveAfterCaughtRevisionFailure",
+      });
+      const revisionReplay = {
+        checkpoints: [],
+        createdAt: 1,
+        mutationId,
+        nextCheckpointOrdinal: 0,
+        nextOrdinal: 0,
+      };
+
+      const result = (await r.runMutation(
+        "bridge:saveAfterCaughtRevisionFailure",
+        { id },
+        {
+          mutationId,
+          mutationIsFresh: true,
+          pushCall: { fn: "bridge:saveAfterCaughtRevisionFailure", rngSeed: mutationId },
+          revisionReplay,
+        },
+      )) as { caught: boolean };
+
+      expect(result.caught).toBe(true);
+      const checkpoints = store.pushEnvelopes.at(-1)?.revisionCheckpoints;
+      expect(checkpoints).toHaveLength(1);
+      expect(checkpoints).toMatchObject([{ operation, ordinal: 0 }]);
+      expect(revisionReplay.nextCheckpointOrdinal).toBe(1);
+      expect(revisionReplay.nextOrdinal).toBe(operation === "create" ? 1 : 0);
+    });
+  }
 
   test("devtools snapshot skips Convex system entrypoint modules", async () => {
     const r = createRunner(
@@ -3273,6 +3376,250 @@ describe("runtime", () => {
     expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "retry" });
   });
 
+  for (const observer of ["diagnostic", "timing", "wake", "span"] as const) {
+    test(`a post-commit ${observer} failure does not replay a durable mutation`, async () => {
+      let calls = 0;
+      const store = new FakeStorage();
+      const r = createRunner(
+        {
+          messages: {
+            ...messages,
+            observer: mutation({
+              args: {},
+              handler: async (ctx) => {
+                calls += 1;
+                return await ctx.db.insert("messages", {
+                  body: observer,
+                  channel: "post-commit-observer",
+                });
+              },
+            }),
+          },
+        },
+        store,
+        storeSchema,
+        observer === "diagnostic"
+          ? {
+              emit: (event: EmbeddedEvent) => {
+                if (event.type === "data") throw new Error("diagnostic callback failed");
+              },
+            }
+          : observer === "span"
+            ? {
+                emit: (event: EmbeddedEvent) => {
+                  if (
+                    event.type === "span" &&
+                    event.name === "storage.commit" &&
+                    event.phase === "finish"
+                  ) {
+                    throw new Error("storage span callback failed");
+                  }
+                },
+              }
+            : {},
+      );
+      const mutationId = `mutation:post-commit-${observer}`;
+      if (observer === "wake") {
+        await store.mutation.write({ args: "{}", mutationId, name: "messages:observer" });
+      }
+      const stopWake =
+        observer === "wake"
+          ? r.remote?.wake?.subscribe(() => {
+              throw new Error("wake callback failed");
+            })
+          : undefined;
+      const options = {
+        mutationId,
+        ...(observer === "timing"
+          ? {
+              onTiming: () => {
+                throw new Error("timing callback failed");
+              },
+            }
+          : {}),
+        ...(observer === "wake"
+          ? {
+              mutationIsFresh: true,
+              pushCall: { fn: "messages:observer", rngSeed: mutationId },
+            }
+          : {}),
+      };
+
+      try {
+        await r.runMutation("messages:observer", {}, options);
+        await r.runMutation("messages:observer", {}, { mutationId });
+      } finally {
+        stopWake?.();
+      }
+
+      expect(calls).toBe(1);
+      const rows = (await r.runQuery("messages:list", {
+        channel: "post-commit-observer",
+      })) as Array<{ body: string }>;
+      expect(rows).toMatchObject([{ body: observer }]);
+    });
+  }
+
+  test("a post-commit storage span failure fulfills an untracked mutation", async () => {
+    let calls = 0;
+    const store = new FakeStorage();
+    const r = createRunner(
+      {
+        messages: {
+          ...messages,
+          span: mutation({
+            args: {},
+            handler: async (ctx) => {
+              calls += 1;
+              return await ctx.db.insert("messages", {
+                body: "span",
+                channel: "post-commit-span",
+              });
+            },
+          }),
+        },
+      },
+      store,
+      storeSchema,
+      {
+        emit: (event: EmbeddedEvent) => {
+          if (
+            event.type === "span" &&
+            event.name === "storage.commit" &&
+            event.phase === "finish"
+          ) {
+            throw new Error("storage span callback failed");
+          }
+        },
+      },
+    );
+
+    await expect(r.runMutation("messages:span", {})).resolves.toMatch(/^messages\|/);
+    expect(calls).toBe(1);
+    expect(await r.runQuery("messages:list", { channel: "post-commit-span" })).toMatchObject([
+      { body: "span" },
+    ]);
+  });
+
+  test("a throwing primary diagnostic observer does not block subscribed post-commit observers", async () => {
+    const events: EmbeddedEvent[] = [];
+    const r = createRunner({ messages }, new FakeStorage(), storeSchema, {
+      emit: (event: EmbeddedEvent) => {
+        if (event.type === "data") throw new Error("primary diagnostic callback failed");
+      },
+    });
+    const unsubscribe = r.subscribeEvents?.((event) => events.push(event));
+
+    try {
+      await r.runMutation("messages:send", {
+        body: "continuity",
+        channel: "post-commit-observer-continuity",
+      });
+      expect(events).toEqual(
+        expect.arrayContaining([expect.objectContaining({ source: "local", type: "data" })]),
+      );
+    } finally {
+      unsubscribe?.();
+    }
+  });
+
+  test("a post-commit scheduler diagnostic failure does not replay a durable mutation", async () => {
+    const store = await NativeStore.openWith(nativeModule().Store, tmp("rt_scheduler_observer.db"));
+    await store.setup(storeSchema);
+    const r = createRunner({ messages }, store, storeSchema, {
+      emit: (event: EmbeddedEvent) => {
+        if (event.type === "scheduler") throw new Error("scheduler callback failed");
+      },
+    });
+    const options = { mutationId: "mutation:post-commit-scheduler" };
+
+    try {
+      const first = await r.runMutation(
+        "messages:scheduleChild",
+        { channel: "post-commit-scheduler" },
+        options,
+      );
+      const second = await r.runMutation(
+        "messages:scheduleChild",
+        { channel: "post-commit-scheduler" },
+        options,
+      );
+      expect(second).toBe(first);
+      expect(await store.schedule.read()).toMatchObject([{ jobId: first, state: "pending" }]);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("a failed pending-schedule diagnostic still wakes the durable due job", async () => {
+    const store = await NativeStore.openWith(
+      nativeModule().Store,
+      tmp("rt_scheduler_wake_observer.db"),
+    );
+    await store.setup(storeSchema);
+    let pendingDiagnostics = 0;
+    const r = createRunner({ messages }, store, storeSchema, {
+      emit: (event: EmbeddedEvent) => {
+        if (
+          event.type === "scheduler" &&
+          event.docWrites.some((write) => write.row.state === "pending")
+        ) {
+          pendingDiagnostics += 1;
+          throw new Error("pending scheduler callback failed");
+        }
+      },
+    });
+
+    try {
+      await expect(
+        r.runMutation("messages:scheduleImmediate", { channel: "post-commit-scheduler-wake" }),
+      ).resolves.toMatch(/^_scheduled_functions\|/);
+      await waitFor(
+        async () =>
+          (
+            (await r.runQuery("messages:list", {
+              channel: "post-commit-scheduler-wake",
+            })) as unknown[]
+          ).length === 1,
+        "scheduler did not wake after its pending diagnostic failed",
+      );
+      expect(pendingDiagnostics).toBe(1);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("a failed cancellation diagnostic still fulfills the durable cancellation", async () => {
+    const store = await NativeStore.openWith(
+      nativeModule().Store,
+      tmp("rt_scheduler_cancel_observer.db"),
+    );
+    await store.setup(storeSchema);
+    let throwOnCancel = false;
+    const r = createRunner({ messages }, store, storeSchema, {
+      emit: (event: EmbeddedEvent) => {
+        if (
+          throwOnCancel &&
+          event.type === "scheduler" &&
+          event.docWrites.some((write) => write.row.state === "canceled")
+        ) {
+          throw new Error("cancellation scheduler callback failed");
+        }
+      },
+    });
+
+    try {
+      const jobId = (await r.runMutation("messages:scheduleChild", {
+        channel: "post-commit-scheduler-cancel",
+      })) as string;
+      throwOnCancel = true;
+      await expect(r.runMutation("messages:cancelScheduled", { id: jobId })).resolves.toBeNull();
+      expect(await store.schedule.read()).toMatchObject([{ jobId, state: "canceled" }]);
+    } finally {
+      await store.close();
+    }
+  });
+
   test("one-document mutations use the storage shortcut when batching is unnecessary", async () => {
     const store = new FakeStorage();
     let oneDocWriteCalls = 0;
@@ -3300,6 +3647,56 @@ describe("runtime", () => {
 
     expect(oneDocWriteCalls).toBe(1);
     expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "shortcut" });
+  });
+
+  test("a caught component failure restores one-document eligibility", async () => {
+    const components = componentsGeneric() as unknown as {
+      embedded: { rev: { restore: unknown } };
+    };
+    const store = new FakeStorage();
+    let oneDocWriteCalls = 0;
+    store.commitOneDocWrite = (commit, options) => {
+      oneDocWriteCalls += 1;
+      return store.commit(
+        {
+          dataOnlyIds: commit.dataOnly
+            ? [{ id: commit.docWrite.id, table: commit.docWrite.table }]
+            : [],
+          deletes: [],
+          docWrites: [commit.docWrite],
+          freshIds: commit.fresh ? [{ id: commit.docWrite.id, table: commit.docWrite.table }] : [],
+        },
+        options,
+      );
+    };
+    const bridge = {
+      recover: mutation({
+        args: { id: v.id("messages") },
+        handler: async (ctx, args) => {
+          try {
+            await ctx.runMutation(components.embedded.rev.restore as never, {
+              revId: "missing",
+              rowId: args.id,
+              table: "messages",
+            });
+          } catch {
+            // The failed component call must not leave its writer in the parent transaction.
+          }
+          await ctx.db.patch(args.id, { body: "recovered" });
+        },
+      }),
+    };
+    const r = createRunner({ bridge, messages }, store, storeSchema);
+    const id = (await r.runMutation("messages:send", {
+      body: "before",
+      channel: "caught-component",
+    })) as string;
+
+    oneDocWriteCalls = 0;
+    await r.runMutation("bridge:recover", { id });
+
+    expect(oneDocWriteCalls).toBe(1);
+    expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "recovered" });
   });
 
   test("fresh mutation id commits terminal row without a pre-handler begin", async () => {
@@ -3555,6 +3952,36 @@ describe("runtime", () => {
     await r.runMutation("messages:send", { channel: "live", body: "b" });
     expect((await nextUpdate(updates, 2)).map((m) => m.body)).toEqual(["a", "b"]);
     off();
+  });
+
+  test("a throwing notify deferral does not reject a commit or strand later notifications", async () => {
+    let deferrals = 0;
+    const r = createRunner({ messages }, new FakeStorage(), storeSchema, {
+      deferNotify: (run) => {
+        deferrals += 1;
+        if (deferrals === 1) throw new Error("notify deferral failed");
+        run();
+      },
+    });
+    const updates: Array<Array<{ body: string }>> = [];
+    const off = r.onUpdate("messages:list", { channel: "defer" }, (value) => {
+      updates.push(value as Array<{ body: string }>);
+    });
+
+    try {
+      expect(await nextUpdate(updates, 0)).toEqual([]);
+      await expect(
+        r.runMutation("messages:send", { body: "first", channel: "defer" }),
+      ).resolves.toMatch(/^messages\|/);
+      expect(updates).toHaveLength(1);
+      await r.runMutation("messages:send", { body: "second", channel: "defer" });
+      expect((await nextUpdate(updates, 1)).map((message) => message.body)).toEqual([
+        "first",
+        "second",
+      ]);
+    } finally {
+      off();
+    }
   });
 
   test("onUpdate does not emit when the query result is unchanged", async () => {
