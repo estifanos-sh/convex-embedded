@@ -266,7 +266,7 @@ const ENTRYPOINTS = {
       "declare function stampLocal(moduleId: string, graphHash: string, exports: Record<string, unknown>): void;",
     ],
   },
-  "internal/text": {
+  text: {
     class: "stable app API",
     exports: ["TextFieldOptions", "TextFieldWriter", "createTextField"],
     signatures: [
@@ -430,6 +430,11 @@ describe("package entrypoint contract", () => {
     ]);
   });
 
+  test("the public text entry exposes only the field convergence API", async () => {
+    const text = await import("@estifanos-sh/convex-embedded/text");
+    expect(Object.keys(text).sort()).toEqual(["createTextField"]);
+  });
+
   test("Node-safe tooling entries are safe to import", async () => {
     for (const entry of ENTRIES) {
       if (
@@ -523,8 +528,12 @@ describe("package entrypoint contract", () => {
     writeFileSync(
       join(consumer, "index.ts"),
       `import type { LocalBuilders } from "@estifanos-sh/convex-embedded/local";
+import { createTextField } from "@estifanos-sh/convex-embedded/text";
+import type { TextFieldOptions, TextFieldWriter } from "@estifanos-sh/convex-embedded/text";
 
 export type LocalContract = LocalBuilders<any>;
+export type TextContract = TextFieldOptions<string>;
+export type TextWriter = TextFieldWriter;
 
 // @ts-expect-error Generated modules, not app code, own the builder factory.
 import { defineLocal } from "@estifanos-sh/convex-embedded/local";
@@ -539,13 +548,17 @@ import { EMBEDDED_LOCAL_REFERENCE } from "@estifanos-sh/convex-embedded/local";
 // @ts-expect-error Ambient registration was removed.
 import type { Register } from "@estifanos-sh/convex-embedded/local";
 
-void [defineLocal, local, stampLocal, localReferenceName, EMBEDDED_LOCAL_REFERENCE];
+void [createTextField, defineLocal, local, stampLocal, localReferenceName, EMBEDDED_LOCAL_REFERENCE];
 `,
     );
     writeFileSync(
       join(consumer, "runtime.mjs"),
       `import * as local from "@estifanos-sh/convex-embedded/local";
+import * as text from "@estifanos-sh/convex-embedded/text";
 if (Object.keys(local).length !== 0) throw new Error("public local runtime exports must be empty");
+if (Object.keys(text).join(",") !== "createTextField") {
+  throw new Error("public text runtime exports must contain only createTextField");
+}
 `,
     );
 

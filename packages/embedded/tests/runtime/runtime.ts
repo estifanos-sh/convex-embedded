@@ -55,7 +55,7 @@ import { NativeStore } from "../../src/node/native";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
 import { e } from "../../src/values";
-import { base as textBase } from "../../src/text";
+import { base as textBase } from "../../src/text/base";
 import { createTextField } from "../../src/text/field";
 import { nativeModule } from "../testkit/native";
 

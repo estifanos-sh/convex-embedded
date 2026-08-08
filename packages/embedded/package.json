@@ -2,6 +2,23 @@
   "name": "@estifanos-sh/convex-embedded",
   "version": "0.0.1",
   "description": "Embedded runtime and Convex server wrapper for local-first Convex apps.",
+  "keywords": [
+    "convex",
+    "expo",
+    "local-first",
+    "offline",
+    "react-native",
+    "sqlite",
+    "wasm"
+  ],
+  "homepage": "https://github.com/estifanos-sh/convex-embedded#readme",
+  "bugs": {
+    "url": "https://github.com/estifanos-sh/convex-embedded/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/estifanos-sh/convex-embedded.git"
+  },
   "files": [
     "dist/*-*.cjs",
     "dist/*-*.d.cts",
@@ -33,6 +50,8 @@
     "dist/schema.d.cts",
     "dist/schema.d.mts",
     "dist/schema.mjs",
+    "dist/text.d.mts",
+    "dist/text.mjs",
     "dist/thread",
     "dist/unplugin.d.mts",
     "dist/unplugin.mjs",
@@ -136,9 +155,9 @@
       "types": "./dist/internal/local.d.mts",
       "import": "./dist/internal/local.mjs"
     },
-    "./internal/text": {
-      "types": "./dist/internal/text.d.mts",
-      "import": "./dist/internal/text.mjs"
+    "./text": {
+      "types": "./dist/text.d.mts",
+      "import": "./dist/text.mjs"
     },
     "./unplugin": {
       "types": "./dist/unplugin.d.mts",

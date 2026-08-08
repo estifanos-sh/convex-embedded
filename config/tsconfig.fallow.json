@@ -27,7 +27,7 @@
       "@estifanos-sh/convex-embedded/internal/local": [
         "./../packages/embedded/src/internal/local.ts"
       ],
-      "@estifanos-sh/convex-embedded/internal/text": ["./../packages/embedded/src/text/field.ts"],
+      "@estifanos-sh/convex-embedded/text": ["./../packages/embedded/src/text.ts"],
       "@estifanos-sh/convex-embedded/local": ["./../packages/embedded/src/local.ts"],
       "@estifanos-sh/convex-embedded/metro": ["./../packages/embedded/src/metro.ts"],
       "@estifanos-sh/convex-embedded/node": ["./../packages/embedded/src/node/index.ts"],
