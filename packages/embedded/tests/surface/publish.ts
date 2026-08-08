@@ -79,9 +79,6 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toMatch(
       /name: Prepare and pack the verified Embedded package[\s\S]*?name: Qualify exact packed artifact[\s\S]*?qualify-tarball artifacts\/convex-embedded\.tgz/,
     );
-    expect(workflow).toContain(
-      "npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public",
-    );
     expect(workflow).toContain('NPM_CONFIG_PROVENANCE: "true"');
     expect(workflow).toContain("Publish package preview prerelease");
     expect(workflow).toContain("gh release create");
@@ -92,6 +89,11 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).toContain("options: [verify, preview, prerelease, release]");
     expect(workflow).toContain("dist_tag=latest");
     expect(workflow).not.toContain("dist_tag=preview");
+    expect(workflow).toContain(
+      "npm's directory publish payload differs from the qualified archive",
+    );
+    expect(workflow).toContain("npm publish ./publish/package");
+    expect(workflow).not.toContain("npm publish ./artifacts/convex-embedded.tgz");
     expect(workflow).toContain("CONVEX_EMBEDDED_PUBLISH_VERSION");
     expect(workflow).toContain("@estifanos-sh/convex-embedded");
     expect(workflow).not.toContain("get-convex/embedded");
@@ -112,9 +114,7 @@ describe("Embedded publishing workflow", () => {
     expect(workflow).not.toContain("labels.*.name, 'npm package'");
     expect(workflow).toContain('PACKAGE_PREVIEW" == "true"');
     expect(workflow).toContain('INPUT_MODE" == "prerelease"');
-    expect(workflow).toContain(
-      'npm dist-tag add "${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}" preview',
-    );
+    expect(workflow).not.toContain("npm dist-tag add");
     expect(workflow).toContain("blacksmith-8vcpu-ubuntu-2404-arm");
     expect(workflow).toContain("This job is deliberately credential-free");
     expect(workflow).toContain("Package releases must dispatch the reviewed workflow from main.");
