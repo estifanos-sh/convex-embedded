@@ -848,7 +848,15 @@ jobs:
 
       - name: Move prerelease channel
         if: needs.gate.outputs.mode == 'prerelease'
-        run: npm dist-tag add "${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}" preview
+        env:
+          NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+        run: |
+          if [[ -n "${NPM_BOOTSTRAP_TOKEN:-}" ]]; then
+            export NODE_AUTH_TOKEN="$NPM_BOOTSTRAP_TOKEN"
+          else
+            unset NODE_AUTH_TOKEN
+          fi
+          npm dist-tag add "${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}" preview
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
