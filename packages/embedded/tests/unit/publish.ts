@@ -76,6 +76,8 @@ describe("Embedded package publication", () => {
         name: packageName,
         publishConfig: { access: "restricted" },
         scripts: { build: "vp pack", postinstall: "false", prepack: "false" },
+        dependencies: { unplugin: "catalog:" },
+        optionalDependencies: { "solid-js": "catalog:" },
         version: "0.0.1",
       }),
     );
@@ -87,11 +89,15 @@ describe("Embedded package publication", () => {
       publishConfig: { access: string };
       repository: { url: string };
       scripts: Record<string, string>;
+      dependencies: Record<string, string>;
+      optionalDependencies: Record<string, string>;
     };
     expect(manifest.name).toBe(packageName);
     expect(manifest.repository.url).toContain(packageRepository);
     expect(manifest.publishConfig.access).toBe("public");
     expect(manifest.scripts).toEqual({ build: "vp pack" });
+    expect(manifest.dependencies.unplugin).toBe("^2.3.10");
+    expect(manifest.optionalDependencies["solid-js"]).toBe("^1.9.13");
   });
 
   test("stamps the release version before build without changing package identity", () => {
