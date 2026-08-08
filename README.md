@@ -7,9 +7,9 @@ local SQLite runtime owns the device projection and all Loro computation.
 ## Requirements
 
 - `convex` 1.43.0 or newer
-- Node.js 24 or newer for the Node runtime and package build tools. Prebuilt Node artifacts support
-  Apple Silicon macOS, Linux x64/ARM64, and Windows x64; Intel macOS requires an explicitly supplied
-  source-built artifact.
+- Node.js 20.19 or newer for the Node runtime and package build tools. Release CI uses Node 24.
+  Prebuilt Node artifacts support Apple Silicon macOS, Linux x64/ARM64, and Windows x64; Intel macOS
+  requires an explicitly supplied source-built artifact.
 - Cross-origin isolation for browser builds that use the threaded WASM runtime
 
 Install the package alongside Convex:
