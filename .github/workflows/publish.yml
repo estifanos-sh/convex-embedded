@@ -487,11 +487,6 @@ jobs:
           run-install: |
             args: ['--frozen-lockfile']
 
-      - name: Enable pnpm for package assembly
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.5.2 --activate
-
       - name: Resolve assembled source
         id: source
         env:
@@ -839,10 +834,9 @@ jobs:
           EXPECTED_TARBALL_SHA256: ${{ needs.release-tag.outputs.tarball_sha256 }}
           PUBLISH_MODE: ${{ needs.gate.outputs.mode }}
         run: |
-          # Publishing a prebuilt tarball preserves its payload, but npm does not derive the
-          # package-page README metadata from that input. Repack the exact extracted tree with
-          # npm itself, prove that it is byte-identical, then publish that directory so npm
-          # records the README as package metadata as well as shipping it in the archive.
+          # Assembly uses npm pack, so the repacked directory must match the exact qualified
+          # archive. Publish the directory rather than the tarball so npm records its root
+          # README as package-page metadata.
           rm -rf publish
           mkdir -p publish/repacked
           tar -xzf artifacts/convex-embedded.tgz -C publish
@@ -868,6 +862,22 @@ jobs:
             unset NODE_AUTH_TOKEN
           fi
           npm publish ./publish/package --ignore-scripts --access public --tag "${{ steps.release.outputs.dist_tag }}"
+
+      - name: Verify README
+        env:
+          PACKAGE_NAME: ${{ steps.release.outputs.package }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          for attempt in {1..10}; do
+            if node packages/embedded/scripts/publish.ts verify-published-readme "$PACKAGE_NAME@$VERSION"; then
+              exit 0
+            fi
+            if [[ "$attempt" -lt 10 ]]; then
+              sleep 3
+            fi
+          done
+          echo "::error::npm did not store the assembled package README."
+          exit 1
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3

@@ -265,7 +265,7 @@ export function packPackage(directory: string, destination: string, mode: Publis
   verifyPackageTree(directory, mode);
   mkdirSync(destination, { recursive: true });
   const before = new Set(readdirSync(destination));
-  execFileSync("pnpm", ["pack", "--pack-destination", destination], {
+  execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", destination], {
     cwd: directory,
     env: process.env,
     stdio: "inherit",
@@ -274,7 +274,7 @@ export function packPackage(directory: string, destination: string, mode: Publis
     (name) => name.endsWith(".tgz") && !before.has(name),
   );
   if (created.length !== 1) {
-    throw new Error(`Expected pnpm pack to create one tarball, found ${created.length}.`);
+    throw new Error(`Expected npm pack to create one tarball, found ${created.length}.`);
   }
   const packed = resolve(destination, created[0]!);
   const stable = resolve(destination, "convex-embedded.tgz");
@@ -320,6 +320,22 @@ export function verifyReadme(readme: string): void {
     if (!readme.includes(marker)) {
       throw new Error(`Embedded package README is missing required documentation: ${marker}.`);
     }
+  }
+}
+
+/** Confirm that npm stored exactly the README carried by the assembled package. */
+export function verifyPublishedReadme(directory: string, packageSpecifier: string): void {
+  const expected = readFileSync(resolve(directory, "README.md"), "utf8");
+  const response = execFileSync("npm", ["view", packageSpecifier, "readme", "--json"], {
+    encoding: "utf8",
+  });
+  const published: unknown = JSON.parse(response);
+  if (typeof published !== "string") {
+    throw new Error(`npm did not return a README for ${packageSpecifier}.`);
+  }
+  verifyReadme(published);
+  if (published !== expected) {
+    throw new Error(`npm README for ${packageSpecifier} does not match the assembled package.`);
   }
 }
 
@@ -481,6 +497,8 @@ function main(): void {
   } else if (command === "verify") verifyPackageTree(directory, mode(3));
   else if (command === "pack") packPackage(directory, resolve(argument(3, "destination")), mode(4));
   else if (command === "verify-tarball") verifyTarball(resolve(argument(3, "tarball")), mode(4));
+  else if (command === "verify-published-readme")
+    verifyPublishedReadme(directory, argument(3, "published package"));
   else if (command === "qualify-tarball") qualifyTarball(resolve(argument(3, "tarball")), mode(4));
   else throw new Error(`Unknown publish command: ${command}`);
 }
