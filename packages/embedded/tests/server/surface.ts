@@ -5,21 +5,16 @@ import {
   makeFunctionReference,
   type RegisteredQuery,
 } from "convex/server";
-import { type ValidatorJSON, v } from "convex/values";
+import { v } from "convex/values";
 import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { defineEmbedded } from "../../src/server";
-import { settlementValidator } from "../../src/component/model";
 import { restore as revisionRestore } from "../../src/component/rev";
 import { hashDocument, hashValue } from "../../src/hash";
 import { pull as componentPull } from "../../src/component/protocol";
 import { retire as componentRetire } from "../../src/component/remote/client";
 import { completeQueryRows } from "../../src/server/query";
-import {
-  EMBEDDED_PROTOCOL_LEGACY_VERSION,
-  EMBEDDED_PROTOCOL_MISMATCH,
-  EMBEDDED_PROTOCOL_VERSION,
-} from "../../src/protocol";
+import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
 import { seedEntropy } from "../../src/entropy";
 import {
   assertIntentField,
@@ -29,7 +24,6 @@ import {
 } from "../../src/crdt/intent";
 import { e } from "../../src/values";
 import { defineEmbeddedSchema, replicatedTable } from "../../src/schema";
-import { validateJson } from "../../src/runtime/validate";
 
 const schema = defineEmbeddedSchema({
   documents: replicatedTable({
@@ -85,7 +79,7 @@ describe("v5 server surface", () => {
     ).resolves.toEqual({ uploadUrl: "https://upload.example/once" });
   });
 
-  test("selects wire 26 for the legacy identity shape and wire 27 for an explicit offer", async () => {
+  test("selects the current wire for an explicit identity offer", async () => {
     const embedded = defineEmbedded({ component, schema });
     const handler = (
       embedded.pull as unknown as {
@@ -102,15 +96,11 @@ describe("v5 server surface", () => {
       },
     };
 
-    await expect(handler(ctx, { request: { kind: "identity" } })).resolves.toMatchObject({
-      identity: null,
-      protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION,
-    });
     await expect(
       handler(ctx, {
         request: {
           kind: "identity",
-          protocolVersions: [EMBEDDED_PROTOCOL_LEGACY_VERSION, EMBEDDED_PROTOCOL_VERSION],
+          protocolVersions: [EMBEDDED_PROTOCOL_VERSION],
         },
       }),
     ).resolves.toMatchObject({
@@ -147,7 +137,7 @@ describe("v5 server surface", () => {
     expect(reads).toBe(0);
   });
 
-  test("admits Preview 2 runtime requests at the component boundary", async () => {
+  test("admits the current runtime request at the component boundary", async () => {
     const result = await (
       componentPull as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
     )._handler(
@@ -161,7 +151,7 @@ describe("v5 server surface", () => {
       {
         runtime: {
           moduleGraphHash: "modules",
-          protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION,
+          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
           schemaHash: "schema",
         },
         rows: [],
@@ -1678,70 +1668,7 @@ describe("v5 server surface", () => {
     });
   });
 
-  test("keeps component opaque failures and server wire validators protocol-specific", () => {
-    const embedded = defineEmbedded({ component, schema });
-    const returns = JSON.parse(
-      (
-        embedded.push as unknown as {
-          exportReturns: () => string;
-        }
-      ).exportReturns(),
-    ) as ValidatorJSON;
-    const wire = (returns as Extract<ValidatorJSON, { type: "union" }>).value[0] as Extract<
-      ValidatorJSON,
-      { type: "union" }
-    >;
-    const [strict, legacy] = wire.value;
-    const opaqueLegacyFailure = {
-      mutationId: "mutation-1",
-      inserts: [],
-      schedules: [],
-      uploads: [],
-      revisions: [],
-      crdt: [
-        {
-          table: "documents",
-          rowId: "documents|local",
-          field: "body",
-          kind: "text",
-          headSeq: 4,
-          projectionHash: "projection-4",
-        },
-      ],
-      authoritative: [
-        {
-          op: "put",
-          table: "documents",
-          rowId: "documents|local",
-          fields: { title: "authoritative" },
-          plainHash: "plain-4",
-        },
-      ],
-      outcome: "rejected" as const,
-      error: { legacy: "opaque" },
-    };
-
-    expect(() =>
-      validateJson(
-        opaqueLegacyFailure,
-        (settlementValidator as unknown as { json: ValidatorJSON }).json,
-        "settlement",
-      ),
-    ).not.toThrow();
-    expect(() => validateJson(opaqueLegacyFailure, strict!, "settlement")).toThrow(
-      "settlement does not match any union member",
-    );
-    expect(() => validateJson(opaqueLegacyFailure, legacy!, "settlement")).not.toThrow();
-    expect(() =>
-      validateJson(
-        { ...opaqueLegacyFailure, error: { code: "EMBEDDED_REJECTED" } },
-        strict!,
-        "settlement",
-      ),
-    ).not.toThrow();
-  });
-
-  test("normalizes cached v26 failure payloads before returning a v27 push settlement", async () => {
+  test("normalizes cached failure payloads before returning a public push settlement", async () => {
     const replayWrite = {
       [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
     };
@@ -1796,7 +1723,7 @@ describe("v5 server surface", () => {
     }
   });
 
-  test("encodes a canonical failure as the opaque v26 settlement shape", async () => {
+  test("encodes canonical failures with the public settlement shape", async () => {
     const replayWrite = {
       [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
     };
@@ -1815,7 +1742,7 @@ describe("v5 server surface", () => {
       crdt: [],
       authoritative: [],
       outcome: "rejected" as const,
-      error: { code: "EMBEDDED_DIVERGENCE", reason: "legacy detail must not cross the bridge" },
+      error: { code: "EMBEDDED_DIVERGENCE", reason: "detail must not cross the boundary" },
     };
     const response = await invokePush(
       embedded,
@@ -1829,10 +1756,14 @@ describe("v5 server surface", () => {
       },
       {
         ...mutationPushRequest("documents:write", {}),
-        runtime: { ...pushRuntime, protocolVersion: EMBEDDED_PROTOCOL_LEGACY_VERSION },
+        runtime: { ...pushRuntime, protocolVersion: EMBEDDED_PROTOCOL_VERSION },
       },
     );
-    expect(response).toMatchObject({ mutationId: "mutation-1", outcome: "rejected", error: null });
+    expect(response).toMatchObject({
+      mutationId: "mutation-1",
+      outcome: "rejected",
+      error: { code: "EMBEDDED_DIVERGENCE" },
+    });
   });
 
   test("gates a pull by manifest placement, rejecting a non-replicated target before invoking it", async () => {

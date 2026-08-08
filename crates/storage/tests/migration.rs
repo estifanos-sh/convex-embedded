@@ -228,7 +228,7 @@ fn remote_authoritative_view_survives_candidate_cutover_without_network() {
         function: "issues:list".to_owned(),
         args: "{}".to_owned(),
         schema_hash: active.hash.clone(),
-        module_hash: "module:preview2".to_owned(),
+        module_hash: "module:baseline".to_owned(),
         skeleton: br#"{"items":[null]}"#.to_vec(),
         paths: serde_json::to_vec(&serde_json::json!([{
             "path": "/items/0",
@@ -344,112 +344,6 @@ fn epoch49_contract_separates_setup_plan_and_publishes_it_with_candidate_cutover
         .unwrap()
         .setup_hash
         .is_none());
-}
-
-fn make_exact_v2_bridge_source(store: &EmbeddedStore) {
-    let mut contract = store.active_contract_debug_read().unwrap();
-    contract.format = 2;
-    contract.package_epoch = 48;
-    contract.kernel_layout_hash = store.baseline_kernel_layout_hash_debug_read();
-    store.leader_fence_debug_delete().unwrap();
-    store.active_contract_debug_write(&contract, 48).unwrap();
-}
-
-#[test]
-fn exact_v2_to_v3_kernel_bridge_seeds_fence_and_skips_unchanged_setup() {
-    let path = tmp_path("migration_v2_v3_leader_fence.db");
-    let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
-    let mut active = schema('0');
-    active.setup_hash = "setup:unchanged".to_owned();
-    store.setup(&active).unwrap();
-    make_exact_v2_bridge_source(&store);
-
-    let candidate = store.migration_begin(&active).unwrap();
-    assert!(candidate.required);
-    assert!(candidate.setup_complete);
-    complete_queue_policy(
-        &store,
-        candidate.candidate_generation,
-        r#"{"collectComplete":true,"thresholds":[]}"#,
-    );
-    // An engine-only bridge has no app setup turn. It still uses the normal candidate/cutover
-    // path so the new semantic key, contract, and SQLite epoch publish atomically.
-    store
-        .migration_commit(&active, candidate.candidate_generation)
-        .unwrap();
-
-    let contract = store.active_contract_debug_read().unwrap();
-    assert_eq!(contract.format, 3);
-    assert_eq!(contract.package_epoch, 49);
-    assert_eq!(store.store_epoch_debug_read().unwrap(), 49);
-    assert_eq!(
-        store.leader_fence_debug_read().unwrap().as_deref(),
-        Some(b"0".as_slice())
-    );
-    assert_eq!(store.leader_fence_write().unwrap(), "1");
-    drop(store);
-
-    let reopened = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
-    reopened.setup(&active).unwrap();
-    assert_eq!(reopened.leader_fence_write().unwrap(), "2");
-}
-
-#[test]
-fn baseline_kernel_bridge_composes_with_app_schema_and_setup_migration() {
-    let path = tmp_path("migration_v2_v3_app_change.db");
-    let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
-    let mut active = schema('0');
-    active.setup_hash = "setup:one".to_owned();
-    store.setup(&active).unwrap();
-    make_exact_v2_bridge_source(&store);
-
-    let mut target = schema('1');
-    target.setup_hash = "setup:two".to_owned();
-    target.tables.push(TableDef {
-        name: "notes".to_owned(),
-        placement: TablePlacement::Replicated,
-        columns: vec![],
-        crdt_fields: vec![],
-        local_fields: vec![],
-        indexes: vec![],
-    });
-    let candidate = store.migration_begin(&target).unwrap();
-    assert!(candidate.required);
-    assert!(!candidate.setup_complete);
-    assert_eq!(candidate.source_schema.hash, active.hash);
-    assert_eq!(candidate.source_schema.setup_hash, active.setup_hash);
-
-    store
-        .migration_bind(&target, candidate.candidate_generation)
-        .unwrap();
-    store
-        .migration_setup_complete(candidate.candidate_generation)
-        .unwrap();
-    store.migration_unbind().unwrap();
-    commit_candidate(&store, &target, candidate.candidate_generation).unwrap();
-
-    let contract = store.active_contract_debug_read().unwrap();
-    assert_eq!(contract.format, 3);
-    assert_eq!(contract.package_epoch, 49);
-    assert_eq!(store.active_setup_hash_debug_read().unwrap(), "setup:two");
-    assert_eq!(store.leader_fence_write().unwrap(), "1");
-    store.setup(&target).unwrap();
-}
-
-#[test]
-fn baseline_kernel_bridge_rejects_unknown_contract_before_candidate_writes() {
-    let path = tmp_path("migration_v2_v3_unknown_contract.db");
-    let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
-    let active = schema('0');
-    store.setup(&active).unwrap();
-    make_exact_v2_bridge_source(&store);
-    let mut unknown = store.active_contract_debug_read().unwrap();
-    unknown.kernel_layout_hash = "unknown-v2-kernel".to_owned();
-    store.active_contract_debug_write(&unknown, 48).unwrap();
-
-    assert!(store.migration_begin(&active).is_err());
-    assert_eq!(store.active_contract_debug_read().unwrap(), unknown);
-    assert_eq!(store.leader_fence_debug_read().unwrap(), None);
 }
 
 #[test]
@@ -1632,7 +1526,7 @@ fn quarantine_retains_the_candidate_record_without_materializing_it() {
 
 #[test]
 fn pre_baseline_store_is_preserved_and_rejected_without_repair() {
-    let path = tmp_path("migration_preview1_cutoff.db");
+    let path = tmp_path("migration_baseline_cutoff.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     let source = schema('0');
     store.setup(&source).unwrap();
@@ -1655,7 +1549,7 @@ fn pre_baseline_store_is_preserved_and_rejected_without_repair() {
         error,
         storage::StorageError::PreBaselineStore {
             found: 46,
-            minimum: 47
+            minimum: 49
         }
     ));
     assert_eq!(store.origin_page_read(1, None, 100).unwrap(), before);
@@ -1668,7 +1562,7 @@ fn pre_baseline_store_is_preserved_and_rejected_without_repair() {
         EmbeddedStore::open(path.to_str().unwrap()).err().unwrap(),
         storage::StorageError::PreBaselineStore {
             found: 46,
-            minimum: 47
+            minimum: 49
         }
     ));
 }

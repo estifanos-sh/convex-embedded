@@ -12,8 +12,8 @@ import {
   packPackage,
   packageName,
   packageRepository,
-  preview2Tag,
-  preview2Version,
+  baselineTag,
+  baselineVersion,
   requiredPackageFiles,
   verifyManifest,
   verifyPackageTree,
@@ -53,11 +53,11 @@ afterEach(() => {
 });
 
 describe("Embedded package publication", () => {
-  test("keeps the historical Preview2 name and rejects fixture-directory debris", () => {
-    expect(preview2Tag).toBe("robelest-v0.0.1-preview-2");
-    expect(preview2Version).toBe("0.0.1-preview-2");
+  test("keeps the public baseline name and rejects fixture-directory debris", () => {
+    expect(baselineTag).toBe("v0.0.1-preview.0");
+    expect(baselineVersion).toBe("0.0.1-preview.0");
 
-    const directory = mkdtempSync(join(tmpdir(), "convex-embedded-preview2-"));
+    const directory = mkdtempSync(join(tmpdir(), "convex-embedded-baseline-"));
     temporary.push(directory);
     writeFileSync(join(directory, "manifest.json"), "{}");
     writeFileSync(join(directory, "store.sqlite3"), "fixture");
@@ -132,9 +132,6 @@ describe("Embedded package publication", () => {
         "# Convex Embedded\n\n`@estifanos-sh/convex-embedded`\n\npnpm add @estifanos-sh/convex-embedded convex",
       ),
     ).toThrow("Quick start");
-    expect(() => verifyReadme(`${readmeFixture}\n@robelest/convex-embedded`)).toThrow(
-      "retired package",
-    );
   });
 
   test("requires every runtime artifact in the packed payload", () => {

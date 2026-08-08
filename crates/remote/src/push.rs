@@ -965,7 +965,7 @@ pub fn decode_push_response(value: &Value) -> RemoteResult<PushResponse> {
 
 /// Decode the closed replay failure shape.
 ///
-/// The v27 server boundary removes historic payloads before this point. Reject every field except
+/// The server boundary removes untrusted payloads before this point. Reject every field except
 /// `code`, so arbitrary application text cannot enter the native/public transport at all.
 fn decode_push_failure(outcome: PushOutcome, value: &Value) -> RemoteResult<PushVerdict> {
     let Value::Object(fields) = value else {

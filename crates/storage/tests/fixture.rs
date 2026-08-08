@@ -16,7 +16,7 @@ use storage::{
 const PERMANENT_KINDS: [i64; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17];
 
 fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/preview2")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/baseline")
 }
 
 fn fixture_schema() -> StoreSchema {
@@ -275,28 +275,28 @@ fn fixture_inventory(store: &EmbeddedStore) -> serde_json::Value {
 }
 
 #[test]
-fn preview2_fixture_matches_checksum_and_semantic_oracle() {
+fn baseline_fixture_matches_checksum_and_semantic_oracle() {
     let manifest_path = fixture_dir().join("manifest.json");
     assert!(
         fixture_path().is_file(),
-        "Preview2 fixture is required before publish/tag"
+        "the public baseline fixture is required before publish/tag"
     );
     assert!(
         manifest_path.is_file(),
-        "Preview2 fixture manifest is required before publish/tag"
+        "the public baseline fixture manifest is required before publish/tag"
     );
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
     let bytes = std::fs::read(fixture_path()).unwrap();
     assert_eq!(format!("{:x}", Sha256::digest(&bytes)), manifest["sha256"]);
-    assert_eq!(manifest["epoch"], 47);
+    assert_eq!(manifest["epoch"], 49);
     assert_eq!(manifest["bootstrapVersion"], 1);
     assert_eq!(
         manifest["permanentOriginKinds"],
         serde_json::json!(PERMANENT_KINDS)
     );
 
-    let opened_path = tmp_path("preview2_fixture_gate.sqlite3");
+    let opened_path = tmp_path("baseline_fixture_gate.sqlite3");
     std::fs::copy(fixture_path(), &opened_path).unwrap();
     let store =
         EmbeddedStore::open_with_identity_key(opened_path.to_str().unwrap(), "unauthenticated")
@@ -319,9 +319,8 @@ fn preview2_fixture_matches_checksum_and_semantic_oracle() {
             .migration_commit(&target, candidate.candidate_generation)
             .unwrap();
     }
-    // Preview 2's V1 contract is readable only long enough to publish the current V3 contract
-    // through the candidate pointer transaction. The setup identity remains separate and the
-    // coordinator fence is initialized with the same publication.
+    // The public baseline is migrated through the usual candidate pointer transaction. App
+    // migrations compose with it without any knowledge of older package releases.
     let contract = store.active_contract_debug_read().unwrap();
     assert_eq!(contract.format, 3);
     assert_eq!(contract.package_epoch, 49);
@@ -369,57 +368,12 @@ fn preview2_fixture_matches_checksum_and_semantic_oracle() {
     assert_eq!(portable_snapshot(&store), manifest["portableOracle"]);
 }
 
-#[test]
-fn preview2_reader_rejects_an_unrecognized_v1_layout_before_candidate_writes() {
-    let opened_path = tmp_path("preview2_fixture_unknown_layout.sqlite3");
-    std::fs::copy(fixture_path(), &opened_path).unwrap();
-    let store =
-        EmbeddedStore::open_with_identity_key(opened_path.to_str().unwrap(), "unauthenticated")
-            .unwrap();
-    store
-        .contract_kernel_hash_debug_write("unrecognized-preview2-kernel")
-        .unwrap();
-
-    let error = store.migration_begin(&fixture_target_schema()).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("supported SQLite/bootstrap/schema contract"));
-    assert_eq!(store.store_epoch_debug_read().unwrap(), 47);
-    assert_eq!(store.active_contract_debug_read().unwrap().format, 1);
-}
-
-#[test]
-fn preview2_reader_rejects_an_unexpected_fence_before_candidate_writes() {
-    let opened_path = tmp_path("preview2_fixture_unexpected_fence.sqlite3");
-    std::fs::copy(fixture_path(), &opened_path).unwrap();
-    let store =
-        EmbeddedStore::open_with_identity_key(opened_path.to_str().unwrap(), "unauthenticated")
-            .unwrap();
-    let before = store.active_contract_debug_read().unwrap();
-    store.leader_fence_debug_write(b"0").unwrap();
-
-    let error = store.migration_begin(&fixture_target_schema()).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("unexpectedly contains a leader fence"));
-    assert_eq!(store.store_epoch_debug_read().unwrap(), 47);
-    assert_eq!(store.active_contract_debug_read().unwrap(), before);
-    assert_eq!(
-        store.bootstrap_debug_read("candidate_generation").unwrap(),
-        None
-    );
-    assert_eq!(
-        store.leader_fence_debug_read().unwrap().as_deref(),
-        Some(b"0".as_slice())
-    );
-}
-
 /// Capture is deliberately ignored: the checked-in database is a release artifact from this exact
 /// writer, not a fixture regenerated (or force-stamped) during ordinary CI.
 #[test]
-#[ignore = "run exactly once from the release candidate when Preview2 runtime changes settle"]
+#[ignore = "run exactly once from the published baseline writer"]
 #[allow(clippy::too_many_lines)]
-fn capture_preview2_fixture_from_exact_writer() {
+fn capture_baseline_fixture_from_exact_writer() {
     std::fs::create_dir_all(fixture_dir()).unwrap();
     let path = fixture_path();
     for suffix in ["", "-wal", "-shm", ".owner"] {
@@ -639,7 +593,7 @@ fn capture_preview2_fixture_from_exact_writer() {
         function: "issues:list".to_owned(),
         args: "{}".to_owned(),
         schema_hash: schema.hash,
-        module_hash: "module:preview2".to_owned(),
+        module_hash: "module:baseline".to_owned(),
         skeleton: br#"{"items":[null]}"#.to_vec(),
         paths: serde_json::to_vec(&serde_json::json!([{
             "path":"/items/0","table":"issues","rowId":server_id
@@ -696,7 +650,7 @@ fn capture_preview2_fixture_from_exact_writer() {
         }
     }
     let bytes = std::fs::read(&path).unwrap();
-    println!("preview2 sha256={:x}", Sha256::digest(bytes));
+    println!("baseline sha256={:x}", Sha256::digest(bytes));
     let reopened =
         EmbeddedStore::open_with_identity_key(fixture_path().to_str().unwrap(), "unauthenticated")
             .unwrap();
@@ -707,13 +661,13 @@ fn capture_preview2_fixture_from_exact_writer() {
         Sha256::digest(serde_json::to_vec(&snapshot).unwrap())
     );
     let manifest = serde_json::json!({
-        "name": "preview2",
-        "releaseIdentity": "robelest-v0.0.1-preview-2",
-        "releasePackage": "@robelest/convex-embedded",
-        "releaseVersion": "0.0.1-preview-2",
-        "fixtureContractVersion": 1,
-        "writer": "storage epoch 47 release candidate",
-        "epoch": 47,
+        "name": "baseline",
+        "releaseIdentity": "v0.0.1-preview.0",
+        "releasePackage": "@estifanos-sh/convex-embedded",
+        "releaseVersion": "0.0.1-preview.0",
+        "fixtureContractVersion": 3,
+        "writer": "public Preview 0 release contract",
+        "epoch": 49,
         "bootstrapVersion": 1,
         "sha256": format!("{:x}", Sha256::digest(std::fs::read(fixture_path()).unwrap())),
         "permanentOriginKinds": PERMANENT_KINDS,

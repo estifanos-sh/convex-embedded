@@ -17,6 +17,7 @@ import type { WasmSource } from "../../src/browser/artifact";
 import { initRuntime } from "../../src/browser/runtime";
 import { StoreRecovery, type RecoveryHost } from "../../src/browser/recovery";
 import { getTimerTime } from "../../src/time";
+import { workerRun } from "./harness/worker";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
 import wasmUrl from "../../dist/wasm/index.wasm?url";
@@ -56,14 +57,7 @@ interface RecoverResult {
 }
 
 self.onmessage = (event: MessageEvent<RecoverRequest>) => {
-  void recover(event.data)
-    .then((result) => self.postMessage({ ok: true, result }))
-    .catch((error: unknown) =>
-      self.postMessage({
-        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-        ok: false,
-      }),
-    );
+  workerRun(() => recover(event.data));
 };
 
 async function loadModules(): Promise<{

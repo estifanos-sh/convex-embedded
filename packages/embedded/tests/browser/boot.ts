@@ -22,9 +22,10 @@ import { initRuntime, openStoreInstance, type WorkerState } from "../../src/brow
 import type { StoreSchema } from "../../src/storage/types";
 import { getTimerTime } from "../../src/time";
 import { fixtureTargetSchema, portableOracle, portableOracleJson } from "../fixture/oracle";
+import { workerRun } from "./harness/worker";
 
-import fixtureManifest from "../../../../crates/storage/tests/fixtures/preview2/manifest.json";
-import fixtureUrl from "../../../../crates/storage/tests/fixtures/preview2/store.sqlite3?url";
+import fixtureManifest from "../../../../crates/storage/tests/fixtures/baseline/manifest.json";
+import fixtureUrl from "../../../../crates/storage/tests/fixtures/baseline/store.sqlite3?url";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
 import wasmUrl from "../../dist/wasm/index.wasm?url";
@@ -179,14 +180,7 @@ self.onmessage = (
                         : request.op === "woundStage"
                           ? woundStage(request)
                           : wound(request);
-  void handler
-    .then((result) => self.postMessage({ ok: true, result }))
-    .catch((error: unknown) =>
-      self.postMessage({
-        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-        ok: false,
-      }),
-    );
+  workerRun(() => handler);
 };
 
 async function fixture(request: FixtureRequest): Promise<{
@@ -212,7 +206,7 @@ async function fixtureInstall(
   const path =
     typeof requestOrPath === "string" ? requestOrPath : storagePath(requestOrPath.storageId);
   const response = await fetch(fixtureUrl);
-  if (!response.ok) throw new Error(`failed to load Preview2 fixture: ${response.status}`);
+  if (!response.ok) throw new Error(`failed to load baseline fixture: ${response.status}`);
   const bytes = new Uint8Array(await response.arrayBuffer());
   const opfs = new OpfsDirectory();
   try {

@@ -17,10 +17,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const packageName = "@estifanos-sh/convex-embedded";
 export const packageRepository = "https://github.com/estifanos-sh/convex-embedded";
-export const preview2Version = "0.0.1-preview-2";
-export const preview2Tag = `robelest-v${preview2Version}`;
-const preview2PackageName = "@robelest/convex-embedded";
-const preview2FixtureSha256 = "bd7e42b1af9227c31576c6fdcb08e87cf8a9136b4065e73184e1daf9003be980";
+export const baselineVersion = "0.0.1-preview.0";
+export const baselineTag = `v${baselineVersion}`;
+const baselinePackageName = packageName;
+const baselineFixtureSha256 = "70ad1b676dc86e701f8fd9f0bc3499206c6f630c48097c4bfb085439add62b41";
+const baselineFixtureEpoch = 49;
+const baselineFixtureBootstrapVersion = 1;
+const baselineFixtureContractVersion = 3;
+const baselineOriginKinds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17];
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryDir = resolve(packageDir, "../..");
@@ -41,7 +45,6 @@ const readmeContract = [
   "## Release and compatibility policy",
   "await client.open()",
 ] as const;
-const retiredPackageIdentities = ["@convex-dev/embedded", "@robelest/convex-embedded"] as const;
 
 interface PackageJson {
   author?: string;
@@ -56,6 +59,23 @@ interface PackageJson {
   scripts?: Record<string, string>;
   version?: string;
   [key: string]: unknown;
+}
+
+interface BaselineFixtureManifest {
+  releaseIdentity?: string;
+  releasePackage?: string;
+  releaseVersion?: string;
+  fixtureContractVersion?: number;
+  epoch?: number;
+  bootstrapVersion?: number;
+  sha256?: string;
+  permanentOriginKinds?: number[];
+  semanticDigest?: string;
+  semanticSnapshot?: unknown;
+  portableOracle?: unknown;
+  originInventory?: unknown[];
+  referencedPayloadCount?: number;
+  contract?: Record<string, unknown>;
 }
 
 export type PublishMode = "verify" | "preview" | "prerelease" | "release";
@@ -87,80 +107,82 @@ export function verifyFixtureFiles(directory: string): void {
   const actual = readdirSync(directory).sort();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(
-      `Preview2 fixture directory must contain only ${expected.join(", ")}; found ${actual.join(", ") || "nothing"}.`,
+      `baseline fixture directory must contain only ${expected.join(", ")}; found ${actual.join(", ") || "nothing"}.`,
     );
   }
   for (const name of expected) {
     const path = resolve(directory, name);
     if (!statSync(path).isFile())
-      throw new Error(`Preview2 fixture artifact is not a file: ${name}.`);
+      throw new Error(`baseline fixture artifact is not a file: ${name}.`);
   }
 }
 
-/** Require the exact historical Preview2 writer artifact before release qualification. */
-export function verifyPreview2Fixture(): void {
-  const directory = resolve(repositoryDir, "crates/storage/tests/fixtures/preview2");
-  if (!existsSync(directory) || !statSync(directory).isDirectory()) {
-    throw new Error("Preview2 SQLite fixture and semantic manifest are required for publication.");
-  }
-  verifyFixtureFiles(directory);
-  const fixture = resolve(directory, "store.sqlite3");
-  const manifestPath = resolve(directory, "manifest.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-    releaseIdentity?: string;
-    releasePackage?: string;
-    releaseVersion?: string;
-    fixtureContractVersion?: number;
-    epoch?: number;
-    bootstrapVersion?: number;
-    sha256?: string;
-    permanentOriginKinds?: number[];
-    semanticDigest?: string;
-    semanticSnapshot?: unknown;
-    portableOracle?: unknown;
-    originInventory?: unknown[];
-    referencedPayloadCount?: number;
-    contract?: Record<string, unknown>;
-  };
-  const checksum = createHash("sha256").update(readFileSync(fixture)).digest("hex");
+function readBaselineFixtureManifest(path: string): BaselineFixtureManifest {
+  return JSON.parse(readFileSync(path, "utf8")) as BaselineFixtureManifest;
+}
+
+function verifyBaselineFixtureChecksum(path: string, manifest: BaselineFixtureManifest): void {
+  const checksum = createHash("sha256").update(readFileSync(path)).digest("hex");
   if (manifest.sha256 !== checksum) {
     throw new Error(
-      `Preview2 fixture checksum mismatch: expected ${manifest.sha256}, got ${checksum}.`,
+      `baseline fixture checksum mismatch: expected ${manifest.sha256}, got ${checksum}.`,
     );
   }
-  if (checksum !== preview2FixtureSha256) {
+  if (checksum !== baselineFixtureSha256) {
     throw new Error(
-      `Preview2 fixture changed from its recorded historical checksum ${preview2FixtureSha256}.`,
+      `baseline fixture changed from its recorded checksum ${baselineFixtureSha256}.`,
     );
   }
-  if (manifest.epoch !== 47 || manifest.bootstrapVersion !== 1) {
-    throw new Error("Preview2 fixture semantic version oracle is invalid.");
-  }
+}
+
+function hasBaselineFixtureContract(manifest: BaselineFixtureManifest): boolean {
+  return [
+    manifest.releaseIdentity === baselineTag &&
+      manifest.releasePackage === baselinePackageName &&
+      manifest.releaseVersion === baselineVersion &&
+      manifest.fixtureContractVersion === baselineFixtureContractVersion,
+    Boolean(manifest.contract?.kernelLayoutHash),
+    Boolean(manifest.contract?.generationLayoutHash),
+    Boolean(manifest.contract?.originWriterHash),
+    Array.isArray(manifest.originInventory),
+    manifest.portableOracle !== undefined,
+    typeof manifest.referencedPayloadCount === "number",
+  ].every(Boolean);
+}
+
+function verifyBaselineFixtureSemantics(manifest: BaselineFixtureManifest): void {
   if (
-    manifest.releaseIdentity !== preview2Tag ||
-    manifest.releasePackage !== preview2PackageName ||
-    manifest.releaseVersion !== preview2Version ||
-    manifest.fixtureContractVersion !== 1 ||
-    !manifest.contract?.kernelLayoutHash ||
-    !manifest.contract?.generationLayoutHash ||
-    !manifest.contract?.originWriterHash ||
-    !manifest.contract?.originReaderHash ||
-    !Array.isArray(manifest.originInventory) ||
-    manifest.portableOracle === undefined ||
-    typeof manifest.referencedPayloadCount !== "number"
+    manifest.epoch !== baselineFixtureEpoch ||
+    manifest.bootstrapVersion !== baselineFixtureBootstrapVersion
   ) {
-    throw new Error("Preview2 fixture release identity or semantic contract is incomplete.");
+    throw new Error("baseline fixture semantic version oracle is invalid.");
+  }
+  if (!hasBaselineFixtureContract(manifest)) {
+    throw new Error("baseline fixture release identity or semantic contract is incomplete.");
   }
   const semanticDigest = createHash("sha256")
     .update(JSON.stringify(manifest.semanticSnapshot))
     .digest("hex");
   if (semanticDigest !== manifest.semanticDigest) {
-    throw new Error("Preview2 fixture semantic snapshot digest does not match its manifest.");
+    throw new Error("baseline fixture semantic snapshot digest does not match its manifest.");
   }
-  const expectedKinds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17];
-  if (JSON.stringify(manifest.permanentOriginKinds) !== JSON.stringify(expectedKinds)) {
-    throw new Error("Preview2 fixture does not enumerate every permanent originated record kind.");
+  if (JSON.stringify(manifest.permanentOriginKinds) !== JSON.stringify(baselineOriginKinds)) {
+    throw new Error("baseline fixture does not enumerate every permanent originated record kind.");
   }
+}
+
+/** Require the exact public baseline writer artifact before release qualification. */
+export function verifyBaselineFixture(): void {
+  const directory = resolve(repositoryDir, "crates/storage/tests/fixtures/baseline");
+  if (!existsSync(directory) || !statSync(directory).isDirectory()) {
+    throw new Error("baseline SQLite fixture and semantic manifest are required for publication.");
+  }
+  verifyFixtureFiles(directory);
+  const fixture = resolve(directory, "store.sqlite3");
+  const manifestPath = resolve(directory, "manifest.json");
+  const manifest = readBaselineFixtureManifest(manifestPath);
+  verifyBaselineFixtureChecksum(fixture, manifest);
+  verifyBaselineFixtureSemantics(manifest);
 }
 
 /** Prepare the assembled package copy without changing its public identity. */
@@ -288,7 +310,7 @@ export function verifyTarball(path: string, mode: PublishMode): void {
  * npm renders this file as the package's primary documentation, so its release contract is part
  * of the payload rather than a best-effort repository extra. Keep the markers semantic instead
  * of freezing prose: documentation can improve without changing this verifier, but a skeletal
- * README or the old package identity cannot ship accidentally.
+ * README cannot ship accidentally.
  */
 export function verifyReadme(readme: string): void {
   if (readme.trim().length === 0) {
@@ -297,11 +319,6 @@ export function verifyReadme(readme: string): void {
   for (const marker of readmeContract) {
     if (!readme.includes(marker)) {
       throw new Error(`Embedded package README is missing required documentation: ${marker}.`);
-    }
-  }
-  for (const identity of retiredPackageIdentities) {
-    if (readme.includes(identity)) {
-      throw new Error(`Embedded package README must not refer to retired package ${identity}.`);
     }
   }
 }
@@ -460,7 +477,7 @@ function main(): void {
     const version = process.env.CONVEX_EMBEDDED_PUBLISH_VERSION?.trim() || undefined;
     prepareBuildVersion(directory, version);
   } else if (command === "fixture") {
-    verifyPreview2Fixture();
+    verifyBaselineFixture();
   } else if (command === "verify") verifyPackageTree(directory, mode(3));
   else if (command === "pack") packPackage(directory, resolve(argument(3, "destination")), mode(4));
   else if (command === "verify-tarball") verifyTarball(resolve(argument(3, "tarball")), mode(4));

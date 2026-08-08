@@ -293,37 +293,13 @@ fn parse_identity_response(
     })
 }
 
-fn identity_args(protocol_versions: Option<&[i64]>) -> ConvexArgs {
+fn identity_args() -> ConvexArgs {
     let mut request = BTreeMap::from([("kind".to_owned(), Value::String("identity".to_owned()))]);
-    if let Some(protocol_versions) = protocol_versions {
-        request.insert(
-            "protocolVersions".to_owned(),
-            Value::Array(
-                protocol_versions
-                    .iter()
-                    .copied()
-                    .map(Value::Int64)
-                    .collect(),
-            ),
-        );
-    }
+    request.insert(
+        "protocolVersions".to_owned(),
+        Value::Array(vec![Value::Int64(EMBEDDED_PROTOCOL_VERSION)]),
+    );
     ConvexArgs::from([("request".to_owned(), Value::Object(request))])
-}
-
-/// Preview 2's frozen identity validator rejects the otherwise additive
-/// `protocolVersions` field. Only that precise validation failure permits the
-/// one legacy-shaped retry; transport, authentication, and application errors
-/// must remain visible to the caller.
-fn rejects_identity_protocol_offer(result: &FunctionResult) -> bool {
-    let message = match result {
-        FunctionResult::ErrorMessage(message) => message,
-        FunctionResult::ConvexError(error) => &error.message,
-        FunctionResult::Value(_) => return false,
-    };
-    message.contains("protocolVersions")
-        && (message.contains("ArgumentValidationError")
-            || message.contains("extra field")
-            || message.contains("unexpected field"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -731,26 +707,14 @@ where
 
     pub async fn identity(&mut self) -> RemoteResult<String> {
         self.refresh_auth().await?;
-        let result = self
-            .query(
-                protocol::pull_function()?,
-                identity_args(Some(&[EMBEDDED_PROTOCOL_VERSION, 26])),
-            )
-            .await?;
-        let (value, expected_protocol) = match result {
-            FunctionResult::Value(value) => (value, EMBEDDED_PROTOCOL_VERSION),
-            result if rejects_identity_protocol_offer(&result) => {
-                let legacy = self
-                    .query(protocol::pull_function()?, identity_args(None))
-                    .await?;
-                let FunctionResult::Value(value) = legacy else {
-                    return Err(function_result_error(protocol::EMBEDDED_PULL, &legacy));
-                };
-                (value, 26)
-            }
-            result => return Err(function_result_error(protocol::EMBEDDED_PULL, &result)),
+        let result = self.query(protocol::pull_function()?, identity_args()).await?;
+        let FunctionResult::Value(value) = result else {
+            return Err(function_result_error(protocol::EMBEDDED_PULL, &result));
         };
-        let accepted = parse_identity_response(&serde_json::Value::from(value), expected_protocol)?;
+        let accepted = parse_identity_response(
+            &serde_json::Value::from(value),
+            EMBEDDED_PROTOCOL_VERSION,
+        )?;
         self.store
             .identity_write(&accepted.identity_key, accepted.identity_json.as_deref())?;
         Ok(accepted.json)
@@ -4111,7 +4075,7 @@ mod tests {
 
     use super::{
         function_result_error, parse_identity_response, pull_change_has_changed,
-        rejected_target_should_retain, rejected_write_targets, rejects_identity_protocol_offer,
+        rejected_target_should_retain, rejected_write_targets,
         ActiveRemoteWrite, AuthoritativeLocalAddress, InflightRemotePush, InflightRemotePushKind,
         PendingCheckpoint, PendingRemoteWrite, PullSubscription, RemoteCommand, RemoteDriver,
         RemoteScope, RemoteSubscription, RemoteWrite,
@@ -4168,34 +4132,6 @@ mod tests {
                 Err(RemoteError::DeploymentMismatch(_))
             ));
         }
-    }
-
-    #[test]
-    fn identity_offer_retries_only_the_preview_two_validation_shape() {
-        assert!(rejects_identity_protocol_offer(
-            &FunctionResult::ErrorMessage(
-                "ArgumentValidationError: Object contains extra field `protocolVersions`"
-                    .to_owned(),
-            )
-        ));
-        assert!(!rejects_identity_protocol_offer(
-            &FunctionResult::ErrorMessage("authentication failed".to_owned(),)
-        ));
-        assert!(!rejects_identity_protocol_offer(
-            &FunctionResult::ErrorMessage(
-                "ArgumentValidationError: request was invalid".to_owned(),
-            )
-        ));
-
-        let legacy = parse_identity_response(
-            &serde_json::json!({ "identity": null, "protocolVersion": 26 }),
-            26,
-        )
-        .unwrap();
-        assert_eq!(
-            legacy.identity_key,
-            crate::config::EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY
-        );
     }
 
     #[test]
