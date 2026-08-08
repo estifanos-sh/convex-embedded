@@ -836,7 +836,30 @@ jobs:
         env:
           NPM_CONFIG_PROVENANCE: "true"
           NPM_BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+          EXPECTED_TARBALL_SHA256: ${{ needs.release-tag.outputs.tarball_sha256 }}
+          PUBLISH_MODE: ${{ needs.gate.outputs.mode }}
         run: |
+          # Publishing a prebuilt tarball preserves its payload, but npm does not derive the
+          # package-page README metadata from that input. Repack the exact extracted tree with
+          # npm itself, prove that it is byte-identical, then publish that directory so npm
+          # records the README as package metadata as well as shipping it in the archive.
+          rm -rf publish
+          mkdir -p publish/repacked
+          tar -xzf artifacts/convex-embedded.tgz -C publish
+          (
+            cd publish/package
+            npm pack --ignore-scripts --pack-destination ../repacked >/dev/null
+          )
+          REPACKED=$(find publish/repacked -name '*.tgz' -type f -print -quit)
+          if [[ -z "$REPACKED" ]]; then
+            echo "::error::npm did not repack the qualified package."
+            exit 1
+          fi
+          REPACKED_TARBALL_SHA256=$(sha256sum "$REPACKED" | awk '{print $1}')
+          if [[ "$REPACKED_TARBALL_SHA256" != "$EXPECTED_TARBALL_SHA256" ]]; then
+            echo "::error::npm's directory publish payload differs from the qualified archive."
+            exit 1
+          fi
           if [[ -n "${NPM_BOOTSTRAP_TOKEN:-}" ]]; then
             echo "::notice::Using the one-time npm bootstrap token fallback. Remove NPM_BOOTSTRAP_TOKEN after this inaugural publish."
             export NODE_AUTH_TOKEN="$NPM_BOOTSTRAP_TOKEN"
@@ -844,11 +867,7 @@ jobs:
             echo "Publishing with npm trusted publishing (OIDC)."
             unset NODE_AUTH_TOKEN
           fi
-          npm publish ./artifacts/convex-embedded.tgz --ignore-scripts --access public --tag "${{ steps.release.outputs.dist_tag }}"
-
-      - name: Move prerelease channel
-        if: needs.gate.outputs.mode == 'prerelease'
-        run: npm dist-tag add "${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}" preview
+          npm publish ./publish/package --ignore-scripts --access public --tag "${{ steps.release.outputs.dist_tag }}"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
