@@ -1,6 +1,6 @@
 import { v } from "convex/values";
 
-import { local } from "../convex/_generated/embedded";
+import { local } from "../convex/embedded.generated";
 
 const ensureVersion = local.internalMutation({
   args: {},

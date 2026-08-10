@@ -14,7 +14,7 @@ use convex_sync_types::SessionId;
 use sha2::{Digest, Sha256};
 use storage::{
     AuthoritativeRow, DirtyHeadToken, IdMappingContent, PendingUpload, PushEnvelope, PushOutcome,
-    PushResponse, UploadLeaseWrite,
+    PushResponse, UploadLeaseWrite, CURRENT_WIRE_CONTRACT_ID,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::mpsc;
@@ -23,10 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     codec,
-    config::{
-        RemoteAuth, RemoteConfig, RemoteFunction, EMBEDDED_PROTOCOL_VERSION,
-        EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY,
-    },
+    config::{RemoteAuth, RemoteConfig, RemoteFunction, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY},
     protocol, pull, push,
     store::{RemoteClock, RemoteStore, RemoteStoreFuture},
     tick::RemoteMutationSettlementProducer,
@@ -172,6 +169,7 @@ pub struct RemoteDriver<
     scope: RemoteScope,
     scope_pending_removals: BTreeSet<String>,
     inflight_remote_push: VecDeque<InflightRemotePush>,
+    blob_stage_pending: usize,
     store: S,
     transport: T,
     uploader: U,
@@ -250,21 +248,23 @@ struct AcceptedIdentity {
     identity_json: Option<String>,
     identity_key: String,
     json: String,
+    contract_id: String,
 }
 
 fn parse_identity_response(
     json: &serde_json::Value,
-    expected_protocol: i64,
+    expected_contract_ids: &[&str],
 ) -> RemoteResult<AcceptedIdentity> {
-    let received = json
-        .get("protocolVersion")
-        .and_then(serde_json::Value::as_f64);
-    if received != Some(expected_protocol as f64) {
-        let received = received.map_or_else(|| "missing".to_owned(), |value| value.to_string());
+    let received = json.get("contractId").and_then(serde_json::Value::as_str);
+    let accepted_contract = received
+        .filter(|received| expected_contract_ids.contains(received))
+        .map(str::to_owned);
+    let Some(contract_id) = accepted_contract else {
+        let received = received.map_or_else(|| "missing".to_owned(), ToString::to_string);
         return Err(RemoteError::DeploymentMismatch(format!(
-            "embedded:identity protocol mismatch: expected {expected_protocol}, received {received}"
+            "embedded:identity contract mismatch: expected one of {expected_contract_ids:?}, received {received}"
         )));
-    }
+    };
     let identity_key = json
         .get("identityKey")
         .and_then(serde_json::Value::as_str)
@@ -290,14 +290,20 @@ fn parse_identity_response(
         identity_json,
         identity_key,
         json,
+        contract_id,
     })
 }
 
-fn identity_args() -> ConvexArgs {
+fn identity_args(contract_ids: &[&str]) -> ConvexArgs {
     let mut request = BTreeMap::from([("kind".to_owned(), Value::String("identity".to_owned()))]);
     request.insert(
-        "protocolVersions".to_owned(),
-        Value::Array(vec![Value::Int64(EMBEDDED_PROTOCOL_VERSION)]),
+        "contractIds".to_owned(),
+        Value::Array(
+            contract_ids
+                .iter()
+                .map(|id| Value::String((*id).to_owned()))
+                .collect(),
+        ),
     );
     ConvexArgs::from([("request".to_owned(), Value::Object(request))])
 }
@@ -387,6 +393,7 @@ where
             scope: RemoteScope::default(),
             scope_pending_removals: BTreeSet::new(),
             inflight_remote_push: VecDeque::new(),
+            blob_stage_pending: 0,
             store,
             transport,
             uploader,
@@ -707,14 +714,18 @@ where
 
     pub async fn identity(&mut self) -> RemoteResult<String> {
         self.refresh_auth().await?;
-        let result = self.query(protocol::pull_function()?, identity_args()).await?;
+        let result = self
+            .query(
+                protocol::pull_function()?,
+                identity_args(&[CURRENT_WIRE_CONTRACT_ID]),
+            )
+            .await?;
         let FunctionResult::Value(value) = result else {
             return Err(function_result_error(protocol::EMBEDDED_PULL, &result));
         };
-        let accepted = parse_identity_response(
-            &serde_json::Value::from(value),
-            EMBEDDED_PROTOCOL_VERSION,
-        )?;
+        let accepted =
+            parse_identity_response(&serde_json::Value::from(value), &[CURRENT_WIRE_CONTRACT_ID])?;
+        self.config.runtime.contract_id = accepted.contract_id;
         self.store
             .identity_write(&accepted.identity_key, accepted.identity_json.as_deref())?;
         Ok(accepted.json)
@@ -1134,22 +1145,7 @@ where
 
     fn remote_settlement_write(&mut self) -> RemoteResult<RemoteTick> {
         let mut tick = RemoteTick::default();
-        while let Some(mut inflight) = self.inflight_remote_push.pop_front() {
-            let result = match inflight.result.try_recv() {
-                Ok(result) => result,
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    self.inflight_remote_push.push_front(inflight);
-                    break;
-                }
-                Err(oneshot::error::TryRecvError::Closed) if self.replay_inflight_discarding => {
-                    continue;
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    return Err(RemoteError::Protocol(
-                        "remote push response channel closed".to_owned(),
-                    ));
-                }
-            };
+        while let Some((inflight, result)) = self.remote_push_result_read()? {
             #[cfg(test)]
             self.actor_trace
                 .lock()
@@ -1158,83 +1154,196 @@ where
             if self.replay_inflight_discarding {
                 continue;
             }
-            match inflight.kind {
-                InflightRemotePushKind::Mutation {
-                    acknowledgements,
-                    envelope,
-                } => {
-                    if let Some(prior_outcome) = mutation_reuse_prior_outcome(&result) {
-                        if prior_outcome == PushOutcome::Applied
-                            || envelope.replay_id != envelope.mutation_id
-                        {
-                            return Err(function_result_error(protocol::EMBEDDED_PUSH, &result));
-                        }
-                        let replay_id = format!("replay:{}", Uuid::new_v4());
-                        self.store.remote_push_replay_write(
-                            &envelope.mutation_id,
-                            envelope.commit_seq,
-                            &envelope.replay_id,
-                            &replay_id,
-                            self.clock.now_ms()?,
-                        )?;
-                        // The prior attempt was terminal without applying app effects. Drain every
-                        // request already sent behind it, then prepare the unchanged durable
-                        // mutation again under the persisted replay id. Waiting for a changed pull
-                        // result here can deadlock forever: a rejected attempt has no hosted
-                        // aftermath, so an unchanged live subscription emits no new snapshot. A
-                        // genuinely stale CRDT retry will still receive the ordinary `rebase`
-                        // outcome, whose separate path waits for the authoritative page write.
-                        self.replay_inflight_discarding = true;
-                        self.replay_inflight_invalidated = false;
-                        continue;
-                    }
-                    let (settlement, outcome) = self.complete_remote_push(
-                        envelope.as_ref(),
-                        &result,
-                        RemoteTick::default(),
-                    )?;
-                    tick.merge(settlement);
-                    if !acknowledgements.is_empty() {
-                        self.store.remote_receipt_delete(&acknowledgements)?;
-                        tick.receipts_pushed += acknowledgements.len();
-                    }
-                    if self.replay_waiting_for_remote_write {
-                        // A rebase leaves the current durable envelope at the queue front. Drain
-                        // the already-sent suffix before pulling and preparing it again; dropping
-                        // those receivers would let a late hosted result poison the next attempt.
-                        self.replay_inflight_discarding = true;
-                        self.replay_inflight_invalidated = false;
-                        continue;
-                    }
-                    if matches!(outcome, PushOutcome::Conflict | PushOutcome::Rejected) {
-                        // Every request already in this window was prepared against the
-                        // speculative effects of the rejected prefix. Keep their original
-                        // receivers alive: same-field suffixes will return `rebase`, while
-                        // independent suffixes may still settle normally. Re-dispatching here
-                        // would race those already-sent mutations with a different replay
-                        // fingerprint.
-                        self.replay_inflight_invalidated = true;
-                    }
-                }
-                InflightRemotePushKind::Checkpoint { checkpoint_id } => {
-                    tick.merge(self.complete_checkpoint_push(
-                        &checkpoint_id,
-                        &result,
-                        RemoteTick::default(),
-                    )?);
-                }
-                InflightRemotePushKind::Blob => {
-                    if !matches!(result, FunctionResult::Value(Value::Null)) {
-                        return Err(function_result_error(protocol::EMBEDDED_PUSH, &result));
-                    }
-                }
-            }
+            self.remote_result_write(inflight.kind, &result, &mut tick)?;
         }
         if self.inflight_remote_push.is_empty() {
             self.replay_inflight_discarding = false;
             self.replay_inflight_invalidated = false;
         }
         Ok(tick)
+    }
+
+    fn remote_push_result_read(
+        &mut self,
+    ) -> RemoteResult<Option<(InflightRemotePush, FunctionResult)>> {
+        let Some(mut inflight) = self.inflight_remote_push.pop_front() else {
+            return Ok(None);
+        };
+        match inflight.result.try_recv() {
+            Ok(result) => Ok(Some((inflight, result))),
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.inflight_remote_push.push_front(inflight);
+                Ok(None)
+            }
+            Err(oneshot::error::TryRecvError::Closed) if self.replay_inflight_discarding => {
+                Ok(None)
+            }
+            Err(oneshot::error::TryRecvError::Closed) => Err(RemoteError::Protocol(
+                "remote push response channel closed".to_owned(),
+            )),
+        }
+    }
+
+    fn remote_result_write(
+        &mut self,
+        kind: InflightRemotePushKind,
+        result: &FunctionResult,
+        tick: &mut RemoteTick,
+    ) -> RemoteResult<()> {
+        match kind {
+            InflightRemotePushKind::Mutation {
+                acknowledgements,
+                envelope,
+            } => self.remote_mutation_settle(&acknowledgements, envelope.as_ref(), result, tick),
+            InflightRemotePushKind::Checkpoint { checkpoint_id } => {
+                tick.merge(self.complete_checkpoint_push(
+                    &checkpoint_id,
+                    result,
+                    RemoteTick::default(),
+                )?);
+                Ok(())
+            }
+            InflightRemotePushKind::Blob => self.remote_blob_settle(result),
+        }
+    }
+
+    fn remote_blob_settle(&mut self, result: &FunctionResult) -> RemoteResult<()> {
+        if !matches!(result, FunctionResult::Value(Value::Null)) {
+            return Err(function_result_error(protocol::EMBEDDED_PUSH, result));
+        }
+        if self.blob_stage_pending > 0 {
+            self.blob_stage_pending -= 1;
+            if self.blob_stage_pending == 0 {
+                self.push_queue_empty = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn remote_mutation_settle(
+        &mut self,
+        acknowledgements: &[String],
+        envelope: &PushEnvelope,
+        result: &FunctionResult,
+        tick: &mut RemoteTick,
+    ) -> RemoteResult<()> {
+        if self.remote_mutation_blob_stage(envelope, result, tick)?
+            || self.remote_mutation_retire(envelope, acknowledgements, result, tick)?
+            || self.remote_mutation_replay_write(envelope, result)?
+        {
+            return Ok(());
+        }
+        self.remote_mutation_complete(envelope, acknowledgements, result, tick)
+    }
+
+    fn remote_mutation_blob_stage(
+        &mut self,
+        envelope: &PushEnvelope,
+        result: &FunctionResult,
+        tick: &mut RemoteTick,
+    ) -> RemoteResult<bool> {
+        let FunctionResult::Value(value) = result else {
+            return Ok(false);
+        };
+        let Some((mutation_id, chunks)) = push::decode_blob_stage(value)? else {
+            return Ok(false);
+        };
+        if mutation_id != envelope.mutation_id {
+            return Err(RemoteError::Protocol(
+                "blob stage mutation ID does not match its durable envelope".to_owned(),
+            ));
+        }
+        let chunk_count = self.stage_mutation_blobs(envelope, chunks)?;
+        tick.push_attempted += chunk_count;
+        self.blob_stage_pending = chunk_count;
+        // The envelope remains durably queued. The next dispatch sends its identical replay after
+        // the scoped chunks; receipts were never acknowledged, so dropping this transient vector
+        // is intentional.
+        self.push_queue_empty = false;
+        Ok(true)
+    }
+
+    fn remote_mutation_retire(
+        &mut self,
+        envelope: &PushEnvelope,
+        acknowledgements: &[String],
+        result: &FunctionResult,
+        tick: &mut RemoteTick,
+    ) -> RemoteResult<bool> {
+        if !push_function_error_is_terminal(result) {
+            return Ok(false);
+        }
+        // A function that was removed or now rejects this replay cannot become valid by retrying
+        // the same durable envelope. Settle it locally as a closed rejection, retaining its
+        // after-image for recovery. Transport failures never reach this branch: they leave the
+        // receiver pending and are retried by the normal actor reconnect path.
+        tick.merge(self.retire_remote_push(envelope, RemoteTick::default())?);
+        if !acknowledgements.is_empty() {
+            // This failed invocation may not have run the component at all, so its carried receipt
+            // acknowledgements remain durable for retry.
+            self.receipt_queue_empty = false;
+        }
+        self.replay_inflight_invalidated = true;
+        Ok(true)
+    }
+
+    fn remote_mutation_replay_write(
+        &mut self,
+        envelope: &PushEnvelope,
+        result: &FunctionResult,
+    ) -> RemoteResult<bool> {
+        let Some(prior_outcome) = mutation_reuse_prior_outcome(result) else {
+            return Ok(false);
+        };
+        if prior_outcome == PushOutcome::Applied || envelope.replay_id != envelope.mutation_id {
+            return Err(function_result_error(protocol::EMBEDDED_PUSH, result));
+        }
+        let replay_id = format!("replay:{}", Uuid::new_v4());
+        self.store.remote_push_replay_write(
+            &envelope.mutation_id,
+            envelope.commit_seq,
+            &envelope.replay_id,
+            &replay_id,
+            self.clock.now_ms()?,
+        )?;
+        // The prior attempt was terminal without applying app effects. Drain every request already
+        // sent behind it, then prepare the unchanged durable mutation again under the persisted
+        // replay id. Waiting for a changed pull result here can deadlock forever: a rejected
+        // attempt has no hosted aftermath, so an unchanged live subscription emits no new
+        // snapshot. A genuinely stale CRDT retry still receives the ordinary `rebase` outcome,
+        // whose separate path waits for the authoritative page write.
+        self.replay_inflight_discarding = true;
+        self.replay_inflight_invalidated = false;
+        Ok(true)
+    }
+
+    fn remote_mutation_complete(
+        &mut self,
+        envelope: &PushEnvelope,
+        acknowledgements: &[String],
+        result: &FunctionResult,
+        tick: &mut RemoteTick,
+    ) -> RemoteResult<()> {
+        let (settlement, outcome) =
+            self.complete_remote_push(envelope, result, RemoteTick::default())?;
+        tick.merge(settlement);
+        if !acknowledgements.is_empty() {
+            self.store.remote_receipt_delete(acknowledgements)?;
+            tick.receipts_pushed += acknowledgements.len();
+        }
+        if self.replay_waiting_for_remote_write {
+            // A rebase leaves the current durable envelope at the queue front. Drain the
+            // already-sent suffix before pulling and preparing it again; dropping those receivers
+            // would let a late hosted result poison the next attempt.
+            self.replay_inflight_discarding = true;
+            self.replay_inflight_invalidated = false;
+        } else if matches!(outcome, PushOutcome::Conflict | PushOutcome::Rejected) {
+            // Every request already in this window was prepared against the speculative effects of
+            // the rejected prefix. Keep their original receivers alive: same-field suffixes return
+            // `rebase`, while independent suffixes may still settle normally.
+            self.replay_inflight_invalidated = true;
+        }
+        Ok(())
     }
 
     async fn queue_changed_subscription_results(&mut self) -> RemoteResult<RemoteTick> {
@@ -1521,6 +1630,23 @@ where
                         .clone(),
                 ),
             ),
+            (
+                "runtime".to_owned(),
+                Value::Object(BTreeMap::from([
+                    (
+                        "schemaHash".to_owned(),
+                        Value::String(self.config.runtime.schema_hash.clone()),
+                    ),
+                    (
+                        "moduleGraphHash".to_owned(),
+                        Value::String(self.config.runtime.module_graph_hash.clone()),
+                    ),
+                    (
+                        "contractId".to_owned(),
+                        Value::String(self.config.runtime.contract_id.clone()),
+                    ),
+                ])),
+            ),
         ]);
         let args = ConvexArgs::from([("request".to_owned(), Value::Object(request))]);
         let (result, remote_tick) = match self
@@ -1680,7 +1806,10 @@ where
             )));
         }
         let (result, result_tick) = self
-            .mutation_with_tick(protocol::upload_function()?, upload::args(upload))
+            .mutation_with_tick(
+                protocol::upload_function()?,
+                upload::args(upload, &self.config.runtime),
+            )
             .await?;
         let FunctionResult::Value(value) = result else {
             return Err(function_result_error(protocol::EMBEDDED_UPLOAD, &result));
@@ -1770,6 +1899,7 @@ where
         if self.replay_waiting_for_remote_write
             || self.replay_inflight_discarding
             || (self.replay_inflight_invalidated && !self.inflight_remote_push.is_empty())
+            || self.blob_stage_pending > 0
             || self.push_queue_empty
         {
             return Ok(tick);
@@ -1796,7 +1926,7 @@ where
         for (queued, (mutation_id, commit_seq)) in queued.iter().zip(&inflight_envelopes) {
             if queued.mutation_id != *mutation_id || queued.commit_seq != *commit_seq {
                 // A local commit can make the durable prefix change while an older window is
-                // already hosted (for example, a legacy store whose commit-sequence cache was
+                // already hosted (for example, a store whose commit-sequence cache was
                 // seeded below a retained push envelope). Keep every durable envelope, drain the
                 // original receivers without adopting their out-of-order results, then replay the
                 // stable durable order. Their persisted replay IDs make any hosted success return
@@ -1830,12 +1960,16 @@ where
             if !self.prepare_pending_envelope(&mut envelope, &mut prefixes)? {
                 break;
             }
-            for checkpoint in envelope
+            let requires_blob_stage = envelope
                 .crdt
                 .iter()
                 .filter_map(|effect| effect.checkpoint.as_ref())
-            {
-                tick.push_attempted += self.stage_blob(&checkpoint.bytes, &checkpoint.hash)?;
+                .any(|checkpoint| checkpoint.bytes.len() > push::BLOB_CHUNK_BYTES);
+            if requires_blob_stage && self.config.runtime.contract_id != CURRENT_WIRE_CONTRACT_ID {
+                return Err(RemoteError::DeploymentMismatch(
+                    "a large Embedded checkpoint requires this wire contract; update the hosted component before replaying it"
+                        .to_owned(),
+                ));
             }
             let carried_acknowledgements = std::mem::take(&mut acknowledgements);
             let args = push::mutation_args(
@@ -1854,6 +1988,11 @@ where
                 result,
             });
             tick.push_attempted += 1;
+            if requires_blob_stage {
+                // Do not speculatively send a suffix until this prefix has either settled or
+                // completed its scoped blob-capability round trip.
+                break;
+            }
         }
         tick.sent += self.flush_outbound().await?;
         self.push_queue_empty = self.store.remote_push_envelope_read(1)?.is_empty();
@@ -1863,10 +2002,10 @@ where
     fn prepare_transport_runtime(&self, envelope: &mut PushEnvelope) -> RemoteResult<()> {
         let queued = &envelope.runtime;
         let current = &self.config.runtime;
-        if queued.protocol_version > current.protocol_version {
+        if queued.contract_id != current.contract_id {
             return Err(RemoteError::DeploymentMismatch(format!(
-                "queued mutation {} requires newer embedded protocol {} (this app uses {}); local data was preserved, so update the app before replaying it",
-                envelope.mutation_id, queued.protocol_version, current.protocol_version
+                "queued mutation {} uses wire contract {} (this app uses {}); local data was preserved, so update the app before replaying it",
+                envelope.mutation_id, queued.contract_id, current.contract_id
             )));
         }
         envelope.runtime.clone_from(current);
@@ -2172,13 +2311,62 @@ where
             return Ok(std::mem::take(tick));
         };
         tick.sent += self.ensure_connected().await?;
-        tick.push_attempted +=
-            self.stage_blob(&checkpoint.checkpoint.bytes, &checkpoint.checkpoint.hash)?;
+        let scope_token = if checkpoint.checkpoint.bytes.len() > push::BLOB_CHUNK_BYTES {
+            if self.config.runtime.contract_id != CURRENT_WIRE_CONTRACT_ID {
+                return Err(RemoteError::DeploymentMismatch(
+                    "a large Embedded checkpoint response requires this wire contract; update the hosted component first"
+                        .to_owned(),
+                ));
+            }
+            let (result, scope_tick) = self
+                .mutation_with_tick(
+                    protocol::push_function()?,
+                    push::checkpoint_scope_args(
+                        self.config.author_client_id.as_str(),
+                        &self.config.runtime,
+                        &checkpoint.request,
+                        &checkpoint.checkpoint,
+                    ),
+                )
+                .await?;
+            tick.merge(scope_tick);
+            let FunctionResult::Value(value) = result else {
+                return Err(function_result_error(protocol::EMBEDDED_PUSH, &result));
+            };
+            let (chunks, ready, token) = push::decode_checkpoint_scope(&value)?;
+            if chunks
+                != checkpoint
+                    .checkpoint
+                    .bytes
+                    .len()
+                    .div_ceil(push::BLOB_CHUNK_BYTES)
+            {
+                return Err(RemoteError::Protocol(
+                    "checkpoint scope changed its blob manifest".to_owned(),
+                ));
+            }
+            if !ready {
+                tick.merge(
+                    self.stage_blob_interruptible(
+                        &checkpoint.checkpoint.bytes,
+                        &checkpoint.checkpoint.hash,
+                        &push::BlobScope::Checkpoint {
+                            token: token.clone(),
+                        },
+                    )
+                    .await?,
+                );
+            }
+            Some(token)
+        } else {
+            None
+        };
         let args = push::checkpoint_args(
             self.config.author_client_id.as_str(),
             &self.config.runtime,
             &checkpoint.request,
             &checkpoint.checkpoint,
+            scope_token.as_deref(),
         );
         let result = self
             .base
@@ -2194,7 +2382,12 @@ where
         Ok(std::mem::take(tick))
     }
 
-    fn stage_blob(&mut self, bytes: &[u8], hash: &str) -> RemoteResult<usize> {
+    fn stage_blob(
+        &mut self,
+        bytes: &[u8],
+        hash: &str,
+        scope: &push::BlobScope,
+    ) -> RemoteResult<usize> {
         if bytes.len() <= push::BLOB_CHUNK_BYTES {
             return Ok(0);
         }
@@ -2203,6 +2396,7 @@ where
             let args = push::blob_args(
                 self.config.author_client_id.as_str(),
                 &self.config.runtime,
+                scope,
                 bytes,
                 hash,
                 ordinal,
@@ -2216,6 +2410,95 @@ where
             });
         }
         Ok(chunks)
+    }
+
+    async fn stage_blob_interruptible(
+        &mut self,
+        bytes: &[u8],
+        hash: &str,
+        scope: &push::BlobScope,
+    ) -> RemoteResult<RemoteTick> {
+        let mut tick = RemoteTick::default();
+        if bytes.len() <= push::BLOB_CHUNK_BYTES {
+            return Ok(tick);
+        }
+        for ordinal in 0..bytes.len().div_ceil(push::BLOB_CHUNK_BYTES) {
+            let (result, result_tick) = self
+                .mutation_with_tick(
+                    protocol::push_function()?,
+                    push::blob_args(
+                        self.config.author_client_id.as_str(),
+                        &self.config.runtime,
+                        scope,
+                        bytes,
+                        hash,
+                        ordinal,
+                    ),
+                )
+                .await?;
+            tick.merge(result_tick);
+            if !matches!(result, FunctionResult::Value(Value::Null)) {
+                return Err(function_result_error(protocol::EMBEDDED_PUSH, &result));
+            }
+            tick.push_attempted += 1;
+        }
+        Ok(tick)
+    }
+
+    fn stage_mutation_blobs(
+        &mut self,
+        envelope: &PushEnvelope,
+        stages: Vec<push::BlobStage>,
+    ) -> RemoteResult<usize> {
+        let mut scopes = BTreeMap::new();
+        for stage in stages {
+            if stage.bytes == 0
+                || stage.chunks != stage.bytes.div_ceil(push::BLOB_CHUNK_BYTES)
+                || stage.chunks > 32
+            {
+                return Err(RemoteError::Protocol(
+                    "blob stage returned an invalid bounded manifest".to_owned(),
+                ));
+            }
+            if scopes.insert(stage.hash.clone(), stage).is_some() {
+                return Err(RemoteError::Protocol(
+                    "blob stage returned duplicate content hashes".to_owned(),
+                ));
+            }
+        }
+        let mut attempted = 0;
+        for checkpoint in envelope
+            .crdt
+            .iter()
+            .filter_map(|effect| effect.checkpoint.as_ref())
+            .filter(|checkpoint| checkpoint.bytes.len() > push::BLOB_CHUNK_BYTES)
+        {
+            let stage = scopes.remove(&checkpoint.hash).ok_or_else(|| {
+                RemoteError::Protocol(
+                    "blob stage did not authorize a carried checkpoint".to_owned(),
+                )
+            })?;
+            if stage.bytes != checkpoint.bytes.len()
+                || stage.chunks != checkpoint.bytes.len().div_ceil(push::BLOB_CHUNK_BYTES)
+            {
+                return Err(RemoteError::Protocol(
+                    "blob stage changed a carried checkpoint manifest".to_owned(),
+                ));
+            }
+            if !stage.token.is_empty() {
+                attempted += self.stage_blob(
+                    &checkpoint.bytes,
+                    &checkpoint.hash,
+                    &push::BlobScope::Mutation { token: stage.token },
+                )?;
+            }
+        }
+        if !scopes.is_empty() {
+            return Err(RemoteError::Protocol(
+                "blob stage authorized content absent from the carried mutation".to_owned(),
+            ));
+        }
+        Ok(attempted)
     }
 
     /// Adopt the server re-run verdict (§2/§11 D2): bind each inserted local id to its hosted id,
@@ -2402,6 +2685,72 @@ where
         self.receipt_queue_empty = false;
         tick.merge(result_tick);
         Ok((tick, response_outcome))
+    }
+
+    /// Retire one durable replay whose target function produced a terminal Convex application
+    /// error instead of the Embedded settlement envelope. The error text is intentionally not
+    /// persisted: application text is untrusted, while `EMBEDDED_REJECTED` is the closed public
+    /// disposition. The durable after-image is retained as a revision so app code can recover it.
+    fn retire_remote_push(
+        &mut self,
+        envelope: &PushEnvelope,
+        result_tick: RemoteTick,
+    ) -> RemoteResult<RemoteTick> {
+        let queued = self.read_queued_envelope()?.ok_or_else(|| {
+            RemoteError::Protocol("remote push retirement lost its queued envelope".to_owned())
+        })?;
+        if queued.mutation_id != envelope.mutation_id || queued.commit_seq != envelope.commit_seq {
+            return Err(RemoteError::Protocol(
+                "remote push retirement is not at the durable queue front".to_owned(),
+            ));
+        }
+        let producer = RemoteMutationSettlementProducer::new(
+            &envelope.mutation_id,
+            &envelope.function,
+            storage::PushVerdict::Rejected(storage::RejectionCode::Rejected),
+        )
+        .expect("a rejected replay is terminal");
+        let settled = self
+            .store
+            .remote_settlement_write(&storage::RemoteSettlementWrite {
+                mutation_id: envelope.mutation_id.clone(),
+                expected_commit_seq: envelope.commit_seq,
+                now_ms: self.clock.now_ms()?,
+                outcome: storage::RemoteSettlementOutcome::Rejected {
+                    schedules: queued.local_schedule_ids.clone(),
+                    targets: rejected_write_targets(&queued)
+                        .into_iter()
+                        .map(|(table, local_document_id)| storage::RemoteRowTarget {
+                            table,
+                            local_document_id,
+                            server_rev_id: None,
+                            // A target that could not invoke its function has no authoritative
+                            // replacement. Preserve every local after-image rather than silently
+                            // restoring an old projection.
+                            retain: true,
+                        })
+                        .collect(),
+                    projections: Vec::new(),
+                },
+            })?;
+        let mut tick = result_tick;
+        tick.rows_applied += settled.projection.committed.len();
+        for commit in settled.projection.committed {
+            for table in commit.changed_tables {
+                if !tick.changed_tables.contains(&table) {
+                    tick.changed_tables.push(table);
+                }
+            }
+        }
+        let retained_revisions = settled.projection.reroots;
+        if !retained_revisions.is_empty() {
+            tick.retained_revisions
+                .extend(retained_revisions.iter().cloned());
+        }
+        tick.push_failed += 1;
+        tick.settlements.push(producer.complete(retained_revisions));
+        self.receipt_queue_empty = false;
+        Ok(tick)
     }
 
     fn wait_for_rebase_remote_write(&mut self) {
@@ -3786,6 +4135,25 @@ fn mutation_reuse_prior_outcome(result: &FunctionResult) -> Option<PushOutcome> 
     PushOutcome::parse(outcome)
 }
 
+/// A received Convex function failure is distinct from a transport failure: the hosted runtime
+/// executed (or could not resolve) this exact call, so replaying the unchanged envelope cannot
+/// repair it. Keep component-wide retirement and protocol mismatch distinct because those are
+/// deployment state, not an individual application replay verdict.
+fn push_function_error_is_terminal(result: &FunctionResult) -> bool {
+    match result {
+        FunctionResult::ErrorMessage(_) => true,
+        FunctionResult::ConvexError(error) => !matches!(
+            convex_error_code(&error.data),
+            Some(
+                "EMBEDDED_MUTATION_ID_REUSE"
+                    | "EMBEDDED_CLIENT_RETIRED"
+                    | "EMBEDDED_PROTOCOL_MISMATCH"
+            )
+        ),
+        FunctionResult::Value(_) => false,
+    }
+}
+
 fn mutation_push_response(
     envelope: &PushEnvelope,
     result: &FunctionResult,
@@ -4075,10 +4443,10 @@ mod tests {
 
     use super::{
         function_result_error, parse_identity_response, pull_change_has_changed,
-        rejected_target_should_retain, rejected_write_targets,
-        ActiveRemoteWrite, AuthoritativeLocalAddress, InflightRemotePush, InflightRemotePushKind,
-        PendingCheckpoint, PendingRemoteWrite, PullSubscription, RemoteCommand, RemoteDriver,
-        RemoteScope, RemoteSubscription, RemoteWrite,
+        rejected_target_should_retain, rejected_write_targets, ActiveRemoteWrite,
+        AuthoritativeLocalAddress, InflightRemotePush, InflightRemotePushKind, PendingCheckpoint,
+        PendingRemoteWrite, PullSubscription, RemoteCommand, RemoteDriver, RemoteScope,
+        RemoteSubscription, RemoteWrite,
     };
     use crate::{
         config::{RemoteConfig, RemoteFunction},
@@ -4089,14 +4457,14 @@ mod tests {
     use storage::PushOutcome;
 
     #[test]
-    fn identity_response_accepts_only_the_current_protocol() {
+    fn identity_response_accepts_only_the_current_contract() {
         let authenticated = parse_identity_response(
             &serde_json::json!({
                 "identity": null,
                 "identityKey": "deadbeef",
-                "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
+                "contractId": storage::CURRENT_WIRE_CONTRACT_ID,
             }),
-            crate::config::EMBEDDED_PROTOCOL_VERSION,
+            &[storage::CURRENT_WIRE_CONTRACT_ID],
         )
         .unwrap();
         assert_eq!(authenticated.identity_key, "deadbeef");
@@ -4105,9 +4473,9 @@ mod tests {
         let unauthenticated = parse_identity_response(
             &serde_json::json!({
                 "identity": null,
-                "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
+                "contractId": storage::CURRENT_WIRE_CONTRACT_ID,
             }),
-            crate::config::EMBEDDED_PROTOCOL_VERSION,
+            &[storage::CURRENT_WIRE_CONTRACT_ID],
         )
         .unwrap();
         assert_eq!(
@@ -4124,11 +4492,11 @@ mod tests {
             serde_json::json!({
                 "identity": null,
                 "identityKey": "deadbeef",
-                "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION - 1,
+                "contractId": "sha256:unknown-contract",
             }),
         ] {
             assert!(matches!(
-                parse_identity_response(&response, crate::config::EMBEDDED_PROTOCOL_VERSION),
+                parse_identity_response(&response, &[storage::CURRENT_WIRE_CONTRACT_ID]),
                 Err(RemoteError::DeploymentMismatch(_))
             ));
         }
@@ -4459,7 +4827,7 @@ mod tests {
             "clientRuntime": {
                 "schemaHash": "local",
                 "moduleGraphHash": "local",
-                "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
+                "contractId": storage::CURRENT_WIRE_CONTRACT_ID,
             },
             "functionName": "documents:write",
             "args": {},
@@ -4554,7 +4922,7 @@ mod tests {
             "clientRuntime": {
                 "schemaHash": "local",
                 "moduleGraphHash": "local",
-                "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
+                "contractId": storage::CURRENT_WIRE_CONTRACT_ID,
             },
             "functionName": "documents:write",
             "args": {},
@@ -4772,7 +5140,7 @@ mod tests {
             runtime: storage::RuntimeWireIdentity {
                 schema_hash: "schema".to_owned(),
                 module_graph_hash: "modules".to_owned(),
-                protocol_version: 5,
+                contract_id: "sha256:unknown-contract".to_owned(),
             },
             function: "documents:write".to_owned(),
             args: serde_json::Value::Null,
@@ -5929,7 +6297,7 @@ mod tests {
         );
         driver.connected = true;
 
-        // `second` models the window sent before a same-sequence legacy insertion changed the
+        // `second` models the window sent before a same-sequence insertion changed the
         // durable prefix to `first, second`.
         let second = crate::push::decode_envelope(&replay_envelope_json("second", 2)).unwrap();
         let (second_send, second_result) = oneshot::channel();
@@ -6027,7 +6395,15 @@ mod tests {
         );
         let bytes = vec![7; crate::push::BLOB_CHUNK_BYTES * 2 + 1];
 
-        let chunks = driver.stage_blob(&bytes, "blob-hash").unwrap();
+        let chunks = driver
+            .stage_blob(
+                &bytes,
+                "blob-hash",
+                &crate::push::BlobScope::Mutation {
+                    token: "scope".to_owned(),
+                },
+            )
+            .unwrap();
 
         assert_eq!(chunks, 3);
         assert_eq!(driver.inflight_remote_push.len(), 3);
@@ -6676,6 +7052,77 @@ mod tests {
         assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 1);
     }
 
+    #[test]
+    fn terminal_function_error_retires_its_envelope_and_drains_an_independent_suffix() {
+        let trace = Arc::new(Mutex::new(TransportTrace::default()));
+        let store = test_store("remote-terminal-function-error.db");
+        store
+            .remote_push_envelope_write("missing", 1, &replay_envelope_json("missing", 1), 1)
+            .unwrap();
+        store
+            .remote_push_envelope_write(
+                "independent",
+                2,
+                &replay_envelope_json("independent", 2),
+                2,
+            )
+            .unwrap();
+        let mut driver = RemoteDriver::open_with_store(
+            RemoteConfig::new("https://example.convex.cloud".parse().unwrap()),
+            Arc::clone(&store),
+            TraceTransport { trace },
+            SystemRemoteClock::default(),
+        );
+        let missing = crate::push::decode_envelope(&replay_envelope_json("missing", 1)).unwrap();
+        let independent =
+            crate::push::decode_envelope(&replay_envelope_json("independent", 2)).unwrap();
+        let (missing_send, missing_result) = oneshot::channel();
+        let (independent_send, independent_result) = oneshot::channel();
+        driver.inflight_remote_push.extend([
+            InflightRemotePush {
+                kind: InflightRemotePushKind::Mutation {
+                    acknowledgements: Vec::new(),
+                    envelope: Box::new(missing),
+                },
+                result: missing_result,
+            },
+            InflightRemotePush {
+                kind: InflightRemotePushKind::Mutation {
+                    acknowledgements: Vec::new(),
+                    envelope: Box::new(independent),
+                },
+                result: independent_result,
+            },
+        ]);
+
+        missing_send
+            .send(FunctionResult::ErrorMessage(
+                "Could not find public function documents:write".to_owned(),
+            ))
+            .unwrap();
+        let retired = driver.remote_settlement_write().unwrap();
+        assert_eq!(retired.push_failed, 1);
+        assert_eq!(retired.settlements.len(), 1);
+        assert_eq!(retired.settlements[0].mutation_id(), "missing");
+        assert_eq!(retired.settlements[0].outcome().as_str(), "rejected");
+        assert_eq!(
+            retired.settlements[0].outcome().code(),
+            Some("EMBEDDED_REJECTED")
+        );
+        assert_eq!(store.remote_push_envelope_read(10).unwrap().len(), 1);
+        assert!(driver.replay_inflight_invalidated);
+
+        independent_send
+            .send(applied_push_result("independent"))
+            .unwrap();
+        let settled = driver.remote_settlement_write().unwrap();
+        assert_eq!(settled.push_accepted, 1);
+        assert_eq!(settled.settlements.len(), 1);
+        assert_eq!(settled.settlements[0].mutation_id(), "independent");
+        assert!(driver.inflight_remote_push.is_empty());
+        assert!(store.remote_push_envelope_read(10).unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn rejected_replay_reuse_rotates_only_the_attempt_and_redispatches_after_the_suffix() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
@@ -6889,7 +7336,7 @@ mod tests {
             "clientRuntime": {
                 "schemaHash": "local",
                 "moduleGraphHash": "local",
-                "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
+                "contractId": storage::CURRENT_WIRE_CONTRACT_ID,
             },
             "functionName": "documents:write",
             "args": {},
@@ -7001,7 +7448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_envelope_requiring_a_newer_protocol_is_preserved_and_not_sent() {
+    async fn an_envelope_with_an_unknown_contract_is_preserved_and_not_sent() {
         let trace = Arc::new(Mutex::new(TransportTrace::default()));
         let transport = TraceTransport {
             trace: Arc::clone(&trace),
@@ -7009,8 +7456,7 @@ mod tests {
         let store = test_store("remote-newer-protocol-envelope.db");
         let mut queued: serde_json::Value =
             serde_json::from_str(&replay_envelope_json("queued", 1)).unwrap();
-        queued["clientRuntime"]["protocolVersion"] =
-            serde_json::json!(crate::config::EMBEDDED_PROTOCOL_VERSION + 1);
+        queued["clientRuntime"]["contractId"] = serde_json::json!("sha256:unknown-contract");
         store
             .remote_push_envelope_write("queued", 1, &queued.to_string(), 1)
             .unwrap();

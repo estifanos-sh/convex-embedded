@@ -1,5 +1,5 @@
-// Keep this paired with the mobile Rust wire: older native artifacts omit required settlements.
-const EXPO_NATIVE_API_VERSION = 10;
+import { CURRENT_MOBILE_BRIDGE_CONTRACT_ID, CURRENT_WIRE_CONTRACT_ID } from "./contract";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../storage/contract";
 
 /** Native Expo SharedObject contract. @internal */
 export interface NativeStoreObject {
@@ -11,7 +11,9 @@ export interface NativeStoreObject {
 
 /** Autolinked Expo module contract. @internal */
 export interface NativeModule {
-  apiVersion(): number;
+  bridgeContractId(): string;
+  storageBindingContractId(): string;
+  wireContractId(): string;
   open(path: string, selectorKey: string, defaultIdentityKey: string): Promise<NativeStoreObject>;
 }
 
@@ -30,13 +32,49 @@ export function createNativeModuleLoader(resolve: () => NativeModule | null): ()
         ].join(" "),
       );
     }
-    const version = native.apiVersion();
-    if (version !== EXPO_NATIVE_API_VERSION) {
+    const bridgeContractId = readContractId(native, "bridgeContractId");
+    if (bridgeContractId !== CURRENT_MOBILE_BRIDGE_CONTRACT_ID) {
       throw new Error(
-        `Convex Embedded native API version ${String(version)} does not match JavaScript version ${String(EXPO_NATIVE_API_VERSION)}. Rebuild the native application.`,
+        "Convex Embedded native bridge does not match this JavaScript package. Rebuild the native application.",
+      );
+    }
+    const wireContractId = readContractId(native, "wireContractId");
+    if (wireContractId !== CURRENT_WIRE_CONTRACT_ID) {
+      throw new Error(
+        "Convex Embedded native runtime does not match this JavaScript package. Rebuild the native application.",
+      );
+    }
+    const storageBindingContractId = readContractId(native, "storageBindingContractId");
+    if (storageBindingContractId !== CURRENT_STORAGE_BINDING_CONTRACT_ID) {
+      throw new Error(
+        "Convex Embedded native storage does not match this JavaScript package. Rebuild the native application.",
+      );
+    }
+    if (typeof native.open !== "function") {
+      throw new Error(
+        "Convex Embedded native module is missing open(). Rebuild the native application after installing this package.",
       );
     }
     loaded = native;
     return native;
   };
+}
+
+function readContractId(
+  native: NativeModule,
+  name: "bridgeContractId" | "storageBindingContractId" | "wireContractId",
+): string {
+  const read = native[name];
+  if (typeof read !== "function") {
+    throw new Error(
+      `Convex Embedded native module is missing ${name}(). Rebuild the native application after installing this package.`,
+    );
+  }
+  const value = read.call(native);
+  if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new Error(
+      `Convex Embedded native module returned an invalid ${name}(). Rebuild the native application after installing this package.`,
+    );
+  }
+  return value;
 }

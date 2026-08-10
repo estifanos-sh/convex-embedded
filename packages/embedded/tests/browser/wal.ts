@@ -8,7 +8,6 @@
 import { makeFunctionReference } from "convex/server";
 
 import { initRuntime } from "../../src/browser/runtime";
-import { workerRun } from "./harness/worker";
 
 import napiWorkerUrl from "../../dist/thread/browser-worker.mjs?url";
 import wasmUrl from "../../dist/wasm/index.wasm?url";
@@ -40,7 +39,14 @@ interface WalResult {
 const ROW_COUNT = 200;
 
 self.onmessage = (event: MessageEvent<{ storageId: string }>) => {
-  workerRun(() => run(event.data.storageId));
+  void run(event.data.storageId)
+    .then((result) => self.postMessage({ ok: true, result }))
+    .catch((error: unknown) =>
+      self.postMessage({
+        error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+        ok: false,
+      }),
+    );
 };
 
 async function run(storageId: string): Promise<WalResult> {

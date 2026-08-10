@@ -5,7 +5,7 @@ import path from "node:path";
 
 import { benchDefaults, readTabs } from "../../../../../config/bench.js";
 import { readList, readNumber } from "../../../../../config/read.js";
-import { writeRevisionVolume } from "./volume.js";
+import { writeRevisionVolume } from "../../../scripts/volume.js";
 import { browserBenchOutPath, hostedDeployment, metalFixtureDir, packageRoot } from "./paths.js";
 import type {
   BrowserLatencyBenchOptions,

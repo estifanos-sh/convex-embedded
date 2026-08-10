@@ -24,13 +24,7 @@ import {
   queryGeneric,
 } from "convex/server";
 import { asObjectValidator, ConvexError, v } from "convex/values";
-import type {
-  GenericValidator,
-  Infer,
-  PropertyValidators,
-  Validator,
-  VObject,
-} from "convex/values";
+import type { GenericValidator, PropertyValidators, Validator, VObject } from "convex/values";
 
 import { embeddedFieldMeta } from "../meta";
 import {
@@ -45,19 +39,14 @@ import { canonicalJson, hashDocument, hashValue } from "../hash";
 import { validatorIdReferences, validatorIdValues } from "../id/path";
 import {
   EMBEDDED_PROTOCOL_MISMATCH,
-  EMBEDDED_PROTOCOL_VERSIONS,
-  isEmbeddedProtocolVersion,
-  selectEmbeddedProtocolVersion,
-  type EmbeddedProtocolVersion,
+  CURRENT_WIRE_CONTRACT_ID,
+  isWireContractId,
+  selectWireContractId,
+  type WireContractId,
 } from "../protocol";
 import { withEntropy } from "../entropy";
 import { read as readTime } from "../component/time";
-import {
-  pullChangeValidator,
-  pullCrdtValidator,
-  resultRowValidator,
-  settlementFields,
-} from "../component/model";
+import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../component/model";
 import {
   analyzeEmbeddedSchema,
   embeddedSchemaMeta,
@@ -72,7 +61,6 @@ import {
 import { normalizeMutationResult } from "../result";
 import {
   assertReplicatedReference,
-  assertReplicatedIndex,
   assertReplicatedTarget,
   buildQueryBuilder,
   completeQueryRows,
@@ -139,7 +127,7 @@ type ReplayEnvelope = {
   fingerprint: string;
   logicalFingerprint: string;
   acknowledgeReplayId?: string;
-  runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number };
+  runtime: { schemaHash: string; moduleGraphHash: string; contractId: string };
   resultHash: string;
   mutationTime: number;
   randomSeed: string;
@@ -229,8 +217,16 @@ type Settlement = SettlementInput & {
   >;
 };
 
-/** A settlement after selecting the caller's response adapter. */
-type WireSettlement = Infer<typeof wireSettlementValidator>;
+/** The current protocol has one canonical settlement representation. */
+type WireSettlement = Settlement;
+
+type BlobStage = {
+  kind: "stage";
+  mutationId: string;
+  scopes: Array<{ hash: string; bytes: number; chunks: number; token: string }>;
+};
+
+type CheckpointScope = { chunks: number; ready: boolean; token: string };
 
 type CrdtIntentWriter = {
   text: {
@@ -326,9 +322,9 @@ export type DefinedEmbedded<Schema extends EmbeddedSchemaDefinition> = {
     internalQuery: EmbeddedQueryBuilder<ServerDataModel<Schema>, "internal">;
     internalMutation: RemoteMutationBuilder<ServerDataModel<Schema>, "internal">;
   };
-  upload: ReturnType<typeof buildUpload>;
   pull: ReturnType<typeof buildPull>;
   push: ReturnType<typeof buildPush>;
+  upload: ReturnType<typeof buildUpload>;
 };
 
 export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
@@ -396,9 +392,9 @@ export function defineEmbedded<Schema extends EmbeddedSchemaDefinition>(
         "internal"
       >,
     },
-    upload: buildUpload(),
     pull: buildPull(options.component, options.manifest),
     push: buildPush(options.component, tableNames, crdtFields, placements, options.manifest),
+    upload: buildUpload(),
   };
 }
 
@@ -413,25 +409,6 @@ function buildRemoteBuilder(base: QueryBuilder<any, any> | MutationBuilder<any, 
     registered.__embeddedPlacement = "remote";
     return registered;
   };
-}
-
-function buildUpload() {
-  return mutationGeneric({
-    args: {
-      localStorageId: v.string(),
-      sha256: v.string(),
-      size: v.number(),
-    },
-    returns: v.object({ uploadUrl: v.string() }),
-    handler: async (ctx, args) => {
-      if (args.localStorageId.length === 0) throw new Error("localStorageId must not be empty.");
-      if (!/^[0-9a-f]{64}$/.test(args.sha256)) throw new Error("sha256 must be lowercase hex.");
-      if (!Number.isSafeInteger(args.size) || args.size < 0) {
-        throw new Error("size must be a non-negative safe integer.");
-      }
-      return { uploadUrl: await ctx.storage.generateUploadUrl() };
-    },
-  });
 }
 
 function buildMutationBuilder(
@@ -484,7 +461,7 @@ function buildMutationBuilder(
           );
         }
 
-        assertRuntimeVersion(replay.runtime);
+        normalizeRuntime(replay.runtime);
         const authoredArgs = received;
         const fingerprint = replay.fingerprint;
         const witnessState = await inspectWitnesses(
@@ -599,6 +576,8 @@ function buildMutationBuilder(
             },
           })
           .catch(async (error: unknown) => {
+            const stage = componentBlobStage(error);
+            if (stage) throw blobStageRequired(mutationId, stage);
             const failure = componentFailure(error);
             if (!failure) throw error;
             throw replayFailure(failure.code, failure.targets);
@@ -684,7 +663,7 @@ const replayValidator = v.object({
   runtime: v.object({
     schemaHash: v.string(),
     moduleGraphHash: v.string(),
-    protocolVersion: v.number(),
+    contractId: v.string(),
   }),
   resultHash: v.string(),
   mutationTime: v.number(),
@@ -725,6 +704,47 @@ const replayValidator = v.object({
     }),
   ),
 });
+
+const settlementFields = {
+  mutationId: v.string(),
+  inserts: v.array(v.object({ ordinal: v.number(), table: v.string(), id: v.string() })),
+  schedules: v.array(v.object({ ordinal: v.number(), id: v.string() })),
+  uploads: v.array(v.object({ ordinal: v.number(), url: v.string() })),
+  revisions: v.array(
+    v.object({
+      table: v.string(),
+      rowId: v.string(),
+      revId: v.string(),
+    }),
+  ),
+  crdt: v.array(
+    v.object({
+      table: v.string(),
+      rowId: v.string(),
+      field: v.string(),
+      kind: v.union(v.literal("text"), v.literal("count"), v.literal("set")),
+      headSeq: v.number(),
+      projectionHash: v.string(),
+    }),
+  ),
+  authoritative: v.array(
+    v.union(
+      v.object({
+        op: v.literal("put"),
+        table: v.string(),
+        rowId: v.string(),
+        fields: v.any(),
+        plainHash: v.string(),
+      }),
+      v.object({
+        op: v.literal("del"),
+        table: v.string(),
+        rowId: v.string(),
+        plainHash: v.string(),
+      }),
+    ),
+  ),
+};
 
 const conflictSettlementErrorValidator = v.object({ code: v.literal("EMBEDDED_CONFLICT") });
 const rejectedSettlementErrorValidator = v.object({
@@ -1034,17 +1054,18 @@ function sameRevisionValue(left: RevisionExpectation, right: RevisionExpectation
   );
 }
 
-const runtimeRequestValidator = v.object({
+const currentRuntimeRequestValidator = v.object({
   schemaHash: v.string(),
   moduleGraphHash: v.string(),
-  protocolVersion: v.number(),
+  contractId: v.literal(CURRENT_WIRE_CONTRACT_ID),
 });
+const runtimeRequestValidator = currentRuntimeRequestValidator;
 
 const pullRequestValidator = v.union(
   v.object({
     kind: v.literal("identity"),
-    // Clients advertise their complete discrete set before the server returns identity state.
-    protocolVersions: v.optional(v.array(v.number())),
+    // The public protocol requires an explicit capability offer before identity state is read.
+    contractIds: v.array(v.string()),
   }),
   v.object({
     kind: v.literal("live"),
@@ -1110,11 +1131,16 @@ const pushRequestValidator = v.union(
     kind: v.literal("acknowledge"),
     clientId: v.string(),
     replayId: v.string(),
+    runtime: currentRuntimeRequestValidator,
   }),
   v.object({
     kind: v.literal("blob"),
     clientId: v.string(),
-    runtime: runtimeRequestValidator,
+    runtime: currentRuntimeRequestValidator,
+    scope: v.union(
+      v.object({ kind: v.literal("mutation"), token: v.string() }),
+      v.object({ kind: v.literal("checkpoint"), token: v.string() }),
+    ),
     hash: v.string(),
     bytes: v.number(),
     chunks: v.number(),
@@ -1123,16 +1149,87 @@ const pushRequestValidator = v.union(
     chunkHash: v.string(),
   }),
   v.object({
+    kind: v.literal("checkpointScope"),
+    clientId: v.string(),
+    runtime: runtimeRequestValidator,
+    checkpointId: v.string(),
+    responseToken: v.string(),
+    hash: v.string(),
+    bytes: v.number(),
+  }),
+  v.object({
     kind: v.literal("checkpoint"),
     clientId: v.string(),
     runtime: runtimeRequestValidator,
     checkpointId: v.string(),
     responseToken: v.string(),
+    scopeToken: v.optional(v.string()),
     throughSeq: v.number(),
     projectionHash: v.string(),
     content: opaqueBytesValidator,
   }),
 );
+
+const blobStageValidator = v.object({
+  kind: v.literal("stage"),
+  mutationId: v.string(),
+  scopes: v.array(
+    v.object({ hash: v.string(), bytes: v.number(), chunks: v.number(), token: v.string() }),
+  ),
+});
+const checkpointScopeValidator = v.object({
+  chunks: v.number(),
+  ready: v.boolean(),
+  token: v.string(),
+});
+
+const uploadRequestValidator = v.object({
+  localStorageId: v.string(),
+  sha256: v.string(),
+  size: v.number(),
+  contentType: v.optional(v.string()),
+  runtime: currentRuntimeRequestValidator,
+});
+
+/**
+ * The remote actor reaches this through the application's `embedded:upload` export. It is an
+ * ordinary authenticated Convex mutation: the package never exposes a global upload capability.
+ */
+function buildUpload() {
+  return mutationGeneric({
+    args: uploadRequestValidator,
+    returns: v.object({ uploadUrl: v.string() }),
+    handler: async (ctx, args) => {
+      normalizeRuntime(args.runtime);
+      if ((await ctx.auth.getUserIdentity()) === null) {
+        throw new ConvexError("UNAUTHENTICATED");
+      }
+      assertUploadRequest(args);
+      return { uploadUrl: await ctx.storage.generateUploadUrl() };
+    },
+  });
+}
+
+function assertUploadRequest(args: { localStorageId: string; sha256: string; size: number }): void {
+  if (args.localStorageId.length === 0) {
+    throw new ConvexError({
+      code: "EMBEDDED_UPLOAD_INVALID",
+      message: "Embedded upload localStorageId must not be empty.",
+    });
+  }
+  if (!/^[0-9a-f]{64}$/.test(args.sha256)) {
+    throw new ConvexError({
+      code: "EMBEDDED_UPLOAD_INVALID",
+      message: "Embedded upload sha256 must be a lowercase 64-character hex digest.",
+    });
+  }
+  if (!Number.isSafeInteger(args.size) || args.size < 0) {
+    throw new ConvexError({
+      code: "EMBEDDED_UPLOAD_INVALID",
+      message: "Embedded upload size must be a nonnegative safe integer.",
+    });
+  }
+}
 
 function buildPull(component: EmbeddedComponent, manifest?: FunctionManifest) {
   return queryGeneric({
@@ -1141,7 +1238,7 @@ function buildPull(component: EmbeddedComponent, manifest?: FunctionManifest) {
       v.object({
         identity: v.any(),
         identityKey: v.optional(v.string()),
-        protocolVersion: v.number(),
+        contractId: v.literal(CURRENT_WIRE_CONTRACT_ID),
       }),
       v.object({
         members: v.array(v.object({ table: v.string(), rowId: v.string() })),
@@ -1172,23 +1269,23 @@ function buildPull(component: EmbeddedComponent, manifest?: FunctionManifest) {
     ),
     handler: async (ctx, { request: args }) => {
       if (args.kind === "identity") {
-        const protocolVersion = selectEmbeddedProtocolVersion(args.protocolVersions);
-        if (protocolVersion === undefined) {
+        const contractId = selectWireContractId(args.contractIds);
+        if (contractId === undefined) {
           throw new ConvexError({
             code: EMBEDDED_PROTOCOL_MISMATCH,
-            expected: [...EMBEDDED_PROTOCOL_VERSIONS],
-            message: "Embedded identity request has no supported protocol version.",
-            received: args.protocolVersions,
+            expected: [CURRENT_WIRE_CONTRACT_ID],
+            message: "Embedded identity request has no supported wire contract.",
+            received: args.contractIds,
           });
         }
         const identity = await ctx.auth.getUserIdentity();
         return {
           identity,
           ...(identity ? { identityKey: await hashValue(identity.tokenIdentifier) } : {}),
-          protocolVersion,
+          contractId,
         };
       }
-      assertRuntimeVersion(args.runtime);
+      const runtime = normalizeRuntime(args.runtime);
       assertReplicatedTarget(manifest, args.functionName, "query");
       if (args.kind === "cursor") {
         const queryArgs = paginationArgs(args.args, args.path, args.cursor);
@@ -1229,7 +1326,7 @@ function buildPull(component: EmbeddedComponent, manifest?: FunctionManifest) {
           cursor: args.cursor,
         });
       }
-      return await completeQueryRows(ctx, component, args.runtime, rows, result);
+      return await completeQueryRows(ctx, component, runtime, rows, result);
     },
   });
 }
@@ -1319,9 +1416,18 @@ function buildPush(
 ) {
   return mutationGeneric({
     args: { request: pushRequestValidator },
-    returns: v.union(wireSettlementValidator, v.null()),
-    handler: async (ctx, { request: args }): Promise<WireSettlement | null> => {
+    returns: v.union(
+      wireSettlementValidator,
+      blobStageValidator,
+      checkpointScopeValidator,
+      v.null(),
+    ),
+    handler: async (
+      ctx,
+      { request: args },
+    ): Promise<WireSettlement | BlobStage | CheckpointScope | null> => {
       if (args.kind === "acknowledge") {
+        normalizeRuntime(args.runtime);
         const identity = await identityAttributeOf(ctx);
         await ctx.runMutation(component.protocol.acknowledge, {
           replayId: args.replayId,
@@ -1329,7 +1435,7 @@ function buildPush(
         });
         return null;
       }
-      const wire = assertRuntimeVersion(args.runtime);
+      const runtime = normalizeRuntime(args.runtime);
       if (args.kind === "mutation") {
         const identity = await identityAttributeOf(ctx);
         const { requestId } = await ctx.meta.getRequestMetadata();
@@ -1373,13 +1479,12 @@ function buildPush(
           uploads: args.uploads,
           crdt: args.crdt,
           revisionCheckpoints: args.revisionCheckpoints,
-          runtime: args.runtime,
+          runtime,
           acknowledgeReplayId: args.acknowledgeReplayId,
           expiresAt: readTime() + REPLAY_TTL_MS,
         })) as Settlement | null;
         if (prior) {
           return encodeSettlement(
-            wire,
             normalizeSettlement(
               await refreshAppliedSettlement(ctx, prior, tableNames, crdtFields, placements),
             ),
@@ -1409,8 +1514,22 @@ function buildPush(
               message: "Only mutations created by defineEmbedded can be replayed.",
             });
           }
-          return encodeSettlement(wire, normalizeSettlement(result.settlement));
+          return encodeSettlement(normalizeSettlement(result.settlement));
         } catch (error) {
+          const stage = embeddedBlobStage(error);
+          if (stage) {
+            if (stage.mutationId !== args.mutationId) {
+              throw new Error("Embedded blob capability did not match its mutation.");
+            }
+            const scopes = await ctx.runMutation(component.protocol.blobScopeWrite, {
+              clientId: args.clientId,
+              ...(identity === null ? {} : { identity }),
+              replayId: args.replayId,
+              fingerprint,
+              manifests: stage.manifests,
+            });
+            return { kind: "stage", mutationId: args.mutationId, scopes };
+          }
           // A function removed or narrowed by a later deployment fails before its embedded wrapper
           // can translate the error. Convex has already retried internal mutation failures before
           // surfacing an error here, so the durable envelope must settle instead of poisoning the
@@ -1447,7 +1566,6 @@ function buildPush(
                 );
           const settlement = failureSettlement(args.mutationId, failure.code);
           return encodeSettlement(
-            wire,
             normalizeSettlement(
               (await ctx.runMutation(component.protocol.commit, {
                 request: {
@@ -1456,7 +1574,7 @@ function buildPush(
                   replayId: args.replayId,
                   fingerprint,
                   logicalFingerprint,
-                  runtime: args.runtime,
+                  runtime,
                   ...(identity === null ? {} : { identity }),
                   acknowledgeReplayId: args.acknowledgeReplayId,
                   settlement,
@@ -1469,7 +1587,11 @@ function buildPush(
         }
       }
       if (args.kind === "blob") {
+        const identity = await identityAttributeOf(ctx);
         await ctx.runMutation(component.protocol.blobWrite, {
+          clientId: args.clientId,
+          ...(identity === null ? {} : { identity }),
+          scope: args.scope,
           hash: args.hash,
           bytes: args.bytes,
           chunks: args.chunks,
@@ -1479,10 +1601,25 @@ function buildPush(
         });
         return null;
       }
+      if (args.kind === "checkpointScope") {
+        const identity = await identityAttributeOf(ctx);
+        return await ctx.runMutation(component.protocol.checkpointScopeWrite, {
+          clientId: args.clientId,
+          ...(identity === null ? {} : { identity }),
+          checkpointId: args.checkpointId as never,
+          responseToken: args.responseToken,
+          hash: args.hash,
+          bytes: args.bytes,
+        });
+      }
       if (args.kind === "checkpoint") {
+        const identity = await identityAttributeOf(ctx);
         await ctx.runMutation(component.protocol.checkpointWrite, {
+          clientId: args.clientId,
+          ...(identity === null ? {} : { identity }),
           checkpointId: args.checkpointId,
           responseToken: args.responseToken,
+          ...(args.scopeToken === undefined ? {} : { scopeToken: args.scopeToken }),
           throughSeq: args.throughSeq,
           projectionHash: args.projectionHash,
           content: args.content,
@@ -1495,12 +1632,9 @@ function buildPush(
 }
 
 /**
- * Normalize a cached failure at the current server response boundary.
- *
- * Historic component rows may contain an arbitrary `error` object and reason text. Their exact
- * payload is never forwarded: the outcome determines conflict/rebase, while rejected preserves
- * only the one safe stored distinction (`EMBEDDED_DIVERGENCE`). New records already use this
- * shape, so the same boundary guarantees every Rust client receives the closed form.
+ * Normalize a cached settlement before it crosses the component boundary. Error text never
+ * crosses that boundary: the outcome determines conflict/rebase, while rejected preserves only
+ * the closed `EMBEDDED_DIVERGENCE` distinction.
  */
 function normalizeSettlement(settlement: Settlement): Settlement {
   switch (settlement.outcome) {
@@ -1511,21 +1645,19 @@ function normalizeSettlement(settlement: Settlement): Settlement {
     case "rebase":
       return { ...settlement, error: { code: "EMBEDDED_REBASE" } };
     case "rejected": {
-      const legacyCode = readSettlementErrorCode(settlement.error);
+      const code = readSettlementErrorCode(settlement.error);
       return {
         ...settlement,
         error: {
-          code: legacyCode === "EMBEDDED_DIVERGENCE" ? "EMBEDDED_DIVERGENCE" : "EMBEDDED_REJECTED",
+          code: code === "EMBEDDED_DIVERGENCE" ? "EMBEDDED_DIVERGENCE" : "EMBEDDED_REJECTED",
         },
       };
     }
   }
 }
 
-/**
- * Encode the canonical settlement for the selected package wire.
- */
-function encodeSettlement(_wire: EmbeddedProtocolVersion, settlement: Settlement): WireSettlement {
+/** Return the canonical settlement shape emitted by the current protocol. */
+function encodeSettlement(settlement: Settlement): WireSettlement {
   return settlement;
 }
 
@@ -1857,6 +1989,15 @@ class WriteCapture {
     }
   }
 
+  private assertReplicatedIndex(table: string, index: unknown): void {
+    if (
+      typeof index === "string" &&
+      this.placements.indexes[table]?.remote.includes(index) === true
+    ) {
+      throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
+    }
+  }
+
   private project(table: string, value: unknown): unknown {
     if (typeof value !== "object" || value === null) return value;
     return projectWireDoc(this.placements, table, value as Record<string, unknown>);
@@ -1874,7 +2015,7 @@ class WriteCapture {
         const value = Reflect.get(target, property, receiver);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
-          if (property === "withIndex") assertReplicatedIndex(this.placements, table, args[0]);
+          if (property === "withIndex") this.assertReplicatedIndex(table, args[0]);
           const next = value.apply(target, args);
           if (property === "collect" || property === "take") {
             return Promise.resolve(next).then((rows: unknown[]) =>
@@ -2485,13 +2626,23 @@ async function identityAttributeOf(
   return identity ? await hashValue(identity.tokenIdentifier) : null;
 }
 
-function assertRuntimeVersion(runtime: { protocolVersion: number }): EmbeddedProtocolVersion {
-  if (isEmbeddedProtocolVersion(runtime.protocolVersion)) return runtime.protocolVersion;
+function normalizeRuntime(runtime: {
+  schemaHash: string;
+  moduleGraphHash: string;
+  contractId: string;
+}): { schemaHash: string; moduleGraphHash: string; contractId: WireContractId } {
+  if (isWireContractId(runtime.contractId)) {
+    return {
+      schemaHash: runtime.schemaHash,
+      moduleGraphHash: runtime.moduleGraphHash,
+      contractId: runtime.contractId,
+    };
+  }
   throw new ConvexError({
     code: EMBEDDED_PROTOCOL_MISMATCH,
-    expected: [...EMBEDDED_PROTOCOL_VERSIONS],
-    message: `Embedded protocol ${runtime.protocolVersion} is not supported.`,
-    received: runtime.protocolVersion,
+    expected: [CURRENT_WIRE_CONTRACT_ID],
+    message: "Embedded wire contract is not supported.",
+    received: runtime.contractId,
   });
 }
 
@@ -2569,6 +2720,26 @@ function componentFailure(error: unknown): {
   return data === null ? null : replayFailureData(data);
 }
 
+function componentBlobStage(error: unknown): Array<{ hash: string; bytes: number }> | null {
+  const data = convexErrorData(error);
+  if (data?.code !== "EMBEDDED_BLOB_REQUIRED" || !Array.isArray(data.manifests)) return null;
+  const manifests = data.manifests.map((manifest) => {
+    if (
+      manifest === null ||
+      typeof manifest !== "object" ||
+      typeof (manifest as Record<string, unknown>).hash !== "string" ||
+      typeof (manifest as Record<string, unknown>).bytes !== "number"
+    ) {
+      throw new Error("Embedded component blob stage has an invalid manifest.");
+    }
+    return {
+      hash: (manifest as Record<string, unknown>).hash as string,
+      bytes: (manifest as Record<string, unknown>).bytes as number,
+    };
+  });
+  return manifests;
+}
+
 function convexErrorData(error: unknown): Record<string, unknown> | null {
   if (!(error instanceof ConvexError)) return null;
   return error.data !== null && typeof error.data === "object" && !Array.isArray(error.data)
@@ -2610,6 +2781,50 @@ function isEmbeddedReplayResult(
     (value as Record<string, unknown>).kind === "embeddedReplay" &&
     typeof (value as Record<string, unknown>).settlement === "object"
   );
+}
+
+function blobStageRequired(
+  mutationId: string,
+  manifests: Array<{ hash: string; bytes: number }>,
+): ConvexError<{
+  kind: "embeddedBlobStage";
+  mutationId: string;
+  manifests: Array<{ hash: string; bytes: number }>;
+}> {
+  return new ConvexError({
+    kind: "embeddedBlobStage",
+    mutationId,
+    manifests,
+    message: "The replay requires scoped checkpoint bytes before it can commit.",
+  });
+}
+
+function embeddedBlobStage(
+  error: unknown,
+): { mutationId: string; manifests: Array<{ hash: string; bytes: number }> } | null {
+  const data = convexErrorData(error);
+  if (
+    data?.kind !== "embeddedBlobStage" ||
+    typeof data.mutationId !== "string" ||
+    !Array.isArray(data.manifests)
+  ) {
+    return null;
+  }
+  const manifests = data.manifests.map((manifest) => {
+    if (
+      manifest === null ||
+      typeof manifest !== "object" ||
+      typeof (manifest as Record<string, unknown>).hash !== "string" ||
+      typeof (manifest as Record<string, unknown>).bytes !== "number"
+    ) {
+      throw new Error("Embedded blob stage capability has an invalid manifest.");
+    }
+    return {
+      hash: (manifest as Record<string, unknown>).hash as string,
+      bytes: (manifest as Record<string, unknown>).bytes as number,
+    };
+  });
+  return { mutationId: data.mutationId, manifests };
 }
 
 function uniqueTargets(

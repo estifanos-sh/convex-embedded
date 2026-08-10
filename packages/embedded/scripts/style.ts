@@ -28,7 +28,15 @@ const toolRequiredFiles = new Set([
   "tests/browser/vite-env.d.ts",
   "tests/fixture/convex/convex.config.ts",
 ]);
-const generatedPaths = new Set(["tests/bench/results/artifacts"]);
+const generatedPaths = new Set([
+  "src/browser/coordinator/contract.ts",
+  "src/contract",
+  "src/expo/contract.ts",
+  "src/storage/contract.ts",
+  "tests/bench/results/artifacts",
+  "tests/browser/convex/embedded.generated.ts",
+  "tests/metal/convex/embedded.generated.ts",
+]);
 const rawTimeAllowedFiles = new Set([
   "crates/storage/src/clock.rs",
   "convex/time.ts",

@@ -290,18 +290,15 @@ fn setup_preserves_nonempty_store_when_format_version_changes() {
         store.setup(&schema()),
         Err(StorageError::PreBaselineStore {
             found: 0,
-            minimum: 47
+            minimum: 1
         })
     ));
     assert!(read_doc(&store, "issues", "i1").is_some());
 
-    store.force_user_version_for_test(39);
+    store.force_user_version_for_test(2);
     assert!(matches!(
         store.setup(&schema()),
-        Err(StorageError::PreBaselineStore {
-            found: 39,
-            minimum: 47
-        })
+        Err(StorageError::IncompatibleStore(message)) if message.contains("unsupported store epoch 2")
     ));
     assert!(read_doc(&store, "issues", "i1").is_some());
 }

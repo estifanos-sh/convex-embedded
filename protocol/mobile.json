@@ -1,0 +1,8 @@
+{
+  "format": "convex-embedded-mobile-bridge/v1",
+  "surface": {
+    "algorithm": "semantic-source/v2",
+    "digest": "sha256:a1d8f8b03b558b52bd724c340a63809fb389b6a5eb24b455ad54fdab65967ee7"
+  },
+  "rejection": "wrong-or-missing-contract-id-rebuilds-native-app"
+}

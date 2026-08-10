@@ -54,7 +54,7 @@ vp run @estifanos-sh/convex-embedded-demo-expo#start
 ```
 
 Restart Metro whenever the Convex schema or a device function changes. The Metro adapter regenerates
-the embedded module registry and the shared `convex/_generated/embedded.ts` contract during
+the embedded module registry and the shared `convex/embedded.generated.ts` contract during
 configuration. Vite writes that same contract, which Convex codegen never replaces.
 
 EAS development and store builds use `eas.json`. Run EAS from this directory so it picks up the demo

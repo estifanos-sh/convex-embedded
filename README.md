@@ -7,9 +7,9 @@ local SQLite runtime owns the device projection and all Loro computation.
 ## Requirements
 
 - `convex` 1.43.0 or newer
-- Node.js 20.19 or newer for the Node runtime and package build tools. Release CI uses Node 24.
-  Prebuilt Node artifacts support Apple Silicon macOS, Linux x64/ARM64, and Windows x64; Intel macOS
-  requires an explicitly supplied source-built artifact.
+- Node.js 20.19 or newer for the Node runtime and package build tools. Prebuilt Node artifacts support
+  Apple Silicon macOS, Linux x64/ARM64, and Windows x64; Intel macOS requires an explicitly supplied
+  source-built artifact.
 - Cross-origin isolation for browser builds that use the threaded WASM runtime
 
 Install the package alongside Convex:
@@ -33,7 +33,7 @@ release asset, not an npm publication.
 
 Every npm publication is an explicit `publish.yml` workflow dispatch. Select `prerelease` or
 `release`, provide the exact source commit, and provide a matching `v<version>` tag—for example,
-`v0.0.1-preview.0`. The workflow qualifies and assembles that one commit before creating the tag
+`v0.0.1`. The workflow qualifies and assembles that one commit before creating the tag
 and publishing the package. npm trusted publishing binds release authority to this repository and
 this package identity; no other repository can publish it.
 
@@ -58,7 +58,7 @@ Create one Embedded server definition and export its protocol functions:
 import { defineEmbedded } from "@estifanos-sh/convex-embedded/server";
 
 import { components } from "./_generated/api";
-import { embeddedManifest } from "./_generated/embedded";
+import { embeddedManifest } from "./embedded.generated";
 import schema from "./schema";
 
 export const embedded = defineEmbedded({
@@ -68,7 +68,24 @@ export const embedded = defineEmbedded({
 });
 
 export const { remote, replicated } = embedded;
-export const { upload, pull, push } = embedded;
+export const { pull, push, upload } = embedded;
+```
+
+`upload` is the authenticated endpoint the device remote actor uses to mint the hosted storage
+capability needed to drain a local file. It is not an unauthenticated upload endpoint. For an
+application-owned upload flow, write an ordinary authorized Convex mutation:
+
+```ts
+// convex/uploads.ts
+import { mutation } from "./_generated/server";
+
+export const createUploadUrl = mutation({
+  args: {},
+  handler: async (ctx) => {
+    if ((await ctx.auth.getUserIdentity()) === null) throw new Error("UNAUTHENTICATED");
+    return await ctx.storage.generateUploadUrl();
+  },
+});
 ```
 
 Application functions select an explicit placement and use normal Convex authorization and
@@ -197,7 +214,7 @@ contain an `e.local` field. Search, vector, and staged indexes are supported on 
 only when they are hosted-only; the embedded store does not implement those index kinds.
 
 Device-only functions live in directories the app names with the bundler `local` option, use the
-app-bound `local` namespace from `convex/_generated/embedded`, and are referenced by importing the
+app-bound `local` namespace from `convex/embedded.generated`, and are referenced by importing the
 function value directly. The bundler plugin writes that generated contract from the schema, so the
 builders always use the application's device data model without a global module augmentation.
 
@@ -209,7 +226,7 @@ export default schema;
 
 ```ts
 // local/preferences.ts — an ordinary TypeScript module
-import { local } from "../convex/_generated/embedded";
+import { local } from "../convex/embedded.generated";
 import { v } from "convex/values";
 
 export const setCompact = local.mutation({
@@ -286,13 +303,14 @@ some replicated subscription already delivered, publishes no subscription of its
 served from the server's retained answer, so re-sorting or re-paging a replicated list in one shows
 a list the server never returned.
 
-The build plugin writes `convex/_generated/embedded.ts`, a small checked-in contract holding the
+The build plugin writes `convex/embedded.generated.ts`, a small checked-in contract holding the
 function manifest, identity hashes for the schema source and manifest, and the schema-bound `local`
 builders. Every adapter still analyzes the live schema and inlines the device storage schema into
-the virtual registry, so the contract stays small. Its `_generated` directory keeps it out of
-deployment discovery while `convex/embedded.ts` imports `embeddedManifest` for deployment. Treat it
-like other generated Convex output: do not edit it by hand, and run the configured bundler adapter
-after schema or function changes so stale placement metadata cannot enter a device build.
+the virtual registry, so the contract stays small. The `.generated` filename keeps it out of the
+embedded function graph while `convex/embedded.ts` imports `embeddedManifest` for deployment, and
+keeps it separate from Convex's generator-owned `_generated` directory. Treat it like other
+generated output: do not edit it by hand, and run the configured bundler adapter after schema or
+function changes so stale placement metadata cannot enter a device build.
 
 ## Schema changes and migrations
 
@@ -314,10 +332,9 @@ Applications never author migrations for Embedded's private SQLite tables or rec
 `client.open()` performs package-owned compatibility work automatically and fails without deleting
 the existing store when that work cannot be proven safe.
 
-`@estifanos-sh/convex-embedded@0.0.1-preview.0` is the first supported library-store baseline.
-Each later release must either read that contract unchanged or carry it forward through an explicit,
-tested adapter. Stores outside the published compatibility set are preserved and reported as
-unsupported; Embedded never clears app storage to make an upgrade succeed.
+The package's first public store contract is its compatibility baseline. Stores created by
+unpublished development builds are left intact but cannot be opened by a release; clear that
+development-only app storage once, or choose a new storage id.
 
 ### Hosted Convex data
 
@@ -413,7 +430,7 @@ ready and orchestrates ordinary internal local queries and mutations over device
 ```ts
 import { v } from "convex/values";
 
-import { local } from "../convex/_generated/embedded";
+import { local } from "../convex/embedded.generated";
 import { rewritePreferences } from "./preferences";
 
 export const setup = local.internalAction({
@@ -437,7 +454,7 @@ generated `local` value remains bound to the current schema.
 // local/setup.ts
 import { v } from "convex/values";
 
-import { local } from "../convex/_generated/embedded";
+import { local } from "../convex/embedded.generated";
 
 export const preferencesCurrentWrite = local.internalMutation({
   args: { compact: v.boolean() },
@@ -473,7 +490,9 @@ export const setup = local.internalAction({
 `ctx.ledger` reads only historical `localTable` records. `ctx.ledger.read` validates each
 historical value with the supplied Convex validator.
 `ctx.ledger.delete` consumes one historical record only after its replacement has committed. Both
-reject outside the running setup action. Every local registration dispatched with `ctx.runQuery` or
+reject outside the running setup action. It remains a structurally visible, read-only capability on
+an ordinary local action context because the same action can run normally; runtime setup state is
+the authority boundary. Every local registration dispatched with `ctx.runQuery` or
 `ctx.runMutation` must be a named export so the configured bundler can stamp and register it.
 
 `setup` must be an imported, bundled internal local action with empty arguments and a `null`
@@ -537,7 +556,7 @@ The plugin options are relative to the Vite project root:
 ```ts
 convexEmbedded({
   convexDir: "convex",
-  generatedPath: "_generated/embedded.ts",
+  generatedPath: "embedded.generated.ts",
   local: "local",
   schema,
   schemaPath: "schema.ts",
@@ -635,7 +654,7 @@ module.exports = withConvexEmbedded(getDefaultConfig(__dirname), {
 });
 ```
 
-Metro analyzes `schema` and rewrites `convex/_generated/embedded.ts` before materializing its
+Metro analyzes `schema` and rewrites `convex/embedded.generated.ts` before materializing its
 registry, exactly as the Vite and Unplugin adapters do.
 
 Metro builds its registry when the configuration loads. Restart Metro after changing the schema or

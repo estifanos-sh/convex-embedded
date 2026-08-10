@@ -86,7 +86,7 @@ describe("embedded error registry", () => {
 
   test("normalizes the stable prebaseline marker shared by Node, WASM, and Expo", () => {
     const cause = new Error(
-      "[convex-embedded:EMBEDDED_PRE_BASELINE_STORE] store epoch 46 predates baseline 47",
+      "[convex-embedded:EMBEDDED_PRE_BASELINE_STORE] store epoch 0 predates baseline 1",
     );
     const error = normalizeStorageError(cause);
     expect(isEmbeddedError(error, "EMBEDDED_PRE_BASELINE_STORE")).toBe(true);

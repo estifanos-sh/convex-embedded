@@ -1,9 +1,9 @@
 import { describe, expect, test } from "vite-plus/test";
 import { makeFunctionReference } from "convex/server";
 
-import { EMBEDDED_EPOCH } from "../../src/abi";
+import { EMBEDDED_STORE_EPOCH } from "../../src/abi";
 import { EmbeddedClient } from "../../src/client";
-import { WASM_API_VERSION } from "../../src/browser/artifact";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../../src/storage/contract";
 import {
   ConvexEmbeddedClient,
   createBrowserStorageOwnership,
@@ -15,7 +15,7 @@ import type { WorkerRunner } from "../../src/browser/proxy";
 import { WorkerEvent, type EmbeddedWorker, type RuntimeIdentity } from "../../src/browser/protocol";
 import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
 import { readDevtoolsBridge } from "../../src/devtools/bridge";
-import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import { CURRENT_WIRE_CONTRACT_ID } from "../../src/protocol";
 import type { Runner } from "../../src/runtime/runner";
 import type { RemoteMutationSettlement, RemoteTick } from "../../src/storage/types";
 import { setEmbeddedIdentity } from "../../src/browser/identity";
@@ -29,11 +29,11 @@ function identity(storageId: string): RuntimeIdentity {
   return {
     moduleGraphHash: "modules",
     packageVersion: "0.0.0",
-    protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+    contractId: CURRENT_WIRE_CONTRACT_ID,
     schemaHash: "schema",
     storageId,
-    storeFormatVersion: EMBEDDED_EPOCH,
-    wasmAbiVersion: WASM_API_VERSION,
+    storeFormatVersion: EMBEDDED_STORE_EPOCH,
+    storageBindingId: CURRENT_STORAGE_BINDING_CONTRACT_ID,
   };
 }
 

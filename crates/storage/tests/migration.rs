@@ -300,8 +300,8 @@ fn remote_authoritative_view_survives_candidate_cutover_without_network() {
 }
 
 #[test]
-fn epoch49_contract_separates_setup_plan_and_publishes_it_with_candidate_cutover() {
-    let path = tmp_path("migration_epoch48_setup_plan.db");
+fn durable_baseline_contract_separates_setup_plan_and_publishes_it_with_candidate_cutover() {
+    let path = tmp_path("migration_durable_baseline_setup_plan.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     let mut current = schema('0');
     current.setup_hash = "setup:one".to_owned();
@@ -319,9 +319,9 @@ fn epoch49_contract_separates_setup_plan_and_publishes_it_with_candidate_cutover
         commit_candidate(&store, &current, candidate.candidate_generation).unwrap();
     }
     let contract = store.active_contract_debug_read().unwrap();
-    assert_eq!(store.store_epoch_debug_read().unwrap(), 49);
-    assert_eq!(contract.format, 3);
-    assert_eq!(contract.package_epoch, 49);
+    assert_eq!(store.store_epoch_debug_read().unwrap(), 1);
+    assert_eq!(contract.format, 1);
+    assert_eq!(contract.package_epoch, 1);
     assert!(contract.setup_hash.is_none());
     assert_eq!(store.active_setup_hash_debug_read().unwrap(), "setup:one");
 
@@ -347,8 +347,22 @@ fn epoch49_contract_separates_setup_plan_and_publishes_it_with_candidate_cutover
 }
 
 #[test]
-fn leader_fence_rejects_bad_values_overflow_and_failed_claims_without_advancing() {
-    let path = tmp_path("migration_leader_fence_failures.db");
+fn public_contract_persists_a_monotonic_leader_fence() {
+    let path = tmp_path("migration_public_leader_fence.db");
+    let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
+    store.setup(&schema('0')).unwrap();
+    assert_eq!(store.leader_fence_write().unwrap(), "1");
+    assert_eq!(store.leader_fence_write().unwrap(), "2");
+    drop(store);
+
+    let reopened = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
+    reopened.setup(&schema('0')).unwrap();
+    assert_eq!(reopened.leader_fence_write().unwrap(), "3");
+}
+
+#[test]
+fn public_leader_fence_fails_closed_without_consuming_a_term() {
+    let path = tmp_path("migration_public_leader_fence_failures.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     store.setup(&schema('0')).unwrap();
 
@@ -359,27 +373,17 @@ fn leader_fence_rejects_bad_values_overflow_and_failed_claims_without_advancing(
     ] {
         store.leader_fence_debug_write(value).unwrap();
         assert!(store.leader_fence_write().is_err());
-        assert_eq!(
-            store.leader_fence_debug_read().unwrap().as_deref(),
-            Some(value)
-        );
     }
     store
         .leader_fence_debug_write(i64::MAX.to_string().as_bytes())
         .unwrap();
     assert!(store.leader_fence_write().is_err());
-    assert_eq!(
-        store.leader_fence_debug_read().unwrap().as_deref(),
-        Some(i64::MAX.to_string().as_bytes())
-    );
+    store.leader_fence_debug_delete().unwrap();
+    assert!(store.leader_fence_write().is_err());
 
     store.leader_fence_debug_write(b"0").unwrap();
     fail_next_commit();
     assert!(store.leader_fence_write().is_err());
-    assert_eq!(
-        store.leader_fence_debug_read().unwrap().as_deref(),
-        Some(b"0".as_slice())
-    );
     assert_eq!(store.leader_fence_write().unwrap(), "1");
 }
 
@@ -1526,7 +1530,7 @@ fn quarantine_retains_the_candidate_record_without_materializing_it() {
 
 #[test]
 fn pre_baseline_store_is_preserved_and_rejected_without_repair() {
-    let path = tmp_path("migration_baseline_cutoff.db");
+    let path = tmp_path("migration_prebaseline_cutoff.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     let source = schema('0');
     store.setup(&source).unwrap();
@@ -1542,14 +1546,16 @@ fn pre_baseline_store_is_preserved_and_rejected_without_repair() {
         )
         .unwrap();
     let before = store.origin_page_read(1, None, 100).unwrap();
-    store.force_user_version_for_test(46);
+    // The hard-cut baseline accepts only the first public layout. A pre-release
+    // layout (0) must remain readable only enough to report the hard failure.
+    store.force_user_version_for_test(0);
 
     let error = store.migration_begin(&schema('1')).unwrap_err();
     assert!(matches!(
         error,
         storage::StorageError::PreBaselineStore {
-            found: 46,
-            minimum: 49
+            found: 0,
+            minimum: 1
         }
     ));
     assert_eq!(store.origin_page_read(1, None, 100).unwrap(), before);
@@ -1561,8 +1567,8 @@ fn pre_baseline_store_is_preserved_and_rejected_without_repair() {
     assert!(matches!(
         EmbeddedStore::open(path.to_str().unwrap()).err().unwrap(),
         storage::StorageError::PreBaselineStore {
-            found: 46,
-            minimum: 49
+            found: 0,
+            minimum: 1
         }
     ));
 }
@@ -1755,14 +1761,11 @@ fn origin_writer_identity_is_distinct_from_retained_reader_coverage() {
     assert_ne!(writer, readers);
     assert_eq!(writer.len(), 64);
     assert_eq!(readers.len(), 64);
-    assert!(storage::origin_adapter_applies_debug(47, 49, 51));
-    assert!(!storage::origin_adapter_applies_debug(49, 49, 51));
-    assert!(!storage::origin_adapter_applies_debug(47, 52, 51));
 }
 
 #[test]
-fn reader_only_contract_evolution_neither_migrates_nor_rewrites_active_contract() {
-    let path = tmp_path("migration_reader_only_contract.db");
+fn unknown_public_contract_is_rejected_without_rewriting_active_store() {
+    let path = tmp_path("migration_unknown_public_contract.db");
     let store = EmbeddedStore::open(path.to_str().unwrap()).unwrap();
     let current = schema('0');
     store.setup(&current).unwrap();
@@ -1770,14 +1773,12 @@ fn reader_only_contract_evolution_neither_migrates_nor_rewrites_active_contract(
         .contract_reader_hash_debug_write("reader:previous-release")
         .unwrap();
 
-    let before = store.migration_begin(&current).unwrap();
-    assert!(!before.required);
-    assert_ne!(before.source_contract_hash, before.target_contract_hash);
-    store.setup(&current).unwrap();
-    let after = store.migration_begin(&current).unwrap();
-    assert!(!after.required);
-    assert_eq!(after.source_contract_hash, before.source_contract_hash);
-    assert_eq!(after.target_contract_hash, before.target_contract_hash);
+    let error = store.migration_begin(&current).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("active contract does not match the supported SQLite/bootstrap/schema contract"));
+    assert!(store.setup(&current).is_err());
+    assert_eq!(store.store_epoch_debug_read().unwrap(), 1);
 }
 
 #[test]

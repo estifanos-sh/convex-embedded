@@ -2,9 +2,9 @@
  * Framework-agnostic convergence loop for a single embedded text field.
  *
  * @remarks
- * {@link createTextField} generalizes the editor loop the demos hand-rolled. Every write diffs the
- * live local value against the latest desired value and carries the whole-base fingerprint the engine
- * enforces; a stale-base or out-of-range rejection stays pending and retries from a fresh read. The
+ * {@link createTextField} generalizes the rebase-once editor loop the demos hand-rolled. Every write
+ * diffs the live local value against the latest desired value and carries the whole-base fingerprint
+ * the engine enforces; a stale-base or out-of-range rejection rebases once against a fresh read; the
  * authoritative return value is adopted as the new baseline so the field self-heals toward
  * convergence without ever dropping a pending edit.
  *

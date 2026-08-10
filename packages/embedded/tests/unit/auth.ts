@@ -4,7 +4,7 @@ import { describe, expect, test } from "vite-plus/test";
 
 import { createEmbeddedAuthState, EmbeddedClient } from "../../src/client";
 import {
-  EMBEDDED_PROTOCOL_VERSION,
+  CURRENT_WIRE_CONTRACT_ID,
   EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY,
 } from "../../src/protocol";
 import type { Runner, RunOptions } from "../../src/runtime/runner";
@@ -91,7 +91,7 @@ describe("embedded auth partitions", () => {
         return {
           identity: accepted,
           identityKey: "next-key",
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+          contractId: CURRENT_WIRE_CONTRACT_ID,
         };
       },
       runQuery: (options) => {

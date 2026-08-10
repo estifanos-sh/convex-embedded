@@ -14,6 +14,7 @@
 //! and scheduled jobs are all identity-scoped.
 
 pub mod clock;
+pub mod contract;
 mod crdt;
 mod driver;
 pub mod error;
@@ -46,11 +47,16 @@ pub(crate) fn log_open_phase(phase: &str, start: std::time::Instant) {
 #[inline]
 pub(crate) fn log_open_phase(_phase: &str, _start: std::time::Instant) {}
 
+pub use contract::{
+    CURRENT_MOBILE_BRIDGE_CONTRACT_ID, CURRENT_STORAGE_BINDING_CONTRACT_ID,
+    CURRENT_WIRE_CONTRACT_ID, WIRE_BLOB_CHUNK_BYTES, WIRE_ENDPOINT_PULL, WIRE_ENDPOINT_PUSH,
+    WIRE_ENDPOINT_UPLOAD,
+};
 pub use error::StorageError;
 pub use sql::{DEFAULT_READ_PAGE, READ_CAP};
 pub use store::EmbeddedStore;
 #[cfg(any(test, feature = "testkit"))]
-pub use types::{origin_adapter_applies_debug, origin_codec_manifest_debug};
+pub use types::origin_codec_manifest_debug;
 pub use types::{
     ArchivedRev, ArgRef, AuthoritativeApplyResult, AuthoritativeChange, AuthoritativeRow,
     BaseVersion, Bound, ColValue, ColumnDef, CommitChanges, CommitMutation, CommitOptions,

@@ -13,7 +13,7 @@ import type { LedgerReader } from "../../src/runtime/ledger";
 import { NativeStore } from "../../src/node/native";
 import type { Runner } from "../../src/runtime/runner";
 import {
-  EMBEDDED_PROTOCOL_VERSION,
+  CURRENT_WIRE_CONTRACT_ID,
   EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY,
 } from "../../src/protocol";
 import { defineFunctions } from "../../src/runtime/functions";
@@ -982,7 +982,7 @@ function pendingRemote(): {
     close: async () => undefined,
     pull: async () => emptyTick(),
     scope: { write: async () => undefined },
-    identity: async () => ({ identity: null, protocolVersion: EMBEDDED_PROTOCOL_VERSION }),
+    identity: async () => ({ identity: null, contractId: CURRENT_WIRE_CONTRACT_ID }),
   };
   return {
     remote,
@@ -1009,7 +1009,7 @@ function abortableRemote(): { remote: RemoteSurface; startCalls: () => number } 
     },
     pull: async () => emptyTick(),
     scope: { write: async () => undefined },
-    identity: async () => ({ identity: null, protocolVersion: EMBEDDED_PROTOCOL_VERSION }),
+    identity: async () => ({ identity: null, contractId: CURRENT_WIRE_CONTRACT_ID }),
   };
   return { remote, startCalls: () => calls };
 }
@@ -1037,7 +1037,7 @@ function recoverableRemote(firstError: unknown): {
       return emptyTick();
     },
     scope: { write: async () => undefined },
-    identity: async () => ({ identity: null, protocolVersion: EMBEDDED_PROTOCOL_VERSION }),
+    identity: async () => ({ identity: null, contractId: CURRENT_WIRE_CONTRACT_ID }),
   };
   return { remote, startCalls: () => starts, pullCalls: () => pulls };
 }

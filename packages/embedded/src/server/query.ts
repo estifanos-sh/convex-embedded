@@ -20,8 +20,8 @@ import { pullChangeValidator, pullCrdtValidator, resultRowValidator } from "../c
 import { canonicalJson, hashDocument } from "../hash";
 import {
   EMBEDDED_PROTOCOL_MISMATCH,
-  EMBEDDED_PROTOCOL_VERSIONS,
-  isEmbeddedProtocolVersion,
+  CURRENT_WIRE_CONTRACT_ID,
+  isWireContractId,
 } from "../protocol";
 import { pointerPart } from "../id/path";
 import { projectWireDoc, type EmbeddedSchemaPlacements } from "../schema";
@@ -68,7 +68,7 @@ type QueryTransport =
   | {
       kind: "live";
       component: string;
-      runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number };
+      runtime: { schemaHash: string; moduleGraphHash: string; contractId: string };
       stack: string[];
       topLevel: boolean;
     };
@@ -96,20 +96,10 @@ type EmbeddedRegisteredQuery = RegisteredQuery<any, any, any> & {
   __embeddedPlacement?: "replicated";
 };
 
-export function assertReplicatedIndex(
-  placements: EmbeddedSchemaPlacements,
-  table: string,
-  index: unknown,
-): void {
-  if (typeof index === "string" && placements.indexes[table]?.remote.includes(index) === true) {
-    throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
-  }
-}
-
 const runtimeValidator = v.object({
   schemaHash: v.string(),
   moduleGraphHash: v.string(),
-  protocolVersion: v.number(),
+  contractId: v.string(),
 });
 
 const transportValidator = v.union(
@@ -625,7 +615,7 @@ class QueryCapture {
         const value = Reflect.get(target, property, receiver);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
-          if (property === "withIndex") assertReplicatedIndex(this.placements, table, args[0]);
+          if (property === "withIndex") this.assertReplicatedIndex(table, args[0]);
           const next = value.apply(target, args);
           if (property === "collect" || property === "take") {
             return Promise.resolve(next).then((rows: unknown[]) => {
@@ -678,6 +668,15 @@ class QueryCapture {
     }
   }
 
+  private assertReplicatedIndex(table: string, index: unknown): void {
+    if (
+      typeof index === "string" &&
+      this.placements.indexes[table]?.remote.includes(index) === true
+    ) {
+      throw new Error(`Replicated functions cannot access remote index ${table}.${index}.`);
+    }
+  }
+
   private assertBound(): void {
     if (this.rows.size > MAX_CAPTURED_ROWS) {
       throw new Error(`Embedded query read more than ${MAX_CAPTURED_ROWS} documents.`);
@@ -688,7 +687,7 @@ class QueryCapture {
 export async function completeQueryRows(
   ctx: GenericQueryCtx<any>,
   component: EmbeddedComponent,
-  runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number },
+  runtime: { schemaHash: string; moduleGraphHash: string; contractId: string },
   rows: QueryRow[],
   authored: unknown,
 ) {
@@ -758,12 +757,12 @@ async function plainLiveResult(rows: QueryRow[]) {
   };
 }
 
-function assertRuntimeVersion(runtime: { protocolVersion: number }): void {
-  if (isEmbeddedProtocolVersion(runtime.protocolVersion)) return;
+function assertRuntimeVersion(runtime: { contractId: string }): void {
+  if (isWireContractId(runtime.contractId)) return;
   throw new ConvexError({
     code: EMBEDDED_PROTOCOL_MISMATCH,
-    expected: [...EMBEDDED_PROTOCOL_VERSIONS],
-    received: runtime.protocolVersion,
+    expected: [CURRENT_WIRE_CONTRACT_ID],
+    received: runtime.contractId,
   });
 }
 

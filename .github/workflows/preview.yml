@@ -37,6 +37,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          # `fallow audit` compares this change against the PR base (or the preceding main
+          # commit), so the base must be available locally. Keep the analysis in this existing
+          # job rather than spending another runner allocation on a small Node-only gate.
+          fetch-depth: 0
           persist-credentials: false
 
       # This identifies source changes that can affect the native artifacts. Workflow-only edits
@@ -78,10 +82,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          # `fallow audit` compares this change against the PR base (or the preceding main
-          # commit), so the base must be available locally. Keep the analysis in this existing
-          # job rather than spending another runner allocation on a small Node-only gate.
-          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
@@ -102,6 +102,9 @@ jobs:
           cache: true
           run-install: |
             args: ['--frozen-lockfile']
+
+      - name: Verify generated contracts
+        run: node packages/embedded/scripts/contract.mjs --check
 
       - name: Build embedded TypeScript
         run: vp run @estifanos-sh/convex-embedded#build:ts
@@ -165,11 +168,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Fallow's syntactic report supports Markdown, not GitHub workflow annotations. Surface
-          # its deterministic changed-code report in the run summary instead.
           report="$RUNNER_TEMP/fallow-audit.md"
-          # GitHub limits each job summary to 1 MiB. Reserve half for surrounding CI output,
-          # while retaining enough detail for a useful changed-code report.
           max_report_bytes=524288
           set +e
           vp exec fallow audit --changed-since "$base" --format markdown --no-css-deep > "$report"

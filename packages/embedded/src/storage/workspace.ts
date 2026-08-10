@@ -57,7 +57,7 @@ function mergeTable(left: TableDef, right: TableDef): TableDef {
   const targetColumns = new Map(right.columns.map((column) => [column.name, column]));
   const renamedColumns = new Map<string, string>();
   const columnNames = new Set([...left.columns, ...right.columns].map((column) => column.name));
-  const legacyColumns = left.columns.flatMap((column) => {
+  const retainedColumns = left.columns.flatMap((column) => {
     const target = targetColumns.get(column.name);
     if (
       target !== undefined &&
@@ -70,23 +70,23 @@ function mergeTable(left: TableDef, right: TableDef): TableDef {
     }
     return target === undefined ? [column] : [];
   });
-  const columns = [...legacyColumns, ...right.columns];
+  const columns = [...retainedColumns, ...right.columns];
   const targetIndexes = new Map(right.indexes.map((index) => [index.name, index]));
   const indexNames = new Set([...left.indexes, ...right.indexes].map((index) => index.name));
   const indexes = [
     ...left.indexes.flatMap((index) => {
       const target = targetIndexes.get(index.name);
-      const legacy = {
+      const retained = {
         ...index,
         columns: (index.columns ?? index.fields).map(
           (column) => renamedColumns.get(column) ?? column,
         ),
       };
-      if (target === undefined) return [legacy];
+      if (target === undefined) return [retained];
       if (sameIndex(target, index)) {
         return [];
       }
-      return [{ ...legacy, name: workspaceName("index", index.name, legacy, indexNames) }];
+      return [{ ...retained, name: workspaceName("index", index.name, retained, indexNames) }];
     }),
     ...right.indexes,
   ];

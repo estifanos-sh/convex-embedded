@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,59 +20,64 @@ import {
   packPackage,
   packageName,
   packageRepository,
-  baselineTag,
-  baselineVersion,
   requiredPackageFiles,
   verifyManifest,
-  verifyPackageTree,
-  verifyFixtureFiles,
-  verifyPackedFiles,
+  verifyPublishedReadme,
   verifyReadme,
+  verifyPackageTree,
+  verifyPackedFiles,
 } from "../../scripts/publish.js";
 
 const temporary: string[] = [];
-const readmeFixture = `# Convex Embedded
 
-\`@estifanos-sh/convex-embedded\`
-
-\`\`\`sh
-pnpm add @estifanos-sh/convex-embedded convex
-\`\`\`
-
-## Quick start
-
-## Functions
-
-## Client lifecycle and API
-
-await client.open()
-
-## User data migrations
-
-## Platform setup
-
-## Errors and troubleshooting
-
-## Release and compatibility policy
-`;
+function packageReadme(): string {
+  return [
+    "# Embedded",
+    `\`${packageName}\``,
+    "## 1. Configure Convex",
+    "## Schema changes and migrations",
+    "## 2. Configure the browser build",
+    "## 3. Create a client",
+    "## Troubleshooting browser builds",
+  ].join("\n");
+}
 
 afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { force: true, recursive: true });
 });
 
 describe("Embedded package publication", () => {
-  test("keeps the public baseline name and rejects fixture-directory debris", () => {
-    expect(baselineTag).toBe("v0.0.1-preview.0");
-    expect(baselineVersion).toBe("0.0.1-preview.0");
+  test("requires self-contained npm documentation", () => {
+    expect(() => verifyReadme("# Embedded\n## 1. Configure Convex\n")).toThrow(
+      "README is missing required section",
+    );
+    expect(() =>
+      verifyReadme(
+        [
+          "# Embedded",
+          `\`${packageName}\``,
+          "## 1. Configure Convex",
+          "## Schema changes and migrations",
+          "## 2. Configure the browser build",
+          "## 3. Create a client",
+          "## Troubleshooting browser builds",
+        ].join("\n"),
+      ),
+    ).not.toThrow();
+  });
 
-    const directory = mkdtempSync(join(tmpdir(), "convex-embedded-baseline-"));
+  test("requires npm's package-page README to match the exact qualified directory", () => {
+    const directory = mkdtempSync(join(tmpdir(), "convex-embedded-npm-readme-"));
     temporary.push(directory);
-    writeFileSync(join(directory, "manifest.json"), "{}");
-    writeFileSync(join(directory, "store.sqlite3"), "fixture");
-    expect(() => verifyFixtureFiles(directory)).not.toThrow();
+    const readme = packageReadme();
+    writeFileSync(join(directory, "README.md"), readme);
 
-    writeFileSync(join(directory, "store.sqlite3-wal"), "");
-    expect(() => verifyFixtureFiles(directory)).toThrow("must contain only");
+    expect(() =>
+      verifyPublishedReadme(directory, `${packageName}@0.0.1`, () => readme),
+    ).not.toThrow();
+    expect(() =>
+      verifyPublishedReadme(directory, `${packageName}@0.0.1`, () => `${readme}\nchanged`),
+    ).toThrow("does not match the assembled package");
   });
 
   test("preserves the package identity and strips lifecycle builds", () => {
@@ -130,16 +143,6 @@ describe("Embedded package publication", () => {
     ).toThrow(`only ${packageName} is allowed`);
   });
 
-  test("requires comprehensive npm documentation with the current package identity", () => {
-    expect(() => verifyReadme(readmeFixture)).not.toThrow();
-    expect(() => verifyReadme("")).toThrow("README must not be empty");
-    expect(() =>
-      verifyReadme(
-        "# Convex Embedded\n\n`@estifanos-sh/convex-embedded`\n\npnpm add @estifanos-sh/convex-embedded convex",
-      ),
-    ).toThrow("Quick start");
-  });
-
   test("requires every runtime artifact in the packed payload", () => {
     const complete = new Set(requiredPackageFiles().map((path) => `package/${path}`));
     expect(() => verifyPackedFiles(complete)).not.toThrow();
@@ -191,7 +194,7 @@ describe("Embedded package publication", () => {
         path === "dist/artifact.json"
           ? JSON.stringify({ format: 1, packageVersion: "0.0.0" })
           : path === "README.md"
-            ? readmeFixture
+            ? packageReadme()
             : path === "dist/node.mjs"
               ? "export {};\n"
               : "fixture",
@@ -201,6 +204,21 @@ describe("Embedded package publication", () => {
     preparePackage(directory);
     const tarball = packPackage(directory, destination, "preview");
     expect(() => qualifyTarball(tarball, "preview")).not.toThrow();
+
+    const unpacked = join(destination, "unpacked");
+    const repacked = join(destination, "repacked");
+    mkdirSync(unpacked);
+    mkdirSync(repacked);
+    execFileSync("tar", ["-xzf", tarball, "-C", unpacked]);
+    execFileSync("npm", ["pack", "--ignore-scripts", "--pack-destination", repacked], {
+      cwd: join(unpacked, "package"),
+      stdio: "pipe",
+    });
+    const repackedTarball = join(
+      repacked,
+      readdirSync(repacked).find((name) => name.endsWith(".tgz"))!,
+    );
+    expect(readFileSync(repackedTarball)).toEqual(readFileSync(tarball));
 
     expect(readFileSync(tarball).byteLength).toBeGreaterThan(0);
     writeFileSync(
@@ -234,7 +252,7 @@ describe("Embedded package publication", () => {
         path === "dist/artifact.json"
           ? JSON.stringify({ format: 1, packageVersion: "wrong" })
           : path === "README.md"
-            ? readmeFixture
+            ? packageReadme()
             : "fixture",
       );
     }

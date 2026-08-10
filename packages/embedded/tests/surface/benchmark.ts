@@ -7,7 +7,7 @@ import { describe, expect, test } from "vite-plus/test";
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../../..");
 
 describe("benchmark workflow", () => {
-  test("exercises the release workload on Blacksmith without credentials", () => {
+  test("exercises the release workload on the configured provider without credentials", () => {
     const workflow = readFileSync(join(root, ".github/workflows/benchmark.yml"), "utf8");
 
     expect(workflow).toContain("name: Benchmark");
@@ -16,7 +16,7 @@ describe("benchmark workflow", () => {
     expect(workflow).not.toContain("depot");
     expect(workflow).toContain("Build and exercise the runtime");
     expect(workflow).toContain("Build and compile all Android ABIs");
-    expect(workflow).toContain("@estifanos-sh/convex-embedded#test:kill:node");
+    expect(workflow).toContain("@estifanos-sh/convex-embedded#test:stress:node");
     expect(workflow).not.toContain("id-token: write");
     expect(workflow).not.toContain("npm publish");
     expect(workflow).not.toContain("contents: write");

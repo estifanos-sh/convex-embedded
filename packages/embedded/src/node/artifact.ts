@@ -6,8 +6,8 @@ import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path
 import { fileURLToPath } from "node:url";
 
 import { errorMessage } from "../error";
-import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
-import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
+import { CURRENT_WIRE_CONTRACT_ID } from "../protocol";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../storage/contract";
 
 /**
  * Loaded NAPI module shape expected by the Node adapter.
@@ -15,14 +15,13 @@ import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
  * @internal
  */
 export interface NativeModule {
-  apiVersion(): number;
-  protocolVersion(): number;
+  bindingContractId(): string;
+  contractId(): string;
   Store: {
     open(path: string, selectorKey?: string, defaultIdentityKey?: string): unknown;
   };
 }
 
-const NATIVE_API_VERSION = EMBEDDED_STORAGE_ABI_VERSION;
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -59,22 +58,22 @@ export function loadNativeModule(): NativeModule {
 
 export function validateNativeModule(value: unknown, path: string): NativeModule {
   const module = value as Partial<NativeModule>;
-  if (typeof module.apiVersion !== "function") {
-    throw new Error(`native artifact did not export apiVersion: ${path}`);
+  if (typeof module.bindingContractId !== "function") {
+    throw new Error(`native artifact did not export bindingContractId: ${path}`);
   }
-  const version = module.apiVersion();
-  if (version !== NATIVE_API_VERSION) {
+  const bindingContractId = module.bindingContractId();
+  if (bindingContractId !== CURRENT_STORAGE_BINDING_CONTRACT_ID) {
     throw new Error(
-      `native artifact API version mismatch at ${path}: expected ${NATIVE_API_VERSION}, got ${version}`,
+      `native artifact binding contract mismatch at ${path}: expected ${CURRENT_STORAGE_BINDING_CONTRACT_ID}, got ${bindingContractId}`,
     );
   }
-  if (typeof module.protocolVersion !== "function") {
-    throw new Error(`native artifact did not export protocolVersion: ${path}`);
+  if (typeof module.contractId !== "function") {
+    throw new Error(`native artifact did not export contractId: ${path}`);
   }
-  const protocolVersion = module.protocolVersion();
-  if (protocolVersion !== EMBEDDED_PROTOCOL_VERSION) {
+  const contractId = module.contractId();
+  if (contractId !== CURRENT_WIRE_CONTRACT_ID) {
     throw new Error(
-      `native artifact protocol mismatch at ${path}: expected ${EMBEDDED_PROTOCOL_VERSION}, got ${protocolVersion}`,
+      `native artifact wire contract mismatch at ${path}: expected ${CURRENT_WIRE_CONTRACT_ID}, got ${contractId}`,
     );
   }
   if (typeof module.Store?.open !== "function") {

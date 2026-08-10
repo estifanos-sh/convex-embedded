@@ -37,9 +37,14 @@ import { bytesHash, hashDocument, hashValue } from "../hash";
 import {
   EMBEDDED_CLIENT_RETIRED,
   EMBEDDED_PROTOCOL_MISMATCH,
-  EMBEDDED_PROTOCOL_VERSIONS,
-  isEmbeddedProtocolVersion,
+  CURRENT_WIRE_CONTRACT_ID,
+  isWireContractId,
 } from "../protocol";
+import {
+  WIRE_BLOB_CHUNK_BYTES,
+  WIRE_BLOB_CLIENT_BYTE_LIMIT,
+  WIRE_BLOB_CLIENT_SCOPE_LIMIT,
+} from "../contract/generated";
 
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
 type MutationCtx = GenericMutationCtx<DataModel>;
@@ -51,9 +56,11 @@ const MAX_CHANGES = 1_024;
 const MAX_FILES = 1_024;
 const MAX_ROWS = 1_024;
 const MAX_CRDT_PAYLOAD_BYTES = 1_048_576;
-const BLOB_CHUNK_BYTES = 196_608;
+const BLOB_CHUNK_BYTES = WIRE_BLOB_CHUNK_BYTES;
 const MAX_BLOB_CHUNKS = 32;
 const MAX_CRDT_CHECKPOINT_BYTES = BLOB_CHUNK_BYTES * MAX_BLOB_CHUNKS;
+const BLOB_SCOPE_TTL_MS = 5 * 60 * 1_000;
+const BLOB_SCOPE_SWEEP_SLICE = 8;
 const MAX_PULL_CRDT_PAYLOADS = 512;
 const CRDT_CHECKPOINT_PAYLOAD_INTERVAL = 16;
 // Component queries cannot use Convex pagination. Keep each logical checkpoint page bounded by
@@ -66,7 +73,7 @@ const MAX_CRDT_FIELDS_PER_ROW = 64;
 const runtimeValidator = v.object({
   schemaHash: v.string(),
   moduleGraphHash: v.string(),
-  protocolVersion: v.number(),
+  contractId: v.literal(CURRENT_WIRE_CONTRACT_ID),
 });
 const witnessValidator = v.object({
   table: v.string(),
@@ -196,7 +203,7 @@ export const commit = mutation({
       if (request.verification.kind === "unsupported") {
         throw new ConvexError({
           code: "EMBEDDED_UNSUPPORTED_WITNESS",
-          message: "The carried range witness cannot be reproduced by this V5 server.",
+          message: "The carried range witness cannot be reproduced by the current server.",
         });
       }
       if (request.verification.kind === "conflict") {
@@ -210,6 +217,14 @@ export const commit = mutation({
         ctx,
         request.verification.witnesses,
         request.changes.map(({ table, rowId }) => ({ table, rowId })),
+      );
+      await blobStageAssert(
+        ctx,
+        request.clientId,
+        request.identity,
+        request.replayId,
+        request.fingerprint,
+        request.crdt,
       );
     }
 
@@ -596,7 +611,9 @@ export const replayConsume = mutation({
       .withIndex("by_tokenhash", (q) => q.eq("tokenHash", tokenHash))
       .unique();
     if (!replay || replay.consumedAt !== undefined || replay.expiresAt < readTime()) return null;
-    await ctx.db.patch("replays", replay._id, { consumedAt: readTime() });
+    const runtime = replay.runtime;
+    const consumedAt = readTime();
+    await ctx.db.patch("replays", replay._id, { consumedAt });
     return {
       kind: replay.kind,
       clientId: replay.clientId,
@@ -604,7 +621,7 @@ export const replayConsume = mutation({
       replayId: replay.replayId,
       fingerprint: replay.fingerprint,
       logicalFingerprint: replay.logicalFingerprint,
-      runtime: replay.runtime,
+      runtime,
       acknowledgeReplayId: replay.acknowledgeReplayId,
       resultHash: replay.resultHash,
       mutationTime: replay.mutationTime,
@@ -663,8 +680,161 @@ export const pull = query({
   },
 });
 
+type BlobManifest = { hash: string; bytes: number; chunks: number };
+
+function assertBlobManifest(manifest: BlobManifest): void {
+  if (
+    !Number.isSafeInteger(manifest.bytes) ||
+    manifest.bytes <= BLOB_CHUNK_BYTES ||
+    manifest.bytes > MAX_CRDT_CHECKPOINT_BYTES ||
+    !Number.isSafeInteger(manifest.chunks) ||
+    manifest.chunks !== Math.ceil(manifest.bytes / BLOB_CHUNK_BYTES) ||
+    manifest.chunks > MAX_BLOB_CHUNKS
+  ) {
+    throw new Error("Invalid bounded Embedded blob manifest.");
+  }
+}
+
+async function blobScopeDelete(ctx: MutationCtx): Promise<void> {
+  const now = readTime();
+  const expired = await ctx.db
+    .query("blobScopes")
+    .withIndex("by_expiresat", (q) => q.lt("expiresAt", now))
+    .take(BLOB_SCOPE_SWEEP_SLICE);
+  for (const scope of expired) await ctx.db.delete("blobScopes", scope._id);
+  const candidates = await ctx.db
+    .query("blobs")
+    .withIndex("by_updatedat", (q) => q.lt("updatedAt", now - BLOB_SCOPE_TTL_MS))
+    .take(BLOB_SCOPE_SWEEP_SLICE);
+  for (const blob of candidates) {
+    // Read one more than the sweep budget. An incomplete read must retain the content: a
+    // later, live capability is sufficient to keep a content-addressed blob reachable.
+    const scopes = await ctx.db
+      .query("blobScopes")
+      .withIndex("by_hash", (q) => q.eq("hash", blob.hash))
+      .take(BLOB_SCOPE_SWEEP_SLICE + 1);
+    if (scopes.length > BLOB_SCOPE_SWEEP_SLICE || scopes.some((scope) => scope.expiresAt >= now)) {
+      continue;
+    }
+    for (const scope of scopes) await ctx.db.delete("blobScopes", scope._id);
+    const [checkpoint] = await ctx.db
+      .query("crdtCheckpoints")
+      .withIndex("by_blobid", (q) => q.eq("blobId", blob._id))
+      .take(1);
+    if (checkpoint) continue;
+    const chunks = await ctx.db
+      .query("blobChunks")
+      .withIndex("by_blobid_and_ordinal", (q) => q.eq("blobId", blob._id))
+      .take(MAX_BLOB_CHUNKS + 1);
+    for (const chunk of chunks) await ctx.db.delete("blobChunks", chunk._id);
+    await ctx.db.delete("blobs", blob._id);
+  }
+}
+
+async function blobScopeBudgetAssert(
+  ctx: MutationCtx,
+  clientId: string,
+  identity: string | undefined,
+  additionalBytes: number,
+): Promise<void> {
+  const now = readTime();
+  const active = await ctx.db
+    .query("blobScopes")
+    .withIndex("by_client_identity_expiresat", (q) =>
+      q.eq("clientId", clientId).eq("identity", identity).gt("expiresAt", now),
+    )
+    .take(WIRE_BLOB_CLIENT_SCOPE_LIMIT + 1);
+  const bytes = active.reduce((total, scope) => total + scope.bytes, additionalBytes);
+  if (active.length >= WIRE_BLOB_CLIENT_SCOPE_LIMIT || bytes > WIRE_BLOB_CLIENT_BYTE_LIMIT) {
+    throw new Error("Embedded blob capability budget is exhausted for this client identity.");
+  }
+}
+
+/**
+ * Mint narrowly-scoped upload capabilities after the ordinary replicated mutation has completed
+ * its deterministic, application-authored validation. The server wrapper rolls that validation
+ * transaction back, returns these capabilities, then reruns and commits the same replay once the
+ * bytes arrive.
+ */
+export const blobScopeWrite = mutation({
+  args: {
+    clientId: v.string(),
+    identity: v.optional(v.string()),
+    replayId: v.string(),
+    fingerprint: v.string(),
+    manifests: v.array(v.object({ hash: v.string(), bytes: v.number() })),
+  },
+  returns: v.array(
+    v.object({ hash: v.string(), bytes: v.number(), chunks: v.number(), token: v.string() }),
+  ),
+  handler: async (ctx, args) => {
+    await blobScopeDelete(ctx);
+    const unique = new Map<string, BlobManifest>();
+    for (const manifest of args.manifests) {
+      const chunks = Math.ceil(manifest.bytes / BLOB_CHUNK_BYTES);
+      const scoped = { ...manifest, chunks };
+      assertBlobManifest(scoped);
+      const prior = unique.get(manifest.hash);
+      if (prior && (prior.bytes !== scoped.bytes || prior.chunks !== scoped.chunks)) {
+        throw new Error("Embedded blob hash was reused with a different manifest.");
+      }
+      unique.set(manifest.hash, scoped);
+    }
+    const now = readTime();
+    const scopes = [];
+    for (const manifest of unique.values()) {
+      const prior = await ctx.db
+        .query("blobScopes")
+        .withIndex("by_mutation_and_hash", (q) =>
+          q
+            .eq("clientId", args.clientId)
+            .eq("replayId", args.replayId)
+            .eq("fingerprint", args.fingerprint)
+            .eq("hash", manifest.hash),
+        )
+        .take(8);
+      for (const scope of prior) await ctx.db.delete("blobScopes", scope._id);
+      await blobScopeBudgetAssert(ctx, args.clientId, args.identity, manifest.bytes);
+      const ready = await ctx.db
+        .query("blobs")
+        .withIndex("by_hash", (q) => q.eq("hash", manifest.hash))
+        .unique();
+      const token = crypto.randomUUID();
+      await ctx.db.insert("blobScopes", {
+        tokenHash: await hashValue(token),
+        owner: "mutation",
+        clientId: args.clientId,
+        ...(args.identity === undefined ? {} : { identity: args.identity }),
+        replayId: args.replayId,
+        fingerprint: args.fingerprint,
+        ...manifest,
+        createdAt: now,
+        expiresAt: now + BLOB_SCOPE_TTL_MS,
+      });
+      scopes.push({
+        ...manifest,
+        // A ready, content-addressed blob still receives an owner scope for the final atomic
+        // consume, but the device need not upload its bytes again.
+        token:
+          ready?.state === "ready" &&
+          ready.bytes === manifest.bytes &&
+          ready.chunks === manifest.chunks
+            ? ""
+            : token,
+      });
+    }
+    return scopes;
+  },
+});
+
 export const blobWrite = mutation({
   args: {
+    clientId: v.string(),
+    identity: v.optional(v.string()),
+    scope: v.union(
+      v.object({ kind: v.literal("mutation"), token: v.string() }),
+      v.object({ kind: v.literal("checkpoint"), token: v.string() }),
+    ),
     hash: v.string(),
     bytes: v.number(),
     chunks: v.number(),
@@ -674,13 +844,8 @@ export const blobWrite = mutation({
   },
   returns: v.object({ blobId: v.string(), ready: v.boolean() }),
   handler: async (ctx, args) => {
+    await blobScopeDelete(ctx);
     if (
-      !Number.isSafeInteger(args.bytes) ||
-      args.bytes <= 0 ||
-      args.bytes > MAX_CRDT_CHECKPOINT_BYTES ||
-      !Number.isSafeInteger(args.chunks) ||
-      args.chunks <= 0 ||
-      args.chunks > MAX_BLOB_CHUNKS ||
       !Number.isSafeInteger(args.ordinal) ||
       args.ordinal < 0 ||
       args.ordinal >= args.chunks ||
@@ -688,6 +853,24 @@ export const blobWrite = mutation({
       args.chunk.byteLength > BLOB_CHUNK_BYTES
     ) {
       throw new Error("Invalid bounded Embedded blob chunk.");
+    }
+    assertBlobManifest(args);
+    const tokenHash = await hashValue(args.scope.token);
+    const scope = await ctx.db
+      .query("blobScopes")
+      .withIndex("by_tokenhash", (q) => q.eq("tokenHash", tokenHash))
+      .unique();
+    if (
+      !scope ||
+      scope.expiresAt < readTime() ||
+      scope.owner !== args.scope.kind ||
+      scope.clientId !== args.clientId ||
+      scope.identity !== args.identity ||
+      scope.hash !== args.hash ||
+      scope.bytes !== args.bytes ||
+      scope.chunks !== args.chunks
+    ) {
+      throw new Error("Embedded blob write does not hold a live scoped capability.");
     }
     if (args.chunkHash !== (await bytesHash(args.chunk))) {
       throw new Error("Embedded blob chunk hash does not match its bytes.");
@@ -747,6 +930,63 @@ export const blobWrite = mutation({
       return { blobId: blob._id, ready: true };
     }
     return { blobId: blob._id, ready: blob.state === "ready" };
+  },
+});
+
+export const checkpointScopeWrite = mutation({
+  args: {
+    clientId: v.string(),
+    identity: v.optional(v.string()),
+    checkpointId: v.id("crdtCheckpoints"),
+    responseToken: v.string(),
+    hash: v.string(),
+    bytes: v.number(),
+  },
+  returns: v.object({ chunks: v.number(), ready: v.boolean(), token: v.string() }),
+  handler: async (ctx, args) => {
+    await blobScopeDelete(ctx);
+    const chunks = Math.ceil(args.bytes / BLOB_CHUNK_BYTES);
+    assertBlobManifest({ hash: args.hash, bytes: args.bytes, chunks });
+    const checkpoint = await ctx.db.get("crdtCheckpoints", args.checkpointId);
+    if (
+      !checkpoint ||
+      checkpoint.state !== "requested" ||
+      checkpoint.responseToken !== args.responseToken
+    ) {
+      throw new Error("CRDT checkpoint scope does not match an active request.");
+    }
+    const prior = await ctx.db
+      .query("blobScopes")
+      .withIndex("by_checkpoint_and_hash", (q) =>
+        q.eq("checkpointId", checkpoint._id).eq("hash", args.hash),
+      )
+      .take(8);
+    for (const scope of prior) await ctx.db.delete("blobScopes", scope._id);
+    await blobScopeBudgetAssert(ctx, args.clientId, args.identity, args.bytes);
+    const token = crypto.randomUUID();
+    const now = readTime();
+    await ctx.db.insert("blobScopes", {
+      tokenHash: await hashValue(token),
+      owner: "checkpoint",
+      clientId: args.clientId,
+      ...(args.identity === undefined ? {} : { identity: args.identity }),
+      checkpointId: checkpoint._id,
+      responseTokenHash: await hashValue(args.responseToken),
+      hash: args.hash,
+      bytes: args.bytes,
+      chunks,
+      createdAt: now,
+      expiresAt: now + BLOB_SCOPE_TTL_MS,
+    });
+    const blob = await ctx.db
+      .query("blobs")
+      .withIndex("by_hash", (q) => q.eq("hash", args.hash))
+      .unique();
+    return {
+      chunks,
+      ready: blob?.state === "ready" && blob.bytes === args.bytes && blob.chunks === chunks,
+      token,
+    };
   },
 });
 
@@ -900,12 +1140,6 @@ async function acknowledgeWrite(
     // Commit timestamps are assigned by Convex in this transaction. The fact lives on the exact
     // settlement row, so later rows cannot become eligible for destructive GC by accident.
     await ctx.db.patch("mutations", row._id, { acknowledgedAt: ctx.db.vars.commitTs });
-  }
-  const client = await clientRead(ctx, row.clientId);
-  if (client && row._creationTime > (client.acknowledgedThrough ?? 0)) {
-    // Keep this legacy high-water diagnostic for the remote-client administration surface. It is
-    // intentionally not consulted by settlement deletion; only `mutations.acknowledgedAt` is.
-    await ctx.db.patch("clients", client._id, { acknowledgedThrough: row._creationTime });
   }
 }
 
@@ -1303,8 +1537,11 @@ async function checkpointRequestWrite(
 
 export const checkpointWrite = mutation({
   args: {
+    clientId: v.string(),
+    identity: v.optional(v.string()),
     checkpointId: v.id("crdtCheckpoints"),
     responseToken: v.string(),
+    scopeToken: v.optional(v.string()),
     throughSeq: v.number(),
     projectionHash: v.string(),
     content: opaqueBytesValidator,
@@ -1326,6 +1563,16 @@ export const checkpointWrite = mutation({
       // request is settled without resolving or retaining its losing blob.
       return null;
     }
+    let scope: DataModel["blobScopes"]["document"] | undefined;
+    if (args.content.kind === "staged") {
+      scope = await checkpointScopeRead(ctx, checkpoint, {
+        clientId: args.clientId,
+        ...(args.identity === undefined ? {} : { identity: args.identity }),
+        responseToken: args.responseToken,
+        ...(args.scopeToken === undefined ? {} : { scopeToken: args.scopeToken }),
+        content: args.content,
+      });
+    }
     const blob = await blobResolve(ctx, args.content);
     const field = await ctx.db.get("crdtFields", checkpoint.fieldId);
     if (!field || field.epoch !== checkpoint.epoch || field.headSeq < checkpoint.throughSeq) {
@@ -1338,9 +1585,46 @@ export const checkpointWrite = mutation({
       blobId: blob._id,
       updatedAt: now,
     });
+    if (scope) await ctx.db.delete("blobScopes", scope._id);
     return null;
   },
 });
+
+async function checkpointScopeRead(
+  ctx: MutationCtx,
+  checkpoint: DataModel["crdtCheckpoints"]["document"],
+  args: {
+    clientId: string;
+    identity?: string;
+    responseToken: string;
+    scopeToken?: string;
+    content: { kind: "staged"; blobId: string; bytes: number; hash: string };
+  },
+) {
+  if (args.scopeToken === undefined) {
+    throw new Error("A staged CRDT checkpoint response requires a scoped capability.");
+  }
+  const tokenHash = await hashValue(args.scopeToken);
+  const scope = await ctx.db
+    .query("blobScopes")
+    .withIndex("by_tokenhash", (q) => q.eq("tokenHash", tokenHash))
+    .unique();
+  if (
+    !scope ||
+    scope.owner !== "checkpoint" ||
+    scope.expiresAt < readTime() ||
+    scope.clientId !== args.clientId ||
+    scope.identity !== args.identity ||
+    scope.checkpointId !== checkpoint._id ||
+    scope.responseTokenHash !== (await hashValue(args.responseToken)) ||
+    scope.hash !== args.content.hash ||
+    scope.bytes !== args.content.bytes ||
+    scope.chunks !== Math.ceil(args.content.bytes / BLOB_CHUNK_BYTES)
+  ) {
+    throw new Error("CRDT checkpoint response does not hold its scoped capability.");
+  }
+  return scope;
+}
 
 async function blobResolve(
   ctx: MutationCtx,
@@ -1401,6 +1685,83 @@ async function blobResolve(
   return blob;
 }
 
+/**
+ * The component's commit boundary is the only authority that can request checkpoint bytes. It
+ * runs after replay validation but before any durable commit write, so the server can safely roll
+ * back and mint a manifest-bound capability without accepting untrusted storage allocation.
+ */
+async function blobStageAssert(
+  ctx: MutationCtx,
+  clientId: string,
+  identity: string | undefined,
+  replayId: string,
+  fingerprint: string,
+  effects: Array<{
+    checkpoint?: {
+      content:
+        | { kind: "inline"; bytes: ArrayBuffer; hash: string }
+        | { kind: "staged"; blobId: string; bytes: number; hash: string };
+    };
+  }>,
+): Promise<void> {
+  const missing = new Map<string, { hash: string; bytes: number }>();
+  // Multiple CRDT effects may deliberately share the same content-addressed checkpoint. A
+  // capability is consumed once per manifest, not once per reference.
+  const consumed = new Map<string, DataModel["blobScopes"]["document"]>();
+  for (const effect of effects) {
+    const content = effect.checkpoint?.content;
+    if (content?.kind !== "staged") continue;
+    assertBlobManifest({
+      hash: content.hash,
+      bytes: content.bytes,
+      chunks: Math.ceil(content.bytes / BLOB_CHUNK_BYTES),
+    });
+    const blob = await ctx.db
+      .query("blobs")
+      .withIndex("by_hash", (q) => q.eq("hash", content.blobId))
+      .unique();
+    const scope = await ctx.db
+      .query("blobScopes")
+      .withIndex("by_mutation_and_hash", (q) =>
+        q
+          .eq("clientId", clientId)
+          .eq("replayId", replayId)
+          .eq("fingerprint", fingerprint)
+          .eq("hash", content.hash),
+      )
+      .unique();
+    if (
+      !blob ||
+      blob.state !== "ready" ||
+      content.blobId !== content.hash ||
+      blob.bytes !== content.bytes ||
+      blob.chunks !== Math.ceil(content.bytes / BLOB_CHUNK_BYTES) ||
+      !scope ||
+      scope.owner !== "mutation" ||
+      scope.identity !== identity ||
+      scope.bytes !== content.bytes ||
+      scope.chunks !== Math.ceil(content.bytes / BLOB_CHUNK_BYTES) ||
+      scope.expiresAt < readTime()
+    ) {
+      const prior = missing.get(content.hash);
+      if (prior && prior.bytes !== content.bytes) {
+        throw new Error("Embedded staged checkpoint hash was reused with different bytes.");
+      }
+      missing.set(content.hash, { hash: content.hash, bytes: content.bytes });
+    } else {
+      consumed.set(scope._id, scope);
+    }
+  }
+  if (missing.size > 0) {
+    throw new ConvexError({
+      code: "EMBEDDED_BLOB_REQUIRED",
+      manifests: [...missing.values()],
+      message: "Replay checkpoint bytes must be staged before commit.",
+    });
+  }
+  for (const scope of consumed.values()) await ctx.db.delete("blobScopes", scope._id);
+}
+
 function concatBytes(chunks: Array<ArrayBuffer>): ArrayBuffer {
   const bytes = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
   let offset = 0;
@@ -1427,7 +1788,7 @@ async function clientRead(ctx: MutationCtx, clientId: string) {
 async function clientWrite(
   ctx: MutationCtx,
   clientId: string,
-  runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number },
+  runtime: { schemaHash: string; moduleGraphHash: string; contractId: string },
   identity?: string,
 ) {
   assertRuntime(runtime);
@@ -1442,14 +1803,15 @@ async function clientWrite(
   const fields = {
     schemaHash: runtime.schemaHash,
     moduleGraphHash: runtime.moduleGraphHash,
-    protocolVersion: runtime.protocolVersion,
+    contractId: CURRENT_WIRE_CONTRACT_ID,
     lastSeenAt: now,
     lastPushAt: now,
     ...(identity === undefined ? {} : { identity }),
   };
   if (row) {
-    await ctx.db.patch("clients", row._id, fields);
-    return { ...row, ...fields };
+    const { _id, _creationTime, identity: _oldIdentity, ...stored } = row;
+    await ctx.db.replace("clients", _id, { ...stored, ...fields });
+    return;
   } else {
     const id = await ctx.db.insert("clients", {
       clientId,
@@ -1458,21 +1820,21 @@ async function clientWrite(
     });
     const created = await ctx.db.get("clients", id);
     if (!created) throw new Error("Created remote client was not readable.");
-    return created;
+    return;
   }
 }
 
 function assertRuntime(runtime: {
   schemaHash: string;
   moduleGraphHash: string;
-  protocolVersion: number;
+  contractId: string;
 }): void {
-  if (!isEmbeddedProtocolVersion(runtime.protocolVersion)) {
+  if (!isWireContractId(runtime.contractId)) {
     throw new ConvexError({
       code: EMBEDDED_PROTOCOL_MISMATCH,
-      expected: [...EMBEDDED_PROTOCOL_VERSIONS],
-      message: `Embedded protocol ${runtime.protocolVersion} is not supported.`,
-      received: runtime.protocolVersion,
+      expected: [CURRENT_WIRE_CONTRACT_ID],
+      message: `Embedded wire contract ${runtime.contractId} is not supported.`,
+      received: runtime.contractId,
     });
   }
 }

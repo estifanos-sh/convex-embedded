@@ -22,10 +22,10 @@ import {
   controlChannelName,
   compareFence,
   ControlOp,
-  CoordinatorProtocol,
+  BrowserCoordinationContractId,
   isCanonicalFence,
   isControlMessage,
-  isLegacyLeaderBroadcast,
+  isForeignCoordinationFrame,
   isPeerMessage,
   PeerOp,
   RejectCode,
@@ -121,8 +121,6 @@ interface LeaderDiscovery {
   /** Backoff timer scheduled after a retryable attach rejection, tracked so it can be cancelled. */
   attachBackoff?: Timer;
   leaderBeacon?: Timer;
-  /** One compatibility probe per discovery round; never participates in an attach. */
-  legacyProbeSent?: true;
   recoveryTimer?: Timer;
 }
 
@@ -448,7 +446,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       leaderFence: ownership.fence,
       leaderId: this.state.address.workerId,
       op: ControlOp.BroadcastLeader,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
       scope: this.state.address.scope,
     });
   }
@@ -644,7 +642,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       leaderEpoch: ownership.epoch,
       leaderFence: ownership.fence,
       op: PeerOp.Request,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
       request,
     });
     const { epoch, fence } = ownership;
@@ -722,7 +720,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
       leaderEpoch,
       leaderFence,
       op: PeerOp.Attach,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
       remote: this.init.remote,
       scope: this.state.address.scope,
       storagePath: this.state.address.storagePath,
@@ -795,7 +793,7 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
         leaderFence: leader.fence,
         leaderId: this.state.address.workerId,
         op: ControlOp.BroadcastLeader,
-        protocol: CoordinatorProtocol,
+        coordinationId: BrowserCoordinationContractId,
         scope: this.state.address.scope,
       });
       leader.addLocalClient(this.state.resources.localClient);
@@ -1023,23 +1021,11 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
         clientId: this.state.address.clientId,
         identity: this.state.address.identity,
         op: ControlOp.SeekLeader,
-        protocol: CoordinatorProtocol,
+        coordinationId: BrowserCoordinationContractId,
         scope: this.state.address.scope,
         storagePath: this.state.address.storagePath,
         workerId: this.state.address.workerId,
       });
-      if (this.state.discovery.legacyProbeSent !== true) {
-        this.state.discovery.legacyProbeSent = true;
-        (this.state.resources.control as Mailbox<unknown> | undefined)?.send({
-          clientId: this.state.address.clientId,
-          identity: this.state.address.identity,
-          op: ControlOp.SeekLeader,
-          protocol: 2,
-          scope: this.state.address.scope,
-          storagePath: this.state.address.storagePath,
-          workerId: this.state.address.workerId,
-        });
-      }
       this.state.discovery.leaderBeacon = this.env.setTimer(
         send,
         this.env.timeouts.helloIntervalMs,
@@ -1054,7 +1040,6 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
     if (beacon === undefined) return;
     this.env.clearTimer(beacon);
     this.state.discovery.leaderBeacon = undefined;
-    this.state.discovery.legacyProbeSent = undefined;
   }
 
   private clearPendingAttach(): void {
@@ -1165,24 +1150,12 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
   private readonly onControlMessage = (message: unknown): void => {
     if (this.isClosedOrClosing()) return;
     if (!isControlMessage(message)) {
-      if (isLegacyLeaderBroadcast(message)) {
-        const ownership = this.state.resources.ownership;
-        // A v2 SeekLeader is ignored by active v3 owners. Only a candidate that sees a real
-        // legacy leader advertisement fails, before it can attach or touch physical storage.
-        if (ownership.ownership === "seeking" || ownership.ownership === "attaching") {
-          this.postLocal({
-            event: {
-              at: getTimerTime(),
-              degradation: "deployment-mismatch",
-              error: "ConvexEmbeddedClient cannot coordinate with a legacy browser protocol.",
-              type: "runtime",
-            },
-            op: WorkerEvent.Event,
-          });
-          this.fail(
-            new Error("ConvexEmbeddedClient cannot coordinate with a different browser protocol."),
-          );
-        }
+      if (isForeignCoordinationFrame(message)) {
+        this.fail(
+          new Error(
+            "Another tab is running an incompatible Convex Embedded runtime. Reload all tabs for this site.",
+          ),
+        );
       }
       return;
     }
@@ -1191,7 +1164,16 @@ class FunctionalCoordinatorRuntime implements CoordinatorRuntime {
 
   private readonly onPeerMessage = (message: unknown): void => {
     if (this.isClosedOrClosing()) return;
-    if (!isPeerMessage(message)) return;
+    if (!isPeerMessage(message)) {
+      if (isForeignCoordinationFrame(message)) {
+        this.fail(
+          new Error(
+            "Another tab is running an incompatible Convex Embedded runtime. Reload all tabs for this site.",
+          ),
+        );
+      }
+      return;
+    }
     peerHandlers.get(message.op)?.(this, message as never);
   };
 }

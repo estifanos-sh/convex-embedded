@@ -175,6 +175,10 @@ describe("Expo package surface", () => {
     const source = readFileSync(validation, "utf8");
     expect(source).toContain("ConvexEmbedded.xcframework");
     expect(source).toContain("libconvex_embedded_mobile.so");
+    expect(source).toContain("assertEmbeddedContractIds(library");
+    expect(source).toContain("CURRENT_MOBILE_BRIDGE_CONTRACT_ID");
+    expect(source).toContain("CURRENT_STORAGE_BINDING_CONTRACT_ID");
+    expect(source).toContain("CURRENT_WIRE_CONTRACT_ID");
     for (const abi of ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"]) {
       expect(source).toContain(abi);
     }

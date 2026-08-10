@@ -77,7 +77,7 @@ export function stampLocal(
     const existing = localReferenceName(value);
     if (existing !== undefined && Object.isFrozen(value)) {
       // A generated immutable facade has already carried the only valid identity. The runner's
-      // legacy registration pass is intentionally a no-op in that case. Direct modules can expose
+      // fallback registration pass is intentionally a no-op in that case. Direct modules can expose
       // one registration under two aliases; those continue to register under both table keys.
       if (graphHash !== undefined && existing !== reference) {
         throw new Error(`Embedded local export ${reference} conflicts with immutable ${existing}.`);

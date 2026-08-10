@@ -876,68 +876,61 @@ function collectStorageIdPathKinds(
   prefix: string,
   paths: Map<string, Set<StorageIdPathKind>>,
 ): void {
-  const kind = storageIdLeafKind(validator);
-  if (kind !== undefined) {
+  if (validator.type === "id") {
     if (prefix.length > 0) {
-      addStorageIdPathKind(paths, prefix, kind);
+      addStorageIdPathKind(
+        paths,
+        prefix,
+        validator.tableName === "_storage" ? "storage" : "string",
+      );
     }
     return;
   }
+  if (validator.type === "string" || validator.type === "any") {
+    if (prefix.length > 0) addStorageIdPathKind(paths, prefix, "string");
+    return;
+  }
+  if (
+    validator.type === "literal" &&
+    typeof (validator as unknown as { value?: unknown }).value === "string"
+  ) {
+    if (prefix.length > 0) addStorageIdPathKind(paths, prefix, "string");
+    return;
+  }
   if (validator.type === "array") {
-    collectStorageIdPathKinds(validator.value, storageIdPath(prefix, "[]", ""), paths);
+    collectStorageIdPathKinds(validator.value, `${prefix}[]`, paths);
     return;
   }
   if (validator.type === "record") {
-    collectStorageIdPathKinds(validator.values.fieldType, storageIdPath(prefix, "{}", ""), paths);
+    collectStorageIdPathKinds(validator.values.fieldType, `${prefix}{}`, paths);
     return;
   }
   if (validator.type === "object") {
     for (const [field, child] of Object.entries(validator.value)) {
       collectStorageIdPathKinds(
         child.fieldType,
-        storageIdPath(prefix, encodeStorageIdPathField(field)),
+        prefix.length === 0
+          ? encodeStorageIdPathField(field)
+          : `${prefix}.${encodeStorageIdPathField(field)}`,
         paths,
       );
     }
     return;
   }
   if (validator.type === "union") {
-    mergeStorageIdPathKinds(paths, storageIdUnionPathKinds(validator.value, prefix));
-  }
-}
-
-function storageIdLeafKind(validator: ValidatorJSON): StorageIdPathKind | undefined {
-  if (validator.type === "id") return validator.tableName === "_storage" ? "storage" : "string";
-  if (validator.type === "string" || validator.type === "any") return "string";
-  if (
-    validator.type === "literal" &&
-    typeof (validator as unknown as { value?: unknown }).value === "string"
-  ) {
-    return "string";
-  }
-  return undefined;
-}
-
-function storageIdUnionPathKinds(
-  members: ValidatorJSON[],
-  prefix: string,
-): Map<string, Set<StorageIdPathKind>> {
-  const paths = new Map<string, Set<StorageIdPathKind>>();
-  for (const member of members) {
-    mergeStorageIdPathKinds(paths, storageIdPathKindsForValidator(member, prefix));
-  }
-  for (const [path, kinds] of paths) {
-    if (kinds.has("storage") && kinds.has("string")) {
-      throw new Error(
-        `storage id path ${path} is ambiguous: a union branch can store an ordinary string at the same path`,
-      );
+    const unionPaths = new Map<string, Set<StorageIdPathKind>>();
+    for (const member of validator.value) {
+      mergeStorageIdPathKinds(unionPaths, storageIdPathKindsForValidator(member, prefix));
     }
+    for (const [path, kinds] of unionPaths) {
+      if (kinds.has("storage") && kinds.has("string")) {
+        throw new Error(
+          `storage id path ${path} is ambiguous: a union branch can store an ordinary string at the same path`,
+        );
+      }
+    }
+    mergeStorageIdPathKinds(paths, unionPaths);
   }
-  return paths;
-}
-
-function storageIdPath(prefix: string, segment: string, separator = "."): string {
-  return prefix.length === 0 ? segment : `${prefix}${separator}${segment}`;
 }
 
 function mergeStorageIdPathKinds(

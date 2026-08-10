@@ -16,8 +16,16 @@ public final class ConvexEmbeddedNativeModule: Module {
   public func definition() -> ModuleDefinition {
     Name("ConvexEmbeddedNative")
 
-    Function("apiVersion") {
-      Int(cem_api_version())
+    Function("bridgeContractId") {
+      String(cString: cem_bridge_contract_id())
+    }
+
+    Function("wireContractId") {
+      String(cString: cem_wire_contract_id())
+    }
+
+    Function("storageBindingContractId") {
+      String(cString: cem_storage_binding_contract_id())
     }
 
     AsyncFunction("open") { (path: String, selectorKey: String, defaultIdentityKey: String) in

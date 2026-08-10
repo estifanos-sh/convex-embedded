@@ -300,6 +300,18 @@ fn pull_apply_stamps_logical_clock_seq_into_the_read_page_versions_sidecar() {
     let docs = parse_docs(&page);
     assert_eq!(docs.len(), 1);
     let local_id = docs[0]["_id"].as_str().unwrap();
+    assert_ne!(
+        local_id, SERVER_ID,
+        "a pulled server id is mapped to a device-local document id",
+    );
+    assert_eq!(
+        store
+            .id_read("issues", local_id)
+            .unwrap()
+            .and_then(|mapping| mapping.convex_id().map(str::to_owned)),
+        Some(SERVER_ID.to_owned()),
+        "the server id remains in the durable id mapping, not the materialized document",
+    );
     assert_eq!(
         page.versions.get(local_id),
         Some(&41),

@@ -5,6 +5,7 @@ import { v } from "convex/values";
 import { paginator } from "convex-helpers/server/pagination";
 
 import { identityKey } from "../identity";
+import { CURRENT_WIRE_CONTRACT_ID } from "../../protocol";
 import schema from "../schema";
 
 type DataModel = DataModelFromSchemaDefinition<typeof schema>;
@@ -21,7 +22,7 @@ export const read = query({
     identity: v.optional(identitySelectorValidator),
     schemaHash: v.optional(v.string()),
     moduleGraphHash: v.optional(v.string()),
-    protocolVersion: v.optional(v.number()),
+    contractId: v.optional(v.string()),
     lastSeenBefore: v.optional(v.number()),
     retired: v.optional(v.boolean()),
     paginationOpts: paginationOptsValidator,
@@ -33,10 +34,9 @@ export const read = query({
         identity: v.optional(v.string()),
         schemaHash: v.string(),
         moduleGraphHash: v.string(),
-        protocolVersion: v.number(),
+        contractId: v.literal(CURRENT_WIRE_CONTRACT_ID),
         lastSeenAt: v.number(),
         lastPushAt: v.optional(v.number()),
-        acknowledgedThrough: v.optional(v.number()),
         retired: v.boolean(),
       }),
     ),
@@ -59,7 +59,7 @@ export const read = query({
           client.clientId !== "hosted" &&
           (args.schemaHash === undefined || client.schemaHash === args.schemaHash) &&
           (args.moduleGraphHash === undefined || client.moduleGraphHash === args.moduleGraphHash) &&
-          (args.protocolVersion === undefined || client.protocolVersion === args.protocolVersion) &&
+          (args.contractId === undefined || client.contractId === args.contractId) &&
           (args.lastSeenBefore === undefined || client.lastSeenAt < args.lastSeenBefore) &&
           (args.retired === undefined || client.retired === args.retired),
       )
@@ -76,12 +76,9 @@ export const read = query({
         ...(client.identity === undefined ? {} : { identity: client.identity }),
         schemaHash: client.schemaHash,
         moduleGraphHash: client.moduleGraphHash,
-        protocolVersion: client.protocolVersion,
+        contractId: client.contractId,
         lastSeenAt: client.lastSeenAt,
         ...(client.lastPushAt === undefined ? {} : { lastPushAt: client.lastPushAt }),
-        ...(client.acknowledgedThrough === undefined
-          ? {}
-          : { acknowledgedThrough: client.acknowledgedThrough }),
         retired: client.retired,
       })),
     };

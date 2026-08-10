@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vite-plus/test";
 
+import { loadWasmModule } from "../../src/browser/artifact";
 import { nativePlatformUnsupported } from "../../src/node/artifact";
 
 describe("Node native artifact platforms", () => {
@@ -13,5 +14,15 @@ describe("Node native artifact platforms", () => {
     expect(nativePlatformUnsupported("linux", "x64")).toBeUndefined();
     expect(nativePlatformUnsupported("linux", "arm64")).toBeUndefined();
     expect(nativePlatformUnsupported("win32", "x64")).toBeUndefined();
+  });
+
+  test("rejects an explicit legacy browser module instead of silently loading another artifact", async () => {
+    await expect(
+      loadWasmModule({
+        Store: { open: () => undefined },
+        apiVersion: () => 10,
+        contractId: () => "sha256:legacy",
+      } as never),
+    ).rejects.toThrow("did not export bindingContractId");
   });
 });

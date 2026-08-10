@@ -3,7 +3,7 @@ import { v } from "convex/values";
 import { components } from "./_generated/api";
 import { remote } from "./embedded";
 import { read as readTime } from "./time";
-import { EMBEDDED_PROTOCOL_VERSION } from "../../../src/protocol";
+import { CURRENT_WIRE_CONTRACT_ID } from "../../../src/protocol";
 
 const revisionValidator = v.union(
   v.object({
@@ -47,7 +47,7 @@ export const commit = remote.mutation({
       runtime: {
         schemaHash: "fixture",
         moduleGraphHash: "fixture",
-        protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+        contractId: CURRENT_WIRE_CONTRACT_ID,
       },
     };
     if (args.outcome === "applied") {
@@ -108,7 +108,7 @@ export const client = remote.mutation({
     clientId: v.string(),
     schemaHash: v.string(),
     moduleGraphHash: v.string(),
-    protocolVersion: v.number(),
+    contractId: v.string(),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -137,7 +137,7 @@ export const client = remote.mutation({
       runtime: {
         schemaHash: args.schemaHash,
         moduleGraphHash: args.moduleGraphHash,
-        protocolVersion: args.protocolVersion,
+        contractId: args.contractId,
       },
       expiresAt: readTime() + 60_000,
     });
@@ -155,7 +155,7 @@ export const client = remote.mutation({
         runtime: {
           schemaHash: args.schemaHash,
           moduleGraphHash: args.moduleGraphHash,
-          protocolVersion: args.protocolVersion,
+          contractId: args.contractId,
         },
         kind: "apply",
         verification: { kind: "ready", witnesses: [] },

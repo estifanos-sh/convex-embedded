@@ -27,13 +27,19 @@ export type LocalMutationCtx<DataModel extends GenericDataModel> = Omit<
   "scheduler" | "storage"
 >;
 
-/** Context passed to a device-only action. Actions orchestrate separate query/mutation calls. */
+/**
+ * Context passed to a device-only action. Actions orchestrate separate query/mutation calls.
+ *
+ * `ledger` is structurally present so one ordinary internal local action can be passed to
+ * `client.open(setup)`. TypeScript cannot specialize an already-authored action handler from its
+ * later use at `open`, so its methods reject unless that action is running as setup.
+ */
 export type LocalActionCtx<DataModel extends GenericDataModel> = Omit<
   RuntimeActionCtx<DataModel>,
   "scheduler" | "storage" | "runAction"
 > & {
-  /** Frozen pre-cutover records, available only while `client.open(setup)` is running. */
-  ledger: LedgerReader;
+  /** Frozen pre-cutover device records; usable only while `client.open(setup)` is running. */
+  readonly ledger: LedgerReader;
 };
 
 declare const localFunction: unique symbol;

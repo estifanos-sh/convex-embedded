@@ -15,7 +15,8 @@ import {
   WASI,
 } from "@napi-rs/wasm-runtime";
 import { OpfsDirectory, opfsImports } from "./opfs";
-import { EMBEDDED_STORAGE_ABI_VERSION } from "../abi";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../storage/contract";
+import { CURRENT_WIRE_CONTRACT_ID } from "../protocol";
 import { EmbeddedError } from "../error";
 
 type BrowserWorker = {
@@ -76,8 +77,10 @@ interface WasmInstance {
  * @internal
  */
 export interface WasmModule {
-  /** Storage artifact API version exported by the Rust/WASM module. */
-  apiVersion(): number;
+  /** Exact storage binding contract exported by the Rust/WASM module. */
+  bindingContractId(): string;
+  /** Hosted wire contract exported by the Rust/WASM module. */
+  contractId(): string;
   /** Store constructor exported by the Rust/WASM module. */
   Store: {
     /** Opens an embedded store for the given browser storage path. */
@@ -123,13 +126,6 @@ export interface LoadWasmOptions {
   /** Optional registry that collects spawned pthreads so recovery can terminate the pool. */
   registry?: PthreadRegistry;
 }
-
-/**
- * Expected browser WASM storage artifact API version.
- *
- * @internal
- */
-export const WASM_API_VERSION = EMBEDDED_STORAGE_ABI_VERSION;
 
 /**
  * Thrown when the shared linear memory backing the store cannot be reserved because the device
@@ -446,13 +442,22 @@ function threadEventMessage(event: unknown): string {
 
 function validateWasmModule(value: unknown): WasmModule {
   const module = value as Partial<WasmModule>;
-  if (typeof module.apiVersion !== "function") {
-    throw new Error("browser WASM artifact did not export apiVersion");
+  if (typeof module.bindingContractId !== "function") {
+    throw new Error("browser WASM artifact did not export bindingContractId");
   }
-  const version = module.apiVersion();
-  if (version !== WASM_API_VERSION) {
+  const bindingContractId = module.bindingContractId();
+  if (bindingContractId !== CURRENT_STORAGE_BINDING_CONTRACT_ID) {
     throw new Error(
-      `browser WASM artifact API version mismatch: expected ${WASM_API_VERSION}, got ${version}`,
+      `browser WASM artifact binding contract mismatch: expected ${CURRENT_STORAGE_BINDING_CONTRACT_ID}, got ${bindingContractId}`,
+    );
+  }
+  if (typeof module.contractId !== "function") {
+    throw new Error("browser WASM artifact did not export contractId");
+  }
+  const wireContractId = module.contractId();
+  if (wireContractId !== CURRENT_WIRE_CONTRACT_ID) {
+    throw new Error(
+      `browser WASM artifact wire contract mismatch: expected ${CURRENT_WIRE_CONTRACT_ID}, got ${wireContractId}`,
     );
   }
   if (typeof module.Store?.open !== "function") {
@@ -465,7 +470,15 @@ function isExplicitModuleSource(
   source: WasmSource | undefined,
 ): source is WasmModule | Promise<WasmModule> | (() => WasmModule | Promise<WasmModule>) {
   return (
-    typeof source === "function" || Boolean(source && ("apiVersion" in source || "then" in source))
+    typeof source === "function" ||
+    Boolean(
+      source &&
+      ("Store" in source ||
+        "apiVersion" in source ||
+        "bindingContractId" in source ||
+        "contractId" in source ||
+        "then" in source),
+    )
   );
 }
 

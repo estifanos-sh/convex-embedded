@@ -1,3 +1,2 @@
 
 .env.local
-tests/*/convex/embedded.generated.ts

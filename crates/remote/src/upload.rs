@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 use convex::Value;
-use storage::PendingUpload;
+use storage::{PendingUpload, RuntimeWireIdentity};
 
 use crate::{ConvexArgs, RemoteError, RemoteResult};
 
@@ -76,7 +76,7 @@ impl RemoteUploader for HttpRemoteUploader {
     }
 }
 
-pub(crate) fn args(upload: &PendingUpload) -> ConvexArgs {
+pub(crate) fn args(upload: &PendingUpload, runtime: &RuntimeWireIdentity) -> ConvexArgs {
     let mut args = BTreeMap::from([
         (
             "localStorageId".to_owned(),
@@ -91,6 +91,23 @@ pub(crate) fn args(upload: &PendingUpload) -> ConvexArgs {
             Value::String(content_type.clone()),
         );
     }
+    args.insert(
+        "runtime".to_owned(),
+        Value::Object(BTreeMap::from([
+            (
+                "schemaHash".to_owned(),
+                Value::String(runtime.schema_hash.clone()),
+            ),
+            (
+                "moduleGraphHash".to_owned(),
+                Value::String(runtime.module_graph_hash.clone()),
+            ),
+            (
+                "contractId".to_owned(),
+                Value::String(runtime.contract_id.clone()),
+            ),
+        ])),
+    );
     args
 }
 

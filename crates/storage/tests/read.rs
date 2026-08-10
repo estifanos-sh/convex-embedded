@@ -457,6 +457,23 @@ fn order_key_matches_convex_total_order() {
     let expected: Vec<&str> = ordered.iter().map(|(id, _)| *id).collect();
     assert_eq!(doc_ids(&asc), expected, "ascending order must match Convex");
 
+    // This has the same table/index/bounds shape as the preceding query, so it must not reuse
+    // the cached ascending SQL plan. Direction changes both ORDER BY and cursor predicates.
+    let desc = store
+        .doc_page_read(&ReadSpec {
+            table: "vals".into(),
+            index: Some("by_v".into()),
+            order: Order::Desc,
+            ..Default::default()
+        })
+        .unwrap();
+    let descending: Vec<&str> = expected.iter().rev().copied().collect();
+    assert_eq!(
+        doc_ids(&desc),
+        descending,
+        "descending order must match Convex"
+    );
+
     let neg_zero = store
         .doc_page_read(&ReadSpec {
             table: "vals".into(),

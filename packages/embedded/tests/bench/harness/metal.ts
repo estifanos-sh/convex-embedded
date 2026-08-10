@@ -2,7 +2,7 @@ import { ConvexHttpClient } from "convex/browser";
 import { makeFunctionReference } from "convex/server";
 
 import { getTimerTime } from "../../../src/time.js";
-import { revisionVolumeId } from "./volume.js";
+import { revisionVolumeId } from "../../../scripts/volume.js";
 import { installMetalDevicePage, observePageFailures } from "../../browser/harness/page.js";
 import { sleep } from "./env.js";
 import { replaceMetalRevisionVolume } from "./options.js";

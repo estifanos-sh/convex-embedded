@@ -9,6 +9,23 @@ import {
   revisionCheckpointValidator,
   settlementValidator,
 } from "./model";
+import { CURRENT_WIRE_CONTRACT_ID } from "../protocol";
+
+const runtimeValidator = v.object({
+  schemaHash: v.string(),
+  moduleGraphHash: v.string(),
+  contractId: v.literal(CURRENT_WIRE_CONTRACT_ID),
+});
+const storedRuntimeValidator = runtimeValidator;
+const clientFields = {
+  clientId: v.string(),
+  schemaHash: v.string(),
+  moduleGraphHash: v.string(),
+  lastSeenAt: v.number(),
+  lastPushAt: v.optional(v.number()),
+  retired: v.boolean(),
+  identity: v.optional(v.string()),
+};
 
 export default defineSchema({
   mutations: defineTable({
@@ -20,8 +37,7 @@ export default defineSchema({
     settlement: settlementValidator,
     settledAt: v.number(),
     // Acknowledgement is a fact about this exact replay row. A client-wide creation-time fence
-    // can accidentally acknowledge another row written between two pushes, so it is retained
-    // only as legacy diagnostic data on `clients`, never as the deletion authority.
+    // can accidentally acknowledge another row written between two pushes.
     acknowledgedAt: v.optional(v.commitTs()),
     identity: v.optional(v.string()),
   })
@@ -41,11 +57,7 @@ export default defineSchema({
     replayId: v.string(),
     fingerprint: v.string(),
     logicalFingerprint: v.string(),
-    runtime: v.object({
-      schemaHash: v.string(),
-      moduleGraphHash: v.string(),
-      protocolVersion: v.number(),
-    }),
+    runtime: storedRuntimeValidator,
     acknowledgeReplayId: v.optional(v.string()),
     resultHash: v.string(),
     mutationTime: v.number(),
@@ -112,7 +124,8 @@ export default defineSchema({
       "state",
       "retainUntil",
       "throughSeq",
-    ]),
+    ])
+    .index("by_blobid", ["blobId"]),
 
   blobs: defineTable({
     hash: v.string(),
@@ -121,7 +134,9 @@ export default defineSchema({
     state: v.union(v.literal("staging"), v.literal("ready")),
     createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_hash", ["hash"]),
+  })
+    .index("by_hash", ["hash"])
+    .index("by_updatedat", ["updatedAt"]),
 
   blobChunks: defineTable({
     blobId: v.id("blobs"),
@@ -129,6 +144,31 @@ export default defineSchema({
     bytes: v.bytes(),
     hash: v.string(),
   }).index("by_blobid_and_ordinal", ["blobId", "ordinal"]),
+
+  // A capability is created only after the hosted replay has run the application's own mutation
+  // handler without committing it. It authorizes one exact blob manifest for a short window;
+  // chunks must present this token before they can allocate component storage.
+  blobScopes: defineTable({
+    tokenHash: v.string(),
+    owner: v.union(v.literal("mutation"), v.literal("checkpoint")),
+    clientId: v.string(),
+    identity: v.optional(v.string()),
+    replayId: v.optional(v.string()),
+    fingerprint: v.optional(v.string()),
+    checkpointId: v.optional(v.id("crdtCheckpoints")),
+    responseTokenHash: v.optional(v.string()),
+    hash: v.string(),
+    bytes: v.number(),
+    chunks: v.number(),
+    expiresAt: v.number(),
+    createdAt: v.number(),
+  })
+    .index("by_tokenhash", ["tokenHash"])
+    .index("by_hash", ["hash"])
+    .index("by_mutation_and_hash", ["clientId", "replayId", "fingerprint", "hash"])
+    .index("by_checkpoint_and_hash", ["checkpointId", "hash"])
+    .index("by_client_identity_expiresat", ["clientId", "identity", "expiresAt"])
+    .index("by_expiresat", ["expiresAt"]),
 
   revisions: defineTable({
     key: v.optional(v.string()),
@@ -190,17 +230,9 @@ export default defineSchema({
     updatedAt: v.number(),
   }).index("by_storageid", ["storageId"]),
 
-  clients: defineTable({
-    clientId: v.string(),
-    schemaHash: v.string(),
-    moduleGraphHash: v.string(),
-    protocolVersion: v.number(),
-    lastSeenAt: v.number(),
-    lastPushAt: v.optional(v.number()),
-    acknowledgedThrough: v.optional(v.number()),
-    retired: v.boolean(),
-    identity: v.optional(v.string()),
-  })
+  clients: defineTable(
+    v.object({ ...clientFields, contractId: v.literal(CURRENT_WIRE_CONTRACT_ID) }),
+  )
     .index("by_clientid", ["clientId"])
     .index("by_lastseenat", ["lastSeenAt"])
     .index("by_identity_and_lastseenat", ["identity", "lastSeenAt"]),

@@ -1,16 +1,14 @@
-// Keep this paired with the mobile Rust wire: required terminal settlements are not compatible
-// with an artifact that serializes the older tick shape.
-const VERSION = 10;
+import { CURRENT_MOBILE_BRIDGE_CONTRACT_ID } from "./contract";
 const BUFFER = "$buffer";
 const FLOAT = "$float";
 const INTEGER = "$integer";
 const FLOAT_VIEW = new DataView(new ArrayBuffer(8));
 
 export interface NativeEnvelope {
+  bridgeContractId: string;
   buffers: Uint8Array[];
   json: string;
   operation: string;
-  version: number;
 }
 
 interface NativeError {
@@ -19,18 +17,23 @@ interface NativeError {
 }
 
 interface NativeResponse {
+  bridgeContractId: string;
   buffers: Uint8Array[];
   error?: NativeError | null;
   json: string;
   ok: boolean;
-  version: number;
 }
 
-/** Encode one versioned request for the mobile Rust binding. @internal */
+/** Encode one exact-contract request for the mobile Rust binding. @internal */
 export function encodeRequest(operation: string, value?: unknown): Uint8Array {
   const buffers: Uint8Array[] = [];
   const json = JSON.stringify(split(value, buffers)) ?? "null";
-  return encodeMessage({ buffers, json, operation, version: VERSION });
+  return encodeMessage({
+    bridgeContractId: CURRENT_MOBILE_BRIDGE_CONTRACT_ID,
+    buffers,
+    json,
+    operation,
+  });
 }
 
 /** Decode a request envelope for protocol conformance tests. @internal */
@@ -39,7 +42,7 @@ export function decodeRequest(bytes: Uint8Array): NativeEnvelope {
   if (
     !request ||
     typeof request !== "object" ||
-    typeof request.version !== "number" ||
+    request.bridgeContractId !== CURRENT_MOBILE_BRIDGE_CONTRACT_ID ||
     typeof request.operation !== "string" ||
     typeof request.json !== "string" ||
     !Array.isArray(request.buffers)
@@ -55,7 +58,7 @@ export function decodeResponse<T>(bytes: Uint8Array): T {
   if (
     !response ||
     typeof response !== "object" ||
-    response.version !== VERSION ||
+    response.bridgeContractId !== CURRENT_MOBILE_BRIDGE_CONTRACT_ID ||
     typeof response.ok !== "boolean" ||
     typeof response.json !== "string" ||
     !Array.isArray(response.buffers)
@@ -123,8 +126,8 @@ function join(value: unknown, buffers: Uint8Array[]): unknown {
 function encodeMessage(value: NativeEnvelope): Uint8Array {
   const writer = new MessageWriter();
   writer.map(4);
-  writer.string("version");
-  writer.integer(value.version);
+  writer.string("bridgeContractId");
+  writer.string(value.bridgeContractId);
   writer.string("operation");
   writer.string(value.operation);
   writer.string("json");

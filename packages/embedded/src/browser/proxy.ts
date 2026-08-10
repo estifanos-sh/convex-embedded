@@ -19,7 +19,7 @@ import type { ConvexEmbeddedRemoteOptions } from "../client";
 import type { FunctionReference } from "../runtime/functions";
 import { getTimerTime } from "../time";
 import { randomId } from "../id/random";
-import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
+import { CURRENT_WIRE_CONTRACT_ID } from "../protocol";
 import type { RemoteIdentity, RemoteMutationSettlement } from "../storage/types";
 import {
   deserializeError,
@@ -185,7 +185,7 @@ export class WorkerRunner implements Runner {
                     clientId: this.clientId,
                     moduleGraphHash: init.identity?.moduleGraphHash ?? "local",
                     operationTimeoutMs: init.remote.operationTimeoutMs,
-                    protocolVersion: init.identity?.protocolVersion ?? EMBEDDED_PROTOCOL_VERSION,
+                    contractId: init.identity?.contractId ?? CURRENT_WIRE_CONTRACT_ID,
                     receiveTimeoutMs: init.remote.receiveTimeoutMs,
                     schemaHash: init.identity?.schemaHash ?? "local",
                     url: init.remote.url,

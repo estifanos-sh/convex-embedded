@@ -4,7 +4,6 @@ import type { DOMProps } from "expo/dom";
 import { Redirect, useLocalSearchParams } from "expo-router";
 import {
   forwardRef,
-  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -102,11 +101,8 @@ type DocumentScreenProps = {
   onReady?: (id: string) => void;
 };
 
-export const DocumentScreen = memo(
-  forwardRef<DocumentScreenHandle, DocumentScreenProps>(function DocumentScreen(
-    { active = true, documentId: id, onClose, onReady },
-    ref,
-  ) {
+export const DocumentScreen = forwardRef<DocumentScreenHandle, DocumentScreenProps>(
+  function DocumentScreen({ active = true, documentId: id, onClose, onReady }, ref) {
     const connection = useEmbeddedConnectionState();
     const [document, setDocument] = useState<EditorDocument | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -517,7 +513,7 @@ export const DocumentScreen = memo(
         )}
       </View>
     );
-  }),
+  },
 );
 
 function EditorHeader({

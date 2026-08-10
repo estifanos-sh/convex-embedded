@@ -13,8 +13,8 @@ import {
 } from "../../../config";
 
 void describe("demo deployment configuration", () => {
-  void it("keeps the generated Embedded contract under Convex's generated directory", () => {
-    assert.equal(embeddedGeneratedPath, "_generated/embedded.ts");
+  void it("keeps the generated Embedded contract outside Convex's generated directory", () => {
+    assert.equal(embeddedGeneratedPath, "embedded.generated.ts");
   });
 
   void it("uses process overrides before the shared root environment", () => {

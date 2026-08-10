@@ -47,7 +47,6 @@ export function createSchedulerService(
   pending?: Array<() => Promise<void>>,
   scheduled?: string[],
   pendingRows?: ScheduledJob[],
-  postCommit?: (run: () => void) => void,
 ): SchedulerService {
   const service = fullStore(store);
   const insert = async (
@@ -81,32 +80,19 @@ export function createSchedulerService(
       updatedTime: now,
     };
     scheduled?.push(job.jobId);
-    const announce = () => {
-      emitSchedulerUpsert(emit, job);
-      wake(Math.max(0, job.dueTime - getTimerTime()));
-    };
-    const announceAfterCommit = () => {
-      if (!postCommit) return announce();
-      // Preserve event-before-wake ordering, but each observer is independently post-commit:
-      // a diagnostic callback cannot strand a durable due job without its wake-up.
-      postCommit(() => emitSchedulerUpsert(emit, job));
-      postCommit(() => wake(Math.max(0, job.dueTime - getTimerTime())));
-    };
     const apply = async () => {
       await schedule.write(job);
-      announce();
-    };
-    const applyAfterCommit = async () => {
-      await schedule.write(job);
-      announceAfterCommit();
+      emitSchedulerUpsert(emit, job);
+      wake(Math.max(0, job.dueTime - getTimerTime()));
     };
     if (pending && pendingRows) {
       pendingRows.push(job);
       pending.push(async () => {
-        announceAfterCommit();
+        emitSchedulerUpsert(emit, job);
+        wake(Math.max(0, job.dueTime - getTimerTime()));
       });
     } else if (pending) {
-      pending.push(applyAfterCommit);
+      pending.push(apply);
     } else {
       await apply();
     }
@@ -127,22 +113,8 @@ export function createSchedulerService(
         if (job) emitSchedulerUpsert(emit, job);
         wake(0);
       };
-      if (pending) {
-        pending.push(async () => {
-          const job = await schedule.cancel(jobId, getTimerTime());
-          const announce = () => {
-            if (job) emitSchedulerUpsert(emit, job);
-            wake(0);
-          };
-          if (!postCommit) announce();
-          else {
-            postCommit(() => {
-              if (job) emitSchedulerUpsert(emit, job);
-            });
-            postCommit(() => wake(0));
-          }
-        });
-      } else await apply();
+      if (pending) pending.push(apply);
+      else await apply();
     },
   };
 }

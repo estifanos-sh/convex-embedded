@@ -832,7 +832,7 @@ export interface RemoteSurface {
 export interface RemoteIdentity {
   identity: UserIdentity | null;
   identityKey?: string;
-  protocolVersion: number;
+  contractId: string;
 }
 
 export interface RemoteDocPushWire {
@@ -946,7 +946,7 @@ export interface RemoteStartOptions {
   /** Receives native actor transitions after their local transaction commits. */
   notify?: (tick: RemoteTick) => void;
   operationTimeoutMs?: number;
-  protocolVersion: number;
+  contractId: string;
   receiveTimeoutMs?: number;
   schemaHash: string;
   /** Internal browser WASM socket bridge. */
@@ -957,7 +957,7 @@ export interface RemoteStartOptions {
 /** Runtime identity fields carried by a durable mutation envelope. @internal */
 export interface RemoteRuntimeIdentity {
   moduleGraphHash: string;
-  protocolVersion: number;
+  contractId: string;
   schemaHash: string;
 }
 

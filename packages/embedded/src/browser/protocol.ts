@@ -37,13 +37,13 @@ export type EmbeddedWorkerSource = EmbeddedWorker | (() => EmbeddedWorker);
 export interface RuntimeIdentity {
   moduleGraphHash: string;
   packageVersion: string;
-  protocolVersion: number;
+  contractId: string;
   schemaHash: string;
   setupGraphHash?: string;
   setupReference?: string;
   storageId: string;
   storeFormatVersion: number;
-  wasmAbiVersion: number;
+  storageBindingId: string;
 }
 
 export const WorkerCommand = {
@@ -93,7 +93,7 @@ export type WorkerRequest =
         clientId?: string;
         moduleGraphHash: string;
         operationTimeoutMs?: number;
-        protocolVersion: number;
+        contractId: string;
         receiveTimeoutMs?: number;
         schemaHash: string;
         url: string;

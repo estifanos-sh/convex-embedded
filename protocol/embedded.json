@@ -1,0 +1,38 @@
+{
+  "format": "convex-embedded-wire-contract/v1",
+  "surface": {
+    "path": "protocol/embedded.surface.json",
+    "digest": "sha256:3ef5bd3173959b5d1242369d9b0a7e049d2d3ad5637a4d3177f0cde4261a34b8"
+  },
+  "identity": {
+    "request": { "kind": "identity", "offers": "contractIds:string[]" },
+    "response": "identity,identityKey?,contractId"
+  },
+  "runtime": {
+    "fields": ["schemaHash", "moduleGraphHash", "contractId"],
+    "contract": "exact"
+  },
+  "envelope": {
+    "identity": ["mutationId", "replayId", "logicalFingerprint"],
+    "settlement": ["applied", "conflict", "rejected", "rebase"],
+    "malformed": "quarantine-verbatim"
+  },
+  "blob": {
+    "flow": ["manifest", "capability", "chunk", "commit"],
+    "binding": [
+      "runtime.contractId",
+      "clientId",
+      "scope",
+      "identityKey",
+      "owner",
+      "hash",
+      "bytes",
+      "chunks",
+      "expiry"
+    ],
+    "chunkBytes": 196608,
+    "clientScopes": 16,
+    "clientBytes": 8388608,
+    "cleanup": "bounded-expiry"
+  }
+}

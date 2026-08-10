@@ -11,8 +11,16 @@ class ConvexEmbeddedNativeModule : Module() {
   override fun definition() = ModuleDefinition {
     Name("ConvexEmbeddedNative")
 
-    Function("apiVersion") {
-      Native.apiVersion()
+    Function("bridgeContractId") {
+      Native.bridgeContractId()
+    }
+
+    Function("wireContractId") {
+      Native.wireContractId()
+    }
+
+    Function("storageBindingContractId") {
+      Native.storageBindingContractId()
     }
 
     AsyncFunction("open") { path: String, selectorKey: String, defaultIdentityKey: String ->

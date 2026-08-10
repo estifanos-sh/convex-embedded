@@ -7,7 +7,7 @@ export function remoteConfigKey(
     authFetchToken: remote.authFetchToken,
     moduleGraphHash: remote.moduleGraphHash,
     operationTimeoutMs: remote.operationTimeoutMs ?? null,
-    protocolVersion: remote.protocolVersion,
+    contractId: remote.contractId,
     receiveTimeoutMs: remote.receiveTimeoutMs ?? null,
     schemaHash: remote.schemaHash,
     url: remote.url,

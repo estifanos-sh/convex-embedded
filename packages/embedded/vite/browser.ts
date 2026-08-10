@@ -87,7 +87,6 @@ export const browserProject = {
       provider: playwright() as never,
     },
     include: [
-      "tests/browser/fixture.ts",
       "tests/browser/memory.ts",
       "tests/browser/protocol.ts",
       "tests/browser/runtime.ts",

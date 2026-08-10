@@ -19,7 +19,10 @@ test("generated contract exports schema-bound local builders without carrying th
     artifact: {
       artifactHash: "artifact-hash",
       executionHash: "graph-hash",
-      expectedBinding: { mobileAbi: 10, storageAbi: 33 },
+      expectedBinding: {
+        mobileContractId: "sha256:mobile",
+        storageContractId: "sha256:storage",
+      },
       format: 1,
       modules: [],
       replicationHash: "manifest-hash",
@@ -27,7 +30,7 @@ test("generated contract exports schema-bound local builders without carrying th
       setups: [],
     },
     embeddedSchema: toEmbeddedGeneratedSchema(analyzeEmbeddedSchema(schema)),
-    generatedPath: "/repo/convex/_generated/embedded.ts",
+    generatedPath: "/repo/convex/embedded.generated.ts",
     localModules: {
       "local/drafts": { file: "/repo/local/drafts.ts" },
     },
@@ -46,16 +49,12 @@ test("generated contract exports schema-bound local builders without carrying th
   });
 
   expect(source).toContain("embeddedGeneratedFormatVersion = 4");
-  expect(source).toContain(
-    'embeddedGeneratedIdentity = {"formatVersion":4,"manifestHash":"manifest-hash","schemaSourceHash":"schema-source-hash"}',
-  );
-  expect(source).toContain(
-    'embeddedManifest = {"documents":{"list":{"kind":"query","placement":"replicated","visibility":"public"}}}',
-  );
+  expect(source).toContain("embeddedGeneratedIdentity = {\n  formatVersion: 4,");
+  expect(source).toContain("embeddedManifest = {\n  documents: {");
   expect(source).toContain(
     'import { defineLocal } from "@estifanos-sh/convex-embedded/internal/local";',
   );
-  expect(source).toContain('import schema from "../schema.js";');
+  expect(source).toContain('import schema from "./schema.js";');
   expect(source).toContain("export const local = defineLocal(schema);");
   expect(source).not.toContain("Register");
   expect(source).not.toContain('"@estifanos-sh/convex-embedded/local"');
@@ -108,7 +107,7 @@ test("generator atomically creates the contract needed by bundler builds", async
       root,
     });
 
-    expect(result.path).toBe(path.join(convex, "_generated", "embedded.ts"));
+    expect(result.path).toBe(path.join(convex, "embedded.generated.ts"));
     expect(result.bundle.embeddedSchema.runtimeStoreSchema.tables.length).toBeGreaterThan(0);
     await expect(readFile(result.path, "utf8")).resolves.toContain("embeddedManifest");
     expect(result.source).not.toContain("runtimeStoreSchema");

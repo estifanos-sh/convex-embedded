@@ -7,18 +7,40 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use jni::{
     objects::{JByteArray, JClass, JString},
-    sys::{jbyteArray, jdouble, jint, jlong},
+    sys::{jbyteArray, jdouble, jlong},
     JNIEnv,
 };
 
 use crate::{clock_read, close_handle, open_path, request_bytes, BridgeError};
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_convex_embedded_mobile_Native_apiVersion(
-    _env: JNIEnv<'_>,
+pub extern "system" fn Java_dev_convex_embedded_mobile_Native_bridgeContractId(
+    mut env: JNIEnv<'_>,
     _class: JClass<'_>,
-) -> jint {
-    crate::API_VERSION as jint
+) -> jni::sys::jstring {
+    env.new_string(storage::CURRENT_MOBILE_BRIDGE_CONTRACT_ID)
+        .map(JString::into_raw)
+        .unwrap_or_default()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_convex_embedded_mobile_Native_wireContractId(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jni::sys::jstring {
+    env.new_string(storage::CURRENT_WIRE_CONTRACT_ID)
+        .map(JString::into_raw)
+        .unwrap_or_default()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_convex_embedded_mobile_Native_storageBindingContractId(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) -> jni::sys::jstring {
+    env.new_string(storage::CURRENT_STORAGE_BINDING_CONTRACT_ID)
+        .map(JString::into_raw)
+        .unwrap_or_default()
 }
 
 #[unsafe(no_mangle)]

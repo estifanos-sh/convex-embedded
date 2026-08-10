@@ -28,7 +28,7 @@ pub(crate) struct StartOptions {
     client_id: Option<String>,
     module_graph_hash: String,
     operation_timeout_ms: Option<u64>,
-    protocol_version: i64,
+    contract_id: String,
     receive_timeout_ms: Option<u64>,
     schema_hash: String,
 }
@@ -214,7 +214,7 @@ impl RemoteHost {
         config.runtime = storage::RuntimeWireIdentity {
             schema_hash: options.schema_hash,
             module_graph_hash: options.module_graph_hash,
-            protocol_version: options.protocol_version,
+            contract_id: options.contract_id,
         };
         config.timing = RemoteTiming {
             receive_timeout: options.receive_timeout_ms.map_or_else(
