@@ -243,8 +243,8 @@ fn encode_runtime(runtime: &RuntimeWireIdentity) -> Value {
             Value::String(runtime.module_graph_hash.clone()),
         ),
         (
-            "protocolVersion".to_owned(),
-            Value::Float64(runtime.protocol_version as f64),
+            "contractId".to_owned(),
+            Value::String(runtime.contract_id.clone()),
         ),
     ]))
 }
@@ -695,7 +695,7 @@ mod tests {
         RuntimeWireIdentity {
             schema_hash: "schema-1".to_owned(),
             module_graph_hash: "modules-1".to_owned(),
-            protocol_version: crate::config::EMBEDDED_PROTOCOL_VERSION,
+            contract_id: storage::CURRENT_WIRE_CONTRACT_ID.to_owned(),
         }
     }
 

@@ -484,10 +484,10 @@ function localRuntimeCacheKey(
   return [
     identity.schemaHash,
     identity.moduleGraphHash,
-    identity.protocolVersion,
+    identity.contractId,
     identity.packageVersion,
     identity.storageId,
-    identity.wasmAbiVersion,
+    identity.storageBindingId,
     storagePath,
     setup?.reference ?? "",
     setup?.graphHash ?? "",

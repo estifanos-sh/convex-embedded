@@ -6,6 +6,7 @@ import {
   type RegisteredQuery,
 } from "convex/server";
 import { v } from "convex/values";
+import { createHash } from "node:crypto";
 import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { defineEmbedded } from "../../src/server";
@@ -14,7 +15,8 @@ import { hashDocument, hashValue } from "../../src/hash";
 import { pull as componentPull } from "../../src/component/protocol";
 import { retire as componentRetire } from "../../src/component/remote/client";
 import { completeQueryRows } from "../../src/server/query";
-import { EMBEDDED_PROTOCOL_MISMATCH, EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import { EMBEDDED_PROTOCOL_MISMATCH, CURRENT_WIRE_CONTRACT_ID } from "../../src/protocol";
+import { WIRE_SURFACE } from "../../src/contract/generated";
 import { seedEntropy } from "../../src/entropy";
 import {
   assertIntentField,
@@ -49,6 +51,17 @@ const component = {
   protocol: { installation: {}, pull: componentPullReference },
 } as unknown as ComponentApi<"embedded">;
 
+function canonicalWireValidatorJson(value: unknown): string {
+  if (value === CURRENT_WIRE_CONTRACT_ID) return JSON.stringify("$CURRENT_WIRE_CONTRACT_ID");
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalWireValidatorJson).join(",")}]`;
+  const fields = value as Record<string, unknown>;
+  return `{${Object.keys(fields)
+    .sort()
+    .map((field) => `${JSON.stringify(field)}:${canonicalWireValidatorJson(fields[field])}`)
+    .join(",")}}`;
+}
+
 describe("v5 server surface", () => {
   test("requires only the component and app schema", () => {
     const embedded = defineEmbedded({ component, schema });
@@ -61,31 +74,13 @@ describe("v5 server surface", () => {
     ]);
   });
 
-  test("mints a hosted upload URL for the remote byte drain", async () => {
-    const embedded = defineEmbedded({ component, schema });
-    const handler = (
-      embedded.upload as unknown as {
-        _handler: (
-          ctx: unknown,
-          args: { localStorageId: string; sha256: string; size: number },
-        ) => Promise<unknown>;
-      }
-    )._handler;
-    await expect(
-      handler(
-        { storage: { generateUploadUrl: async () => "https://upload.example/once" } },
-        { localStorageId: "_storage|local", sha256: "a".repeat(64), size: 5 },
-      ),
-    ).resolves.toEqual({ uploadUrl: "https://upload.example/once" });
-  });
-
-  test("selects the current wire for an explicit identity offer", async () => {
+  test("selects the sole public wire from an explicit offer", async () => {
     const embedded = defineEmbedded({ component, schema });
     const handler = (
       embedded.pull as unknown as {
         _handler: (
           ctx: unknown,
-          args: { request: { kind: "identity"; protocolVersions?: number[] } },
+          args: { request: { kind: "identity"; contractIds?: string[] } },
         ) => Promise<unknown>;
       }
     )._handler;
@@ -100,12 +95,12 @@ describe("v5 server surface", () => {
       handler(ctx, {
         request: {
           kind: "identity",
-          protocolVersions: [EMBEDDED_PROTOCOL_VERSION],
+          contractIds: [CURRENT_WIRE_CONTRACT_ID],
         },
       }),
     ).resolves.toMatchObject({
       identity: null,
-      protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+      contractId: CURRENT_WIRE_CONTRACT_ID,
     });
   });
 
@@ -115,7 +110,7 @@ describe("v5 server surface", () => {
       embedded.pull as unknown as {
         _handler: (
           ctx: unknown,
-          args: { request: { kind: "identity"; protocolVersions: number[] } },
+          args: { request: { kind: "identity"; contractIds: string[] } },
         ) => Promise<unknown>;
       }
     )._handler;
@@ -131,33 +126,124 @@ describe("v5 server surface", () => {
             },
           },
         },
-        { request: { kind: "identity", protocolVersions: [25, 28] } },
+        { request: { kind: "identity", contractIds: ["sha256:unknown-a", "sha256:unknown-b"] } },
       ),
     ).rejects.toMatchObject({ data: { code: EMBEDDED_PROTOCOL_MISMATCH } });
     expect(reads).toBe(0);
   });
 
-  test("admits the current runtime request at the component boundary", async () => {
-    const result = await (
-      componentPull as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
-    )._handler(
-      {
-        db: {
-          query: () => ({
-            withIndex: () => ({ unique: async () => null }),
-          }),
+  test("mints an upload URL only for an authenticated exact-current request", async () => {
+    const embedded = defineEmbedded({ component, schema });
+    const handler = (
+      embedded.upload as unknown as {
+        _handler: (ctx: unknown, args: unknown) => Promise<unknown>;
+      }
+    )._handler;
+    let urls = 0;
+    await expect(
+      handler(
+        {
+          auth: { getUserIdentity: async () => ({ tokenIdentifier: "user" }) },
+          storage: {
+            generateUploadUrl: async () => {
+              urls += 1;
+              return "https://upload.example";
+            },
+          },
+        },
+        {
+          localStorageId: "local:1",
+          sha256: "a".repeat(64),
+          size: 0,
+          runtime: {
+            schemaHash: "schema",
+            moduleGraphHash: "modules",
+            contractId: CURRENT_WIRE_CONTRACT_ID,
+          },
+        },
+      ),
+    ).resolves.toEqual({ uploadUrl: "https://upload.example" });
+    expect(urls).toBe(1);
+  });
+
+  test("rejects a non-current upload request before authentication or URL allocation", async () => {
+    const embedded = defineEmbedded({ component, schema });
+    const handler = (
+      embedded.upload as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+    )._handler;
+    let auth = 0;
+    let urls = 0;
+    await expect(
+      handler(
+        {
+          auth: {
+            getUserIdentity: async () => {
+              auth += 1;
+              return null;
+            },
+          },
+          storage: {
+            generateUploadUrl: async () => {
+              urls += 1;
+              return "https://upload.example";
+            },
+          },
+        },
+        {
+          localStorageId: "local:1",
+          sha256: "a".repeat(64),
+          size: 0,
+          runtime: { schemaHash: "schema", moduleGraphHash: "modules", contractId: "sha256:wrong" },
+        },
+      ),
+    ).rejects.toMatchObject({ data: { code: EMBEDDED_PROTOCOL_MISMATCH } });
+    expect(auth).toBe(0);
+    expect(urls).toBe(0);
+  });
+
+  test("does not allocate an upload URL for unauthenticated or malformed requests", async () => {
+    const embedded = defineEmbedded({ component, schema });
+    const handler = (
+      embedded.upload as unknown as { _handler: (ctx: unknown, args: unknown) => Promise<unknown> }
+    )._handler;
+    let urls = 0;
+    const ctx = {
+      auth: { getUserIdentity: async () => null },
+      storage: {
+        generateUploadUrl: async () => {
+          urls += 1;
+          return "https://upload.example";
         },
       },
-      {
-        runtime: {
-          moduleGraphHash: "modules",
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
-          schemaHash: "schema",
-        },
-        rows: [],
+    };
+    const valid = {
+      localStorageId: "local:1",
+      sha256: "a".repeat(64),
+      size: 0,
+      runtime: {
+        schemaHash: "schema",
+        moduleGraphHash: "modules",
+        contractId: CURRENT_WIRE_CONTRACT_ID,
       },
-    );
-    expect(result).toMatchObject({ changes: [], crdt: [], members: [] });
+    };
+    await expect(handler(ctx, valid)).rejects.toThrow("UNAUTHENTICATED");
+    expect(urls).toBe(0);
+
+    const authenticated = {
+      ...ctx,
+      auth: { getUserIdentity: async () => ({ tokenIdentifier: "user" }) },
+    };
+    for (const request of [
+      { ...valid, localStorageId: "" },
+      { ...valid, sha256: "A".repeat(64) },
+      { ...valid, size: -1 },
+      { ...valid, size: 0.5 },
+    ]) {
+      await expect(handler(authenticated, request)).rejects.toMatchObject({
+        data: { code: "EMBEDDED_UPLOAD_INVALID" },
+      });
+    }
+    expect(urls).toBe(0);
   });
 
   test("keeps query transport out of the authored TypeScript surface", () => {
@@ -322,7 +408,7 @@ describe("v5 server surface", () => {
           component: "components/embedded/protocol:pull",
           runtime: {
             moduleGraphHash: "modules",
-            protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+            contractId: CURRENT_WIRE_CONTRACT_ID,
             schemaHash: "schema",
           },
           stack: [],
@@ -416,7 +502,7 @@ describe("v5 server surface", () => {
       {
         runtime: {
           moduleGraphHash: "modules",
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+          contractId: CURRENT_WIRE_CONTRACT_ID,
           schemaHash: "schema",
         },
         rows: [
@@ -460,7 +546,7 @@ describe("v5 server surface", () => {
       {
         runtime: {
           moduleGraphHash: "modules",
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+          contractId: CURRENT_WIRE_CONTRACT_ID,
           schemaHash: "schema",
         },
         rows,
@@ -496,7 +582,7 @@ describe("v5 server surface", () => {
   test("hashes the plain fast path with the CRDT-excluding document hash", async () => {
     const runtime = {
       moduleGraphHash: "modules",
-      protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+      contractId: CURRENT_WIRE_CONTRACT_ID,
       schemaHash: "schema",
     };
     const fields = { _id: "documents:1", _creationTime: 1, owner: "o", title: "T" };
@@ -536,7 +622,7 @@ describe("v5 server surface", () => {
 
   const cacheRuntime = {
     moduleGraphHash: "modules",
-    protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+    contractId: CURRENT_WIRE_CONTRACT_ID,
     schemaHash: "schema",
   };
   const cacheCtx = {
@@ -680,7 +766,7 @@ describe("v5 server surface", () => {
       logicalFingerprint: "logical-fingerprint",
       runtime: {
         moduleGraphHash: "modules",
-        protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+        contractId: CURRENT_WIRE_CONTRACT_ID,
         schemaHash: "schema",
       },
       resultHash: await hashValue(null),
@@ -1462,7 +1548,7 @@ describe("v5 server surface", () => {
   const pushRuntime = {
     schemaHash: "schema",
     moduleGraphHash: "graph",
-    protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+    contractId: CURRENT_WIRE_CONTRACT_ID,
   };
   const mutationPushRequest = (functionName: string, args: unknown) => ({
     kind: "mutation" as const,
@@ -1668,7 +1754,7 @@ describe("v5 server surface", () => {
     });
   });
 
-  test("normalizes cached failure payloads before returning a public push settlement", async () => {
+  test("normalizes cached failure payloads before returning a canonical push settlement", async () => {
     const replayWrite = {
       [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
     };
@@ -1723,49 +1809,6 @@ describe("v5 server surface", () => {
     }
   });
 
-  test("encodes canonical failures with the public settlement shape", async () => {
-    const replayWrite = {
-      [Symbol.for("toReferencePath")]: "components/embedded/protocol:replayWrite",
-    };
-    const embedded = defineEmbedded({
-      component: {
-        protocol: { installation: {}, pull: componentPullReference, replayWrite },
-      } as unknown as ComponentApi<"embedded">,
-      schema,
-    });
-    const base = {
-      mutationId: "mutation-1",
-      inserts: [],
-      schedules: [],
-      uploads: [],
-      revisions: [],
-      crdt: [],
-      authoritative: [],
-      outcome: "rejected" as const,
-      error: { code: "EMBEDDED_DIVERGENCE", reason: "detail must not cross the boundary" },
-    };
-    const response = await invokePush(
-      embedded,
-      {
-        auth: { getUserIdentity: async () => null },
-        meta: { getRequestMetadata: async () => ({ requestId: "request-1" }) },
-        runMutation: async (reference: unknown) => {
-          if (reference === replayWrite) return base;
-          throw new Error("unexpected mutation after cached settlement");
-        },
-      },
-      {
-        ...mutationPushRequest("documents:write", {}),
-        runtime: { ...pushRuntime, protocolVersion: EMBEDDED_PROTOCOL_VERSION },
-      },
-    );
-    expect(response).toMatchObject({
-      mutationId: "mutation-1",
-      outcome: "rejected",
-      error: { code: "EMBEDDED_DIVERGENCE" },
-    });
-  });
-
   test("gates a pull by manifest placement, rejecting a non-replicated target before invoking it", async () => {
     const embedded = defineEmbedded({
       component,
@@ -1808,91 +1851,74 @@ describe("v5 server surface", () => {
     const pull = JSON.parse(
       (embedded.pull as unknown as { exportArgs(): string }).exportArgs(),
     ) as ExportedArgs;
+    const upload = JSON.parse(
+      (embedded.upload as unknown as { exportArgs(): string }).exportArgs(),
+    ) as { type: string; value: Record<string, { optional: boolean }> };
     const pushRequest = push.value.request.fieldType;
     const pullRequest = pull.value.request.fieldType;
 
     expect(push.type).toBe("object");
     expect(push.value.request.optional).toBe(false);
     expect(pushRequest.type).toBe("union");
-    expect(Object.keys(pushRequest.value[0]!.value).sort()).toEqual([
-      "acknowledgeReplayId",
-      "afterImages",
-      "argRefs",
-      "args",
-      "clientId",
-      "crdt",
-      "functionName",
-      "inserts",
-      "kind",
-      "logicalFingerprint",
-      "mutationId",
-      "mutationTime",
-      "randomSeed",
-      "reads",
-      "replayId",
-      "resultHash",
-      "revisionCheckpoints",
-      "runtime",
-      "schedules",
-      "uploads",
-    ]);
-    expect(Object.keys(pushRequest.value[1]!.value).sort()).toEqual([
-      "clientId",
-      "kind",
-      "replayId",
-    ]);
-    expect(Object.keys(pushRequest.value[2]!.value).sort()).toEqual([
-      "bytes",
-      "chunk",
-      "chunkHash",
-      "chunks",
-      "clientId",
-      "hash",
-      "kind",
-      "ordinal",
-      "runtime",
-    ]);
-    expect(Object.keys(pushRequest.value[3]!.value).sort()).toEqual([
-      "checkpointId",
-      "clientId",
-      "content",
-      "kind",
-      "projectionHash",
-      "responseToken",
-      "runtime",
-      "throughSeq",
-    ]);
+    const pushKinds = WIRE_SURFACE.discriminators.push;
+    for (const [index, kind] of pushKinds.entries()) {
+      const shape = WIRE_SURFACE.push[kind] as {
+        fields: readonly string[];
+        optional?: readonly string[];
+      };
+      expect(Object.keys(pushRequest.value[index]!.value).sort()).toEqual([...shape.fields].sort());
+      for (const field of shape.optional ?? []) {
+        expect(pushRequest.value[index]!.value[field]?.optional).toBe(true);
+      }
+    }
     expect(pull.type).toBe("object");
     expect(pull.value.request.optional).toBe(false);
     expect(pullRequest.type).toBe("union");
-    expect(Object.keys(pullRequest.value[0]!.value).sort()).toEqual(["kind", "protocolVersions"]);
-    expect(pullRequest.value[0]!.value.protocolVersions?.optional).toBe(true);
-    expect(pullRequest.value[1]!.value.runtime?.optional).toBe(false);
-    expect(pullRequest.value[1]!.value.functionName?.optional).toBe(false);
-    expect(pullRequest.value[1]!.value).not.toHaveProperty("clientId");
-    expect(pullRequest.value[1]!.value).not.toHaveProperty("crdt");
-    expect(Object.keys(pullRequest.value[2]!.value).sort()).toEqual([
-      "args",
-      "checkpointId",
-      "cursor",
-      "epoch",
-      "field",
-      "functionName",
-      "headSeq",
-      "kind",
-      "rowId",
-      "runtime",
-      "table",
-    ]);
-    expect(Object.keys(pullRequest.value[3]!.value).sort()).toEqual([
-      "args",
-      "boundary",
-      "cursor",
-      "functionName",
-      "kind",
-      "path",
-      "runtime",
-    ]);
+    const pullKinds = WIRE_SURFACE.discriminators.pull;
+    for (const [index, kind] of pullKinds.entries()) {
+      const shape = WIRE_SURFACE.pull[kind] as {
+        fields: readonly string[];
+        optional?: readonly string[];
+      };
+      expect(Object.keys(pullRequest.value[index]!.value).sort()).toEqual([...shape.fields].sort());
+      for (const field of shape.optional ?? []) {
+        expect(pullRequest.value[index]!.value[field]?.optional).toBe(true);
+      }
+    }
+    expect(pullRequest.value[2]!.value.runtime?.optional).toBe(false);
+    expect(pullRequest.value[2]!.value.functionName?.optional).toBe(false);
+    expect(pullRequest.value[2]!.value).not.toHaveProperty("clientId");
+    expect(pullRequest.value[2]!.value).not.toHaveProperty("crdt");
+    expect(upload.type).toBe("object");
+    expect(Object.keys(upload.value).sort()).toEqual([...WIRE_SURFACE.upload.fields].sort());
+    for (const field of WIRE_SURFACE.upload.optional ?? []) {
+      expect(upload.value[field]?.optional).toBe(true);
+    }
+    const digest = (value: unknown) =>
+      `sha256:${createHash("sha256").update(canonicalWireValidatorJson(value)).digest("hex")}`;
+    // These are digests of the full, recursively canonicalized Convex ValidatorJSON exports—not
+    // a field-name approximation. Changing any nested type, optionality, literal, union member,
+    // or return shape therefore changes the descriptor and its computed wire contract hash.
+    expect({
+      pullArgs: digest(
+        JSON.parse((embedded.pull as unknown as { exportArgs(): string }).exportArgs()),
+      ),
+      pushArgs: digest(
+        JSON.parse((embedded.push as unknown as { exportArgs(): string }).exportArgs()),
+      ),
+      uploadArgs: digest(
+        JSON.parse((embedded.upload as unknown as { exportArgs(): string }).exportArgs()),
+      ),
+      pullReturns: digest(
+        JSON.parse((embedded.pull as unknown as { exportReturns(): string }).exportReturns()),
+      ),
+      pushReturns: digest(
+        JSON.parse((embedded.push as unknown as { exportReturns(): string }).exportReturns()),
+      ),
+      uploadReturns: digest(
+        JSON.parse((embedded.upload as unknown as { exportReturns(): string }).exportReturns()),
+      ),
+    }).toEqual(WIRE_SURFACE.validators);
   });
 
   test("does not add engine tables to the app schema", () => {

@@ -1,7 +1,8 @@
 use std::{
-    ffi::{c_char, CStr},
+    ffi::{c_char, CStr, CString},
     panic::{catch_unwind, AssertUnwindSafe},
     ptr,
+    sync::OnceLock,
 };
 
 use crate::{clock_read, close_handle, open_path, request_bytes, BridgeError};
@@ -35,8 +36,32 @@ impl CemBuffer {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cem_api_version() -> u32 {
-    crate::API_VERSION
+pub extern "C" fn cem_bridge_contract_id() -> *const c_char {
+    contract_string(storage::CURRENT_MOBILE_BRIDGE_CONTRACT_ID)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cem_wire_contract_id() -> *const c_char {
+    contract_string(storage::CURRENT_WIRE_CONTRACT_ID)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cem_storage_binding_contract_id() -> *const c_char {
+    contract_string(storage::CURRENT_STORAGE_BINDING_CONTRACT_ID)
+}
+
+fn contract_string(value: &str) -> *const c_char {
+    static MOBILE: OnceLock<CString> = OnceLock::new();
+    static STORAGE: OnceLock<CString> = OnceLock::new();
+    static WIRE: OnceLock<CString> = OnceLock::new();
+    let slot = match value {
+        storage::CURRENT_MOBILE_BRIDGE_CONTRACT_ID => &MOBILE,
+        storage::CURRENT_STORAGE_BINDING_CONTRACT_ID => &STORAGE,
+        storage::CURRENT_WIRE_CONTRACT_ID => &WIRE,
+        _ => unreachable!("only generated contract IDs cross the mobile C ABI"),
+    };
+    slot.get_or_init(|| CString::new(value).expect("contract IDs contain no NUL bytes"))
+        .as_ptr()
 }
 
 /// Open a store and return its opaque registry handle.

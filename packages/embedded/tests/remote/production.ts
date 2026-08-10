@@ -9,7 +9,7 @@ import { api } from "../../../../convex/_generated/api";
 import schema from "../../../../convex/schema";
 import { ConvexEmbeddedClient } from "../../src/node/client";
 import { readDevtoolsBridge } from "../../src/devtools/bridge";
-import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import { CURRENT_WIRE_CONTRACT_ID } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
 import { read as readTime } from "../testkit/time";
 import { fixtureAdminKey, fixtureRemoteUrl } from "../testkit/remote";
@@ -39,7 +39,7 @@ const BLOB_CHUNK_BYTES = 196_608;
 const runtime = {
   schemaHash: "production-contract",
   moduleGraphHash: "production-contract",
-  protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+  contractId: CURRENT_WIRE_CONTRACT_ID,
 };
 
 type PullArgs = Extract<FunctionArgs<typeof api.embedded.pull>["request"], { kind: "live" }>;
@@ -75,7 +75,7 @@ describe("v5 production pull contract", () => {
       pull(client, {
         functionName: "documents:read",
         args: { limit: 1 },
-        runtime: { ...runtime, protocolVersion: EMBEDDED_PROTOCOL_VERSION - 1 },
+        runtime: { ...runtime, contractId: "sha256:unknown-contract" as never },
       }),
     ).rejects.toThrow();
   });

@@ -6,7 +6,7 @@ import { NativeStore } from "../../src/node/native";
 import { StoreAdapter, type StoreBinding } from "../../src/storage/binding";
 
 const prebaseline = new Error(
-  "[convex-embedded:EMBEDDED_PRE_BASELINE_STORE] store epoch 46 predates baseline 47",
+  "[convex-embedded:EMBEDDED_PRE_BASELINE_STORE] store epoch 0 predates baseline 1",
 );
 
 describe("storage open error boundaries", () => {

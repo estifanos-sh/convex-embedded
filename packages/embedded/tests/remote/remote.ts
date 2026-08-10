@@ -11,7 +11,7 @@ import schema from "../../../../convex/schema";
 import { hashDocument, hashValue } from "../../src/hash";
 import { ConvexEmbeddedClient } from "../../src/node/client";
 import { readDevtoolsBridge } from "../../src/devtools/bridge";
-import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import { CURRENT_WIRE_CONTRACT_ID } from "../../src/protocol";
 import { getTimerTime } from "../../src/time";
 import { fixtureRemoteUrl } from "../testkit/remote";
 import { read as readTime } from "../testkit/time";
@@ -20,7 +20,7 @@ const remoteUrl = fixtureRemoteUrl();
 const testRuntime = {
   schemaHash: "v5-test",
   moduleGraphHash: "v5-test",
-  protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+  contractId: CURRENT_WIRE_CONTRACT_ID,
 };
 type PushArgs = {
   kind: "mutation";
@@ -67,10 +67,9 @@ interface RemoteClientMetadata {
   lastPushAt?: number;
   lastSeenAt: number;
   moduleGraphHash: string;
-  protocolVersion: number;
+  contractId: string;
   retired: boolean;
   schemaHash: string;
-  acknowledgedThrough?: number;
 }
 
 async function runPush(client: ConvexHttpClient, args: PushArgs): Promise<PushResult> {
@@ -174,10 +173,10 @@ describe("v5 real Convex vertical slice", () => {
         args: { limit: 1 },
         runtime: {
           ...testRuntime,
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION - 1,
+          contractId: "sha256:unknown-contract" as never,
         },
       }),
-    ).rejects.toThrow(`Embedded protocol ${EMBEDDED_PROTOCOL_VERSION - 1} is not supported`);
+    ).rejects.toThrow(`Embedded protocol ${"sha256:unknown-contract"} is not supported`);
   });
 
   test("routes actions and hosted-only functions through Convex", async () => {
@@ -301,11 +300,10 @@ describe("v5 real Convex vertical slice", () => {
     expect(clientLookup.pagesRead).toBeGreaterThanOrEqual(1);
     expect(metadata).toMatchObject({
       moduleGraphHash: testRuntime.moduleGraphHash,
-      protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+      contractId: CURRENT_WIRE_CONTRACT_ID,
       retired: false,
       schemaHash: testRuntime.schemaHash,
     });
-    expect(metadata.acknowledgedThrough).toBeUndefined();
     expect(metadata.lastPushAt).toBeTypeOf("number");
 
     await expect(
@@ -348,6 +346,7 @@ describe("v5 real Convex vertical slice", () => {
         kind: "acknowledge",
         clientId,
         replayId: laterMutationId,
+        runtime: testRuntime,
       },
     });
     const acknowledged = await client.query(api.mutation.list, {
@@ -361,7 +360,6 @@ describe("v5 real Convex vertical slice", () => {
       ).toMatchObject({ acknowledged: true });
     }
     const acknowledgedMetadata = (await remoteClientMetadata(client, clientId)).metadata;
-    expect(acknowledgedMetadata?.acknowledgedThrough).toBeTypeOf("number");
     if (!acknowledgedMetadata) throw new Error("Expected acknowledged remote client metadata.");
     expect(
       await client.mutation(api.mutation.remove, {
@@ -1697,15 +1695,14 @@ describe("v5 real Convex vertical slice", () => {
 
     expect(replayed).toEqual(first);
     expect(replayed.inserts).toEqual(first.inserts);
-    expect((await remoteClientMetadata(client, firstClientId)).metadata?.acknowledgedThrough).toBe(
-      undefined,
-    );
     await client.mutation(api.embedded.push, {
-      request: { kind: "acknowledge", clientId: nextClientId, replayId: mutationId },
+      request: {
+        kind: "acknowledge",
+        clientId: nextClientId,
+        replayId: mutationId,
+        runtime: testRuntime,
+      },
     });
-    expect(
-      (await remoteClientMetadata(client, firstClientId)).metadata?.acknowledgedThrough,
-    ).toBeTypeOf("number");
     for (const insert of first.inserts) {
       if (insert.table === "documents") {
         await client.mutation(api.documents.del, { id: insert.id as never });

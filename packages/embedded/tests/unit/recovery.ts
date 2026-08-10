@@ -421,7 +421,7 @@ describe("stale-generation start continuation", () => {
   const remoteOptions = {
     authFetchToken: false,
     moduleGraphHash: "modules",
-    protocolVersion: 1,
+    contractId: "sha256:test-contract",
     schemaHash: "schema",
     url: "https://example.convex.cloud",
   };

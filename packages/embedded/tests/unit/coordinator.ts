@@ -6,12 +6,12 @@ import {
   runtimeScope,
   setEmbeddedIdentity,
 } from "../../src/browser/identity";
-import { WASM_API_VERSION } from "../../src/browser/artifact";
-import { EMBEDDED_EPOCH } from "../../src/abi";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../../src/storage/contract";
+import { EMBEDDED_STORE_EPOCH } from "../../src/abi";
 import { getTimerTime } from "../../src/time";
 import { EmbeddedClient } from "../../src/client";
 import type { DiagnosticEvent as EmbeddedEvent } from "../../src/events";
-import { EMBEDDED_PROTOCOL_VERSION } from "../../src/protocol";
+import { CURRENT_WIRE_CONTRACT_ID } from "../../src/protocol";
 import type { Runner } from "../../src/runtime/runner";
 import {
   WorkerCommand,
@@ -29,7 +29,8 @@ import type { WorkerState } from "../../src/browser/runtime";
 import {
   controlChannelName,
   ControlOp,
-  CoordinatorProtocol,
+  BrowserCoordinationContractId,
+  isForeignCoordinationFrame,
   PeerOp,
   RejectCode,
   type BroadcastChannelLike,
@@ -39,6 +40,22 @@ import {
 } from "../../src/browser/coordinator/protocol";
 
 describe("browser deployment coordination", () => {
+  test("fails closed for any private coordination operation without this contract", () => {
+    for (const op of [...Object.values(ControlOp), ...Object.values(PeerOp)]) {
+      expect(isForeignCoordinationFrame({ op })).toBe(true);
+      expect(isForeignCoordinationFrame({ coordinationId: "sha256:old", op })).toBe(true);
+      expect(isForeignCoordinationFrame({ coordinationId: 1, op })).toBe(true);
+    }
+    expect(isForeignCoordinationFrame({ op: 999 })).toBe(true);
+    expect(isForeignCoordinationFrame({ type: "unrelated" })).toBe(false);
+    expect(
+      isForeignCoordinationFrame({
+        coordinationId: BrowserCoordinationContractId,
+        op: PeerOp.Attach,
+      }),
+    ).toBe(false);
+  });
+
   test("opens storage only after the page grants ownership", async () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
     const responses: WorkerResponse[] = [];
@@ -119,103 +136,6 @@ describe("browser deployment coordination", () => {
 
     expect(result(responses, 1)?.error?.message).toContain("durable leader fencing");
     expect(closed).toEqual(["remote", "store", "pthreads", "opfs"]);
-  });
-
-  test("legacy discovery probe rejects a v2 leader without attaching or opening storage", async () => {
-    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
-    const channels = new ChannelBus();
-    const responses: WorkerResponse[] = [];
-    const legacy = channels.open(controlChannelName(identity().storageId));
-    legacy.addEventListener("message", ({ data }) => {
-      const probe = data as { op?: unknown; protocol?: unknown };
-      if (probe.op !== ControlOp.SeekLeader || probe.protocol !== 2) return;
-      legacy.postMessage({
-        identity: identity(),
-        leaderEpoch: "legacy-session",
-        leaderId: "legacy-worker",
-        op: ControlOp.BroadcastLeader,
-        protocol: 2,
-        scope: runtimeScope(identity()),
-      });
-    });
-    let opens = 0;
-    const runtime = createCoordinatorRuntime(
-      {
-        clientId: "follower",
-        id: 1,
-        identity: identity(),
-        op: WorkerCommand.Init,
-        storageOwner: false,
-        storagePath: "documents.db",
-      },
-      {
-        assertCapabilities: () => undefined,
-        channels: { open: (name) => channels.open(name) },
-        closeSelf: () => undefined,
-        locks: { request: async (_name, callback) => await callback() },
-        openRuntime: async () => {
-          opens += 1;
-          return pendingRemoteRuntime();
-        },
-        postLocal: (response) => responses.push(response),
-        randomId: (prefix) => `${prefix}-follower`,
-      },
-    );
-
-    await runtime.start();
-
-    expect(result(responses, 1)?.error?.message).toContain("different browser protocol");
-    expect(opens).toBe(0);
-    legacy.close();
-  });
-
-  test("an active v3 leader ignores a legacy discovery seek", async () => {
-    setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
-    const channels = new ChannelBus();
-    const responses: WorkerResponse[] = [];
-    const runtime = createCoordinatorRuntime(
-      {
-        clientId: "owner",
-        id: 1,
-        identity: identity(),
-        op: WorkerCommand.Init,
-        storageOwner: true,
-        storagePath: "documents.db",
-      },
-      {
-        assertCapabilities: () => undefined,
-        channels: { open: (name) => channels.open(name) },
-        closeSelf: () => undefined,
-        locks: { request: async (_name, callback) => await callback() },
-        openRuntime: async () => testRuntime("owner", [], async () => "still-active"),
-        postLocal: (response) => responses.push(response),
-        randomId: (prefix) => `${prefix}-owner`,
-      },
-    );
-    await runtime.start();
-
-    const legacy = channels.open(controlChannelName(identity().storageId));
-    legacy.postMessage({
-      clientId: "legacy-client",
-      identity: identity(),
-      op: ControlOp.SeekLeader,
-      protocol: 2,
-      scope: runtimeScope(identity()),
-      storagePath: "documents.db",
-      workerId: "legacy-worker",
-    });
-    runtime.handle({
-      args: {},
-      clientId: "owner",
-      id: 2,
-      name: "documents:read",
-      op: WorkerCommand.Query,
-    });
-    await waitUntil(() => result(responses, 2) !== undefined);
-
-    expect(result(responses, 2)).toEqual({ id: 2, op: WorkerEvent.Result, result: "still-active" });
-    legacy.close();
-    await runtime.close();
   });
 
   test("acknowledges close only after the storage runtime has closed", async () => {
@@ -330,7 +250,7 @@ describe("browser deployment coordination", () => {
           authFetchToken: false,
           clientId: "client",
           moduleGraphHash: "modules",
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+          contractId: CURRENT_WIRE_CONTRACT_ID,
           schemaHash: "schema",
           url: "https://pending.convex.cloud",
         },
@@ -372,8 +292,8 @@ describe("browser deployment coordination", () => {
 
   test("runtime identity carries the local store format version", () => {
     setEmbeddedIdentity({ moduleGraphHash: "modules", schemaHash: "schema" });
-    expect(EMBEDDED_EPOCH).toBe(49);
-    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(49);
+    expect(EMBEDDED_STORE_EPOCH).toBe(1);
+    expect(createRuntimeIdentity("documents").storeFormatVersion).toBe(1);
   });
 
   test("a store format version mismatch surfaces as a runtime identity mismatch", () => {
@@ -445,7 +365,7 @@ describe("browser deployment coordination", () => {
         leaderEpoch: "leader-old",
         leaderFence: "0",
         op: PeerOp.Attach,
-        protocol: CoordinatorProtocol,
+        coordinationId: BrowserCoordinationContractId,
         scope: runtimeScope(newIdentity),
         storagePath: leader.storagePath,
         workerId: "worker-new",
@@ -531,12 +451,12 @@ describe("browser deployment coordination", () => {
         leaderEpoch: "leader-incarnation",
         leaderFence: "1",
         op: PeerOp.Attach,
-        protocol: CoordinatorProtocol,
+        coordinationId: BrowserCoordinationContractId,
         remote: {
           authFetchToken: false,
           clientId: "client",
           moduleGraphHash: "modules",
-          protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+          contractId: CURRENT_WIRE_CONTRACT_ID,
           schemaHash: "schema",
           url: "https://fixture.convex.cloud",
         },
@@ -820,13 +740,13 @@ describe("browser deployment coordination", () => {
       leaderFence: oldEvent.leaderFence!,
       leaderId: "first-incarnation",
       op: PeerOp.Attached,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
     } satisfies PeerMessage);
     stalePeer.postMessage({
       leaderEpoch: "leader-first-incarnation",
       leaderFence: oldEvent.leaderFence!,
       op: PeerOp.Response,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
       response: { id: 777, op: WorkerEvent.Result, result: "late-first-result" },
     } satisfies PeerMessage);
     await Promise.resolve();
@@ -948,7 +868,7 @@ function coordinator(
             authFetchToken: false,
             clientId: workerId,
             moduleGraphHash: "modules",
-            protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+            contractId: CURRENT_WIRE_CONTRACT_ID,
             schemaHash: "schema",
             url: "https://fixture.convex.cloud",
           }
@@ -1172,11 +1092,11 @@ function identity(overrides: Partial<RuntimeIdentity> = {}): RuntimeIdentity {
   return {
     moduleGraphHash: "modules",
     packageVersion: "0.0.0",
-    protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+    contractId: CURRENT_WIRE_CONTRACT_ID,
     schemaHash: "schema",
     storageId: "documents",
-    storeFormatVersion: EMBEDDED_EPOCH,
-    wasmAbiVersion: WASM_API_VERSION,
+    storeFormatVersion: EMBEDDED_STORE_EPOCH,
+    storageBindingId: CURRENT_STORAGE_BINDING_CONTRACT_ID,
     ...overrides,
   };
 }

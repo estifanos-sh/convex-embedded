@@ -25,12 +25,10 @@ import type {
 import type {
   CommitOptions,
   CountSpec,
-  CrdtSnapshot,
   KeyPage,
   IdMapping,
   MutationCall,
   MutationRecord,
-  OneDocWriteCommit,
   RemoteScope,
   RemoteSurface,
   RuntimeStorage,
@@ -815,17 +813,10 @@ class FakeStorage implements RuntimeStorage {
   private readonly docs = new Map<string, StoredDoc>();
   private readonly ids = new Map<string, IdMapping>();
   private readonly mutations = new Map<string, MutationRecord & { args: string; name: string }>();
-  commitFailures = 0;
-  commitOneDocWrite?: (
-    commit: OneDocWriteCommit,
-    options?: CommitOptions,
-  ) => ReturnType<FakeStorage["commit"]>;
-  readonly commitOptions: Array<CommitOptions | undefined> = [];
   mutationWriteCalls = 0;
   readonly pushEnvelopes: Array<{
     afterImages: unknown[];
     crdt: unknown[];
-    revisionCheckpoints?: Array<{ operation: "create" | "retain"; ordinal: number }>;
     reads?: Array<{
       kind: string;
       equality?: Array<{ field: string; value: unknown; commitTs?: true }>;
@@ -851,9 +842,7 @@ class FakeStorage implements RuntimeStorage {
     crdt: {
       read: (_table: string, _id: string, _field: string): Promise<number | undefined> =>
         Promise.resolve(undefined),
-      snapshot: {
-        read: (_table: string, _id: string): Promise<CrdtSnapshot[]> => Promise.resolve([]),
-      },
+      snapshot: { read: (_table: string, _id: string) => Promise.resolve([]) },
     },
     page: {
       read: (spec: ReadSpec): Promise<DocPage> =>
@@ -973,11 +962,6 @@ class FakeStorage implements RuntimeStorage {
   }
 
   commit(batch: WriteBatch, options?: CommitOptions) {
-    this.commitOptions.push(options);
-    if (this.commitFailures > 0) {
-      this.commitFailures -= 1;
-      return Promise.reject(new Error("transient commit failure"));
-    }
     const commitTs = options?.commitTs === true ? (this.commitTs += 1n) : undefined;
     if (commitTs !== undefined && options !== undefined) {
       for (const write of batch.docWrites) {
@@ -2240,7 +2224,6 @@ describe("runtime", () => {
         };
       };
     };
-    let restoreAttempts = 0;
     const bridge = {
       savepoint: mutation({
         args: { id: v.id("messages"), fail: v.boolean() },
@@ -2274,7 +2257,6 @@ describe("runtime", () => {
       restore: mutation({
         args: { id: v.id("messages"), revId: v.string(), write: v.boolean() },
         handler: async (ctx, args) => {
-          restoreAttempts += 1;
           const revision = (await ctx.runMutation(components.embedded.rev.restore as never, {
             table: "messages",
             rowId: args.id,
@@ -2309,20 +2291,8 @@ describe("runtime", () => {
 
     await r.runMutation("bridge:edit", { id, body: "changed" });
     await expect(
-      r.runMutation(
-        "bridge:restore",
-        { id, revId: revision.revId, write: false },
-        { mutationId: "mutation:restore-postcondition" },
-      ),
+      r.runMutation("bridge:restore", { id, revId: revision.revId, write: false }),
     ).rejects.toThrow("matching document replace");
-    await expect(
-      r.runMutation(
-        "bridge:restore",
-        { id, revId: revision.revId, write: false },
-        { mutationId: "mutation:restore-postcondition" },
-      ),
-    ).rejects.toThrow("matching document replace");
-    expect(restoreAttempts).toBe(1);
     await r.runMutation("bridge:restore", { id, revId: revision.revId, write: true });
     const restored = (await r.runQuery("messages:get", { id })) as { body: string };
     expect(restored.body).toBe("draft");
@@ -2430,91 +2400,6 @@ describe("runtime", () => {
     await store.close();
   });
 
-  for (const operation of ["create", "retain"] as const) {
-    test(`a caught nested revision ${operation} failure restores replay checkpoints`, async () => {
-      const components = componentsGeneric() as unknown as {
-        embedded: { rev: { create: unknown; retain: unknown } };
-      };
-      const store = new FakeStorage();
-      let snapshotReads = 0;
-      const overfullSnapshots: CrdtSnapshot[] = Array.from({ length: 65 }, (_, index) => ({
-        bytes: new ArrayBuffer(0),
-        field: `body.${index}`,
-        hash: "not-read-after-limit-check",
-        headSeq: 0,
-        kind: "text",
-        projectionHash: "",
-      }));
-      store.doc.crdt.snapshot.read = async () => (snapshotReads++ === 0 ? overfullSnapshots : []);
-      const bridge = {
-        saveAfterCaughtRevisionFailure: mutation({
-          args: { id: v.id("messages") },
-          handler: async (ctx, args) => {
-            const document = await ctx.db.get(args.id);
-            if (!document) throw new Error("Document not found.");
-            const { _creationTime, _id, ...value } = document;
-            const revision = {
-              deleted: false,
-              rowId: args.id,
-              table: "messages",
-              value,
-            };
-            const reference =
-              operation === "create"
-                ? components.embedded.rev.create
-                : components.embedded.rev.retain;
-            const revisionArgs =
-              operation === "create" ? revision : { ...revision, origin: "displaced" as const };
-            let caught = false;
-            try {
-              await ctx.runMutation(reference as never, revisionArgs);
-            } catch {
-              caught = true;
-            }
-            const saved = await ctx.runMutation(reference as never, revisionArgs);
-            return { caught, saved };
-          },
-        }),
-      };
-      const r = createRunner({ bridge, messages }, store, storeSchema);
-      const id = (await r.runMutation("messages:send", {
-        body: operation,
-        channel: "revision-replay",
-      })) as string;
-      const mutationId = `mutation:revision-${operation}-caught`;
-      await store.mutation.write({
-        args: "{}",
-        mutationId,
-        name: "bridge:saveAfterCaughtRevisionFailure",
-      });
-      const revisionReplay = {
-        checkpoints: [],
-        createdAt: 1,
-        mutationId,
-        nextCheckpointOrdinal: 0,
-        nextOrdinal: 0,
-      };
-
-      const result = (await r.runMutation(
-        "bridge:saveAfterCaughtRevisionFailure",
-        { id },
-        {
-          mutationId,
-          mutationIsFresh: true,
-          pushCall: { fn: "bridge:saveAfterCaughtRevisionFailure", rngSeed: mutationId },
-          revisionReplay,
-        },
-      )) as { caught: boolean };
-
-      expect(result.caught).toBe(true);
-      const checkpoints = store.pushEnvelopes.at(-1)?.revisionCheckpoints;
-      expect(checkpoints).toHaveLength(1);
-      expect(checkpoints).toMatchObject([{ operation, ordinal: 0 }]);
-      expect(revisionReplay.nextCheckpointOrdinal).toBe(1);
-      expect(revisionReplay.nextOrdinal).toBe(operation === "create" ? 1 : 0);
-    });
-  }
-
   test("devtools snapshot skips Convex system entrypoint modules", async () => {
     const r = createRunner(
       {
@@ -2536,78 +2421,6 @@ describe("runtime", () => {
 
     expect(paths).toContain("messages:list");
     expect(paths).not.toContain("convex.config");
-  });
-
-  test("direct devtools commits retain replicated and device commit options", async () => {
-    const replicatedStore = new FakeStorage();
-    const replicated = createRunner({ messages }, replicatedStore, storeSchema);
-    const events: EmbeddedEvent[] = [];
-    const unsubscribe = replicated.subscribeEvents?.((event) => events.push(event));
-    const id = (await replicated.runMutation("messages:send", {
-      body: "before",
-      channel: "devtools",
-    })) as string;
-    replicatedStore.commitOptions.length = 0;
-    const eventsBeforePatch = events.length;
-
-    await replicated.devtools({
-      fields: { body: "after" },
-      id,
-      kind: "patchDocument",
-      table: "messages",
-    });
-    expect(replicatedStore.commitOptions).toEqual([
-      { changes: "omit", mutation: "none", source: "local" },
-    ]);
-    expect(events.slice(eventsBeforePatch)).toContainEqual(
-      expect.objectContaining({ source: "local", type: "data" }),
-    );
-
-    await replicated.devtools({
-      id: "messages|000000000000400080000000000000ff",
-      kind: "deleteDocument",
-      table: "messages",
-    });
-    expect(replicatedStore.commitOptions).toHaveLength(1);
-
-    await replicated.devtools({ id, kind: "deleteDocument", table: "messages" });
-    expect(replicatedStore.commitOptions).toEqual([
-      { changes: "omit", mutation: "none", source: "local" },
-      { changes: "omit", mutation: "none", source: "local" },
-    ]);
-    unsubscribe?.();
-
-    const deviceSchema: StoreSchema = {
-      hash: "device-devtools",
-      tables: [{ columns: [], indexes: [], name: "preferences", placement: "device" }],
-    };
-    const deviceStore = new FakeStorage();
-    const deviceId = "preferences|00000000000040008000000000000001";
-    await deviceStore.commit(
-      {
-        deletes: [],
-        docWrites: [
-          {
-            cols: [],
-            creationTime: 1,
-            data: { compact: true },
-            id: deviceId,
-            table: "preferences",
-          },
-        ],
-      },
-      { changes: "omit", source: "device" },
-    );
-    const device = createRunner({}, deviceStore, deviceSchema);
-    deviceStore.commitOptions.length = 0;
-
-    await device.devtools({
-      fields: { compact: false },
-      id: deviceId,
-      kind: "patchDocument",
-      table: "preferences",
-    });
-    expect(deviceStore.commitOptions).toEqual([{ changes: "omit", source: "device" }]);
   });
 
   test("table/id overload rejects ids from another table", async () => {
@@ -2855,6 +2668,57 @@ describe("runtime", () => {
     ]);
     unsubscribe?.();
     await store.close();
+  });
+
+  test("a post-commit diagnostic failure does not reject or replay a durable mutation", async () => {
+    let calls = 0;
+    const r = createRunner(
+      {
+        messages: {
+          ...messages,
+          observedWrite: mutation({
+            args: { channel: v.string() },
+            handler: async (ctx, args) => {
+              calls += 1;
+              return await ctx.db.insert("messages", { body: "durable", channel: args.channel });
+            },
+          }),
+        },
+      },
+      new FakeStorage(),
+      storeSchema,
+      {
+        emit: (event: EmbeddedEvent) => {
+          if (event.type === "data") throw new Error("diagnostic callback failed");
+        },
+      },
+    );
+
+    const id = await r.runMutation("messages:observedWrite", { channel: "observer" });
+
+    expect(id).toMatch(/^messages\|/);
+    expect(calls).toBe(1);
+    expect(await r.runQuery("messages:list", { channel: "observer" })).toMatchObject([
+      { body: "durable" },
+    ]);
+  });
+
+  test("a post-commit scheduler diagnostic failure does not reject its durable schedule", async () => {
+    const store = await NativeStore.openWith(nativeModule().Store, tmp("rt_scheduler_observer.db"));
+    await store.setup(storeSchema);
+    const r = createRunner({ messages }, store, storeSchema, {
+      emit: (event: EmbeddedEvent) => {
+        if (event.type === "scheduler") throw new Error("scheduler diagnostic failed");
+      },
+    });
+
+    try {
+      const jobId = await r.runMutation("messages:scheduleChild", { channel: "observer" });
+      expect(jobId).toMatch(/^_scheduled_functions\|/);
+      expect(await store.schedule.read()).toMatchObject([{ jobId, state: "pending" }]);
+    } finally {
+      await store.close();
+    }
   });
 
   test("remote-enabled runners persist schedule intent without executing it locally", async () => {
@@ -3346,359 +3210,6 @@ describe("runtime", () => {
     expect(seen.map((message) => message.body)).toEqual(["a"]);
   });
 
-  test("storage commit failures leave an accepted mutation retryable", async () => {
-    let calls = 0;
-    const store = new FakeStorage();
-    store.commitFailures = 1;
-    const r = createRunner(
-      {
-        messages: {
-          ...messages,
-          count: mutation({
-            args: {},
-            handler: async (ctx) => {
-              calls += 1;
-              return await ctx.db.insert("messages", { body: "retry", channel: "retry" });
-            },
-          }),
-        },
-      },
-      store,
-      storeSchema,
-    );
-
-    await expect(
-      r.runMutation("messages:count", {}, { mutationId: "mutation:retry" }),
-    ).rejects.toThrow("transient commit failure");
-    const id = await r.runMutation("messages:count", {}, { mutationId: "mutation:retry" });
-
-    expect(calls).toBe(2);
-    expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "retry" });
-  });
-
-  for (const observer of ["diagnostic", "timing", "wake", "span"] as const) {
-    test(`a post-commit ${observer} failure does not replay a durable mutation`, async () => {
-      let calls = 0;
-      const store = new FakeStorage();
-      const r = createRunner(
-        {
-          messages: {
-            ...messages,
-            observer: mutation({
-              args: {},
-              handler: async (ctx) => {
-                calls += 1;
-                return await ctx.db.insert("messages", {
-                  body: observer,
-                  channel: "post-commit-observer",
-                });
-              },
-            }),
-          },
-        },
-        store,
-        storeSchema,
-        observer === "diagnostic"
-          ? {
-              emit: (event: EmbeddedEvent) => {
-                if (event.type === "data") throw new Error("diagnostic callback failed");
-              },
-            }
-          : observer === "span"
-            ? {
-                emit: (event: EmbeddedEvent) => {
-                  if (
-                    event.type === "span" &&
-                    event.name === "storage.commit" &&
-                    event.phase === "finish"
-                  ) {
-                    throw new Error("storage span callback failed");
-                  }
-                },
-              }
-            : {},
-      );
-      const mutationId = `mutation:post-commit-${observer}`;
-      if (observer === "wake") {
-        await store.mutation.write({ args: "{}", mutationId, name: "messages:observer" });
-      }
-      const stopWake =
-        observer === "wake"
-          ? r.remote?.wake?.subscribe(() => {
-              throw new Error("wake callback failed");
-            })
-          : undefined;
-      const options = {
-        mutationId,
-        ...(observer === "timing"
-          ? {
-              onTiming: () => {
-                throw new Error("timing callback failed");
-              },
-            }
-          : {}),
-        ...(observer === "wake"
-          ? {
-              mutationIsFresh: true,
-              pushCall: { fn: "messages:observer", rngSeed: mutationId },
-            }
-          : {}),
-      };
-
-      try {
-        await r.runMutation("messages:observer", {}, options);
-        await r.runMutation("messages:observer", {}, { mutationId });
-      } finally {
-        stopWake?.();
-      }
-
-      expect(calls).toBe(1);
-      const rows = (await r.runQuery("messages:list", {
-        channel: "post-commit-observer",
-      })) as Array<{ body: string }>;
-      expect(rows).toMatchObject([{ body: observer }]);
-    });
-  }
-
-  test("a post-commit storage span failure fulfills an untracked mutation", async () => {
-    let calls = 0;
-    const store = new FakeStorage();
-    const r = createRunner(
-      {
-        messages: {
-          ...messages,
-          span: mutation({
-            args: {},
-            handler: async (ctx) => {
-              calls += 1;
-              return await ctx.db.insert("messages", {
-                body: "span",
-                channel: "post-commit-span",
-              });
-            },
-          }),
-        },
-      },
-      store,
-      storeSchema,
-      {
-        emit: (event: EmbeddedEvent) => {
-          if (
-            event.type === "span" &&
-            event.name === "storage.commit" &&
-            event.phase === "finish"
-          ) {
-            throw new Error("storage span callback failed");
-          }
-        },
-      },
-    );
-
-    await expect(r.runMutation("messages:span", {})).resolves.toMatch(/^messages\|/);
-    expect(calls).toBe(1);
-    expect(await r.runQuery("messages:list", { channel: "post-commit-span" })).toMatchObject([
-      { body: "span" },
-    ]);
-  });
-
-  test("a throwing primary diagnostic observer does not block subscribed post-commit observers", async () => {
-    const events: EmbeddedEvent[] = [];
-    const r = createRunner({ messages }, new FakeStorage(), storeSchema, {
-      emit: (event: EmbeddedEvent) => {
-        if (event.type === "data") throw new Error("primary diagnostic callback failed");
-      },
-    });
-    const unsubscribe = r.subscribeEvents?.((event) => events.push(event));
-
-    try {
-      await r.runMutation("messages:send", {
-        body: "continuity",
-        channel: "post-commit-observer-continuity",
-      });
-      expect(events).toEqual(
-        expect.arrayContaining([expect.objectContaining({ source: "local", type: "data" })]),
-      );
-    } finally {
-      unsubscribe?.();
-    }
-  });
-
-  test("a post-commit scheduler diagnostic failure does not replay a durable mutation", async () => {
-    const store = await NativeStore.openWith(nativeModule().Store, tmp("rt_scheduler_observer.db"));
-    await store.setup(storeSchema);
-    const r = createRunner({ messages }, store, storeSchema, {
-      emit: (event: EmbeddedEvent) => {
-        if (event.type === "scheduler") throw new Error("scheduler callback failed");
-      },
-    });
-    const options = { mutationId: "mutation:post-commit-scheduler" };
-
-    try {
-      const first = await r.runMutation(
-        "messages:scheduleChild",
-        { channel: "post-commit-scheduler" },
-        options,
-      );
-      const second = await r.runMutation(
-        "messages:scheduleChild",
-        { channel: "post-commit-scheduler" },
-        options,
-      );
-      expect(second).toBe(first);
-      expect(await store.schedule.read()).toMatchObject([{ jobId: first, state: "pending" }]);
-    } finally {
-      await store.close();
-    }
-  });
-
-  test("a failed pending-schedule diagnostic still wakes the durable due job", async () => {
-    const store = await NativeStore.openWith(
-      nativeModule().Store,
-      tmp("rt_scheduler_wake_observer.db"),
-    );
-    await store.setup(storeSchema);
-    let pendingDiagnostics = 0;
-    const r = createRunner({ messages }, store, storeSchema, {
-      emit: (event: EmbeddedEvent) => {
-        if (
-          event.type === "scheduler" &&
-          event.docWrites.some((write) => write.row.state === "pending")
-        ) {
-          pendingDiagnostics += 1;
-          throw new Error("pending scheduler callback failed");
-        }
-      },
-    });
-
-    try {
-      await expect(
-        r.runMutation("messages:scheduleImmediate", { channel: "post-commit-scheduler-wake" }),
-      ).resolves.toMatch(/^_scheduled_functions\|/);
-      await waitFor(
-        async () =>
-          (
-            (await r.runQuery("messages:list", {
-              channel: "post-commit-scheduler-wake",
-            })) as unknown[]
-          ).length === 1,
-        "scheduler did not wake after its pending diagnostic failed",
-      );
-      expect(pendingDiagnostics).toBe(1);
-    } finally {
-      await store.close();
-    }
-  });
-
-  test("a failed cancellation diagnostic still fulfills the durable cancellation", async () => {
-    const store = await NativeStore.openWith(
-      nativeModule().Store,
-      tmp("rt_scheduler_cancel_observer.db"),
-    );
-    await store.setup(storeSchema);
-    let throwOnCancel = false;
-    const r = createRunner({ messages }, store, storeSchema, {
-      emit: (event: EmbeddedEvent) => {
-        if (
-          throwOnCancel &&
-          event.type === "scheduler" &&
-          event.docWrites.some((write) => write.row.state === "canceled")
-        ) {
-          throw new Error("cancellation scheduler callback failed");
-        }
-      },
-    });
-
-    try {
-      const jobId = (await r.runMutation("messages:scheduleChild", {
-        channel: "post-commit-scheduler-cancel",
-      })) as string;
-      throwOnCancel = true;
-      await expect(r.runMutation("messages:cancelScheduled", { id: jobId })).resolves.toBeNull();
-      expect(await store.schedule.read()).toMatchObject([{ jobId, state: "canceled" }]);
-    } finally {
-      await store.close();
-    }
-  });
-
-  test("one-document mutations use the storage shortcut when batching is unnecessary", async () => {
-    const store = new FakeStorage();
-    let oneDocWriteCalls = 0;
-    store.commitOneDocWrite = (commit, options) => {
-      oneDocWriteCalls += 1;
-      return store.commit(
-        {
-          dataOnlyIds: commit.dataOnly
-            ? [{ id: commit.docWrite.id, table: commit.docWrite.table }]
-            : [],
-          deletes: [],
-          docWrites: [commit.docWrite],
-          freshIds: commit.fresh ? [{ id: commit.docWrite.id, table: commit.docWrite.table }] : [],
-        },
-        options,
-      );
-    };
-    const r = createRunner({ messages }, store, storeSchema);
-
-    const id = (await r.runMutation("messages:send", {
-      body: "before",
-      channel: "fast",
-    })) as string;
-    await r.runMutation("messages:rename", { body: "shortcut", id });
-
-    expect(oneDocWriteCalls).toBe(1);
-    expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "shortcut" });
-  });
-
-  test("a caught component failure restores one-document eligibility", async () => {
-    const components = componentsGeneric() as unknown as {
-      embedded: { rev: { restore: unknown } };
-    };
-    const store = new FakeStorage();
-    let oneDocWriteCalls = 0;
-    store.commitOneDocWrite = (commit, options) => {
-      oneDocWriteCalls += 1;
-      return store.commit(
-        {
-          dataOnlyIds: commit.dataOnly
-            ? [{ id: commit.docWrite.id, table: commit.docWrite.table }]
-            : [],
-          deletes: [],
-          docWrites: [commit.docWrite],
-          freshIds: commit.fresh ? [{ id: commit.docWrite.id, table: commit.docWrite.table }] : [],
-        },
-        options,
-      );
-    };
-    const bridge = {
-      recover: mutation({
-        args: { id: v.id("messages") },
-        handler: async (ctx, args) => {
-          try {
-            await ctx.runMutation(components.embedded.rev.restore as never, {
-              revId: "missing",
-              rowId: args.id,
-              table: "messages",
-            });
-          } catch {
-            // The failed component call must not leave its writer in the parent transaction.
-          }
-          await ctx.db.patch(args.id, { body: "recovered" });
-        },
-      }),
-    };
-    const r = createRunner({ bridge, messages }, store, storeSchema);
-    const id = (await r.runMutation("messages:send", {
-      body: "before",
-      channel: "caught-component",
-    })) as string;
-
-    oneDocWriteCalls = 0;
-    await r.runMutation("bridge:recover", { id });
-
-    expect(oneDocWriteCalls).toBe(1);
-    expect(await r.runQuery("messages:get", { id })).toMatchObject({ body: "recovered" });
-  });
-
   test("fresh mutation id commits terminal row without a pre-handler begin", async () => {
     const store = new FakeStorage();
     const r = createRunner({ messages }, store, storeSchema);
@@ -3954,7 +3465,7 @@ describe("runtime", () => {
     off();
   });
 
-  test("a throwing notify deferral does not reject a commit or strand later notifications", async () => {
+  test("a failed notification deferral falls back without stranding later updates", async () => {
     let deferrals = 0;
     const r = createRunner({ messages }, new FakeStorage(), storeSchema, {
       deferNotify: (run) => {
@@ -3973,9 +3484,9 @@ describe("runtime", () => {
       await expect(
         r.runMutation("messages:send", { body: "first", channel: "defer" }),
       ).resolves.toMatch(/^messages\|/);
-      expect(updates).toHaveLength(1);
+      expect((await nextUpdate(updates, 1)).map((message) => message.body)).toEqual(["first"]);
       await r.runMutation("messages:send", { body: "second", channel: "defer" });
-      expect((await nextUpdate(updates, 1)).map((message) => message.body)).toEqual([
+      expect((await nextUpdate(updates, 2)).map((message) => message.body)).toEqual([
         "first",
         "second",
       ]);

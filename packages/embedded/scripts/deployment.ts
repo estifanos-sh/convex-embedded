@@ -4,12 +4,12 @@ import { makeFunctionReference } from "convex/server";
 import { deploymentUrl } from "../../../config/deployment.ts";
 import { convexDeployment } from "../../../config/env.ts";
 import { repoRoot } from "../../../config/read.ts";
-import { EMBEDDED_PROTOCOL_VERSION } from "../src/protocol.ts";
+import { CURRENT_WIRE_CONTRACT_ID } from "../src/contract/generated.ts";
 
 const pull = makeFunctionReference<
   "query",
-  { request: { kind: "identity" } },
-  { identity: unknown; identityKey: string; protocolVersion?: number }
+  { request: { kind: "identity"; contractIds: string[] } },
+  { identity: unknown; identityKey: string; contractId?: string }
 >("embedded:pull");
 
 export async function verifyDeployment(): Promise<void> {
@@ -26,17 +26,17 @@ export async function verifyDeployment(): Promise<void> {
   if (deployment) verifyDeploymentUrl(deployment, url);
 
   const identity = await new ConvexHttpClient(url.origin).query(pull, {
-    request: { kind: "identity" },
+    request: { kind: "identity", contractIds: [CURRENT_WIRE_CONTRACT_ID] },
   });
-  if (identity.protocolVersion !== EMBEDDED_PROTOCOL_VERSION) {
-    const received = identity.protocolVersion ?? "missing";
+  if (identity.contractId !== CURRENT_WIRE_CONTRACT_ID) {
+    const received = identity.contractId ?? "missing";
     throw new Error(
-      `Embedded deployment mismatch at ${url.origin}: client protocol ${EMBEDDED_PROTOCOL_VERSION}, deployment protocol ${received}. Deploy this revision before running hosted browser tests.`,
+      `Embedded deployment mismatch at ${url.origin}: client contract ${CURRENT_WIRE_CONTRACT_ID}, deployment contract ${received}. Deploy this revision before running hosted browser tests.`,
     );
   }
 
   console.log(
-    `Verified Embedded deployment ${url.origin} at protocol ${EMBEDDED_PROTOCOL_VERSION}.`,
+    `Verified Embedded deployment ${url.origin} at contract ${CURRENT_WIRE_CONTRACT_ID}.`,
   );
 }
 

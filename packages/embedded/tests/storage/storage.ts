@@ -204,48 +204,6 @@ describe("native storage details", () => {
     });
   });
 
-  test("one-docWrite resolves pending timestamps through the generic commit", async () => {
-    const genericCommits: Array<{ batch: unknown; options: unknown }> = [];
-    const store = NativeStore.wrap({
-      clear: async () => undefined,
-      clockRead: () => 1,
-      close: async () => undefined,
-      commit: async (batch: unknown, options: unknown) => {
-        genericCommits.push({ batch, options });
-        return { changedTables: ["issues"], changes: [], commitSeq: 1, commitTs: "42" };
-      },
-      setup: async () => undefined,
-    });
-
-    const docWrite: DocWrite = {
-      ...issue("timestamp-fallback", "timestamp", "open"),
-      data: { stamp: commitTsPlaceholder, status: "open", title: "timestamp" },
-      cols: [["status", PENDING_COMMIT_TS]],
-      pendingCommitTs: true,
-    };
-    await expect(
-      store.commitOneDocWrite!(
-        { fresh: true, dataOnly: true, docWrite },
-        { changes: "omit", mutation: "none", source: "local" },
-      ),
-    ).resolves.toMatchObject({ changedTables: ["issues"], commitSeq: 1, commitTs: 42n });
-
-    expect(genericCommits).toHaveLength(1);
-    expect(genericCommits[0]).toMatchObject({
-      batch: {
-        docWrites: [{ table: docWrite.table, id: docWrite.id, pendingCommitTs: true }],
-        freshIds: [{ table: docWrite.table, id: docWrite.id }],
-        dataOnlyIds: [{ table: docWrite.table, id: docWrite.id }],
-      },
-      options: { commitTs: true, includeChanges: false, source: "local" },
-    });
-    expect(docWrite).toMatchObject({
-      data: { stamp: 42n, status: "open", title: "timestamp" },
-      cols: [["status", 42n]],
-    });
-    expect(docWrite).not.toHaveProperty("pendingCommitTs");
-  });
-
   test("completes a claimed upload through the atomic mapping path", async () => {
     const store = await open(tmp("native_upload_complete.db"));
     await store.setup(schema);

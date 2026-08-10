@@ -8,6 +8,8 @@ import { delete as fileDelete, read as fileRead } from "./file";
 import { delete as mutationDelete, read as mutationCacheRead } from "./mutation";
 import {
   acknowledge,
+  blobScopeWrite,
+  checkpointScopeWrite,
   commit,
   pull,
   replayConsume,
@@ -40,6 +42,8 @@ export const embeddedComponentModules: ModuleMap = {
   mutation: { delete: mutationDelete, read: mutationCacheRead },
   protocol: {
     acknowledge,
+    blobScopeWrite,
+    checkpointScopeWrite,
     commit,
     pull,
     replayConsume,

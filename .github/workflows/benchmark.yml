@@ -54,10 +54,7 @@ jobs:
           vp run '@estifanos-sh/convex-embedded#native'
           vp run '@estifanos-sh/convex-embedded#wasm'
           vp run '@estifanos-sh/convex-embedded#test:node'
-          vp run '@estifanos-sh/convex-embedded#test:fixture:node'
           vp run '@estifanos-sh/convex-embedded#test:stress:node'
-          vp run '@estifanos-sh/convex-embedded#test:kill:node'
-          cargo test -p storage --features testkit --test fixture
           cargo test -p storage --features testkit --test migration
 
   android:

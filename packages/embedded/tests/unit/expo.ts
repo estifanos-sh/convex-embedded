@@ -5,11 +5,16 @@ import { installExpoCrypto } from "../../src/expo/cryptography";
 import { createNativeModuleLoader, type NativeModule } from "../../src/expo/module";
 import type { NativeStoreObject } from "../../src/expo/module";
 import { ExpoStoreBinding } from "../../src/expo/store";
+import {
+  CURRENT_MOBILE_BRIDGE_CONTRACT_ID,
+  CURRENT_WIRE_CONTRACT_ID,
+} from "../../src/expo/contract";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../../src/storage/contract";
 
 vi.mock("../../src/expo/native", () => ({ loadNativeModule: vi.fn() }));
 
 describe("Expo native bridge", () => {
-  test("forwards durable setup completion through the versioned native bridge", async () => {
+  test("forwards durable setup completion through the exact-contract native bridge", async () => {
     const requests: ReturnType<typeof decodeRequest>[] = [];
     const native: NativeStoreObject = {
       call: async (bytes) => {
@@ -25,7 +30,12 @@ describe("Expo native bridge", () => {
     await binding.migrationSetupComplete?.(7);
 
     expect(requests).toEqual([
-      { buffers: [], json: "[7]", operation: "migrationSetupComplete", version: 10 },
+      {
+        bridgeContractId: CURRENT_MOBILE_BRIDGE_CONTRACT_ID,
+        buffers: [],
+        json: "[7]",
+        operation: "migrationSetupComplete",
+      },
     ]);
   });
 
@@ -64,7 +74,7 @@ describe("Expo native bridge", () => {
       buffers: [new Uint8Array([1, 2, 3])],
       json: '["blob",{"$buffer":0},{"$integer":"9007199254740993"}]',
       operation: "blobWrite",
-      version: 10,
+      bridgeContractId: CURRENT_MOBILE_BRIDGE_CONTRACT_ID,
     });
   });
 
@@ -79,7 +89,7 @@ describe("Expo native bridge", () => {
   });
 
   test("loads once and rejects missing or stale native modules", () => {
-    const native = module(10);
+    const native = module();
     const resolve = vi.fn(() => native);
     const load = createNativeModuleLoader(resolve);
 
@@ -87,9 +97,46 @@ describe("Expo native bridge", () => {
     expect(load()).toBe(native);
     expect(resolve).toHaveBeenCalledOnce();
     expect(() => createNativeModuleLoader(() => null)()).toThrow("not linked");
-    expect(() => createNativeModuleLoader(() => module(9))()).toThrow(
-      "does not match JavaScript version 10",
+    expect(() => createNativeModuleLoader(() => module(`sha256:${"0".repeat(64)}`))()).toThrow(
+      "does not match this JavaScript package",
     );
+    expect(() =>
+      createNativeModuleLoader(() => ({ apiVersion: () => 10 }) as unknown as NativeModule)(),
+    ).toThrow("missing bridgeContractId");
+    expect(() =>
+      createNativeModuleLoader(
+        () => ({ ...module(), bridgeContractId: () => "not-a-contract" }) as NativeModule,
+      )(),
+    ).toThrow("invalid bridgeContractId");
+    expect(() =>
+      createNativeModuleLoader(
+        () => ({ ...module(), wireContractId: undefined }) as unknown as NativeModule,
+      )(),
+    ).toThrow("missing wireContractId");
+    expect(() =>
+      createNativeModuleLoader(
+        () => ({ ...module(), wireContractId: () => `sha256:${"1".repeat(64)}` }) as NativeModule,
+      )(),
+    ).toThrow("does not match this JavaScript package");
+    expect(() =>
+      createNativeModuleLoader(
+        () => ({ ...module(), storageBindingContractId: undefined }) as unknown as NativeModule,
+      )(),
+    ).toThrow("missing storageBindingContractId");
+    expect(() =>
+      createNativeModuleLoader(
+        () =>
+          ({
+            ...module(),
+            storageBindingContractId: () => `sha256:${"2".repeat(64)}`,
+          }) as NativeModule,
+      )(),
+    ).toThrow("native storage does not match this JavaScript package");
+    expect(() =>
+      createNativeModuleLoader(
+        () => ({ ...module(), open: undefined }) as unknown as NativeModule,
+      )(),
+    ).toThrow("missing open");
   });
 
   test("decodes response buffers and exact integers", () => {
@@ -177,7 +224,7 @@ describe("Expo native bridge", () => {
 
     await binding.remoteStart({
       moduleGraphHash: "module",
-      protocolVersion: 24,
+      contractId: "sha256:test-contract",
       schemaHash: "schema",
       url: "https://example.convex.cloud",
     });
@@ -215,7 +262,7 @@ describe("Expo native bridge", () => {
         return await new Promise<string>(() => undefined);
       },
       moduleGraphHash: "module",
-      protocolVersion: 24,
+      contractId: "sha256:test-contract",
       schemaHash: "schema",
       url: "https://example.convex.cloud",
     });
@@ -226,9 +273,11 @@ describe("Expo native bridge", () => {
   });
 });
 
-function module(version: number): NativeModule {
+function module(bridgeContractId: string = CURRENT_MOBILE_BRIDGE_CONTRACT_ID): NativeModule {
   return {
-    apiVersion: () => version,
+    bridgeContractId: () => bridgeContractId,
+    storageBindingContractId: () => CURRENT_STORAGE_BINDING_CONTRACT_ID,
+    wireContractId: () => CURRENT_WIRE_CONTRACT_ID,
     open: vi.fn(),
   };
 }
@@ -246,8 +295,8 @@ function response(json: string, buffers: Uint8Array[]): Uint8Array {
   }
   string(bytes, "error");
   bytes.push(0xc0);
-  string(bytes, "version");
-  bytes.push(10);
+  string(bytes, "bridgeContractId");
+  string(bytes, CURRENT_MOBILE_BRIDGE_CONTRACT_ID);
   return Uint8Array.from(bytes);
 }
 

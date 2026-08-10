@@ -1,0 +1,8 @@
+{
+  "format": "convex-embedded-storage-binding/v1",
+  "surface": {
+    "algorithm": "semantic-source/v2",
+    "digest": "sha256:9000235ec619c1716b785fa2dab5ae675fcf1554eb523d807942da0a49e44e2a"
+  },
+  "rejection": "wrong-or-missing-contract-id-rebuilds-native-artifact"
+}

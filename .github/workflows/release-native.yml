@@ -59,6 +59,11 @@ jobs:
         with:
           node-version: 24
 
+      - name: Verify generated contracts
+        run: |
+          pnpm install --frozen-lockfile
+          node packages/embedded/scripts/contract.mjs --check
+
       # Leaving CONVEX_EMBEDDED_MOBILE_SLICES unset builds every triple in `iosTargetTriples`.
       # mobile.ts verifies the assembled XCFramework's slices, architectures, exported symbols,
       # and deployment targets before this job can pass.
@@ -66,6 +71,9 @@ jobs:
         env:
           EAS_BUILD_PLATFORM: ios
         run: node demos/expo/scripts/native.ts eas
+
+      - name: Compile Expo iOS consumer
+        run: node packages/embedded/scripts/mobilecompile.ts ios
 
       - name: Upload XCFramework
         uses: actions/upload-artifact@v7
@@ -114,6 +122,11 @@ jobs:
         with:
           node-version: 24
 
+      - name: Verify generated contracts
+        run: |
+          pnpm install --frozen-lockfile
+          node packages/embedded/scripts/contract.mjs --check
+
       # Leaving CONVEX_EMBEDDED_MOBILE_SLICES unset builds every ABI in `androidAbis`. mobile.ts
       # verifies each library's machine type, 16 KiB page alignment, and JNI exports before this
       # job can pass.
@@ -121,6 +134,9 @@ jobs:
         env:
           EAS_BUILD_PLATFORM: android
         run: node demos/expo/scripts/native.ts eas
+
+      - name: Compile Expo Android consumer
+        run: node packages/embedded/scripts/mobilecompile.ts android
 
       - name: Upload Android libraries
         uses: actions/upload-artifact@v7

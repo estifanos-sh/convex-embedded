@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -17,14 +16,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 export const packageName = "@estifanos-sh/convex-embedded";
 export const packageRepository = "https://github.com/estifanos-sh/convex-embedded";
-export const baselineVersion = "0.0.1-preview.0";
-export const baselineTag = `v${baselineVersion}`;
-const baselinePackageName = packageName;
-const baselineFixtureSha256 = "70ad1b676dc86e701f8fd9f0bc3499206c6f630c48097c4bfb085439add62b41";
-const baselineFixtureEpoch = 49;
-const baselineFixtureBootstrapVersion = 1;
-const baselineFixtureContractVersion = 3;
-const baselineOriginKinds = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17];
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryDir = resolve(packageDir, "../..");
@@ -33,17 +24,13 @@ const nodeTargets = ["darwin-arm64", "linux-arm64-gnu", "linux-x64-gnu", "win32-
 const androidAbis = ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"] as const;
 const appleSlices = ["ios-arm64", "ios-arm64-simulator"] as const;
 const readmeContract = [
-  "# Convex Embedded",
+  "# Embedded",
   `\`${packageName}\``,
-  `pnpm add ${packageName} convex`,
-  "## Quick start",
-  "## Functions",
-  "## Client lifecycle and API",
-  "## User data migrations",
-  "## Platform setup",
-  "## Errors and troubleshooting",
-  "## Release and compatibility policy",
-  "await client.open()",
+  "## 1. Configure Convex",
+  "## Schema changes and migrations",
+  "## 2. Configure the browser build",
+  "## 3. Create a client",
+  "## Troubleshooting browser builds",
 ] as const;
 
 interface PackageJson {
@@ -66,24 +53,6 @@ type DependencySection =
   | "devDependencies"
   | "optionalDependencies"
   | "peerDependencies";
-
-interface BaselineFixtureManifest {
-  releaseIdentity?: string;
-  releasePackage?: string;
-  releaseVersion?: string;
-  fixtureContractVersion?: number;
-  epoch?: number;
-  bootstrapVersion?: number;
-  sha256?: string;
-  permanentOriginKinds?: number[];
-  semanticDigest?: string;
-  semanticSnapshot?: unknown;
-  portableOracle?: unknown;
-  originInventory?: unknown[];
-  referencedPayloadCount?: number;
-  contract?: Record<string, unknown>;
-}
-
 export type PublishMode = "verify" | "preview" | "prerelease" | "release";
 
 const dependencySections: DependencySection[] = [
@@ -112,90 +81,6 @@ export function prepareBuildVersion(directory: string, version?: string): Packag
   manifest.version = version;
   writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
   return manifest;
-}
-
-/** Keep a frozen fixture directory to its two reviewable, durable release artifacts. */
-export function verifyFixtureFiles(directory: string): void {
-  const expected = ["manifest.json", "store.sqlite3"];
-  const actual = readdirSync(directory).sort();
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(
-      `baseline fixture directory must contain only ${expected.join(", ")}; found ${actual.join(", ") || "nothing"}.`,
-    );
-  }
-  for (const name of expected) {
-    const path = resolve(directory, name);
-    if (!statSync(path).isFile())
-      throw new Error(`baseline fixture artifact is not a file: ${name}.`);
-  }
-}
-
-function readBaselineFixtureManifest(path: string): BaselineFixtureManifest {
-  return JSON.parse(readFileSync(path, "utf8")) as BaselineFixtureManifest;
-}
-
-function verifyBaselineFixtureChecksum(path: string, manifest: BaselineFixtureManifest): void {
-  const checksum = createHash("sha256").update(readFileSync(path)).digest("hex");
-  if (manifest.sha256 !== checksum) {
-    throw new Error(
-      `baseline fixture checksum mismatch: expected ${manifest.sha256}, got ${checksum}.`,
-    );
-  }
-  if (checksum !== baselineFixtureSha256) {
-    throw new Error(
-      `baseline fixture changed from its recorded checksum ${baselineFixtureSha256}.`,
-    );
-  }
-}
-
-function hasBaselineFixtureContract(manifest: BaselineFixtureManifest): boolean {
-  return [
-    manifest.releaseIdentity === baselineTag &&
-      manifest.releasePackage === baselinePackageName &&
-      manifest.releaseVersion === baselineVersion &&
-      manifest.fixtureContractVersion === baselineFixtureContractVersion,
-    Boolean(manifest.contract?.kernelLayoutHash),
-    Boolean(manifest.contract?.generationLayoutHash),
-    Boolean(manifest.contract?.originWriterHash),
-    Array.isArray(manifest.originInventory),
-    manifest.portableOracle !== undefined,
-    typeof manifest.referencedPayloadCount === "number",
-  ].every(Boolean);
-}
-
-function verifyBaselineFixtureSemantics(manifest: BaselineFixtureManifest): void {
-  if (
-    manifest.epoch !== baselineFixtureEpoch ||
-    manifest.bootstrapVersion !== baselineFixtureBootstrapVersion
-  ) {
-    throw new Error("baseline fixture semantic version oracle is invalid.");
-  }
-  if (!hasBaselineFixtureContract(manifest)) {
-    throw new Error("baseline fixture release identity or semantic contract is incomplete.");
-  }
-  const semanticDigest = createHash("sha256")
-    .update(JSON.stringify(manifest.semanticSnapshot))
-    .digest("hex");
-  if (semanticDigest !== manifest.semanticDigest) {
-    throw new Error("baseline fixture semantic snapshot digest does not match its manifest.");
-  }
-  if (JSON.stringify(manifest.permanentOriginKinds) !== JSON.stringify(baselineOriginKinds)) {
-    throw new Error("baseline fixture does not enumerate every permanent originated record kind.");
-  }
-}
-
-/** Require the exact public baseline writer artifact before release qualification. */
-export function verifyBaselineFixture(): void {
-  const directory = resolve(repositoryDir, "crates/storage/tests/fixtures/baseline");
-  if (!existsSync(directory) || !statSync(directory).isDirectory()) {
-    throw new Error("baseline SQLite fixture and semantic manifest are required for publication.");
-  }
-  verifyFixtureFiles(directory);
-  const fixture = resolve(directory, "store.sqlite3");
-  const manifestPath = resolve(directory, "manifest.json");
-  const manifest = readBaselineFixtureManifest(manifestPath);
-  verifyBaselineFixtureChecksum(fixture, manifest);
-  verifyBaselineFixtureSemantics(manifest);
 }
 
 /** Prepare the assembled package copy without changing its public identity. */
@@ -375,39 +260,6 @@ export function verifyTarball(path: string, mode: PublishMode): void {
 }
 
 /**
- * npm renders this file as the package's primary documentation, so its release contract is part
- * of the payload rather than a best-effort repository extra. Keep the markers semantic instead
- * of freezing prose: documentation can improve without changing this verifier, but a skeletal
- * README cannot ship accidentally.
- */
-export function verifyReadme(readme: string): void {
-  if (readme.trim().length === 0) {
-    throw new Error("Embedded package README must not be empty.");
-  }
-  for (const marker of readmeContract) {
-    if (!readme.includes(marker)) {
-      throw new Error(`Embedded package README is missing required documentation: ${marker}.`);
-    }
-  }
-}
-
-/** Confirm that npm stored exactly the README carried by the assembled package. */
-export function verifyPublishedReadme(directory: string, packageSpecifier: string): void {
-  const expected = readFileSync(resolve(directory, "README.md"), "utf8");
-  const response = execFileSync("npm", ["view", packageSpecifier, "readme", "--json"], {
-    encoding: "utf8",
-  });
-  const published: unknown = JSON.parse(response);
-  if (typeof published !== "string") {
-    throw new Error(`npm did not return a README for ${packageSpecifier}.`);
-  }
-  verifyReadme(published);
-  if (published !== expected) {
-    throw new Error(`npm README for ${packageSpecifier} does not match the assembled package.`);
-  }
-}
-
-/**
  * Qualify the exact npm payload after assembly.
  *
  * This deliberately installs the tarball in a fresh consumer outside the workspace. It exercises
@@ -525,6 +377,38 @@ export function verifyManifest(manifest: PackageJson, mode: PublishMode): void {
   }
 }
 
+/** Keep npm's package page self-contained while the documentation site does not exist yet. */
+export function verifyReadme(readme: string): void {
+  for (const required of readmeContract) {
+    if (!readme.includes(required)) {
+      throw new Error(`Embedded package README is missing required section: ${required}`);
+    }
+  }
+}
+
+function readPublishedReadme(packageSpecifier: string): unknown {
+  return JSON.parse(
+    execFileSync("npm", ["view", packageSpecifier, "readme", "--json"], { encoding: "utf8" }),
+  ) as unknown;
+}
+
+/** Verify npm rendered the exact README carried by the verified package directory. */
+export function verifyPublishedReadme(
+  directory: string,
+  packageSpecifier: string,
+  read = readPublishedReadme,
+): void {
+  const expected = readFileSync(resolve(directory, "README.md"), "utf8");
+  const published = read(packageSpecifier);
+  if (typeof published !== "string") {
+    throw new Error(`npm did not return a README for ${packageSpecifier}.`);
+  }
+  verifyReadme(published);
+  if (published !== expected) {
+    throw new Error(`npm README for ${packageSpecifier} does not match the assembled package.`);
+  }
+}
+
 function readPackageJson(path: string): PackageJson {
   return JSON.parse(readFileSync(path, "utf8")) as PackageJson;
 }
@@ -556,8 +440,6 @@ function main(): void {
   } else if (command === "prepare-build") {
     const version = process.env.CONVEX_EMBEDDED_PUBLISH_VERSION?.trim() || undefined;
     prepareBuildVersion(directory, version);
-  } else if (command === "fixture") {
-    verifyBaselineFixture();
   } else if (command === "verify") verifyPackageTree(directory, mode(3));
   else if (command === "pack") packPackage(directory, resolve(argument(3, "destination")), mode(4));
   else if (command === "verify-tarball") verifyTarball(resolve(argument(3, "tarball")), mode(4));

@@ -6,8 +6,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { cargoTargetDir } from "../../../config/build.ts";
-import { EMBEDDED_PROTOCOL_VERSION } from "../src/protocol.ts";
-import { EMBEDDED_STORAGE_ABI_VERSION } from "../src/abi.ts";
+import { CURRENT_WIRE_CONTRACT_ID } from "../src/contract/generated.ts";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../src/storage/contract.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
@@ -74,19 +74,19 @@ function loadNativeArtifact(path: string): void {
         "-e",
         `
           const module = require(process.argv[1]);
-          const api = Number(process.argv[2]);
-          const protocol = Number(process.argv[3]);
+          const binding = process.argv[2];
+          const contract = process.argv[3];
           const source = process.argv[4];
-          if (module.apiVersion?.() !== api) {
-            throw new Error(\`Native artifact API version mismatch after copy: \${source}\`);
+          if (module.bindingContractId?.() !== binding) {
+            throw new Error(\`Native artifact binding contract mismatch after copy: \${source}\`);
           }
-          if (module.protocolVersion?.() !== protocol) {
-            throw new Error(\`Native artifact protocol version mismatch after copy: \${source}\`);
+          if (module.contractId?.() !== contract) {
+            throw new Error(\`Native artifact wire contract mismatch after copy: \${source}\`);
           }
         `,
         probe,
-        String(EMBEDDED_STORAGE_ABI_VERSION),
-        String(EMBEDDED_PROTOCOL_VERSION),
+        String(CURRENT_STORAGE_BINDING_CONTRACT_ID),
+        String(CURRENT_WIRE_CONTRACT_ID),
         path,
       ],
       { stdio: "inherit" },

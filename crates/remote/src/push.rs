@@ -13,9 +13,67 @@ use storage::{
 
 use crate::{codec, ConvexArgs, RemoteError, RemoteResult};
 
-pub const BLOB_CHUNK_BYTES: usize = 196_608;
+pub const BLOB_CHUNK_BYTES: usize = storage::WIRE_BLOB_CHUNK_BYTES;
+
+/// Authority required before the component will accept a staged blob chunk. The mutation scope
+/// is minted only after the hosted application handler has replayed successfully; the checkpoint
+/// scope is the secret response token from an already-authorized pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobScope {
+    Mutation { token: String },
+    Checkpoint { token: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobStage {
+    pub hash: String,
+    pub bytes: usize,
+    pub chunks: usize,
+    pub token: String,
+}
 
 pub fn checkpoint_args(
+    client_id: &str,
+    runtime: &RuntimeWireIdentity,
+    request: &storage::CrdtCheckpointRequest,
+    checkpoint: &CrdtCheckpoint,
+    scope_token: Option<&str>,
+) -> ConvexArgs {
+    let mut fields = BTreeMap::from([
+        ("kind".to_owned(), Value::String("checkpoint".to_owned())),
+        ("clientId".to_owned(), Value::String(client_id.to_owned())),
+        ("runtime".to_owned(), encode_runtime(runtime)),
+        (
+            "checkpointId".to_owned(),
+            Value::String(request.checkpoint_id.clone()),
+        ),
+        (
+            "responseToken".to_owned(),
+            Value::String(request.response_token.clone()),
+        ),
+        (
+            "throughSeq".to_owned(),
+            Value::Float64(checkpoint.through_seq as f64),
+        ),
+        (
+            "projectionHash".to_owned(),
+            Value::String(request.projection_hash.clone()),
+        ),
+        (
+            "content".to_owned(),
+            encode_opaque(&checkpoint.bytes, &checkpoint.hash),
+        ),
+    ]);
+    if let Some(scope_token) = scope_token {
+        fields.insert(
+            "scopeToken".to_owned(),
+            Value::String(scope_token.to_owned()),
+        );
+    }
+    BTreeMap::from([("request".to_owned(), Value::Object(fields))])
+}
+
+pub fn checkpoint_scope_args(
     client_id: &str,
     runtime: &RuntimeWireIdentity,
     request: &storage::CrdtCheckpointRequest,
@@ -24,7 +82,10 @@ pub fn checkpoint_args(
     BTreeMap::from([(
         "request".to_owned(),
         Value::Object(BTreeMap::from([
-            ("kind".to_owned(), Value::String("checkpoint".to_owned())),
+            (
+                "kind".to_owned(),
+                Value::String("checkpointScope".to_owned()),
+            ),
             ("clientId".to_owned(), Value::String(client_id.to_owned())),
             ("runtime".to_owned(), encode_runtime(runtime)),
             (
@@ -35,17 +96,10 @@ pub fn checkpoint_args(
                 "responseToken".to_owned(),
                 Value::String(request.response_token.clone()),
             ),
+            ("hash".to_owned(), Value::String(checkpoint.hash.clone())),
             (
-                "throughSeq".to_owned(),
-                Value::Float64(checkpoint.through_seq as f64),
-            ),
-            (
-                "projectionHash".to_owned(),
-                Value::String(request.projection_hash.clone()),
-            ),
-            (
-                "content".to_owned(),
-                encode_opaque(&checkpoint.bytes, &checkpoint.hash),
+                "bytes".to_owned(),
+                Value::Float64(checkpoint.bytes.len() as f64),
             ),
         ])),
     )])
@@ -54,6 +108,7 @@ pub fn checkpoint_args(
 pub fn blob_args(
     client_id: &str,
     runtime: &RuntimeWireIdentity,
+    scope: &BlobScope,
     bytes: &[u8],
     hash: &str,
     ordinal: usize,
@@ -67,6 +122,7 @@ pub fn blob_args(
             ("kind".to_owned(), Value::String("blob".to_owned())),
             ("clientId".to_owned(), Value::String(client_id.to_owned())),
             ("runtime".to_owned(), encode_runtime(runtime)),
+            ("scope".to_owned(), encode_blob_scope(scope)),
             ("hash".to_owned(), Value::String(hash.to_owned())),
             ("bytes".to_owned(), Value::Float64(bytes.len() as f64)),
             ("chunks".to_owned(), Value::Float64(chunks as f64)),
@@ -75,6 +131,19 @@ pub fn blob_args(
             ("chunkHash".to_owned(), Value::String(sha256_hex(chunk))),
         ])),
     )])
+}
+
+fn encode_blob_scope(scope: &BlobScope) -> Value {
+    match scope {
+        BlobScope::Mutation { token } => Value::Object(BTreeMap::from([
+            ("kind".to_owned(), Value::String("mutation".to_owned())),
+            ("token".to_owned(), Value::String(token.clone())),
+        ])),
+        BlobScope::Checkpoint { token } => Value::Object(BTreeMap::from([
+            ("kind".to_owned(), Value::String("checkpoint".to_owned())),
+            ("token".to_owned(), Value::String(token.clone())),
+        ])),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -274,8 +343,8 @@ fn encode_runtime(runtime: &RuntimeWireIdentity) -> Value {
             Value::String(runtime.module_graph_hash.clone()),
         ),
         (
-            "protocolVersion".to_owned(),
-            Value::Float64(runtime.protocol_version as f64),
+            "contractId".to_owned(),
+            Value::String(runtime.contract_id.clone()),
         ),
     ]))
 }
@@ -516,7 +585,7 @@ pub fn decode_envelope(json: &str) -> RemoteResult<PushEnvelope> {
         .map(|_| json_string(fields, "replayId"))
         .transpose()?
         .unwrap_or_else(|| mutation_id.clone());
-    let logical_fingerprint = fields
+    let stored_fingerprint = fields
         .get("logicalFingerprint")
         .map(|_| json_string(fields, "logicalFingerprint"))
         .transpose()?
@@ -524,7 +593,7 @@ pub fn decode_envelope(json: &str) -> RemoteResult<PushEnvelope> {
     Ok(PushEnvelope {
         mutation_id,
         replay_id,
-        logical_fingerprint,
+        logical_fingerprint: stored_fingerprint,
         commit_seq: json_i64(fields, "commitSeq")?,
         runtime,
         function: json_string(fields, "functionName")?,
@@ -644,10 +713,18 @@ fn decode_revision_checkpoint(value: &serde_json::Value) -> RemoteResult<Revisio
 
 fn decode_runtime(value: &serde_json::Value) -> RemoteResult<RuntimeWireIdentity> {
     let fields = json_object(value, "runtime identity")?;
+    let schema_hash = json_string(fields, "schemaHash")?;
+    let module_graph_hash = json_string(fields, "moduleGraphHash")?;
     Ok(RuntimeWireIdentity {
-        schema_hash: json_string(fields, "schemaHash")?,
-        module_graph_hash: json_string(fields, "moduleGraphHash")?,
-        protocol_version: json_i64(fields, "protocolVersion")?,
+        schema_hash,
+        module_graph_hash,
+        contract_id: fields
+            .get("contractId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                RemoteError::Protocol("runtime identity contractId must be a string".to_owned())
+            })?,
     })
 }
 
@@ -670,7 +747,12 @@ fn decode_revision_candidate(value: &serde_json::Value) -> RemoteResult<Revision
         }
     };
     let expected = match &content {
-        RevisionContent::Value(_) => ["content", "rowId", "table", "value"].as_slice(),
+        // Device runtime has always recorded the local creation time in its durable after-image.
+        // It is provenance, not a hosted document field; validate and deliberately omit it from
+        // the typed request that is sent to the current server contract.
+        RevisionContent::Value(_) => {
+            ["content", "creationTime", "rowId", "table", "value"].as_slice()
+        }
         RevisionContent::Deleted => ["content", "rowId", "table"].as_slice(),
     };
     if fields.len() != expected.len() || fields.keys().any(|key| !expected.contains(&key.as_str()))
@@ -678,6 +760,14 @@ fn decode_revision_candidate(value: &serde_json::Value) -> RemoteResult<Revision
         return Err(RemoteError::Protocol(
             "revision candidate contains unknown fields".to_owned(),
         ));
+    }
+    if matches!(content, RevisionContent::Value(_)) {
+        let creation_time = json_number(fields, "creationTime")?;
+        if !creation_time.is_finite() || creation_time < 0.0 {
+            return Err(RemoteError::Protocol(
+                "revision candidate creationTime must be a finite nonnegative number".to_owned(),
+            ));
+        }
     }
     Ok(RevisionCandidate {
         table: json_string(fields, "table")?,
@@ -963,10 +1053,105 @@ pub fn decode_push_response(value: &Value) -> RemoteResult<PushResponse> {
     })
 }
 
-/// Decode the closed replay failure shape.
-///
-/// The server boundary removes untrusted payloads before this point. Reject every field except
-/// `code`, so arbitrary application text cannot enter the native/public transport at all.
+/// Decode a scoped stage challenge. `None` means this is an ordinary terminal push response.
+pub fn decode_blob_stage(value: &Value) -> RemoteResult<Option<(String, Vec<BlobStage>)>> {
+    let Value::Object(fields) = value else {
+        return Ok(None);
+    };
+    if fields.get("kind") != Some(&Value::String("stage".to_owned())) {
+        return Ok(None);
+    }
+    let mutation_id = codec::expect_string(
+        fields
+            .get("mutationId")
+            .ok_or_else(|| RemoteError::Protocol("blob stage is missing mutationId".to_owned()))?,
+        "mutationId",
+    )?;
+    let Value::Array(scopes) = fields
+        .get("scopes")
+        .ok_or_else(|| RemoteError::Protocol("blob stage is missing scopes".to_owned()))?
+    else {
+        return Err(RemoteError::Protocol(
+            "blob stage scopes must be an array".to_owned(),
+        ));
+    };
+    let mut decoded = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let Value::Object(scope) = scope else {
+            return Err(RemoteError::Protocol(
+                "blob stage scope must be an object".to_owned(),
+            ));
+        };
+        let bytes = codec::expect_integral_number(
+            scope.get("bytes").ok_or_else(|| {
+                RemoteError::Protocol("blob stage scope is missing bytes".to_owned())
+            })?,
+            "bytes",
+        )?;
+        let chunks = codec::expect_integral_number(
+            scope.get("chunks").ok_or_else(|| {
+                RemoteError::Protocol("blob stage scope is missing chunks".to_owned())
+            })?,
+            "chunks",
+        )?;
+        decoded.push(BlobStage {
+            hash: codec::expect_string(
+                scope.get("hash").ok_or_else(|| {
+                    RemoteError::Protocol("blob stage scope is missing hash".to_owned())
+                })?,
+                "hash",
+            )?,
+            bytes: usize::try_from(bytes).map_err(|_| {
+                RemoteError::Protocol("blob stage bytes are out of range".to_owned())
+            })?,
+            chunks: usize::try_from(chunks).map_err(|_| {
+                RemoteError::Protocol("blob stage chunks are out of range".to_owned())
+            })?,
+            token: codec::expect_string(
+                scope.get("token").ok_or_else(|| {
+                    RemoteError::Protocol("blob stage scope is missing token".to_owned())
+                })?,
+                "token",
+            )?,
+        });
+    }
+    Ok(Some((mutation_id, decoded)))
+}
+
+pub fn decode_checkpoint_scope(value: &Value) -> RemoteResult<(usize, bool, String)> {
+    let Value::Object(fields) = value else {
+        return Err(RemoteError::Protocol(
+            "checkpoint scope result must be an object".to_owned(),
+        ));
+    };
+    let chunks = codec::expect_integral_number(
+        fields.get("chunks").ok_or_else(|| {
+            RemoteError::Protocol("checkpoint scope is missing chunks".to_owned())
+        })?,
+        "chunks",
+    )?;
+    let chunks = usize::try_from(chunks).map_err(|_| {
+        RemoteError::Protocol("checkpoint scope chunks are out of range".to_owned())
+    })?;
+    let token = codec::expect_string(
+        fields
+            .get("token")
+            .ok_or_else(|| RemoteError::Protocol("checkpoint scope is missing token".to_owned()))?,
+        "token",
+    )?;
+    let ready = match fields.get("ready") {
+        Some(Value::Boolean(ready)) => *ready,
+        other => {
+            return Err(RemoteError::Protocol(format!(
+                "checkpoint scope ready must be a boolean, got {other:?}"
+            )));
+        }
+    };
+    Ok((chunks, ready, token))
+}
+
+/// Decode the closed replay failure shape. Reject every field except `code`, so arbitrary
+/// application text cannot enter the native/public transport at all.
 fn decode_push_failure(outcome: PushOutcome, value: &Value) -> RemoteResult<PushVerdict> {
     let Value::Object(fields) = value else {
         return Err(RemoteError::Protocol(
@@ -1305,7 +1490,10 @@ mod tests {
     use convex::Value;
     use storage::{BaseVersion, PushVerdict, RejectionCode};
 
-    use super::{decode_envelope, decode_push_response, mutation_args, RemoteError};
+    use super::{
+        blob_args, checkpoint_scope_args, decode_checkpoint_scope, decode_envelope,
+        decode_push_response, mutation_args, BlobScope, RemoteError,
+    };
 
     fn envelope_with_after_images(after_images: &serde_json::Value) -> String {
         serde_json::json!({
@@ -1314,7 +1502,7 @@ mod tests {
             "clientRuntime": {
                 "schemaHash": "local",
                 "moduleGraphHash": "local",
-                "protocolVersion": crate::config::EMBEDDED_PROTOCOL_VERSION,
+                "contractId": storage::CURRENT_WIRE_CONTRACT_ID,
             },
             "functionName": "documents:write",
             "args": {},
@@ -1340,6 +1528,29 @@ mod tests {
     fn present_after_images_array_decodes() {
         let json = envelope_with_after_images(&serde_json::json!([]));
         assert!(decode_envelope(&json).is_ok());
+    }
+
+    #[test]
+    fn populated_after_image_is_validated_then_omitted_from_dispatch() {
+        let json = envelope_with_after_images(&serde_json::json!([{
+            "content": "value",
+            "table": "documents",
+            "rowId": "local",
+            "value": { "title": "draft" },
+            "creationTime": 1,
+        }]));
+        let envelope = decode_envelope(&json).unwrap();
+        let args = mutation_args(&envelope, "client", None).unwrap();
+        let Value::Object(request) = &args["request"] else {
+            panic!("request must be an object");
+        };
+        let Value::Array(after_images) = &request["afterImages"] else {
+            panic!("afterImages must be an array");
+        };
+        let Value::Object(after_image) = &after_images[0] else {
+            panic!("after image must be an object");
+        };
+        assert!(!after_image.contains_key("creationTime"));
     }
 
     #[test]
@@ -1412,6 +1623,83 @@ mod tests {
         };
         assert_eq!(equality["commitTs"], Value::Boolean(true));
         assert_eq!(equality["value"], Value::Int64(i64::MAX));
+    }
+
+    #[test]
+    fn blob_and_checkpoint_scope_args_bind_the_exact_manifest() {
+        let runtime = storage::RuntimeWireIdentity {
+            schema_hash: "schema".to_owned(),
+            module_graph_hash: "modules".to_owned(),
+            contract_id: storage::CURRENT_WIRE_CONTRACT_ID.to_owned(),
+        };
+        let bytes = vec![7; super::BLOB_CHUNK_BYTES + 1];
+        let blob = blob_args(
+            "client",
+            &runtime,
+            &BlobScope::Mutation {
+                token: "mutation-token".to_owned(),
+            },
+            &bytes,
+            "hash",
+            1,
+        );
+        let Value::Object(blob) = &blob["request"] else {
+            panic!("blob request must be an object");
+        };
+        let Value::Object(scope) = &blob["scope"] else {
+            panic!("blob scope must be an object");
+        };
+        assert_eq!(scope["kind"], Value::String("mutation".to_owned()));
+        assert_eq!(scope["token"], Value::String("mutation-token".to_owned()));
+        assert_eq!(blob["bytes"], Value::Float64(bytes.len() as f64));
+        assert_eq!(blob["chunks"], Value::Float64(2.0));
+
+        let request = storage::CrdtCheckpointRequest {
+            checkpoint_id: "checkpoint".to_owned(),
+            response_token: "response-token".to_owned(),
+            through_seq: 8,
+            projection_hash: "projection".to_owned(),
+        };
+        let checkpoint = storage::CrdtCheckpoint {
+            through_seq: 8,
+            bytes,
+            hash: "hash".to_owned(),
+        };
+        let scope = checkpoint_scope_args("client", &runtime, &request, &checkpoint);
+        let Value::Object(scope) = &scope["request"] else {
+            panic!("checkpoint scope request must be an object");
+        };
+        assert_eq!(scope["kind"], Value::String("checkpointScope".to_owned()));
+        assert_eq!(
+            scope["checkpointId"],
+            Value::String("checkpoint".to_owned())
+        );
+        assert_eq!(
+            scope["responseToken"],
+            Value::String("response-token".to_owned())
+        );
+        assert_eq!(scope["hash"], Value::String("hash".to_owned()));
+    }
+
+    #[test]
+    fn checkpoint_scope_decoder_requires_a_complete_capability() {
+        let ready = Value::Object(std::collections::BTreeMap::from([
+            ("chunks".to_owned(), Value::Float64(2.0)),
+            ("ready".to_owned(), Value::Boolean(false)),
+            ("token".to_owned(), Value::String("capability".to_owned())),
+        ]));
+        assert_eq!(
+            decode_checkpoint_scope(&ready).unwrap(),
+            (2, false, "capability".to_owned())
+        );
+        let incomplete = Value::Object(std::collections::BTreeMap::from([(
+            "chunks".to_owned(),
+            Value::Float64(2.0),
+        )]));
+        assert!(matches!(
+            decode_checkpoint_scope(&incomplete),
+            Err(RemoteError::Protocol(_))
+        ));
     }
 
     fn failure_response(outcome: &str, error: &serde_json::Value) -> Value {

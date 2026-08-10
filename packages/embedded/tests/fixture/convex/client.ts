@@ -9,7 +9,7 @@ export const list = remote.query({
     identityKey: v.optional(v.string()),
     schemaHash: v.optional(v.string()),
     moduleGraphHash: v.optional(v.string()),
-    protocolVersion: v.optional(v.number()),
+    contractId: v.optional(v.string()),
     lastSeenBefore: v.optional(v.number()),
     retired: v.optional(v.boolean()),
     paginationOpts: paginationOptsValidator,

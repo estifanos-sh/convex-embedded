@@ -89,7 +89,7 @@ try {
         .split("\n")
         .map((symbol) => symbol.trim().replace(/^_/, "")),
     );
-    if (!symbols.includes("cem_api_version")) {
+    if (!symbols.includes("cem_bridge_contract_id") || !symbols.includes("cem_wire_contract_id")) {
       throw new Error("Compiled Expo app is missing the Convex Embedded native storage symbols.");
     }
   } else {

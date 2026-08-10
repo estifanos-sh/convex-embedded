@@ -6,6 +6,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from "../protocol";
+import { CURRENT_BROWSER_COORDINATION_CONTRACT_ID } from "./contract";
 
 export type InitRequest = Extract<WorkerRequest, { op: typeof WorkerCommand.Init }>;
 
@@ -39,9 +40,8 @@ export const PeerOp = {
 } as const;
 
 export type PeerOpCode = (typeof PeerOp)[keyof typeof PeerOp];
-export const CoordinatorProtocol = 3;
-/** Read-only discovery compatibility for the immediately preceding coordinator protocol. */
-export const LegacyCoordinatorProtocol = 2;
+/** Exact contract required for one browser coordination session. @internal */
+export const BrowserCoordinationContractId = CURRENT_BROWSER_COORDINATION_CONTRACT_ID;
 
 /**
  * Why a leader rejected an attach. Identity and storage-path mismatches are permanent — the
@@ -74,7 +74,7 @@ export type ControlMessage =
       clientId: string;
       identity: RuntimeIdentity;
       op: typeof ControlOp.SeekLeader;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
       scope: string;
       storagePath: string;
       workerId: string;
@@ -86,7 +86,7 @@ export type ControlMessage =
       leaderFence: string;
       leaderId: string;
       op: typeof ControlOp.BroadcastLeader;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
       scope: string;
     };
 
@@ -98,7 +98,7 @@ export type PeerMessage =
       /** The term advertised by the leader this attach is targeting. */
       leaderFence: string;
       op: typeof PeerOp.Attach;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
       remote?: InitRequest["remote"];
       scope: string;
       storagePath: string;
@@ -109,14 +109,14 @@ export type PeerMessage =
       leaderEpoch: string;
       leaderFence: string;
       op: typeof PeerOp.Request;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
       request: WorkerRequest;
     }
   | {
       leaderEpoch: string;
       leaderFence: string;
       op: typeof PeerOp.RequestAck;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
       requestId: number;
     }
   | {
@@ -126,7 +126,7 @@ export type PeerMessage =
       /** The leader's device-only module configuration, which a follower cannot read itself. */
       localConfigured?: boolean;
       op: typeof PeerOp.Attached;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
     }
   | {
       code: RejectCodeValue;
@@ -134,13 +134,13 @@ export type PeerMessage =
       leaderEpoch: string;
       leaderFence: string;
       op: typeof PeerOp.Rejected;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
     }
   | {
       leaderEpoch: string;
       leaderFence: string;
       op: typeof PeerOp.Response;
-      protocol: typeof CoordinatorProtocol;
+      coordinationId: typeof BrowserCoordinationContractId;
       response: WorkerResponse;
     };
 
@@ -244,7 +244,7 @@ export function requestAck(
     leaderEpoch,
     leaderFence,
     op: PeerOp.RequestAck,
-    protocol: CoordinatorProtocol,
+    coordinationId: BrowserCoordinationContractId,
     requestId,
   };
 }
@@ -262,37 +262,13 @@ export function compareFence(left: string, right: string): -1 | 0 | 1 {
 }
 
 export function isControlMessage(value: unknown): value is ControlMessage {
-  if (!isRecord(value) || value.protocol !== CoordinatorProtocol) return false;
+  if (!hasCurrentCoordinationId(value)) return false;
   return controlValidators.get(value.op as ControlOpCode)?.(value) ?? false;
 }
 
 export function isPeerMessage(value: unknown): value is PeerMessage {
-  if (!isRecord(value) || value.protocol !== CoordinatorProtocol) return false;
+  if (!hasCurrentCoordinationId(value)) return false;
   return peerValidators.get(value.op as PeerOpCode)?.(value) ?? false;
-}
-
-/**
- * Do not silently wait out an attach timeout when another package version uses this channel.
- * Version three intentionally makes fenced ownership frames incompatible with version two.
- */
-export function isLegacyLeaderBroadcast(value: unknown): value is {
-  identity: RuntimeIdentity;
-  leaderEpoch: string;
-  leaderId: string;
-  op: typeof ControlOp.BroadcastLeader;
-  protocol: typeof LegacyCoordinatorProtocol;
-  scope: string;
-} {
-  return (
-    isRecord(value) &&
-    value.protocol === LegacyCoordinatorProtocol &&
-    value.op === ControlOp.BroadcastLeader &&
-    isRuntimeIdentity(value.identity) &&
-    typeof value.leaderEpoch === "string" &&
-    typeof value.leaderId === "string" &&
-    typeof value.scope === "string" &&
-    !("leaderFence" in value)
-  );
 }
 
 function isRuntimeIdentity(value: unknown): value is RuntimeIdentity {
@@ -300,12 +276,32 @@ function isRuntimeIdentity(value: unknown): value is RuntimeIdentity {
     isRecord(value) &&
     typeof value.moduleGraphHash === "string" &&
     typeof value.packageVersion === "string" &&
-    typeof value.protocolVersion === "number" &&
+    typeof value.contractId === "string" &&
     typeof value.schemaHash === "string" &&
     typeof value.storageId === "string" &&
     typeof value.storeFormatVersion === "number" &&
-    typeof value.wasmAbiVersion === "number"
+    typeof value.storageBindingId === "string"
   );
+}
+
+/** Frames from another bundle must never reach a handler: reload before rejoining the channel. */
+export function hasCurrentCoordinationId(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    typeof value.coordinationId === "string" &&
+    value.coordinationId === BrowserCoordinationContractId
+  );
+}
+
+/**
+ * Identifies a frame that cannot safely be interpreted on a private coordination channel.
+ *
+ * A future bundle may introduce a new numeric operation before this bundle knows its enum member.
+ * Those channels carry coordination frames only, so any numeric `op` without this exact contract
+ * is fail-closed. Messages without an operation remain unrelated noise and are ignored.
+ */
+export function isForeignCoordinationFrame(value: unknown): boolean {
+  return isRecord(value) && typeof value.op === "number" && !hasCurrentCoordinationId(value);
 }
 
 function isWorkerRequest(value: unknown): value is WorkerRequest {
@@ -324,7 +320,7 @@ function isRemoteInit(value: unknown): value is NonNullable<InitRequest["remote"
     typeof value.moduleGraphHash === "string" &&
     (value.operationTimeoutMs === undefined || typeof value.operationTimeoutMs === "number") &&
     (value.receiveTimeoutMs === undefined || typeof value.receiveTimeoutMs === "number") &&
-    typeof value.protocolVersion === "number" &&
+    typeof value.contractId === "string" &&
     typeof value.schemaHash === "string" &&
     typeof value.url === "string"
   );

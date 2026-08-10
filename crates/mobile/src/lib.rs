@@ -13,8 +13,8 @@ mod remote;
 mod wire;
 
 pub use ffi::{
-    cem_api_version, cem_buffer_free, cem_clock_read_value, cem_close, cem_open_path, cem_request,
-    CemBuffer,
+    cem_bridge_contract_id, cem_buffer_free, cem_clock_read_value, cem_close, cem_open_path,
+    cem_request, cem_storage_binding_contract_id, cem_wire_contract_id, CemBuffer,
 };
 
 use std::collections::BTreeMap;
@@ -26,8 +26,6 @@ use storage::{
 use thiserror::Error;
 
 use crate::wire::{Request, Response};
-
-pub const API_VERSION: u32 = wire::VERSION;
 
 type BridgeResult<T> = Result<T, BridgeError>;
 

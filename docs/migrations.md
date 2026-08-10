@@ -37,7 +37,7 @@ An app writes normal local functions in the local roots it already gives the bun
 // local/setup.ts
 import { v } from "convex/values";
 
-import { local } from "../convex/_generated/embedded";
+import { local } from "../convex/embedded.generated";
 import { rewritePreferences } from "./preferences";
 
 export const setup = local.internalAction({
@@ -109,7 +109,7 @@ Use the generated `local` value directly; no migration registry or folder is int
 // local/setup.ts
 import { v } from "convex/values";
 
-import { local } from "../convex/_generated/embedded";
+import { local } from "../convex/embedded.generated";
 
 export const preferencesCurrentWrite = local.internalMutation({
   args: { compact: v.boolean() },
@@ -144,8 +144,9 @@ export const setup = local.internalAction({
 
 `ctx.ledger` reads only historical `localTable` records. `ctx.ledger.read` validates each
 historical value with the supplied Convex validator.
-`ctx.ledger.delete` consumes one historical record only after its replacement has committed. Both
-reject outside the running setup action. Keep setup and its target-schema helpers idempotent so a resumed
+`ctx.ledger.delete` consumes one historical record only after its replacement has committed. It is
+a readonly context property and rejects outside the running setup action; TypeScript cannot
+specialize an ordinary action handler from a later `open(setup)` call. Keep setup and its target-schema helpers idempotent so a resumed
 candidate can safely run them again.
 
 ## Explicit Client Lifecycle
@@ -174,15 +175,10 @@ ordinary local functions but fails closed as a setup identity.
 
 ## Store Contract
 
-An active store contract includes:
-
-- the application storage schema hash;
-- the frozen public-baseline kernel fingerprint;
-- a separate rebuildable generation-layout fingerprint;
-- the current origin-record writer fingerprint;
-- the retained origin-record reader-coverage fingerprint;
-- the setup identity hash;
-- and the package epoch.
+The public store contract includes the application storage schema hash, the frozen kernel
+fingerprint, the rebuildable generation-layout fingerprint, the current origin-record writer
+fingerprint, the bootstrap version, and the package epoch. The completed setup identity is stored
+beside the active contract, rather than changing that contract's physical format.
 
 The kernel fingerprint covers only the append-only bootstrap, active pointer, originated ledger,
 and content-addressed payload locating plane. A candidate never repairs or replaces that plane.
@@ -192,16 +188,16 @@ contains only current encoders; reader coverage contains every retained decoder.
 does not itself rewrite a store. Changing a generation layout or current writer without advancing
 the package epoch fails closed.
 
-The application schema hash must include validators as well as table, placement, field, column,
-CRDT, and index definitions. A same-schema backfill is detected through the setup graph hash.
+The application schema hash includes validators, table placement, fields, columns, CRDT fields, and
+indexes. A same-schema backfill is detected through the stamped setup identity.
 
-The first public package baseline is `@estifanos-sh/convex-embedded@0.0.1-preview.0` (epoch 49).
-Any nonempty library store below that epoch raises the named `PreBaselineStore` error and is left
-logically untouched by migration code; there is no flat-layout reader, extractor, seeder,
-active-ledger repair, or automatic deletion path. A newer unsupported epoch and a missing active
-contract also fail closed. Future package adapters are selected by the interval
-`source_epoch < introduced_epoch <= target_epoch`, so a device may skip releases without depending
-on an exact adjacent epoch pair.
+Durable epoch 1 / format 1 is the first public compatibility baseline. It is a store-layout
+admission marker, not a negotiated wire version: wire, storage-binding, and coordinator
+compatibility use their own computed hashes. A store from an unpublished
+development build, a newer unsupported epoch, or a missing active contract fails closed and remains
+untouched. There is no reader or automatic repair path for unreleased layouts. A future package
+change that needs a physical-store transition must add and test its explicit forward bridge before
+raising the epoch; an application never needs to author that bridge.
 
 Candidate finalization treats the frozen origin ledger as the authoritative rebuild source. A
 retry after an interrupted finalization drops and recreates every unpublished generation table,
@@ -209,34 +205,13 @@ including system projections, before replaying from the beginning. Resetting onl
 is invalid because insert-only projections such as the mutation table may already contain a partial
 prefix.
 
-The current package epoch is 49. The commit-timestamp floor remains a lazy key in the frozen kernel,
+The current durable baseline epoch is 1. The commit-timestamp floor remains a lazy key in the frozen kernel,
 so stores that never use `ctx.db.vars.commitTs` pay no setup write.
 
-The release baseline is the checked-in
-`crates/storage/tests/fixtures/baseline/{store.sqlite3,manifest.json}`, emitted by the exact public
-baseline writer, checkpointed and closed before capture. Those are the only two permitted directory entries;
-WAL, shared-memory, owner, or unrelated files fail the publication verifier and the capture command
-removes its known auxiliary files after closing the final reader. The manifest binds the baseline to
-`@estifanos-sh/convex-embedded@0.0.1-preview.0` / `v0.0.1-preview.0`, the SQLite SHA-256,
-complete store-contract fingerprints, `(kind, codec, flags, count)` origin inventory, referenced
-payload validation, and a canonical semantic snapshot. The Rust gate runs the normal candidate
-engine when a future package requires an upgrade.
-
-The checked-in manifest cannot contain the hash of the commit that contains that same manifest.
-Instead, every release job resolves the requested ref once, and every qualification and assembly job
-checks out that exact SHA. Only after the common native, WASM, fixture, crash, stress, and memory gates
-and complete package assembly succeed may the workflow create the requested release tag at that SHA.
-Publication depends on a tag-target equality check against the validated SHA. Once the baseline tag
-exists, the verifier compares both fixture files byte-for-byte with that commit; later releases may
-add sibling fixture directories but cannot rewrite the baseline pair.
-
-The same bytes and portable oracle gate all production adapters before a release tag is created.
-The packaged Node addon and the real browser worker/WASM/OPFS runtime each run the shared candidate
-protocol, compare the complete portable snapshot after cold migration, close, and compare it again
-after warm reopen. Representative Node `SIGKILL` and browser `Worker.terminate()` tests kill the
-owner after durable candidate preparation and require the next owner to report/resume the candidate
-without changing the oracle. Release-mode 1k/10k cold and warm stress budgets run beside the browser
-WASM memory ceilings. Merely opening the database through a raw binding is not equivalent coverage.
+Every release job resolves the requested ref once, and every qualification and assembly job checks
+out that exact SHA. Only after common native, WASM, crash, stress, memory, and complete-package
+assembly gates succeed may the workflow create the requested release tag at that SHA. Publication
+depends on a tag-target equality check against the validated SHA.
 
 ## Physical Model
 
@@ -281,7 +256,7 @@ The store treats data by semantic ownership rather than by physical table.
 | Pull cursor                             | Carry last, with a digest of its membership and projection dependencies; reject materialization on any mismatch                                                      |
 | SQL indexes, query cache, commit cache  | Recreate from the target contract                                                                                                                                    |
 
-The public baseline's compatibility promise includes the exact offline-visible authoritative view. Projection,
+The compatibility contract includes the exact offline-visible authoritative view. Projection,
 membership, result, and cursor origins are maintained in the same transaction as their generation
 tables. Materialization order is projection, membership, result, then cursor. The cursor record
 contains a dependency digest recomputed in the candidate, so an old cursor can never publish over
@@ -504,7 +479,7 @@ The implementation is not complete unless automated tests cover:
 ## Implementation Map
 
 - `packages/embedded/src/client.ts`: explicit lifecycle, setup validation, candidate orchestration
-- `convex/_generated/embedded.ts`: generated schema-bound `local` authoring contract
+- `convex/embedded.generated.ts`: generated schema-bound `local` authoring contract
 - `packages/embedded/src/local.ts`: public local function types
 - `packages/embedded/src/local/internal.ts`: private builders, stamps, and setup identity markers
 - `packages/embedded/src/storage/workspace.ts`: private source/target compatibility schema

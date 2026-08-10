@@ -213,13 +213,43 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       "internal",
       {
         bytes: number;
+        clientId: string;
+        identity?: string;
         chunk: ArrayBuffer;
         chunkHash: string;
         chunks: number;
         hash: string;
         ordinal: number;
+        scope: { kind: "mutation"; token: string } | { kind: "checkpoint"; token: string };
       },
       { blobId: string; ready: boolean },
+      Name
+    >;
+    blobScopeWrite: FunctionReference<
+      "mutation",
+      "internal",
+      {
+        clientId: string;
+        identity?: string;
+        replayId: string;
+        fingerprint: string;
+        manifests: Array<{ hash: string; bytes: number }>;
+      },
+      Array<{ hash: string; bytes: number; chunks: number; token: string }>,
+      Name
+    >;
+    checkpointScopeWrite: FunctionReference<
+      "mutation",
+      "internal",
+      {
+        clientId: string;
+        identity?: string;
+        checkpointId: string;
+        responseToken: string;
+        hash: string;
+        bytes: number;
+      },
+      { chunks: number; ready: boolean; token: string },
       Name
     >;
     checkpointRead: FunctionReference<
@@ -258,12 +288,15 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       "mutation",
       "internal",
       {
+        clientId: string;
+        identity?: string;
         checkpointId: string;
         content:
           | { bytes: ArrayBuffer; hash: string; kind: "inline" }
           | { blobId: string; bytes: number; hash: string; kind: "staged" };
         projectionHash: string;
         responseToken: string;
+        scopeToken?: string;
         throughSeq: number;
       },
       null,
@@ -321,7 +354,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               replayId: string;
               runtime: {
                 moduleGraphHash: string;
-                protocolVersion: number;
+                contractId: string;
                 schemaHash: string;
               };
               settlement: {
@@ -394,7 +427,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
               >;
               runtime: {
                 moduleGraphHash: string;
-                protocolVersion: number;
+                contractId: string;
                 schemaHash: string;
               };
               settlement:
@@ -574,7 +607,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         }>;
         runtime: {
           moduleGraphHash: string;
-          protocolVersion: number;
+          contractId: string;
           schemaHash: string;
         };
       },
@@ -696,7 +729,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         }>;
         runtime: {
           moduleGraphHash: string;
-          protocolVersion: number;
+          contractId: string;
           schemaHash: string;
         };
         schedules: Array<{ mutationId: string; ordinal: number }>;
@@ -788,7 +821,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         }>;
         runtime: {
           moduleGraphHash: string;
-          protocolVersion: number;
+          contractId: string;
           schemaHash: string;
         };
         schedules: Array<{ mutationId: string; ordinal: number }>;
@@ -1094,7 +1127,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             maximumRowsRead?: number;
             numItems: number;
           };
-          protocolVersion?: number;
+          contractId?: string;
           retired?: boolean;
           schemaHash?: string;
         },
@@ -1102,13 +1135,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           continueCursor: string;
           isDone: boolean;
           page: Array<{
-            acknowledgedThrough?: number;
             clientId: string;
             identity?: string;
             lastPushAt?: number;
             lastSeenAt: number;
             moduleGraphHash: string;
-            protocolVersion: number;
+            contractId: string;
             retired: boolean;
             schemaHash: string;
           }>;

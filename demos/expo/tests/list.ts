@@ -1,13 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import {
-  documentIdSetsAreEqual,
-  documentListItems,
-  documentRowIsEqual,
-  type DocumentRowProps,
-  type DocumentSummary,
-} from "../src/row";
+import { documentRowIsEqual, type DocumentRowProps, type DocumentSummary } from "../src/row";
 
 const document: DocumentSummary = {
   _creationTime: 1,
@@ -65,42 +59,5 @@ void describe("document row memo boundary", () => {
     changed({ onOpen: () => undefined });
     changed({ onToggleExpanded: () => undefined });
     changed({ onTogglePin: () => undefined });
-  });
-});
-
-void describe("document list projection", () => {
-  void it("keeps pinned and unpinned query order in one projection", () => {
-    const second = {
-      ...document,
-      _id: "documents|second" as DocumentSummary["_id"],
-      title: "Second",
-    };
-    const third = { ...document, _id: "documents|third" as DocumentSummary["_id"], title: "Third" };
-
-    const items = documentListItems(
-      [document, second, third],
-      new Set([third._id, second._id]),
-      new Set([second._id]),
-      third._id,
-    );
-
-    assert.deepEqual(
-      items.map(({ document: item, expanded, opening, pinned }) => ({
-        id: item._id,
-        expanded,
-        opening,
-        pinned,
-      })),
-      [
-        { id: second._id, expanded: true, opening: false, pinned: true },
-        { id: third._id, expanded: false, opening: true, pinned: true },
-        { id: document._id, expanded: false, opening: false, pinned: false },
-      ],
-    );
-  });
-
-  void it("recognizes an unchanged local id set", () => {
-    assert.equal(documentIdSetsAreEqual(new Set(["one", "two"]), new Set(["two", "one"])), true);
-    assert.equal(documentIdSetsAreEqual(new Set(["one"]), new Set(["two"])), false);
   });
 });

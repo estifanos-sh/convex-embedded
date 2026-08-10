@@ -20,7 +20,7 @@ import { emitWorkerRemoteError, type WorkerState } from "../runtime";
 import type { BroadcastChannelLike, PeerMessage } from "./protocol";
 import {
   AttachRejection,
-  CoordinatorProtocol,
+  BrowserCoordinationContractId,
   PeerOp,
   RejectCode,
   requestAck,
@@ -133,7 +133,7 @@ export class LeaderRuntime {
       leaderId,
       localConfigured: this.state.runtime.runner.localConfigured,
       op: PeerOp.Attached,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
     } satisfies PeerMessage);
     const client = this.state.clients.get(localClientKey(message.workerId, message.clientId));
     if (client) postRemoteSnapshot(this.state, client);
@@ -374,7 +374,7 @@ export function attachFollower(
         leaderEpoch: leader.leaderEpoch,
         leaderFence: leader.leaderFence,
         op: PeerOp.Response,
-        protocol: CoordinatorProtocol,
+        coordinationId: BrowserCoordinationContractId,
         response,
       } satisfies PeerMessage);
     follower.clients.add(key);
@@ -411,7 +411,7 @@ export function attachFollower(
       leaderEpoch: leader.leaderEpoch,
       leaderFence: leader.leaderFence,
       op: PeerOp.Rejected,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
     } satisfies PeerMessage);
     channel.close();
   }
@@ -432,7 +432,7 @@ export async function handlePeerRequest(
       leaderEpoch: leader.leaderEpoch,
       leaderFence: leader.leaderFence,
       op: PeerOp.Response,
-      protocol: CoordinatorProtocol,
+      coordinationId: BrowserCoordinationContractId,
       response: {
         error: serializeError(
           new Error("ConvexEmbeddedClient is not connected to this browser runtime leader."),

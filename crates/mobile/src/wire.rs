@@ -2,10 +2,6 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{BridgeError, BridgeResult};
 
-// Remote ticks now carry required terminal settlement records, so older mobile binaries must not
-// silently omit the field when paired with newer JavaScript.
-pub(crate) const VERSION: u32 = 10;
-
 #[derive(Debug)]
 pub(crate) struct Request {
     pub operation: String,
@@ -82,13 +78,13 @@ impl Response {
 pub(crate) fn decode_request(bytes: &[u8]) -> BridgeResult<Request> {
     let mut reader = Reader::new(bytes);
     let fields = reader.map_len()?;
-    let mut version = None;
+    let mut bridge_contract_id = None;
     let mut operation = None;
     let mut json = None;
     let mut buffers = None;
     for _ in 0..fields {
         match reader.string()?.as_str() {
-            "version" => version = Some(reader.unsigned()?),
+            "bridgeContractId" => bridge_contract_id = Some(reader.string()?),
             "operation" => operation = Some(reader.string()?),
             "json" => json = Some(reader.string()?),
             "buffers" => {
@@ -111,12 +107,11 @@ pub(crate) fn decode_request(bytes: &[u8]) -> BridgeResult<Request> {
             "request envelope has trailing bytes".to_owned(),
         ));
     }
-    let version = version
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| BridgeError::Protocol("request version is missing or invalid".to_owned()))?;
-    if version != VERSION {
+    let bridge_contract_id = bridge_contract_id
+        .ok_or_else(|| BridgeError::Protocol("request bridge contract is missing".to_owned()))?;
+    if bridge_contract_id != storage::CURRENT_MOBILE_BRIDGE_CONTRACT_ID {
         return Err(BridgeError::Protocol(format!(
-            "unsupported mobile protocol version {version}; expected {VERSION}"
+            "mobile bridge contract mismatch; rebuild the native application"
         )));
     }
     Ok(Request {
@@ -149,8 +144,8 @@ pub(crate) fn encode_response(response: &Response) -> Vec<u8> {
     } else {
         bytes.push(0xc0);
     }
-    string(&mut bytes, "version");
-    unsigned(&mut bytes, u64::from(VERSION));
+    string(&mut bytes, "bridgeContractId");
+    string(&mut bytes, storage::CURRENT_MOBILE_BRIDGE_CONTRACT_ID);
     bytes
 }
 
@@ -158,8 +153,8 @@ pub(crate) fn encode_response(response: &Response) -> Vec<u8> {
 pub(crate) fn encode_request(request: &Request) -> Vec<u8> {
     let mut bytes = Vec::new();
     map(&mut bytes, 4);
-    string(&mut bytes, "version");
-    unsigned(&mut bytes, u64::from(VERSION));
+    string(&mut bytes, "bridgeContractId");
+    string(&mut bytes, storage::CURRENT_MOBILE_BRIDGE_CONTRACT_ID);
     string(&mut bytes, "operation");
     string(&mut bytes, &request.operation);
     string(&mut bytes, "json");
@@ -346,24 +341,6 @@ impl<'a> Reader<'a> {
         Ok(self.take(len)?.to_vec())
     }
 
-    fn unsigned(&mut self) -> BridgeResult<u64> {
-        let tag = self.byte()?;
-        match tag {
-            0x00..=0x7f => Ok(u64::from(tag)),
-            0xcc => Ok(u64::from(self.byte()?)),
-            0xcd => Ok(u64::from(self.u16()?)),
-            0xce => Ok(u64::from(self.u32()?)),
-            0xcf => {
-                Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(
-                    |_| BridgeError::Protocol("truncated u64".to_owned()),
-                )?))
-            }
-            _ => Err(BridgeError::Protocol(
-                "expected unsigned integer".to_owned(),
-            )),
-        }
-    }
-
     fn u16(&mut self) -> BridgeResult<u16> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(
             |_| BridgeError::Protocol("truncated u16".to_owned()),
@@ -432,23 +409,6 @@ fn boolean(bytes: &mut Vec<u8>, value: bool) {
     bytes.push(if value { 0xc3 } else { 0xc2 });
 }
 
-fn unsigned(bytes: &mut Vec<u8>, value: u64) {
-    if value < 128 {
-        bytes.push(value as u8);
-    } else if u8::try_from(value).is_ok() {
-        bytes.extend_from_slice(&[0xcc, value as u8]);
-    } else if u16::try_from(value).is_ok() {
-        bytes.push(0xcd);
-        bytes.extend_from_slice(&(value as u16).to_be_bytes());
-    } else if u32::try_from(value).is_ok() {
-        bytes.push(0xce);
-        bytes.extend_from_slice(&(value as u32).to_be_bytes());
-    } else {
-        bytes.push(0xcf);
-        bytes.extend_from_slice(&value.to_be_bytes());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
@@ -470,6 +430,24 @@ mod tests {
         let request = decode_request(&encoded).expect("request should decode");
         let value: Binary = payload(&request).expect("binary marker should decode");
         assert_eq!(value.bytes, [1, 2, 3]);
+    }
+
+    #[test]
+    fn request_rejects_a_foreign_bridge_contract() {
+        let mut encoded = encode_request(&Request {
+            operation: "setup".to_owned(),
+            json: "[]".to_owned(),
+            buffers: Vec::new(),
+        });
+        let expected = storage::CURRENT_MOBILE_BRIDGE_CONTRACT_ID.as_bytes();
+        let start = encoded
+            .windows(expected.len())
+            .position(|window| window == expected)
+            .expect("encoded bridge contract");
+        encoded[start..start + expected.len()].fill(b'0');
+
+        let error = decode_request(&encoded).expect_err("foreign bridge contract must fail");
+        assert!(error.to_string().contains("rebuild the native application"));
     }
 
     #[test]

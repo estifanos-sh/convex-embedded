@@ -1,0 +1,12 @@
+{
+  "format": "convex-embedded-browser-coordination/v1",
+  "surface": {
+    "algorithm": "semantic-source/v2",
+    "digest": "sha256:fa0e28e04dcf6b4f36c980bf8184609ef390bf71f8ecbb25ecb5e134617342fa"
+  },
+  "identity": {
+    "storageBinding": "exact",
+    "wire": "exact"
+  },
+  "rejection": "wrong-or-missing-coordination-id-reloads"
+}

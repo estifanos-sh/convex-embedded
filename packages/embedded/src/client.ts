@@ -66,7 +66,7 @@ import {
 } from "./error";
 import { randomId } from "./id/random";
 import { REMOTE_CLIENT_RETIRED_PREFIX, RotationBreaker } from "./retirement";
-import { EMBEDDED_PROTOCOL_VERSION, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "./protocol";
+import { CURRENT_WIRE_CONTRACT_ID, EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY } from "./protocol";
 import type {
   DiagnosticEvent,
   EmbeddedOperationEvent,
@@ -550,9 +550,7 @@ export class EmbeddedClient {
   private persistence: "durable" | "temporary" = "durable";
   private replicationPullError: EmbeddedConnectionError | undefined;
   private remoteStart: Promise<void> | undefined;
-  /** Highest durable browser ownership term admitted by the remote-event ingress fence. */
   private remoteLeaderFence: string | undefined;
-  /** Once browser framing begins, native/unframed events may no longer regress this client. */
   private remoteLeaderFramed = false;
   private remoteIncarnation: string | undefined;
   private remoteGeneration = -1;
@@ -1081,7 +1079,50 @@ export class EmbeddedClient {
     setup?: LocalSetupAction,
   ): Promise<ClientState> {
     if ("runner" in options) {
-      return this.initPrebuilt(options);
+      let unsubscribeEvents: (() => void) | undefined;
+      let unsubscribeSettlements: (() => void) | undefined;
+      let cleaned = false;
+      const cleanup = async (): Promise<void> => {
+        if (cleaned) return;
+        cleaned = true;
+        unsubscribeEvents?.();
+        unsubscribeSettlements?.();
+        await options.close?.();
+      };
+      try {
+        unsubscribeEvents = options.eagerRunner?.subscribeEvents?.((event) =>
+          this.emitDiagnostic(event),
+        );
+        unsubscribeSettlements = options.eagerRunner?.subscribeRemoteSettlements?.(
+          (event, settlements) => this.publishBrowserMutationSettlements(event, settlements),
+        );
+        const runner = await options.runner;
+        unsubscribeEvents ??= runner.subscribeEvents?.((event) => this.emitDiagnostic(event));
+        unsubscribeSettlements ??= runner.subscribeRemoteSettlements?.((event, settlements) =>
+          this.publishBrowserMutationSettlements(event, settlements),
+        );
+        if (this.closed) throw new EmbeddedClosedError();
+        await this.readCachedIdentity(runner, this.authGeneration);
+        // Worker-backed runtimes execute candidate setup as part of their Init protocol before this
+        // runner resolves. Never execute it again against the now-published generation.
+        if (options.remoteConfigured === true) {
+          void this.refreshRunnerIdentity(runner, this.authGeneration);
+        }
+        return {
+          close: cleanup,
+          remote: undefined,
+          remoteConfigured: options.remoteConfigured === true,
+          runner,
+        };
+      } catch (error) {
+        try {
+          await cleanup();
+        } catch {
+          // Preserve the initialization error while still making the best effort to release the
+          // runner owner that may have been acquired before it rejected.
+        }
+        throw error;
+      }
     }
 
     const baseSchema = options.storeSchema ?? toRuntimeStoreSchema(options.schema);
@@ -1150,7 +1191,7 @@ export class EmbeddedClient {
             ...toRemoteStartOptions(options.remote!, this.auth, this.clientId, {
               schemaHash: schema.hash ?? "local",
               moduleGraphHash,
-              protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+              contractId: CURRENT_WIRE_CONTRACT_ID,
             }),
             notify: (tick) => {
               this.processRemoteTick(tick, runner);
@@ -1235,53 +1276,6 @@ export class EmbeddedClient {
       runner,
       store,
     };
-  }
-
-  private async initPrebuilt(options: EmbeddedRuntimeClientOptions): Promise<ClientState> {
-    let unsubscribeEvents: (() => void) | undefined;
-    let unsubscribeSettlements: (() => void) | undefined;
-    let cleaned = false;
-    const cleanup = async (): Promise<void> => {
-      if (cleaned) return;
-      cleaned = true;
-      unsubscribeEvents?.();
-      unsubscribeSettlements?.();
-      await options.close?.();
-    };
-    try {
-      unsubscribeEvents = options.eagerRunner?.subscribeEvents?.((event) =>
-        this.emitDiagnostic(event),
-      );
-      unsubscribeSettlements = options.eagerRunner?.subscribeRemoteSettlements?.(
-        (event, settlements) => this.publishBrowserMutationSettlements(event, settlements),
-      );
-      const runner = await options.runner;
-      unsubscribeEvents ??= runner.subscribeEvents?.((event) => this.emitDiagnostic(event));
-      unsubscribeSettlements ??= runner.subscribeRemoteSettlements?.((event, settlements) =>
-        this.publishBrowserMutationSettlements(event, settlements),
-      );
-      if (this.closed) throw new EmbeddedClosedError();
-      await this.readCachedIdentity(runner, this.authGeneration);
-      // Worker-backed runtimes execute candidate setup as part of their Init protocol before this
-      // runner resolves. Never execute it again against the now-published generation.
-      if (options.remoteConfigured === true) {
-        void this.refreshRunnerIdentity(runner, this.authGeneration);
-      }
-      return {
-        close: cleanup,
-        remote: undefined,
-        remoteConfigured: options.remoteConfigured === true,
-        runner,
-      };
-    } catch (error) {
-      try {
-        await cleanup();
-      } catch {
-        // Preserve the initialization error while still making the best effort to release the
-        // runner owner that may have been acquired before it rejected.
-      }
-      throw error;
-    }
   }
 
   private listen(
@@ -1530,133 +1524,90 @@ export class EmbeddedClient {
 
   private emitDiagnostic(event: DiagnosticEvent): boolean {
     if (event.type === "runtime") this.updateLocalConnection(event);
-    if (event.type === "remote" && !this.admitRemoteDiagnostic(event)) return false;
+    if (event.type === "remote") {
+      if (!this.admitRemoteLeader(event)) return false;
+      if (event.incarnation !== undefined && event.incarnation !== this.remoteIncarnation) {
+        this.remoteIncarnation = event.incarnation;
+        this.remoteGeneration = -1;
+        this.remoteSequence = -1;
+      }
+      if (event.generation !== undefined) {
+        if (event.generation < this.remoteGeneration) return false;
+        if (event.generation > this.remoteGeneration) {
+          this.remoteGeneration = event.generation;
+          this.remoteSequence = -1;
+        }
+        if (event.sequence !== undefined) {
+          if (event.sequence <= this.remoteSequence) return false;
+          this.remoteSequence = event.sequence;
+        }
+      }
+      if ((event.tick?.pullSnapshots ?? 0) > 0) this.replicationPullError = undefined;
+      if ((event.tick?.pullDiagnostics ?? 0) > 0) {
+        this.replicationPullError = toConnectionError(
+          event.error ?? event.tick?.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR,
+          "EMBEDDED_REPLICATION",
+        );
+      }
+      if (event.status === "error") {
+        this.setReplicationConnection({
+          error:
+            event.error?.includes("remote command channel closed") && this.replicationPullError
+              ? this.replicationPullError
+              : toConnectionError(
+                  event.error ?? "Remote replication failed.",
+                  "EMBEDDED_REPLICATION",
+                ),
+          status: "error",
+        });
+      } else if (this.replicationPullError !== undefined && event.status !== "closed") {
+        this.setReplicationConnection({ error: this.replicationPullError, status: "error" });
+      } else if (event.status === "offline") {
+        this.setReplicationConnection({ status: "offline" });
+      } else if (event.status === "closed") {
+        this.setReplicationConnection({ status: "closed" });
+      } else if (event.status === "starting") {
+        this.setReplicationConnection({ status: "starting" });
+      } else if (event.status === "started") {
+        if (
+          this.replicationConnection.status !== "offline" &&
+          this.replicationConnection.status !== "online"
+        ) {
+          this.setReplicationConnection({ status: "starting" });
+        }
+      } else if (event.status === "connected") {
+        this.setReplicationConnection(this.onlineConnection(event.tick));
+      } else if (event.status === "tick") {
+        if (this.replicationConnection.status !== "offline") {
+          this.setReplicationConnection(this.onlineConnection(event.tick));
+        }
+      } else if (event.status === "idle") {
+        this.setReplicationConnection(this.onlineConnection(event.tick));
+      }
+      this.acceptedRemoteSettlementEvents.add(event);
+    }
     this.devtools.emit(event);
     return true;
   }
 
-  /**
-   * Admit one remote diagnostic before it can affect connection state, devtools, or its paired
-   * browser settlement vector. This is deliberately the only remote-event ingress fence.
-   */
-  private admitRemoteDiagnostic(event: EmbeddedRemoteEvent): boolean {
-    if (event.leaderFence !== undefined) {
-      if (
-        !isCanonicalLeaderFence(event.leaderFence) ||
-        !isCanonicalLeaderIncarnation(event.incarnation)
-      ) {
-        return false;
-      }
-      const currentFence = this.remoteLeaderFence;
-      if (currentFence !== undefined) {
-        const comparison = compareLeaderFence(event.leaderFence, currentFence);
-        if (comparison < 0) return false;
-        if (comparison > 0) {
-          this.remoteLeaderFence = event.leaderFence;
-          this.remoteIncarnation = undefined;
-          this.remoteGeneration = -1;
-          this.remoteSequence = -1;
-        }
-      } else {
-        this.remoteLeaderFence = event.leaderFence;
+  private admitRemoteLeader(event: EmbeddedRemoteEvent): boolean {
+    if (event.leaderFence === undefined) return !this.remoteLeaderFramed;
+    if (!isCanonicalLeaderFence(event.leaderFence) || !isCanonicalLeaderEpoch(event.incarnation)) {
+      return false;
+    }
+    if (this.remoteLeaderFence !== undefined) {
+      const comparison = compareLeaderFence(event.leaderFence, this.remoteLeaderFence);
+      if (comparison < 0) return false;
+      if (comparison === 0 && event.incarnation !== this.remoteIncarnation) return false;
+      if (comparison > 0) {
         this.remoteIncarnation = undefined;
         this.remoteGeneration = -1;
         this.remoteSequence = -1;
       }
-      this.remoteLeaderFramed = true;
-      // A term identifies the durable owner; its random incarnation identifies precisely one
-      // session. A second session at the same term is a split-brain signal, never a handoff.
-      if (
-        this.remoteIncarnation !== undefined &&
-        event.incarnation !== undefined &&
-        event.incarnation !== this.remoteIncarnation
-      ) {
-        return false;
-      }
-    } else if (this.remoteLeaderFramed) {
-      return false;
     }
-    if (event.incarnation !== undefined && event.incarnation !== this.remoteIncarnation) {
-      this.remoteIncarnation = event.incarnation;
-      this.remoteGeneration = -1;
-      this.remoteSequence = -1;
-    }
-    if (event.generation !== undefined) {
-      if (event.generation < this.remoteGeneration) return false;
-      if (event.generation > this.remoteGeneration) {
-        this.remoteGeneration = event.generation;
-        this.remoteSequence = -1;
-      }
-      if (event.sequence !== undefined) {
-        if (event.sequence <= this.remoteSequence) return false;
-        this.remoteSequence = event.sequence;
-      }
-    }
-    this.updateRemoteConnection(event);
-    this.acceptedRemoteSettlementEvents.add(event);
+    this.remoteLeaderFence = event.leaderFence;
+    this.remoteLeaderFramed = true;
     return true;
-  }
-
-  /** Reduce one admitted remote diagnostic into its observable connection state. */
-  private updateRemoteConnection(event: EmbeddedRemoteEvent): void {
-    if ((event.tick?.pullSnapshots ?? 0) > 0) this.replicationPullError = undefined;
-    if ((event.tick?.pullDiagnostics ?? 0) > 0) {
-      this.replicationPullError = toConnectionError(
-        event.error ?? event.tick?.pullError ?? REMOTE_PULL_DIAGNOSTIC_ERROR,
-        "EMBEDDED_REPLICATION",
-      );
-    }
-    if (event.status === "error") {
-      this.setReplicationConnection({
-        error:
-          event.error?.includes("remote command channel closed") && this.replicationPullError
-            ? this.replicationPullError
-            : toConnectionError(
-                event.error ?? "Remote replication failed.",
-                "EMBEDDED_REPLICATION",
-              ),
-        status: "error",
-      });
-      return;
-    }
-    if (this.replicationPullError !== undefined && event.status !== "closed") {
-      this.setReplicationConnection({ error: this.replicationPullError, status: "error" });
-      return;
-    }
-    if (event.status === "offline") {
-      this.setReplicationConnection({ status: "offline" });
-      return;
-    }
-    if (event.status === "closed") {
-      this.setReplicationConnection({ status: "closed" });
-      return;
-    }
-    if (event.status === "starting") {
-      this.setReplicationConnection({ status: "starting" });
-      return;
-    }
-    if (event.status === "started") {
-      if (
-        this.replicationConnection.status !== "offline" &&
-        this.replicationConnection.status !== "online"
-      ) {
-        this.setReplicationConnection({ status: "starting" });
-      }
-      return;
-    }
-    if (event.status === "connected") {
-      this.setReplicationConnection(this.onlineConnection(event.tick));
-      return;
-    }
-    if (event.status === "tick") {
-      if (this.replicationConnection.status !== "offline") {
-        this.setReplicationConnection(this.onlineConnection(event.tick));
-      }
-      return;
-    }
-    if (event.status === "idle") {
-      this.setReplicationConnection(this.onlineConnection(event.tick));
-    }
   }
 
   private updateLocalConnection(event: Extract<DiagnosticEvent, { type: "runtime" }>): void {
@@ -1849,7 +1800,6 @@ export class EmbeddedClient {
   }
 }
 
-/** Compare canonical decimal fences without coercing potentially 64-bit terms to Number. */
 function compareLeaderFence(left: string, right: string): -1 | 0 | 1 {
   if (left.length !== right.length) return left.length < right.length ? -1 : 1;
   if (left === right) return 0;
@@ -1860,8 +1810,7 @@ function isCanonicalLeaderFence(value: string): boolean {
   return /^(0|[1-9][0-9]*)$/.test(value);
 }
 
-/** Browser leader sessions are opaque tokens, but never empty or whitespace-normalized values. */
-function isCanonicalLeaderIncarnation(value: unknown): value is string {
+function isCanonicalLeaderEpoch(value: unknown): value is string {
   return (
     typeof value === "string" && value.length > 0 && value.trim() === value && !/\s/.test(value)
   );
@@ -1876,7 +1825,7 @@ function toRemoteStartOptions(
   options: ConvexEmbeddedRemoteOptions,
   auth: EmbeddedAuthState,
   clientId: string,
-  runtime: { schemaHash: string; moduleGraphHash: string; protocolVersion: number },
+  runtime: { schemaHash: string; moduleGraphHash: string; contractId: string },
 ): RemoteStartOptions {
   return {
     auth: async (request) =>
@@ -1884,7 +1833,7 @@ function toRemoteStartOptions(
     clientId,
     moduleGraphHash: runtime.moduleGraphHash,
     operationTimeoutMs: options.operationTimeoutMs,
-    protocolVersion: runtime.protocolVersion,
+    contractId: runtime.contractId,
     receiveTimeoutMs: options.receiveTimeoutMs,
     schemaHash: runtime.schemaHash,
     url: options.url,

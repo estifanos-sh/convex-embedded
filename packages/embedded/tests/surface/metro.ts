@@ -69,7 +69,7 @@ describe("embedded Metro adapter", () => {
       const dependency = path.join(convexDir, "helper.ts");
       first.resolver.resolveRequest(context, toVirtualSourceId(dependency), "ios");
       expect(previous).toHaveBeenLastCalledWith(context, dependency, "ios");
-      const generated = path.join(convexDir, "_generated", "embedded.ts");
+      const generated = path.join(convexDir, "embedded.generated.ts");
       first.resolver.resolveRequest(context, toVirtualSourceId(generated), "android");
       expect(previous).toHaveBeenLastCalledWith(context, generated, "android");
       expect(fallback).not.toHaveBeenCalled();
@@ -85,7 +85,7 @@ describe("embedded Metro adapter", () => {
         originModulePath: path.join(root, "local", "pins.ts"),
       };
       expect(
-        first.resolver.resolveRequest(sourceContext, "../convex/_generated/embedded.js", "ios"),
+        first.resolver.resolveRequest(sourceContext, "../convex/embedded.generated.js", "ios"),
       ).toEqual({ moduleName: generated, source: "previous" });
       expect(previous).toHaveBeenLastCalledWith(sourceContext, generated, "ios");
     });
@@ -241,7 +241,7 @@ export const ${name} = ${placement}.${builder}({});
 }
 
 function localFunctions(depth = 1): string {
-  return `import { local } from "${"../".repeat(depth)}convex/_generated/embedded";
+  return `import { local } from "${"../".repeat(depth)}convex/embedded.generated";
 
 export const setCompact = local.mutation({ args: {}, handler: async () => null });
 `;

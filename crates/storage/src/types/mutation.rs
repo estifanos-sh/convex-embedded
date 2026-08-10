@@ -231,7 +231,7 @@ impl CrdtFieldKind {
 pub struct RuntimeWireIdentity {
     pub schema_hash: String,
     pub module_graph_hash: String,
-    pub protocol_version: i64,
+    pub contract_id: String,
 }
 
 /// One durable local mutation and its deterministic replay envelope.

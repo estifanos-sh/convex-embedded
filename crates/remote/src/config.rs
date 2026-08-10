@@ -2,13 +2,10 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 
 use convex::base_client::AuthTokenFetcher;
 use convex_sync_types::UdfPath;
-use storage::RuntimeWireIdentity;
+use storage::{RuntimeWireIdentity, CURRENT_WIRE_CONTRACT_ID};
 use url::Url;
 
 use crate::{RemoteError, RemoteResult};
-
-/// The current wire requires structured, sanitized terminal replay failure codes.
-pub const EMBEDDED_PROTOCOL_VERSION: i64 = 27;
 
 /// Reserved local partition key for unauthenticated data; non-hex so it never collides with a `hashValue` digest.
 pub const EMBEDDED_UNAUTHENTICATED_IDENTITY_KEY: &str = "unauthenticated";
@@ -134,7 +131,7 @@ impl RemoteConfig {
             runtime: RuntimeWireIdentity {
                 schema_hash: "local".to_owned(),
                 module_graph_hash: "local".to_owned(),
-                protocol_version: EMBEDDED_PROTOCOL_VERSION,
+                contract_id: CURRENT_WIRE_CONTRACT_ID.to_owned(),
             },
             timing: RemoteTiming::default(),
         }

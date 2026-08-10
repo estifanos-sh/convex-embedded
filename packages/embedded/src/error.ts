@@ -21,11 +21,11 @@ export const EMBEDDED_ERROR_CODES = {
   EMBEDDED_DEPENDENCY_FAILED: "required insert, upload, or schedule producer cannot apply",
   EMBEDDED_CLIENT_RETIRED:
     "client incarnation was retired; rotate ID, retain pending work, and establish fresh pull state",
-  EMBEDDED_PROTOCOL_MISMATCH: "client and deployment protocol versions differ",
+  EMBEDDED_PROTOCOL_MISMATCH: "client and deployment wire contracts differ",
   EMBEDDED_STORAGE: "local durable storage could not open or commit",
   EMBEDDED_PRE_BASELINE_STORE:
     "the existing store predates the supported migration baseline and was preserved",
-  EMBEDDED_UNSUPPORTED: "a local-capable function used a primitive V5 cannot reproduce",
+  EMBEDDED_UNSUPPORTED: "a local-capable function used a primitive the server cannot reproduce",
 } as const;
 
 /** Stable public error code. @public */

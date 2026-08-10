@@ -134,10 +134,7 @@ export interface EmbeddedStorageEvent {
 export interface EmbeddedRemoteEvent {
   at: number;
   attempt: number;
-  /**
-   * Canonical decimal ownership term for browser-coordinated remotes. Native/direct runtimes do
-   * not frame events with a leader fence.
-   */
+  /** Durable browser ownership term; absent outside browser coordination. */
   leaderFence?: string;
   /** Browser leader incarnation; a change resets the per-runtime generation and sequence fence. */
   incarnation?: string;
@@ -185,7 +182,7 @@ export interface EmbeddedRemoteEvent {
     };
   };
   type: "remote";
-  wasmApiVersion?: number;
+  storageBindingId?: string;
 }
 
 /**

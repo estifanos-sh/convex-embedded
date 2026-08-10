@@ -3,11 +3,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-/// The first public `@estifanos-sh/convex-embedded` store contract. Its byte identity is frozen:
-/// every later runtime must either keep accepting it or add one explicit forward adapter.
-pub const BASELINE_STORE_EPOCH: i64 = 49;
-pub const BASELINE_STORE_FORMAT: i64 = 3;
-
 /// Permanent numeric identities for originated semantic records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
@@ -96,7 +91,7 @@ pub struct OriginPage {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreContract {
-    /// Encoding discriminator for the public baseline contract.
+    /// Encoding discriminator for the public store contract.
     pub format: i64,
     pub bootstrap_version: i64,
     pub package_epoch: i64,
@@ -104,11 +99,10 @@ pub struct StoreContract {
     pub kernel_layout_hash: String,
     pub generation_layout_hash: String,
     pub origin_writer_hash: String,
-    /// Retained reader metadata is deliberately outside candidate identity: reader coverage is a
-    /// runtime capability, not a durable migration trigger.
+    /// Reader coverage is a runtime capability, never a durable migration trigger.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin_reader_hash: String,
-    /// Setup identity lives in the bootstrap setup-plan record, rather than in this contract.
+    /// Setup identity is stored independently in the bootstrap setup-plan record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_hash: Option<String>,
 }
@@ -117,9 +111,9 @@ impl StoreContract {
     #[must_use]
     pub fn for_schema(schema: &super::StoreSchema) -> Self {
         Self {
-            format: BASELINE_STORE_FORMAT,
+            format: crate::sql::DURABLE_STORE_FORMAT,
             bootstrap_version: crate::sql::BOOTSTRAP_VERSION,
-            package_epoch: BASELINE_STORE_EPOCH,
+            package_epoch: crate::sql::DURABLE_STORE_EPOCH,
             app_schema_hash: schema.hash.clone(),
             kernel_layout_hash: manifest_hash(&crate::sql::kernel_layout_manifest()),
             generation_layout_hash: manifest_hash(&crate::sql::generation_contract_manifest()),
@@ -134,14 +128,20 @@ impl StoreContract {
     }
 
     #[must_use]
-    pub(crate) fn has_exact_baseline_layout(&self) -> bool {
-        self.format == BASELINE_STORE_FORMAT
+    pub(crate) fn has_current_format(&self) -> bool {
+        self.format == crate::sql::DURABLE_STORE_FORMAT
+    }
+
+    #[must_use]
+    pub(crate) fn has_exact_current_layout(&self) -> bool {
+        self.has_current_format()
             && self.bootstrap_version == crate::sql::BOOTSTRAP_VERSION
-            && self.package_epoch == BASELINE_STORE_EPOCH
+            && self.package_epoch == crate::sql::DURABLE_STORE_EPOCH
             && self.kernel_layout_hash == manifest_hash(&crate::sql::kernel_layout_manifest())
             && self.generation_layout_hash
                 == manifest_hash(&crate::sql::generation_contract_manifest())
             && self.origin_writer_hash == manifest_hash(&origin_writer_manifest())
+            && self.origin_reader_hash.is_empty()
             && self.setup_hash.is_none()
     }
 
@@ -331,36 +331,6 @@ pub(crate) fn origin_encode_current(
     Ok((entry.codec, (entry.encode)(value)?))
 }
 
-type OriginAdapterFn = fn(OriginKind, serde_json::Value) -> Result<serde_json::Value, StorageError>;
-
-struct OriginAdapter {
-    introduced_epoch: i64,
-    adapt: OriginAdapterFn,
-}
-
-// The public baseline has no predecessor adapter. Future adapters are appended here
-// and retained while a released source epoch can still reach the current package.
-const ORIGIN_ADAPTERS: [OriginAdapter; 0] = [];
-
-pub(crate) fn origin_adapt(
-    kind: OriginKind,
-    mut value: serde_json::Value,
-    source_epoch: i64,
-    target_epoch: i64,
-) -> Result<serde_json::Value, StorageError> {
-    for adapter in ORIGIN_ADAPTERS
-        .iter()
-        .filter(|adapter| adapter_applies(source_epoch, adapter.introduced_epoch, target_epoch))
-    {
-        value = (adapter.adapt)(kind, value)?;
-    }
-    Ok(value)
-}
-
-const fn adapter_applies(source_epoch: i64, introduced_epoch: i64, target_epoch: i64) -> bool {
-    source_epoch < introduced_epoch && introduced_epoch <= target_epoch
-}
-
 #[cfg(any(test, feature = "testkit"))]
 #[must_use]
 pub fn origin_codec_manifest_debug() -> (String, String) {
@@ -368,16 +338,6 @@ pub fn origin_codec_manifest_debug() -> (String, String) {
         manifest_hash(&origin_writer_manifest()),
         manifest_hash(&origin_reader_manifest()),
     )
-}
-
-#[cfg(any(test, feature = "testkit"))]
-#[must_use]
-pub const fn origin_adapter_applies_debug(
-    source_epoch: i64,
-    introduced_epoch: i64,
-    target_epoch: i64,
-) -> bool {
-    adapter_applies(source_epoch, introduced_epoch, target_epoch)
 }
 
 fn manifest_hash<T: Serialize>(value: &T) -> String {

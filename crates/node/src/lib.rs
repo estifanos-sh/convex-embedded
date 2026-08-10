@@ -60,18 +60,16 @@ use storage::{
     TableDef, TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch,
 };
 
-const API_VERSION: u32 = 33;
-
-#[napi(js_name = "apiVersion")]
+#[napi(js_name = "bindingContractId")]
 #[must_use]
-pub fn api_version() -> u32 {
-    API_VERSION
+pub fn binding_contract_id() -> String {
+    storage::CURRENT_STORAGE_BINDING_CONTRACT_ID.to_owned()
 }
 
-#[napi(js_name = "protocolVersion")]
+#[napi(js_name = "contractId")]
 #[must_use]
-pub fn protocol_version() -> i64 {
-    remote::config::EMBEDDED_PROTOCOL_VERSION
+pub fn contract_id() -> String {
+    storage::CURRENT_WIRE_CONTRACT_ID.to_owned()
 }
 
 /// A user-declared index column. Index columns store an order-preserving key (any value type),
@@ -451,7 +449,7 @@ pub struct JsRemoteStartOptions {
     pub module_graph_hash: String,
     pub notify: Option<JsFunction>,
     pub operation_timeout_ms: Option<u32>,
-    pub protocol_version: i64,
+    pub contract_id: String,
     pub receive_timeout_ms: Option<u32>,
     pub schema_hash: String,
     pub transport: Option<JsObject>,
@@ -3421,7 +3419,7 @@ fn remote_config(options: JsRemoteStartOptions) -> napi::Result<RemoteConfig> {
     config.runtime = storage::RuntimeWireIdentity {
         schema_hash: options.schema_hash,
         module_graph_hash: options.module_graph_hash,
-        protocol_version: options.protocol_version,
+        contract_id: options.contract_id,
     };
     config.timing = RemoteTiming {
         receive_timeout: options

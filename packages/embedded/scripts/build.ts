@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
+run(process.execPath, ["scripts/contract.mjs", "--check"], packageDir);
 run("vp", ["pack"], packageDir);
 await import("./wasm.ts");
 await import("./native.ts");

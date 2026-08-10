@@ -20,18 +20,17 @@ use crate::sql::{
 #[cfg(any(test, feature = "testkit"))]
 use crate::types::RevFrontier;
 use crate::types::{
-    origin_adapt, origin_current_codec, origin_decode, origin_encode_current,
-    AuthoritativeApplyResult, AuthoritativeRow, ColValue, CommitMutation, CommitOptions,
-    CommitResult, CommitSource, CountSpec, CrdtOp, CrdtOperation, DeleteIn, DeleteResult,
-    DirtyHeadDebug, DocWrite, FileMetadata, FileStore, IdMapping, IdMappingContent,
-    MembershipRange, MigrationCandidate, MigrationStep, MutationCall, MutationRecord,
-    MutationStatus, OriginCursor, OriginKind, OriginPage, OriginRecord, Page, PendingUpload,
-    ReadSpec, RemoteMember, RemotePageWrite, RemotePageWriteResult, RemotePending,
-    RemoteSettlementOutcome, RemoteSettlementWrite, RemoteSettlementWriteResult, ResultEntry,
-    RevKey, RevState, RevWriteResult, RowChange, RowChangeOp, RowHead, RowKey, ScheduledJob,
-    ScheduledState, StoreContract, StoreSchema, TableDef, TablePlacement, UploadLease,
-    UploadLeaseWrite, WriteBatch, ORIGIN_FLAG_DISCARDED, ORIGIN_FLAG_QUARANTINED,
-    BASELINE_STORE_EPOCH,
+    origin_current_codec, origin_decode, origin_encode_current, AuthoritativeApplyResult,
+    AuthoritativeRow, ColValue, CommitMutation, CommitOptions, CommitResult, CommitSource,
+    CountSpec, CrdtOp, CrdtOperation, DeleteIn, DeleteResult, DirtyHeadDebug, DocWrite,
+    FileMetadata, FileStore, IdMapping, IdMappingContent, MembershipRange, MigrationCandidate,
+    MigrationStep, MutationCall, MutationRecord, MutationStatus, OriginCursor, OriginKind,
+    OriginPage, OriginRecord, Page, PendingUpload, ReadSpec, RemoteMember, RemotePageWrite,
+    RemotePageWriteResult, RemotePending, RemoteSettlementOutcome, RemoteSettlementWrite,
+    RemoteSettlementWriteResult, ResultEntry, RevKey, RevState, RevWriteResult, RowChange,
+    RowChangeOp, RowHead, RowKey, ScheduledJob, ScheduledState, StoreContract, StoreSchema,
+    TableDef, TablePlacement, UploadLease, UploadLeaseWrite, WriteBatch, ORIGIN_FLAG_DISCARDED,
+    ORIGIN_FLAG_QUARANTINED,
 };
 
 static PATH_LOCKS: LazyLock<Mutex<FxHashMap<String, Weak<Mutex<()>>>>> =
@@ -54,8 +53,7 @@ const ORIGIN_FLAGS_NONE: i64 = 0;
 /// Codec for quarantine/discard metadata. It is deliberately not any semantic record codec: a
 /// future semantic codec may be binary and must never be asked to decode this JSON envelope.
 const ORIGIN_DISPOSITION_CODEC: i64 = 1;
-const MIN_SUPPORTED_EPOCH: i64 = BASELINE_STORE_EPOCH;
-const CURRENT_STORE_EPOCH: i64 = BASELINE_STORE_EPOCH;
+const DURABLE_STORE_EPOCH: i64 = sql::DURABLE_STORE_EPOCH;
 const REMOTE_SEED_MIN_BATCH: usize = 64;
 const REMOTE_SEED_PARAMETER_BUDGET: usize = 900;
 
@@ -64,10 +62,7 @@ fn remote_cursor_key_encode(subscription: &str) -> String {
 }
 
 fn contract_matches_store_epoch(contract: &StoreContract, stored_epoch: i64) -> bool {
-    // A release may only accept the one immutable public baseline until it explicitly adds the
-    // next contract adapter. This makes compatibility a narrow, reviewed promise.
-    debug_assert_eq!(sql::EMBEDDED_EPOCH, CURRENT_STORE_EPOCH);
-    stored_epoch == BASELINE_STORE_EPOCH && contract.has_exact_baseline_layout()
+    stored_epoch == DURABLE_STORE_EPOCH && contract.has_exact_current_layout()
 }
 
 /// How long a claimed scheduled job holds its lease before another worker may reclaim it. A worker
@@ -271,15 +266,15 @@ impl EmbeddedStore {
             let stored_epoch = driver
                 .run_row(sql::READ_USER_VERSION, Vec::new(), |row| int_at(row, 0))?
                 .unwrap_or(0);
-            if stored_epoch < MIN_SUPPORTED_EPOCH {
+            if stored_epoch < DURABLE_STORE_EPOCH {
                 return Err(StorageError::PreBaselineStore {
                     found: stored_epoch,
-                    minimum: MIN_SUPPORTED_EPOCH,
+                    minimum: DURABLE_STORE_EPOCH,
                 });
             }
-            if stored_epoch > CURRENT_STORE_EPOCH {
+            if stored_epoch > DURABLE_STORE_EPOCH {
                 return Err(StorageError::IncompatibleStore(format!(
-                    "store epoch {stored_epoch} is newer than runtime epoch {CURRENT_STORE_EPOCH}; the store was preserved"
+                    "store epoch {stored_epoch} is newer than the supported durable baseline {DURABLE_STORE_EPOCH}; the store was preserved"
                 )));
             }
             stored_epoch
@@ -502,20 +497,20 @@ impl EmbeddedStore {
             )?;
             return self.activate_schema_unlocked(schema);
         }
-        if stored_version < MIN_SUPPORTED_EPOCH {
+        if stored_version < DURABLE_STORE_EPOCH {
             return Err(StorageError::PreBaselineStore {
                 found: stored_version,
-                minimum: MIN_SUPPORTED_EPOCH,
+                minimum: DURABLE_STORE_EPOCH,
             });
         }
-        if stored_version > CURRENT_STORE_EPOCH {
+        if stored_version > DURABLE_STORE_EPOCH {
             return Err(StorageError::IncompatibleStore(format!(
                 "unsupported store epoch {stored_version}; the existing store was preserved"
             )));
         }
         if !has_bootstrap {
             return Err(StorageError::IncompatibleStore(
-                "the store has no compatible bootstrap plane; the existing store was preserved"
+                "the store has no current durable-baseline bootstrap plane; the existing store was preserved"
                     .to_owned(),
             ));
         }
@@ -534,11 +529,11 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
-        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let requested = StoreContract::for_schema(schema);
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let active_setup = self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY)?;
         let requested_setup = Self::target_setup_hash(&active_setup, schema);
-        if !active.has_exact_baseline_layout()
+        if !active.has_current_format()
             || !active.has_same_candidate_identity(&requested)
             || requested_setup != active_setup
         {
@@ -600,7 +595,7 @@ impl EmbeddedStore {
                 .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
             self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &contract)?;
             self.driver
-                .execute(&sql::write_user_version(CURRENT_STORE_EPOCH), Vec::new())?;
+                .execute(&sql::write_user_version(DURABLE_STORE_EPOCH), Vec::new())?;
             Ok(())
         })();
         match written {
@@ -660,9 +655,9 @@ impl EmbeddedStore {
         &self,
         contract: &StoreContract,
     ) -> Result<(), StorageError> {
-        if !contract.has_exact_baseline_layout() {
+        if !contract.has_exact_current_layout() {
             return Err(StorageError::IncompatibleStore(
-                "active contract is outside the supported baseline; the store was preserved"
+                "active contract is outside the supported public store baseline; the store was preserved"
                     .to_owned(),
             ));
         }
@@ -1289,12 +1284,6 @@ impl EmbeddedStore {
         }
     }
 
-    /// Seed the frozen originated ledger from the generation-zero layout that
-    /// existed before the ledger was introduced.
-    ///
-    /// This is intentionally a one-time adapter. Once the bootstrap table is
-    /// present, all later releases locate originated state exclusively through
-    /// the frozen ledger rather than through old application tables.
     /// Create or resume an isolated generation carrying the active originated ledger.
     #[allow(clippy::too_many_lines)]
     pub fn migration_prepare(
@@ -1341,20 +1330,21 @@ impl EmbeddedStore {
             });
         }
         let stored_version = self.read_user_version()?;
-        if stored_version < MIN_SUPPORTED_EPOCH {
+        if stored_version < DURABLE_STORE_EPOCH {
             return Err(StorageError::PreBaselineStore {
                 found: stored_version,
-                minimum: MIN_SUPPORTED_EPOCH,
+                minimum: DURABLE_STORE_EPOCH,
             });
         }
-        if stored_version > CURRENT_STORE_EPOCH {
+        if stored_version > DURABLE_STORE_EPOCH {
             return Err(StorageError::IncompatibleStore(format!(
-                "store epoch {stored_version} is newer than runtime epoch {CURRENT_STORE_EPOCH}; the store was preserved"
+                "store epoch {stored_version} is newer than the supported durable baseline {DURABLE_STORE_EPOCH}; the store was preserved"
             )));
         }
         if !existing_tables.iter().any(|table| table == sql::BOOTSTRAP) {
             return Err(StorageError::IncompatibleStore(
-                "the store has no compatible bootstrap plane; the store was preserved".to_owned(),
+                "the store has no current durable-baseline bootstrap plane; the store was preserved"
+                    .to_owned(),
             ));
         }
         let resolved_generation = self
@@ -1386,7 +1376,7 @@ impl EmbeddedStore {
         {
             return Err(StorageError::IncompatibleStore(
                 "the active contract does not match the supported SQLite/bootstrap/schema contract; the store was preserved"
-                    .to_owned(),
+                .to_owned(),
             ));
         }
         self.leader_fence_validate_for_contract_unlocked(&active)?;
@@ -1404,7 +1394,7 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
-        if active.has_exact_baseline_layout()
+        if active.has_current_format()
             && active.has_same_candidate_identity(&target)
             && target_setup_hash == active_setup_hash
         {
@@ -1565,10 +1555,9 @@ impl EmbeddedStore {
             )?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_COPY_STATE_KEY, b"pending")?;
             self.write_bootstrap_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY, b"pending")?;
-            let setup_skipped = target_setup_hash.is_empty();
             self.write_bootstrap_unlocked(
                 sql::CANDIDATE_SETUP_STATE_KEY,
-                if setup_skipped {
+                if target_setup_hash.is_empty() {
                     b"skipped"
                 } else {
                     b"pending"
@@ -1757,34 +1746,29 @@ impl EmbeddedStore {
                         .to_owned(),
                 )
             })?;
-        let source = self
+        if self
             .bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
-            .ok_or_else(|| {
-                StorageError::IncompatibleStore(
-                    "active contract is missing; the active store was preserved".to_owned(),
-                )
-            })?;
-        let target = self
+            .is_none()
+        {
+            return Err(StorageError::IncompatibleStore(
+                "active contract is missing; the active store was preserved".to_owned(),
+            ));
+        }
+        if self
             .bootstrap_contract_read_unlocked(sql::CANDIDATE_CONTRACT_KEY)?
-            .ok_or_else(|| {
-                StorageError::IncompatibleStore(
-                    "candidate contract is missing; the active store was preserved".to_owned(),
-                )
-            })?;
-        self.candidate_origin_copy_step_unlocked(
-            source_generation,
-            generation,
-            source.package_epoch,
-            target.package_epoch,
-        )
+            .is_none()
+        {
+            return Err(StorageError::IncompatibleStore(
+                "candidate contract is missing; the active store was preserved".to_owned(),
+            ));
+        }
+        self.candidate_origin_copy_step_unlocked(source_generation, generation)
     }
 
     fn candidate_origin_copy_step_unlocked(
         &self,
         source_generation: i64,
         candidate_generation: i64,
-        source_epoch: i64,
-        target_epoch: i64,
     ) -> Result<MigrationStep, StorageError> {
         if self.candidate_origin_copy_complete_unlocked()? {
             return Ok(MigrationStep {
@@ -1808,7 +1792,7 @@ impl EmbeddedStore {
             });
         }
         for record in &mut page {
-            *record = origin_record_encode_current(record, source_epoch, target_epoch)?;
+            *record = origin_record_encode_current(record)?;
         }
         let next = page
             .last()
@@ -1848,16 +1832,7 @@ impl EmbeddedStore {
         Ok(self
             .bootstrap_read_unlocked(sql::CANDIDATE_COPY_STATE_KEY)?
             .as_deref()
-            == Some(b"complete")
-            // Candidates created by the previous unreleased layout had one overloaded state.
-            // Its later values still mean origin copying completed, so never re-copy them.
-            || (self
-                .bootstrap_read_unlocked(sql::CANDIDATE_COPY_STATE_KEY)?
-                .is_none()
-                && matches!(
-                    self.bootstrap_read_unlocked(sql::CANDIDATE_STATE_KEY)?.as_deref(),
-                    Some(b"copied" | b"materializing" | b"ready")
-                )))
+            == Some(b"complete"))
     }
 
     fn candidate_origin_copy_cursor_read_unlocked(&self) -> Result<OriginCursor, StorageError> {
@@ -2573,6 +2548,7 @@ impl EmbeddedStore {
                     "active contract is missing; the active store was preserved".to_owned(),
                 )
             })?;
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let active_setup = self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY)?;
         let target_setup = Self::target_setup_hash(&active_setup, schema);
         let candidate_setup = self.setup_hash_read_unlocked(sql::CANDIDATE_SETUP_HASH_KEY)?;
@@ -2587,7 +2563,6 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
-        self.leader_fence_validate_for_contract_unlocked(&active)?;
         if !matches!(
             self.bootstrap_read_unlocked(sql::CANDIDATE_SETUP_STATE_KEY)?
                 .as_deref(),
@@ -2694,6 +2669,7 @@ impl EmbeddedStore {
                     "active contract is missing; the active store was preserved".to_owned(),
                 )
             })?;
+        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let active_setup = self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY)?;
         let target_setup = Self::target_setup_hash(&active_setup, schema);
         let candidate_setup = self.setup_hash_read_unlocked(sql::CANDIDATE_SETUP_HASH_KEY)?;
@@ -2708,7 +2684,6 @@ impl EmbeddedStore {
                     .to_owned(),
             ));
         }
-        self.leader_fence_validate_for_contract_unlocked(&active)?;
         let previous_generation = self.driver.generation();
         let previous_tables = lock(&self.tables).clone();
         *lock(&self.tables) = schema
@@ -2785,7 +2760,7 @@ impl EmbeddedStore {
             // them in the same cutover transaction so a process restart can never observe the new
             // generation through the old runtime epoch (or vice versa).
             self.driver
-                .execute(&sql::write_user_version(CURRENT_STORE_EPOCH), Vec::new())?;
+                .execute(&sql::write_user_version(DURABLE_STORE_EPOCH), Vec::new())?;
             let mut retired = self.retired_generations_read_unlocked()?;
             if !retired.contains(&active_generation) {
                 retired.push(active_generation);
@@ -2796,7 +2771,6 @@ impl EmbeddedStore {
                 sql::CANDIDATE_SOURCE_KEY,
                 sql::CANDIDATE_CONTRACT_KEY,
                 sql::CANDIDATE_SETUP_HASH_KEY,
-                sql::CANDIDATE_STATE_KEY,
                 sql::CANDIDATE_COPY_STATE_KEY,
                 sql::CANDIDATE_MATERIALIZE_STATE_KEY,
                 sql::CANDIDATE_SETUP_STATE_KEY,
@@ -2873,14 +2847,7 @@ impl EmbeddedStore {
         let materialized = self
             .bootstrap_read_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY)?
             .as_deref()
-            == Some(b"complete")
-            || (self
-                .bootstrap_read_unlocked(sql::CANDIDATE_MATERIALIZE_STATE_KEY)?
-                .is_none()
-                && self
-                    .bootstrap_read_unlocked(sql::CANDIDATE_STATE_KEY)?
-                    .as_deref()
-                    == Some(b"ready"));
+            == Some(b"complete");
         if materialized {
             return Ok(MigrationStep {
                 done: true,
@@ -3684,7 +3651,6 @@ impl EmbeddedStore {
             sql::CANDIDATE_SOURCE_KEY,
             sql::CANDIDATE_CONTRACT_KEY,
             sql::CANDIDATE_SETUP_HASH_KEY,
-            sql::CANDIDATE_STATE_KEY,
             sql::CANDIDATE_COPY_STATE_KEY,
             sql::CANDIDATE_MATERIALIZE_STATE_KEY,
             sql::CANDIDATE_SETUP_STATE_KEY,
@@ -4126,11 +4092,9 @@ impl EmbeddedStore {
                     "active contract is missing; the store was preserved".to_owned(),
                 )
             })?;
-        if !contract_matches_store_epoch(&active, stored_epoch)
-            || !active.has_exact_baseline_layout()
-        {
+        if !contract_matches_store_epoch(&active, stored_epoch) || !active.has_current_format() {
             return Err(StorageError::IncompatibleStore(
-                "leader fence requires the published baseline store contract; the store was preserved"
+                "leader fence requires the public store contract; the store was preserved"
                     .to_owned(),
             ));
         }
@@ -4150,15 +4114,15 @@ impl EmbeddedStore {
             self.write_bootstrap_unlocked(sql::LEADER_FENCE_KEY, encoded.as_bytes())?;
             Ok(encoded)
         });
-        // Attempt restoration after both a successful commit and every rollback/error path. A
-        // failed restoration is surfaced only when publication succeeded; on a failed claim the
-        // original failure remains the causally useful result.
         let restored = self
             .driver
             .execute("PRAGMA synchronous = NORMAL", Vec::new());
         match advanced {
             Ok(value) => {
-                restored?;
+                // The fence transaction has already published this term. Restoring the connection
+                // performance mode cannot change ownership, so it must not turn a successful claim
+                // into an apparent failure.
+                drop(restored);
                 Ok(value)
             }
             Err(error) => {
@@ -4404,6 +4368,25 @@ impl EmbeddedStore {
     pub fn execute_sql_for_test(&self, sql: &str) {
         self.driver.execute(sql, Vec::new()).unwrap();
         self.driver.clear_statements();
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    #[doc(hidden)]
+    pub fn leader_fence_debug_write(&self, value: &[u8]) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.transaction_unlocked(|| self.write_bootstrap_unlocked(sql::LEADER_FENCE_KEY, value))
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
+    #[doc(hidden)]
+    pub fn leader_fence_debug_delete(&self) -> Result<(), StorageError> {
+        let _guard = lock(&self.operation_lock);
+        self.transaction_unlocked(|| {
+            self.driver.execute(
+                sql::DELETE_BOOTSTRAP,
+                vec![text_value(sql::LEADER_FENCE_KEY.to_owned())],
+            )
+        })
     }
 
     /// Test-only: write a retained-result entry inside an explicit transaction, mirroring the
@@ -8739,56 +8722,14 @@ impl EmbeddedStore {
             .ok_or_else(|| StorageError::IncompatibleStore("active contract is missing".to_owned()))
     }
 
-    /// Replaces the active contract and header epoch together for bridge-admission tests.
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn active_contract_debug_write(
-        &self,
-        contract: &StoreContract,
-        epoch: i64,
-    ) -> Result<(), StorageError> {
-        let _guard = lock(&self.operation_lock);
-        let encoded = serde_json::to_vec(contract)
-            .map_err(|error| StorageError::Unsatisfiable(error.to_string()))?;
-        self.transaction_unlocked(|| {
-            self.write_bootstrap_unlocked(sql::ACTIVE_CONTRACT_KEY, &encoded)?;
-            self.driver
-                .execute(&sql::write_user_version(epoch), Vec::new())
-        })
-    }
-
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn leader_fence_debug_read(&self) -> Result<Option<Vec<u8>>, StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.bootstrap_read_unlocked(sql::LEADER_FENCE_KEY)
-    }
-
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn bootstrap_debug_read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.bootstrap_read_unlocked(key)
-    }
-
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn leader_fence_debug_write(&self, value: &[u8]) -> Result<(), StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.transaction_unlocked(|| self.write_bootstrap_unlocked(sql::LEADER_FENCE_KEY, value))
-    }
-
-    #[cfg(any(test, feature = "testkit"))]
-    pub fn leader_fence_debug_delete(&self) -> Result<(), StorageError> {
-        let _guard = lock(&self.operation_lock);
-        self.transaction_unlocked(|| {
-            self.driver.execute(
-                sql::DELETE_BOOTSTRAP,
-                vec![text_value(sql::LEADER_FENCE_KEY.to_owned())],
-            )
-        })
-    }
-
     /// Reads the published setup-plan identity without exposing bootstrap internals to bindings.
     #[cfg(any(test, feature = "testkit"))]
     pub fn active_setup_hash_debug_read(&self) -> Result<String, StorageError> {
         let _guard = lock(&self.operation_lock);
+        self.bootstrap_contract_read_unlocked(sql::ACTIVE_CONTRACT_KEY)?
+            .ok_or_else(|| {
+                StorageError::IncompatibleStore("active contract is missing".to_owned())
+            })?;
         self.setup_hash_read_unlocked(sql::ACTIVE_SETUP_HASH_KEY)
     }
 
@@ -8931,7 +8872,7 @@ impl EmbeddedStore {
         })
     }
 
-    /// Replaces the active kernel fingerprint to exercise fail-closed contract admission.
+    /// Replaces the active kernel fingerprint to exercise fail-closed historical-contract admission.
     #[cfg(any(test, feature = "testkit"))]
     pub fn contract_kernel_hash_debug_write(&self, hash: &str) -> Result<(), StorageError> {
         let _guard = lock(&self.operation_lock);
@@ -12001,11 +11942,7 @@ fn remote_member_projection_hash(projection: &RowHead) -> [u8; 32] {
 
 /// Decode through the retained reader for the source codec, then write the current codec into the
 /// unpublished candidate. The source ledger is never modified.
-fn origin_record_encode_current(
-    record: &OriginRecord,
-    source_epoch: i64,
-    target_epoch: i64,
-) -> Result<OriginRecord, StorageError> {
+fn origin_record_encode_current(record: &OriginRecord) -> Result<OriginRecord, StorageError> {
     let expected = origin_hash(
         &record.identity_key,
         record.kind,
@@ -12025,7 +11962,6 @@ fn origin_record_encode_current(
     let (codec, payload) = match record.flags {
         ORIGIN_FLAGS_NONE => {
             let (kind, value) = origin_decode(record.kind, record.codec, &record.payload)?;
-            let value = origin_adapt(kind, value, source_epoch, target_epoch)?;
             origin_encode_current(kind, &value)?
         }
         ORIGIN_FLAG_QUARANTINED => {
@@ -12037,7 +11973,6 @@ fn origin_record_encode_current(
                 )
             })?;
             let (kind, value) = origin_decode(record.kind, prior_codec, &prior_payload)?;
-            let value = origin_adapt(kind, value, source_epoch, target_epoch)?;
             let (prior_codec, prior_payload) = origin_encode_current(kind, &value)?;
             let prior_hash = origin_hash(
                 &record.identity_key,

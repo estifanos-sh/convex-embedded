@@ -24,6 +24,11 @@ import {
   iosTargetTriples,
   mobileSlices,
 } from "../../../config/build.ts";
+import {
+  CURRENT_MOBILE_BRIDGE_CONTRACT_ID,
+  CURRENT_WIRE_CONTRACT_ID,
+} from "../src/expo/contract.ts";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../src/storage/contract.ts";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageDir, "../..");
@@ -37,7 +42,9 @@ const appleArchitectures = {
 } as const;
 const iosDeploymentTarget = "15.1";
 const cSymbols = [
-  "cem_api_version",
+  "cem_bridge_contract_id",
+  "cem_storage_binding_contract_id",
+  "cem_wire_contract_id",
   "cem_open_path",
   "cem_request",
   "cem_clock_read_value",
@@ -45,7 +52,9 @@ const cSymbols = [
   "cem_buffer_free",
 ];
 const jniSymbols = [
-  "Java_dev_convex_embedded_mobile_Native_apiVersion",
+  "Java_dev_convex_embedded_mobile_Native_bridgeContractId",
+  "Java_dev_convex_embedded_mobile_Native_storageBindingContractId",
+  "Java_dev_convex_embedded_mobile_Native_wireContractId",
   "Java_dev_convex_embedded_mobile_Native_open",
   "Java_dev_convex_embedded_mobile_Native_call",
   "Java_dev_convex_embedded_mobile_Native_clockRead",
@@ -221,6 +230,7 @@ function verifyAppleFiles(
   const library = resolve(directory, libraryPath);
   const headers = resolve(directory, headersPath);
   assertArtifact(library);
+  assertEmbeddedContractIds(library, identifier);
   const packagedHeaderPath = resolve(headers, "convex_embedded_mobile.h");
   const moduleMapPath = resolve(headers, "module.modulemap");
   assertArtifact(packagedHeaderPath);
@@ -326,6 +336,7 @@ function verifyAndroid(): void {
   for (const abi of abis) {
     const library = resolve(nativeDir, "android", abi, "libconvex_embedded_mobile.so");
     assertArtifact(library);
+    assertEmbeddedContractIds(library, abi);
     const header = execText(readelf, ["-hW", library]);
     if (!machines[abi].test(header)) throw new Error(`Android artifact has the wrong ABI: ${abi}`);
     const programHeaders = execText(readelf, ["-lW", library]);
@@ -387,6 +398,24 @@ function assertSymbols(output: string, symbols: readonly string[], artifactName:
   for (const symbol of symbols) {
     if (!exported.has(symbol))
       throw new Error(`${artifactName} is missing native symbol ${symbol}`);
+  }
+}
+
+/**
+ * A native symbol alone proves only that some bridge was packaged. The three literal contract IDs
+ * are emitted by the Rust exports and must be present in the exact binary we ship, so a stale
+ * XCFramework or JNI library cannot pass verification after the JavaScript or wire ABI changes.
+ */
+function assertEmbeddedContractIds(path: string, artifactName: string): void {
+  const bytes = readFileSync(path);
+  for (const [name, value] of [
+    ["mobile bridge", CURRENT_MOBILE_BRIDGE_CONTRACT_ID],
+    ["storage binding", CURRENT_STORAGE_BINDING_CONTRACT_ID],
+    ["wire", CURRENT_WIRE_CONTRACT_ID],
+  ] as const) {
+    if (!bytes.includes(Buffer.from(value))) {
+      throw new Error(`${artifactName} does not embed the current ${name} contract ID: ${value}`);
+    }
   }
 }
 

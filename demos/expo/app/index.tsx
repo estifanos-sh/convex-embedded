@@ -23,13 +23,8 @@ import {
   toggleExpanded as toggleExpandedMutation,
 } from "$local/view";
 import { client } from "@/src/client";
-import { DocumentRow } from "@/src/list";
-import {
-  documentIdSetsAreEqual,
-  documentListItems,
-  type DocumentListItem,
-  type DocumentSummary,
-} from "@/src/row";
+import { DocumentRow, type DocumentRowProps } from "@/src/list";
+import type { DocumentSummary } from "@/src/row";
 import {
   markFirstRender,
   markListReady,
@@ -40,6 +35,8 @@ import {
 import { useEmbeddedQuery } from "@/src/query";
 import { colors, fontSize, radius, spacing } from "@/src/theme";
 import { DocumentScreen, type DocumentScreenHandle } from "./document/[id]";
+
+type DocumentListItem = Pick<DocumentRowProps, "document" | "expanded" | "opening" | "pinned">;
 
 function documentKey({ document }: DocumentListItem): string {
   return document._id;
@@ -169,7 +166,20 @@ export default function DocumentsScreen() {
 
   const rows = query.status === "ready" ? query.value : undefined;
   const documentRows: DocumentListItem[] = React.useMemo(() => {
-    return documentListItems(rows ?? [], pinnedDocumentIds, expandedDocumentIds, openingDocumentId);
+    const list = rows ?? [];
+    const ordered =
+      pinnedDocumentIds.size === 0
+        ? list
+        : [
+            ...list.filter((document) => pinnedDocumentIds.has(document._id)),
+            ...list.filter((document) => !pinnedDocumentIds.has(document._id)),
+          ];
+    return ordered.map((document) => ({
+      document,
+      expanded: expandedDocumentIds.has(document._id),
+      opening: openingDocumentId === document._id,
+      pinned: pinnedDocumentIds.has(document._id),
+    }));
   }, [expandedDocumentIds, openingDocumentId, pinnedDocumentIds, rows]);
   const renderDocument = React.useCallback(
     ({ item }: ListRenderItemInfo<DocumentListItem>) => (
@@ -345,9 +355,9 @@ function usePinnedDocumentIds(): ReadonlySet<string> {
     const watch = client.watchQuery(pinnedDocumentsQuery, {});
     const read = () => {
       try {
-        writeDocumentIds(setPinnedIds, watch.localQueryResult() ?? []);
+        setPinnedIds(new Set(watch.localQueryResult() ?? []));
       } catch {
-        writeDocumentIds(setPinnedIds, []);
+        setPinnedIds(new Set());
       }
     };
     const unsubscribe = watch.onUpdate(read);
@@ -365,9 +375,9 @@ function useExpandedDocumentIds(): ReadonlySet<string> {
     const watch = client.watchQuery(expandedDocumentsQuery, {});
     const read = () => {
       try {
-        writeDocumentIds(setExpandedIds, watch.localQueryResult() ?? []);
+        setExpandedIds(new Set(watch.localQueryResult() ?? []));
       } catch {
-        writeDocumentIds(setExpandedIds, []);
+        setExpandedIds(new Set());
       }
     };
     const unsubscribe = watch.onUpdate(read);
@@ -376,14 +386,6 @@ function useExpandedDocumentIds(): ReadonlySet<string> {
   }, []);
 
   return expandedIds;
-}
-
-function writeDocumentIds(
-  write: React.Dispatch<React.SetStateAction<ReadonlySet<string>>>,
-  ids: readonly string[],
-): void {
-  const next = new Set(ids);
-  write((current) => (documentIdSetsAreEqual(current, next) ? current : next));
 }
 
 function QueryState({

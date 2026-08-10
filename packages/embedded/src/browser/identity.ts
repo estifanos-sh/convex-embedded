@@ -1,8 +1,8 @@
 import type { RuntimeIdentity } from "./protocol";
 import { browserStorageId } from "./storage";
-import { WASM_API_VERSION } from "./artifact";
-import { EMBEDDED_EPOCH } from "../abi";
-import { EMBEDDED_PROTOCOL_VERSION } from "../protocol";
+import { CURRENT_STORAGE_BINDING_CONTRACT_ID } from "../storage/contract";
+import { EMBEDDED_STORE_EPOCH } from "../abi";
+import { CURRENT_WIRE_CONTRACT_ID } from "../protocol";
 
 /**
  * Replaced with the real package version at build time (see `tsdown.config.ts` `define`). Falls
@@ -47,13 +47,13 @@ export function createRuntimeIdentity(storageId = browserStorageId()): RuntimeId
   return {
     moduleGraphHash: embeddedIdentity.moduleGraphHash,
     packageVersion: PACKAGE_VERSION,
-    protocolVersion: EMBEDDED_PROTOCOL_VERSION,
+    contractId: CURRENT_WIRE_CONTRACT_ID,
     schemaHash: embeddedIdentity.schemaHash,
     storageId,
     // This is the published storage-contract epoch, including candidate migrations. It remains
     // part of admission even though physical ownership is keyed only by the OPFS store address.
-    storeFormatVersion: EMBEDDED_EPOCH,
-    wasmAbiVersion: WASM_API_VERSION,
+    storeFormatVersion: EMBEDDED_STORE_EPOCH,
+    storageBindingId: CURRENT_STORAGE_BINDING_CONTRACT_ID,
   };
 }
 
@@ -90,12 +90,12 @@ export function assertSameRuntimeIdentity(
 const runtimeIdentityFields = [
   "moduleGraphHash",
   "packageVersion",
-  "protocolVersion",
+  "contractId",
   "schemaHash",
   "setupGraphHash",
   "setupReference",
   "storeFormatVersion",
-  "wasmAbiVersion",
+  "storageBindingId",
 ] as const satisfies ReadonlyArray<keyof RuntimeIdentity>;
 
 /** An existing storage owner was opened by a different app deployment. @internal */
@@ -114,8 +114,8 @@ function identityFieldLabel(field: keyof RuntimeIdentity): string {
   if (field === "schemaHash") return "schema";
   if (field === "setupGraphHash" || field === "setupReference") return "setup action";
   if (field === "packageVersion") return "package";
-  if (field === "protocolVersion") return "protocol";
-  if (field === "wasmAbiVersion") return "WASM runtime";
+  if (field === "contractId") return "protocol";
+  if (field === "storageBindingId") return "storage runtime";
   if (field === "storeFormatVersion") return "store format";
   return "storage";
 }

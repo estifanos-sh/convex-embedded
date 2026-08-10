@@ -124,8 +124,8 @@ export interface WorkerState {
   store: WasmStore;
   /** Active watch cleanup callbacks keyed by watch ID. */
   stops: Map<number, () => void>;
-  /** Loaded WASM storage ABI version for artifact freshness diagnostics. */
-  wasmApiVersion?: number;
+  /** Loaded storage binding contract for artifact freshness diagnostics. */
+  storageBindingId?: string;
   /** emnapi pthread pool for the live store instance; recovery terminates it before a graft. */
   pthreads?: PthreadRegistry;
   /** Store-instance recovery controller; when present, lane ops are watchdog-covered. */
@@ -156,74 +156,6 @@ const REMOTE_DEPLOYMENT_MISMATCH_PREFIX = "remote deployment mismatch:";
  * inbound tick queues no further outbound work.
  */
 const REMOTE_RESPONSE_KEEPALIVE_MS = 500;
-
-/** The scheduling outcome of one completed browser remote actor turn. @internal */
-export interface WorkerRemoteTurnDecision {
-  awaitingResponse: boolean;
-  idle: boolean;
-  nextDelay: number | undefined;
-  status: "starting" | "tick" | "idle";
-}
-
-/**
- * Derives the post-turn scheduler state without performing transport, storage, or event work.
- *
- * @internal
- */
-export function decideWorkerRemoteTurn({
-  active,
-  awaitingResponse,
-  connected,
-  networkOnline,
-  pending,
-  pullAttempted,
-  pushPending,
-  pushUnblocked,
-  sent,
-  wakePending,
-}: {
-  active: boolean;
-  awaitingResponse: boolean;
-  connected: boolean;
-  networkOnline: boolean;
-  pending: RemotePending | undefined;
-  pullAttempted: number;
-  pushPending: boolean;
-  pushUnblocked: boolean;
-  sent: number;
-  wakePending: boolean;
-}): WorkerRemoteTurnDecision {
-  const pendingIsEmpty = remotePendingIsEmpty(pending);
-  const nextAwaitingResponse = pendingIsEmpty
-    ? false
-    : pullAttempted > 0
-      ? false
-      : sent > 0
-        ? true
-        : active
-          ? false
-          : awaitingResponse;
-  const idle =
-    connected &&
-    networkOnline &&
-    !nextAwaitingResponse &&
-    !wakePending &&
-    !pushPending &&
-    pendingIsEmpty;
-  const nextDelay = wakePending
-    ? 0
-    : nextAwaitingResponse
-      ? REMOTE_RESPONSE_KEEPALIVE_MS
-      : pushUnblocked && !pendingIsEmpty
-        ? 0
-        : undefined;
-  return {
-    awaitingResponse: nextAwaitingResponse,
-    idle,
-    nextDelay,
-    status: idle ? "idle" : connected ? "tick" : "starting",
-  };
-}
 
 /** Sink for boot-lifecycle and degradation events surfaced during {@link initRuntime}. */
 export type RuntimeEventSink = (event: EmbeddedRuntimeEvent) => void;
@@ -464,7 +396,7 @@ async function startWorkerRemote(
     clientId: remote.clientId,
     moduleGraphHash: remote.moduleGraphHash,
     operationTimeoutMs: remote.operationTimeoutMs,
-    protocolVersion: remote.protocolVersion,
+    contractId: remote.contractId,
     receiveTimeoutMs: remote.receiveTimeoutMs,
     schemaHash: remote.schemaHash,
     transport,
@@ -575,7 +507,7 @@ function emitWorkerRemoteEvent(
     sequence,
     tick,
     type: "remote",
-    wasmApiVersion: state.wasmApiVersion,
+    storageBindingId: state.storageBindingId,
   };
   state.remoteEvent = event;
   if (state.emitRemote) {
@@ -1436,21 +1368,25 @@ export function startWorkerRemoteLoop(
         // it must clear the response fence even when the turn also reports outbound protocol
         // messages. Otherwise an empty follow-up has nothing left to receive and the browser polls
         // forever while connectionState remains `starting`.
-        const decision = decideWorkerRemoteTurn({
-          active,
-          awaitingResponse,
-          connected: state.remoteConnected === true,
-          networkOnline: state.remoteNetworkOnline !== false,
-          pending: state.remotePending,
-          pullAttempted: pulled.pullAttempted,
-          pushPending: pushPending !== undefined,
-          pushUnblocked,
-          sent: pulled.sent,
-          wakePending,
-        });
-        awaitingResponse = decision.awaitingResponse;
-        if (decision.idle) state.recovery?.onRemoteIdle();
-        const { nextDelay: delay, status } = decision;
+        if (remotePendingIsEmpty(state.remotePending)) awaitingResponse = false;
+        else if (pulled.pullAttempted > 0) awaitingResponse = false;
+        else if (pulled.sent > 0) awaitingResponse = true;
+        else if (active) awaitingResponse = false;
+        const idle =
+          state.remoteConnected === true &&
+          state.remoteNetworkOnline !== false &&
+          !awaitingResponse &&
+          !wakePending &&
+          pushPending === undefined &&
+          remotePendingIsEmpty(state.remotePending);
+        if (idle) state.recovery?.onRemoteIdle();
+        const delay = wakePending
+          ? 0
+          : awaitingResponse
+            ? REMOTE_RESPONSE_KEEPALIVE_MS
+            : pushUnblocked && !remotePendingIsEmpty(state.remotePending)
+              ? 0
+              : undefined;
         if (pullDiagnostic) {
           emit("error", {
             durationMs: getElapsedTime(startedAt),
@@ -1462,7 +1398,7 @@ export function startWorkerRemoteLoop(
           nextDelay = delay;
           return;
         }
-        emit(status, {
+        emit(idle ? "idle" : state.remoteConnected === true ? "tick" : "starting", {
           durationMs: getElapsedTime(startedAt),
           foreground,
           nextRunIn: delay,
@@ -1636,7 +1572,7 @@ export async function initRuntime(options: {
       runner,
       stops: new Map(),
       store,
-      wasmApiVersion: opened.wasmApiVersion,
+      storageBindingId: opened.storageBindingId,
     };
     holder.state = state;
     return state;
@@ -1674,7 +1610,7 @@ export async function openStoreInstance(
   store: WasmStore;
   pthreads: PthreadRegistry;
   storagePath: string;
-  wasmApiVersion: number;
+  storageBindingId: string;
 }> {
   const debug = options.debug ?? (() => undefined);
   const pthreads = new PthreadRegistry();
@@ -1696,7 +1632,7 @@ export async function openStoreInstance(
     opfs,
     registry: pthreads,
   });
-  const wasmApiVersion = wasm.apiVersion();
+  const storageBindingId = wasm.bindingContractId();
   debug("worker:wasm:load:done");
   const openAndSetup = async (): Promise<WasmStore> => {
     debug("worker:store:open:start");
@@ -1719,7 +1655,7 @@ export async function openStoreInstance(
     pthreads,
     storagePath,
     store,
-    wasmApiVersion,
+    storageBindingId,
   };
 }
 

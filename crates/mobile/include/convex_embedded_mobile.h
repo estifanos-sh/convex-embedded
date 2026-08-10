@@ -10,7 +10,11 @@ typedef struct CemBuffer {
   uintptr_t capacity;
 } CemBuffer;
 
-uint32_t cem_api_version(void);
+const char *cem_bridge_contract_id(void);
+
+const char *cem_wire_contract_id(void);
+
+const char *cem_storage_binding_contract_id(void);
 
 uint64_t cem_open_path(const char *path, const char *selector_key,
                        const char *default_identity_key, CemBuffer *error);
