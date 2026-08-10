@@ -13,19 +13,55 @@ export const embeddedGeneratedIdentity = {
 } as const;
 export const embeddedManifest = {
   documents: {
-    read: { kind: "query", placement: "replicated", visibility: "public" },
-    write: { kind: "mutation", placement: "replicated", visibility: "public" },
-    del: { kind: "mutation", placement: "replicated", visibility: "public" },
-    summaries: { kind: "query", placement: "replicated", visibility: "public" },
+    read: {
+      kind: "query",
+      placement: "replicated",
+      visibility: "public",
+    },
+    write: {
+      kind: "mutation",
+      placement: "replicated",
+      visibility: "public",
+    },
+    del: {
+      kind: "mutation",
+      placement: "replicated",
+      visibility: "public",
+    },
+    summaries: {
+      kind: "query",
+      placement: "replicated",
+      visibility: "public",
+    },
   },
   files: {
-    generateUploadUrl: { kind: "mutation", placement: "replicated", visibility: "public" },
-    metadata: { kind: "query", placement: "replicated", visibility: "public" },
-    url: { kind: "query", placement: "replicated", visibility: "public" },
+    generateUploadUrl: {
+      kind: "mutation",
+      placement: "replicated",
+      visibility: "public",
+    },
+    metadata: {
+      kind: "query",
+      placement: "replicated",
+      visibility: "public",
+    },
+    url: {
+      kind: "query",
+      placement: "replicated",
+      visibility: "public",
+    },
   },
   remote: {
-    history: { kind: "query", placement: "remote", visibility: "public" },
-    restore: { kind: "mutation", placement: "remote", visibility: "public" },
+    history: {
+      kind: "query",
+      placement: "remote",
+      visibility: "public",
+    },
+    restore: {
+      kind: "mutation",
+      placement: "remote",
+      visibility: "public",
+    },
   },
 } as const;
 

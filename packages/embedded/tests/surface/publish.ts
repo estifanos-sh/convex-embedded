@@ -42,7 +42,9 @@ describe("Embedded publishing workflow", () => {
         if (runner === "${{") continue;
         const isTrustedPublish =
           workflowPaths[index] === ".github/workflows/publish.yml" && runner === "ubuntu-24.04";
-        expect(isTrustedPublish || declared.includes(runner)).toBe(true);
+        const isPathFilter =
+          workflowPaths[index] === ".github/workflows/preview.yml" && runner === "ubuntu-24.04";
+        expect(isTrustedPublish || isPathFilter || declared.includes(runner)).toBe(true);
       }
       for (const [, runner] of workflow.matchAll(/^\s*- runner:\s+([^\s#]+).*$/gm)) {
         expect(declared).toContain(runner);
@@ -50,6 +52,8 @@ describe("Embedded publishing workflow", () => {
     }
 
     const publish = workflows[workflowPaths.indexOf(".github/workflows/publish.yml")!];
+    const preview = workflows[workflowPaths.indexOf(".github/workflows/preview.yml")!];
+    expect(jobBody(preview, "changes")).toContain("runs-on: ubuntu-24.04");
     const publishJob = jobBody(publish, "publish");
     expect(publishJob).toContain("runs-on: ubuntu-24.04");
     expect(publishJob).toContain("id-token: write");

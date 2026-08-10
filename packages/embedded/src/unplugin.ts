@@ -201,16 +201,21 @@ const unplugin = createUnplugin((options: ConvexEmbeddedPluginOptions) => {
           return sourcePath === undefined ? null : `\0${toVirtualFacadeId(sourcePath)}`;
         });
       }
+      if (importer?.startsWith(`\0${VIRTUAL_FACADE_MODULE_PREFIX}`)) {
+        const sourcePath = fromVirtualFacadeId(importer.slice(1));
+        if (sourcePath === undefined) return null;
+        return withGeneration((current) => {
+          if (!current.localIds.has(sourcePath)) return null;
+          return resolveDirectoryProbe(id, projectRoots(), options.schemaPath);
+        });
+      }
       if (
         importer !== RESOLVED_VIRTUAL_MODULE_ID &&
         importer !== RESOLVED_VIRTUAL_IDENTITY_MODULE_ID
       ) {
         return null;
       }
-      const { convex, local } = projectRoots();
-      const directory = path.resolve(id);
-      if (directory !== convex && !local.includes(directory)) return null;
-      return path.resolve(convex, options.schemaPath ?? DEFAULT_SCHEMA_PATH);
+      return resolveDirectoryProbe(id, projectRoots(), options.schemaPath);
     },
 
     load(this: { addWatchFile?: (id: string) => void }, id) {
@@ -333,6 +338,16 @@ function isInside(file: string, dir: string): boolean {
 
 function isRelativeOrAbsoluteImport(id: string): boolean {
   return id.startsWith(".") || path.isAbsolute(id);
+}
+
+function resolveDirectoryProbe(
+  id: string,
+  roots: EmbeddedProjectRoots,
+  schemaPath: string | undefined,
+): string | null {
+  const directory = path.resolve(id);
+  if (directory !== roots.convex && !roots.local.includes(directory)) return null;
+  return path.resolve(roots.convex, schemaPath ?? DEFAULT_SCHEMA_PATH);
 }
 
 /** Resolve only paths already discovered as local modules; never probe arbitrary application files. */

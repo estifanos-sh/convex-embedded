@@ -1135,9 +1135,10 @@ describe("embedded unplugin adapter", () => {
   });
 
   test("keeps Vite dev import-analysis directory probes pinned to schema", async () => {
-    await withFixture(async ({ convexDir, localDir }) => {
+    await withFixture(async ({ convexDir, localDir, root }) => {
       await file(convexDir, "schema.ts", "export default {};\n");
       await embeddedEntrypoint(convexDir);
+      const localPath = path.join(localDir, "drafts.ts");
       await file(localDir, "drafts.ts", localFunctions());
 
       const plugin = convexEmbeddedUnplugin.rollup({
@@ -1152,6 +1153,17 @@ describe("embedded unplugin adapter", () => {
       expect(await plugin.resolveId(localDir, `\0${VIRTUAL_MODULE_ID}`)).toBe(
         path.join(convexDir, "schema.ts"),
       );
+      const facade = await plugin.resolveId(localPath, path.join(root, "app.ts"));
+      expect(typeof facade).toBe("string");
+      expect(await plugin.resolveId(convexDir, facade as string)).toBe(
+        path.join(convexDir, "schema.ts"),
+      );
+      expect(await plugin.resolveId(localDir, facade as string)).toBe(
+        path.join(convexDir, "schema.ts"),
+      );
+      expect(
+        await plugin.resolveId(convexDir, "\0virtual:convex-embedded/facade/not-a-local-module"),
+      ).toBe(null);
     });
   });
 
