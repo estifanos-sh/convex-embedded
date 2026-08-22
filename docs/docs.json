@@ -7,36 +7,6 @@
   "installCommand": "pnpm add @estifanos-sh/convex-embedded",
   "startSlug": "/start/overview",
   "llmsDescription": "Local-first storage and replication for Convex applications using @estifanos-sh/convex-embedded.",
-  "hero": {
-    "eyebrow": "Local-first runtime for Convex",
-    "status": "Open source",
-    "deck": "Ordinary Convex schemas and functions, backed by durable device storage and replication.",
-    "paletteLabel": "Add Embedded to a Convex project",
-    "paletteSlug": "/concepts/placement",
-    "paletteText": "local · replicated · remote",
-    "cards": [
-      {
-        "slug": "/start/overview",
-        "title": "Start here",
-        "body": "Understand the runtime, placement model, and supported platforms."
-      },
-      {
-        "slug": "/platform/browser",
-        "title": "Browser",
-        "body": "Bundle the worker and WASM runtime, then configure production headers."
-      },
-      {
-        "slug": "/concepts/replication",
-        "title": "Replication",
-        "body": "Follow local reads and optimistic writes through hosted authority."
-      },
-      {
-        "slug": "/concepts/placement",
-        "title": "Placement model",
-        "body": "Choose what lives on the server, replicates to devices, or stays local."
-      }
-    ]
-  },
   "sidebar": [
     {
       "label": "Getting started",
