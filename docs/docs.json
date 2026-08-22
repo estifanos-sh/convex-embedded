@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "id": "convex-embedded",
+  "title": "Convex Embedded",
+  "description": "The local-first runtime for Convex applications.",
+  "repository": "estifanos-sh/convex-embedded",
+  "installCommand": "pnpm add @estifanos-sh/convex-embedded",
+  "startSlug": "/start/overview",
+  "llmsDescription": "Local-first storage and replication for Convex applications using @estifanos-sh/convex-embedded.",
+  "hero": {
+    "eyebrow": "Local-first runtime for Convex",
+    "status": "Open source",
+    "deck": "Ordinary Convex schemas and functions, backed by durable device storage and replication.",
+    "paletteLabel": "Add Embedded to a Convex project",
+    "paletteSlug": "/concepts/placement",
+    "paletteText": "local · replicated · remote",
+    "cards": [
+      {
+        "slug": "/start/overview",
+        "title": "Start here",
+        "body": "Understand the runtime, placement model, and supported platforms."
+      },
+      {
+        "slug": "/platform/browser",
+        "title": "Browser",
+        "body": "Bundle the worker and WASM runtime, then configure production headers."
+      },
+      {
+        "slug": "/concepts/replication",
+        "title": "Replication",
+        "body": "Follow local reads and optimistic writes through hosted authority."
+      },
+      {
+        "slug": "/concepts/placement",
+        "title": "Placement model",
+        "body": "Choose what lives on the server, replicates to devices, or stays local."
+      }
+    ]
+  },
+  "sidebar": [
+    {
+      "label": "Getting started",
+      "items": [
+        { "title": "Overview", "slug": "/start/overview" },
+        { "title": "Installation", "slug": "/start/installation" },
+        { "title": "Configure Convex", "slug": "/start/convex" },
+        { "title": "Define the schema", "slug": "/start/schema" },
+        { "title": "Create a client", "slug": "/start/client" }
+      ]
+    },
+    {
+      "label": "Platforms",
+      "items": [
+        { "title": "Browser and Vite", "slug": "/platform/browser" },
+        { "title": "Expo and Metro", "slug": "/platform/expo" },
+        { "title": "Node", "slug": "/platform/node" },
+        { "title": "Other bundlers and SSR", "slug": "/platform/bundlers" }
+      ]
+    },
+    {
+      "label": "Concepts",
+      "items": [
+        { "title": "Placement model", "slug": "/concepts/placement" },
+        { "title": "Replication", "slug": "/concepts/replication" },
+        { "title": "Local functions", "slug": "/concepts/functions" },
+        { "title": "Compose local data", "slug": "/concepts/composition" },
+        { "title": "Client lifecycle", "slug": "/concepts/lifecycle" }
+      ]
+    },
+    {
+      "label": "Features",
+      "items": [
+        { "title": "Commit timestamps", "slug": "/features/timestamps" },
+        { "title": "CRDT fields", "slug": "/features/crdt" },
+        { "title": "Revisions", "slug": "/features/revisions" }
+      ]
+    },
+    {
+      "label": "Guides",
+      "items": [
+        { "title": "Schema changes", "slug": "/guides/migrations" },
+        { "title": "Production readiness", "slug": "/guides/production" }
+      ]
+    },
+    {
+      "label": "Reference",
+      "items": [
+        { "title": "Client API", "slug": "/reference/client" },
+        { "title": "Configuration", "slug": "/reference/config" },
+        { "title": "Errors and settlements", "slug": "/reference/errors" },
+        { "title": "Architecture", "slug": "/reference/architecture" },
+        { "title": "Troubleshooting", "slug": "/reference/troubleshooting" }
+      ]
+    }
+  ]
+}
