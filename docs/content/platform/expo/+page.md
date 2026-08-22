@@ -11,7 +11,7 @@ Expo development and release builds use the native store exposed by
 Install Expo's supported TypeScript configuration hook:
 
 ```bash
-pnpm exec expo install tsx -- --dev
+npx expo install tsx -- --dev
 ```
 
 Use a JavaScript shim so Metro can load a TypeScript configuration that imports

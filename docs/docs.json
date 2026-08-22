@@ -4,7 +4,7 @@
   "title": "Convex Embedded",
   "description": "The local-first runtime for Convex applications.",
   "repository": "estifanos-sh/convex-embedded",
-  "installCommand": "pnpm add @estifanos-sh/convex-embedded",
+  "installCommand": "npm install @estifanos-sh/convex-embedded",
   "startSlug": "/start/overview",
   "llmsDescription": "Local-first storage and replication for Convex applications using @estifanos-sh/convex-embedded.",
   "sidebar": [

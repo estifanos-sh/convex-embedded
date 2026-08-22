@@ -8,7 +8,7 @@ description: Install Convex Embedded and verify the runtime requirements for you
 Install Convex Embedded beside Convex in an existing application:
 
 ```bash
-pnpm add @estifanos-sh/convex-embedded convex
+npm install @estifanos-sh/convex-embedded convex
 ```
 
 The package is published independently as
@@ -54,5 +54,5 @@ Android ABIs. That artifact is a GitHub release asset, not an npm publication.
 Install a published prerelease or release by exact version:
 
 ```bash
-pnpm add @estifanos-sh/convex-embedded@<version> convex
+npm install @estifanos-sh/convex-embedded@<version> convex
 ```
