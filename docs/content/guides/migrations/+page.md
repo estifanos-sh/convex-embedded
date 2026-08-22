@@ -59,8 +59,8 @@ export const backfillArchived = migrations.define({
 Dry-run one batch before starting the resumable migration:
 
 ```bash
-pnpm convex run migrations:backfillArchived '{"dryRun":true}'
-pnpm convex run migrations:backfillArchived
+npx convex run migrations:backfillArchived '{"dryRun":true}'
+npx convex run migrations:backfillArchived
 ```
 
 An ordinary `remote.internalMutation` is appropriate for one document or
